@@ -151,3 +151,25 @@ There is no fallback to the native browser. When the Aside CLI is unavailable, t
 ```sh
 gjc config set browser.backend aside
 ```
+
+The routing contract follows Aside's official developer documentation
+(`https://docs.aside.com/help/developers.md`, indexed by
+`https://docs.aside.com/llms.txt`) and the API references bundled with the
+installed Aside version. It covers:
+
+- deterministic Playwright through `aside repl`, including tab attachment,
+  snapshots, locators, authenticated fetch/downloads, screenshots, Chrome
+  profile APIs, visual CUA fallback, and authorized CAPTCHA helpers;
+- agentic `aside exec` work for runtime judgment, source-heavy research,
+  browser history, MFA/autofill, approvals, notifications, monitoring,
+  multi-site synthesis, routines, and resumable `--session` follow-ups;
+- account/model/provider/speed/effort targeting without changing user defaults;
+- dedicated Google, document, media, social, password-manager, PDF, and Office
+  integrations when the installed Aside build exposes them; and
+- explicit permission, privacy, credential, payment, messaging, posting,
+  document-edit, profile-mutation, and destructive-action boundaries.
+
+The always-injected prompt stays a routing and safety contract rather than
+copying every versioned method signature. The user-level `aside` skill contains
+the detailed API inventory and points agents to the installed official builtin
+skills when exact signatures matter.
