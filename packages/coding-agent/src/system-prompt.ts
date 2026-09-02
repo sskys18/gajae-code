@@ -11,7 +11,6 @@ import { systemPromptCapability } from "./capability/system-prompt";
 import type { SkillsSettings } from "./config/settings";
 import { type ContextFile, loadCapability, type SystemPrompt as SystemPromptFile } from "./discovery";
 import type { Skill } from "./extensibility/skills";
-import browserAsidePrompt from "./prompts/agent-fragments/browser-aside.md" with { type: "text" };
 import customSystemPromptTemplate from "./prompts/system/custom-system-prompt.md" with { type: "text" };
 import projectPromptTemplate from "./prompts/system/project-prompt.md" with { type: "text" };
 import systemPromptTemplate from "./prompts/system/system-prompt.md" with { type: "text" };
@@ -367,8 +366,6 @@ export interface BuildSystemPromptOptions {
 	appendSystemPrompt?: string;
 	/** Rendered GJC plugin system-appendix blocks (lower-authority, appended last). */
 	pluginAppendices?: string;
-	/** Browser surface selected for the session. */
-	browserBackend?: "native" | "aside";
 	/** Repeat full tool descriptions in system prompt. Default: false */
 	repeatToolDescriptions?: boolean;
 	/** Skills settings for discovery. */
@@ -544,7 +541,6 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		tools,
 		appendSystemPrompt,
 		pluginAppendices,
-		browserBackend,
 		repeatToolDescriptions = false,
 		toolNames: providedToolNames,
 		cwd,
@@ -734,10 +730,6 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const projectPrompt = resolvedCustomPrompt ? "" : prompt.render(projectPromptTemplate, data).trim();
 	if (projectPrompt) {
 		systemPrompt.push(projectPrompt);
-	}
-
-	if (browserBackend === "aside") {
-		systemPrompt.push(browserAsidePrompt.trim());
 	}
 
 	// Plugin system appendices are appended last as a lower-authority block; they

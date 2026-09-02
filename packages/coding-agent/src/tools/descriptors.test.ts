@@ -39,7 +39,6 @@ function makeSession(overrides: Record<string, unknown> = {}): any {
 		"calc.enabled": true,
 		"skill.enabled": true,
 		"browser.enabled": true,
-		"browser.backend": "native",
 		"computer.enabled": true,
 		"checkpoint.enabled": true,
 		"irc.enabled": true,
@@ -370,17 +369,6 @@ describe("tool descriptor compatibility gate", () => {
 			if (previous === undefined) delete process.env.CLAUDE_CODE_DISABLE_CRON;
 			else process.env.CLAUDE_CODE_DISABLE_CRON = previous;
 		}
-	});
-
-	test("hides the built-in browser tool when Aside is the selected backend", () => {
-		const context = availabilityContext();
-
-		expect(BUILTIN_TOOL_DESCRIPTORS.browser.isAvailable(makeSession({ "browser.backend": "aside" }), context)).toBe(
-			false,
-		);
-		expect(BUILTIN_TOOL_DESCRIPTORS.browser.isAvailable(makeSession({ "browser.backend": "native" }), context)).toBe(
-			true,
-		);
 	});
 
 	test("descriptor creation is side-effect free; materialization registers cleanup exactly once", () => {

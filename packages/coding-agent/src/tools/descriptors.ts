@@ -260,8 +260,7 @@ function availableFor(name: string, session: ToolSession, context = defaultAvail
 	if (name === "search_tool_bm25") return context.discoveryActive ?? resolveDiscoveryActive(session);
 	if (name === "calc") return Boolean(session.settings.get("calc.enabled"));
 	if (name === "skill" || name === "skill_discovery") return Boolean(session.settings.get("skill.enabled"));
-	if (name === "browser")
-		return Boolean(session.settings.get("browser.enabled")) && session.settings.get("browser.backend") === "native";
+	if (name === "browser") return Boolean(session.settings.get("browser.enabled"));
 	if (name === "computer") return isComputerCallable(session);
 	if (name === "checkpoint" || name === "rewind")
 		return Boolean(session.settings.get("checkpoint.enabled")) && (session.taskDepth ?? 0) === 0;

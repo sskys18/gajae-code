@@ -76,7 +76,6 @@ import { EditTool } from "../edit";
 import type { MasterModeContext } from "../master-mode/context";
 import { describeFoldReceipt } from "../session/fold-coordinator";
 import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
-import { applyAsideBrowserBackend } from "../tools/browser/aside-backend";
 import { SearchTool } from "../tools/search";
 import "../discovery";
 import { resolveConfigValue } from "../config/resolve-config-value";
@@ -168,7 +167,6 @@ import {
 	unregisterOwnedRegistration,
 } from "../session/terminal-abort";
 import { formatNoModelsAvailableFallback } from "../setup/model-onboarding-guidance";
-import { probeAsideCli } from "../slash-commands/helpers/aside";
 import {
 	type BuildSystemPromptResult,
 	buildSystemPrompt as buildSystemPromptInternal,
@@ -819,7 +817,6 @@ export interface BuildSystemPromptOptions {
 	cwd?: string;
 	appendPrompt?: string;
 	repeatToolDescriptions?: boolean;
-	browserBackend?: "native" | "aside";
 }
 
 /**
@@ -835,7 +832,6 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		contextFiles: options.contextFiles,
 		appendSystemPrompt: options.appendPrompt,
 		repeatToolDescriptions: options.repeatToolDescriptions,
-		browserBackend: options.browserBackend,
 	});
 }
 
@@ -3030,7 +3026,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// tools are surfaced as always-on custom tools (like plugin MCPs), so an
 			// ordinary session exposes them without needing MCP discovery mode.
 			let conventionalConfigs: Record<string, MCPServerConfig> = {};
-			let conventionalSources: Record<string, Pick<SourceMeta, "provider" | "providerName" | "level">> = {};
+			let conventionalSources: Record<string, SourceMeta> = {};
 			if (options.enableMcpAutoload !== false) {
 				try {
 					const loaded = await loadAllMCPConfigs(cwd, {
@@ -3064,16 +3060,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					logger.warn("Failed to discover conventional MCP servers", { error: safeErrorForLog(error) });
 				}
 			}
-			const asideBackend = applyAsideBrowserBackend(
-				conventionalConfigs,
-				conventionalSources,
-				settings.get("browser.backend") === "aside" && conventionalConfigs.aside === undefined
-					? probeAsideCli()
-					: undefined,
-			);
-			conventionalConfigs = asideBackend.configs;
-			conventionalSources = asideBackend.sources;
-			if (asideBackend.warning) logger.warn(asideBackend.warning);
 			// Always-on GJC plugin-bundle MCP servers, merged over conventional
 			// servers on name collisions. Top-level sessions own a manager and
 			// connect the validated servers; subagents inherit the parent's manager
@@ -3938,7 +3924,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				alwaysApplyRules,
 				skillsSettings: settings.getGroup("skills"),
 				appendSystemPrompt: appendPrompt,
-				browserBackend: settings.get("browser.backend"),
 				pluginAppendices: pluginSystemAppendices,
 				repeatToolDescriptions,
 				intentField,
