@@ -144,6 +144,6 @@ Docs-only remains the smallest safe outcome for the search/context sidecar in is
 
 ## Option D: `browser.backend: aside` (native routing)
 
-This fork-local setting selects Aside as the browser surface. Set `browser.backend` to `"aside"` to hide GJC's built-in browser tool, auto-register `aside mcp` as an always-on MCP server, and add system-prompt guidance requiring browser work through Aside's persistent live logged-in browser REPL. It does not restore the reverted in-process Aside browser backend, and upstream's boundary decision above remains unchanged.
+This fork-local setting selects Aside as the browser surface. Set `browser.backend` to `"aside"` to hide GJC's built-in browser tool and add system-prompt guidance requiring browser work through direct `aside repl` or `aside exec` CLI commands. It does not register or use an MCP server, does not restore the reverted in-process Aside browser backend, and leaves upstream's boundary decision above unchanged.
 
-There is no fallback to the native browser. When the Aside CLI is unavailable, GJC logs a warning naming `browser.backend`, includes the installation command, and starts the session with no browser tool.
+There is no fallback to the native browser. When the Aside CLI is unavailable, the direct CLI command fails clearly and the session has no browser tool.

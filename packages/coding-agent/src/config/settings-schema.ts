@@ -3051,7 +3051,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "tools",
 			label: "Browser Backend",
 			description:
-				"Browser surface offered to the model. 'native' exposes the built-in Puppeteer browser tool. 'aside' hides it and auto-registers the Aside CLI MCP server (`aside mcp`) so every browser task runs in your live logged-in Aside browser (requires the Aside CLI).",
+				"Browser surface offered to the model. 'native' exposes the built-in Puppeteer browser tool. 'aside' hides it and requires every browser task to run through the Aside CLI in your live logged-in browser (requires the Aside CLI).",
 		},
 	},
 
