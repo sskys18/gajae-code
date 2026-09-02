@@ -4,7 +4,7 @@
 
 ### Added
 
-- `browser.backend: "aside"` routes browser work through the Aside CLI MCP server, hiding the built-in browser tool and guiding the model to use Aside's persistent live-browser REPL.
+- `browser.backend: "aside"` hides the built-in browser tool and routes browser work directly through the installed Aside CLI.
 
 - Interactive OAuth account selection now handles a stale or missing pinned credential in place, preserving the session and actionable `/login` or AUTO guidance instead of creating an unhandled rejection and crash record.
 - Named-worktree SDK session.create now gives git worktree add/reuse and workspace install independent 30s budgets instead of charging them against the child 10s semantic-readiness clock. Prep timeouts stay typed and terminal (`worktree_preparation_timeout` / `dependency_preparation_timeout`); Coordinator and ACP preserve those codes instead of collapsing them to `unavailable` or `broker_compensation_unobserved`. Ordinary no-worktree sessions stay 10s/21s.
