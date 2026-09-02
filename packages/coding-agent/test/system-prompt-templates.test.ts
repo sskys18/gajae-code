@@ -565,7 +565,15 @@ describe("system Handlebars prompt templates", () => {
 		const aside = await buildSystemPrompt({ ...options, browserBackend: "aside" });
 
 		expect(native.systemPrompt.join("\n\n")).not.toContain("<browser-backend>");
-		expect(aside.systemPrompt.join("\n\n")).toContain("<browser-backend>");
+		const asidePrompt = aside.systemPrompt.join("\n\n");
+		expect(asidePrompt).toContain("<browser-backend>");
+		expect(asidePrompt).toContain("aside repl");
+		expect(asidePrompt).toContain("aside exec --session");
+		expect(asidePrompt).toContain("authenticated `fetch`");
+		expect(asidePrompt).toContain("`chrome.*`");
+		expect(asidePrompt).toContain("`cua.*`");
+		expect(asidePrompt).toContain("`captcha.*`");
+		expect(asidePrompt).toContain("NEVER use or register an MCP browser server");
 	}, 30_000);
 
 	test("buildSystemPrompt omits CPU info when os.cpus fails", async () => {
