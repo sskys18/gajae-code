@@ -1,7 +1,15 @@
-import type { AutocompleteItem, AutocompleteProvider, SlashCommand } from "@gajae-code/tui";
-import { CombinedAutocompleteProvider, getKeybindings, getSlashCommandMatchRank } from "@gajae-code/tui";
+import {
+	type AutocompleteItem,
+	type AutocompleteProvider,
+	autocompleteFuzzyMatch,
+	autocompleteFuzzyScore,
+	CombinedAutocompleteProvider,
+	extractSlashCommandTokenPrefix,
+	getSlashCommandMatchRank,
+	normalizeFuzzyText,
+	type SlashCommand,
+} from "@gajae-code/tui";
 import type { KeybindingsManager } from "../config/keybindings";
-import { formatKeyHints } from "../config/keybindings";
 import { isSettingsInitialized, settings } from "../config/settings";
 import { applyEmojiCompletion, getEmojiSuggestions, isEmojiPrefix, tryEmojiInlineReplace } from "./emoji-autocomplete";
 
@@ -29,6 +37,7 @@ interface PromptActionAutocompleteOptions {
 	copyCurrentLine: () => void;
 	copyPrompt: () => void;
 	pasteImage: () => void;
+	pasteText: () => void;
 	newSession: () => void;
 	showHelp: () => void;
 	scrollTmuxToPreviousUserInput: () => void;
@@ -37,43 +46,11 @@ interface PromptActionAutocompleteOptions {
 	moveCursorToMessageStart: () => void;
 	moveCursorToLineStart: () => void;
 	moveCursorToLineEnd: () => void;
-}
-
-function fuzzyMatch(query: string, target: string): boolean {
-	if (query.length === 0) return true;
-	if (query.length > target.length) return false;
-
-	let queryIndex = 0;
-	for (let targetIndex = 0; targetIndex < target.length && queryIndex < query.length; targetIndex += 1) {
-		if (query[queryIndex] === target[targetIndex]) {
-			queryIndex += 1;
-		}
-	}
-
-	return queryIndex === query.length;
-}
-
-function fuzzyScore(query: string, target: string): number {
-	if (query.length === 0) return 1;
-	if (target === query) return 100;
-	if (target.startsWith(query)) return 80;
-	if (target.includes(query)) return 60;
-
-	let queryIndex = 0;
-	let gaps = 0;
-	let lastMatchIndex = -1;
-	for (let targetIndex = 0; targetIndex < target.length && queryIndex < query.length; targetIndex += 1) {
-		if (query[queryIndex] === target[targetIndex]) {
-			if (lastMatchIndex >= 0 && targetIndex - lastMatchIndex > 1) {
-				gaps += 1;
-			}
-			lastMatchIndex = targetIndex;
-			queryIndex += 1;
-		}
-	}
-
-	if (queryIndex !== query.length) return 0;
-	return Math.max(1, 40 - gaps * 5);
+	/**
+	 * Ghost-text next-prompt prediction shown in the empty composer as a dim
+	 * inline hint (Tab accepts it via the editor's onTab handler).
+	 */
+	getPromptSuggestion?: () => string | null;
 }
 
 function isPromptActionItem(item: AutocompleteItem): item is PromptActionAutocompleteItem {
@@ -116,6 +93,7 @@ function sortSlashCommandSuggestions(
 ): { items: AutocompleteItem[]; prefix: string } | null {
 	if (!suggestions) return null;
 	const query = suggestions.prefix.slice(1).toLowerCase();
+	const normalizedQuery = normalizeFuzzyText(query);
 	const commandIndexes = new Map(commands.map((command, index) => [command.name, index]));
 	const commandByName = new Map(commands.map(command => [command.name, command]));
 	const items = suggestions.items
@@ -124,13 +102,20 @@ function sortSlashCommandSuggestions(
 			const commandIndex = commandIndexes.get(item.value) ?? index;
 			const lowerName = item.value.toLowerCase();
 			const lowerDesc = command?.description?.toLowerCase() ?? item.description?.toLowerCase() ?? "";
-			const nameScore = fuzzyMatch(query, lowerName) ? fuzzyScore(query, lowerName) : 0;
-			const descScore = fuzzyMatch(query, lowerDesc) ? fuzzyScore(query, lowerDesc) * 0.5 : 0;
+			const normalizedName = normalizeFuzzyText(item.value);
+			const normalizedDesc = normalizeFuzzyText(lowerDesc);
+			const nameScore = autocompleteFuzzyMatch(normalizedQuery, normalizedName)
+				? autocompleteFuzzyScore(normalizedQuery, normalizedName)
+				: 0;
+			const descScore = autocompleteFuzzyMatch(normalizedQuery, normalizedDesc)
+				? autocompleteFuzzyScore(normalizedQuery, normalizedDesc) * 0.5
+				: 0;
+			const isAscii = /^[\x00-\x7F]*$/.test(`${query}${item.value}`);
 			return {
 				item,
 				index,
 				commandIndex,
-				matchRank: getSlashCommandMatchRank(query, lowerName),
+				matchRank: isAscii ? getSlashCommandMatchRank(query, lowerName) : 4,
 				priority: getSlashCommandPriority(command, item),
 				score: Math.max(nameScore, descScore),
 			};
@@ -145,6 +130,10 @@ function sortSlashCommandSuggestions(
 		)
 		.map(({ item }) => item);
 	return { ...suggestions, items };
+}
+
+function isRootPathSuggestionResult(suggestions: { items: AutocompleteItem[]; prefix: string } | null): boolean {
+	return suggestions?.prefix.startsWith("/") === true && suggestions.items.some(item => item.value.startsWith("/"));
 }
 
 function withoutSkillCommandSuggestions(
@@ -168,24 +157,25 @@ function getPromptActionPrefix(textBeforeCursor: string): string | null {
 }
 
 function getSlashTokenPrefix(textBeforeCursor: string): string | null {
-	const slashIndex = textBeforeCursor.lastIndexOf("/");
-	if (slashIndex === -1) return null;
-	const beforeSlash = textBeforeCursor.slice(0, slashIndex);
-	if (beforeSlash && !/\s$/.test(beforeSlash)) return null;
-	const token = textBeforeCursor.slice(slashIndex);
-	if (/[\s]/.test(token)) return null;
-	return token;
+	return extractSlashCommandTokenPrefix(textBeforeCursor);
 }
 
 export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 	#baseProvider: CombinedAutocompleteProvider;
 	#actions: PromptActionDefinition[];
 	#commands: SlashCommand[];
+	#getPromptSuggestion: (() => string | null) | undefined;
 
-	constructor(commands: SlashCommand[], basePath: string, actions: PromptActionDefinition[]) {
+	constructor(
+		commands: SlashCommand[],
+		basePath: string,
+		actions: PromptActionDefinition[],
+		getPromptSuggestion?: () => string | null,
+	) {
 		this.#baseProvider = new CombinedAutocompleteProvider(commands, basePath);
 		this.#actions = actions;
 		this.#commands = commands;
+		this.#getPromptSuggestion = getPromptSuggestion;
 	}
 
 	async getSuggestions(
@@ -203,14 +193,14 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 					const searchable = [action.id, action.label, action.description, ...action.keywords]
 						.join(" ")
 						.toLowerCase();
-					if (!fuzzyMatch(query, searchable)) return null;
+					if (!autocompleteFuzzyMatch(query, searchable)) return null;
 					return {
 						value: action.label,
 						label: action.label,
 						description: action.description,
 						actionId: action.id,
 						execute: action.execute,
-						score: fuzzyScore(query, searchable),
+						score: autocompleteFuzzyScore(query, searchable),
 					} satisfies PromptActionAutocompleteItem & { score: number };
 				})
 				.filter(item => item !== null)
@@ -226,7 +216,10 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 			const baseSuggestions = withoutSkillCommandSuggestions(
 				await this.#baseProvider.getSuggestions(lines, cursorLine, cursorCol),
 			);
-			const skillCommandSuggestions = this.#getSkillCommandSuggestions(textBeforeCursor);
+			if (isRootPathSuggestionResult(baseSuggestions)) return baseSuggestions;
+			const skillCommandSuggestions = this.#getSkillCommandSuggestions(textBeforeCursor, {
+				includeEmpty: false,
+			});
 			return sortSlashCommandSuggestions(
 				mergeAutocompleteSuggestions(baseSuggestions, skillCommandSuggestions),
 				this.#commands,
@@ -239,6 +232,13 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 		}
 
 		return this.#baseProvider.getSuggestions(lines, cursorLine, cursorCol);
+	}
+	getForceFileSuggestions(
+		lines: string[],
+		cursorLine: number,
+		cursorCol: number,
+	): Promise<{ items: AutocompleteItem[]; prefix: string } | null> {
+		return this.#baseProvider.getForceFileSuggestions(lines, cursorLine, cursorCol);
 	}
 
 	applyCompletion(
@@ -294,13 +294,18 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 	}
 
 	getInlineHint(lines: string[], cursorLine: number, cursorCol: number): string | null {
+		// An empty composer renders the pending prompt suggestion as ghost text.
+		if (lines.every(line => line === "")) {
+			const suggestion = this.#getPromptSuggestion?.();
+			if (suggestion) return suggestion;
+		}
 		return this.#baseProvider.getInlineHint?.(lines, cursorLine, cursorCol) ?? null;
 	}
 	trySyncSlashCompletion(textBeforeCursor: string): { items: AutocompleteItem[]; prefix: string } | null {
 		const baseSuggestions = withoutSkillCommandSuggestions(
 			this.#baseProvider.trySyncSlashCompletion?.(textBeforeCursor) ?? null,
 		);
-		const skillCommandSuggestions = this.#getSkillCommandSuggestions(textBeforeCursor);
+		const skillCommandSuggestions = this.#getSkillCommandSuggestions(textBeforeCursor, { includeEmpty: false });
 		return sortSlashCommandSuggestions(
 			mergeAutocompleteSuggestions(baseSuggestions, skillCommandSuggestions),
 			this.#commands,
@@ -311,12 +316,18 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 		return tryEmojiInlineReplace(textBeforeCursor);
 	}
 
-	#getSkillCommandSuggestions(textBeforeCursor: string): { items: AutocompleteItem[]; prefix: string } | null {
+	#getSkillCommandSuggestions(
+		textBeforeCursor: string,
+		options: { includeEmpty: boolean },
+	): { items: AutocompleteItem[]; prefix: string } | null {
 		const prefix = getSlashTokenPrefix(textBeforeCursor);
 		if (!prefix) return null;
 		const query = prefix.slice(1).toLowerCase();
-		if (query.length === 0) return null;
-		const normalizedQuery = query.startsWith("skill-") ? `skill:${query.slice("skill-".length)}` : query;
+		if (query.length === 0 && !options.includeEmpty) return null;
+		const normalizedQuery = normalizeFuzzyText(
+			query.startsWith("skill-") ? `skill:${query.slice("skill-".length)}` : query,
+		);
+		if (query.length > 0 && normalizedQuery.length === 0) return null;
 		const exactNonSkillCommand = this.#commands.some(
 			command => command.name === query && !command.name.startsWith("skill:"),
 		);
@@ -330,16 +341,18 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 					`skill-${skillName}`,
 					...(exactNonSkillCommand ? [] : [skillName]),
 					command.description ?? "",
-				].map(target => target.toLowerCase());
+				].map(target => normalizeFuzzyText(target));
 				if (
-					!searchTargets.some(target => fuzzyMatch(normalizedQuery, target) || target.includes(normalizedQuery))
+					!searchTargets.some(
+						target => autocompleteFuzzyMatch(normalizedQuery, target) || target.includes(normalizedQuery),
+					)
 				) {
 					return null;
 				}
 				const bestScore = Math.max(
 					...searchTargets.map(target =>
-						fuzzyMatch(normalizedQuery, target)
-							? fuzzyScore(normalizedQuery, target)
+						autocompleteFuzzyMatch(normalizedQuery, target)
+							? autocompleteFuzzyScore(normalizedQuery, target)
 							: target.includes(normalizedQuery)
 								? 60
 								: 0,
@@ -364,12 +377,11 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 export function createPromptActionAutocompleteProvider(
 	options: PromptActionAutocompleteOptions,
 ): PromptActionAutocompleteProvider {
-	const editorKeybindings = getKeybindings();
 	const actions: PromptActionDefinition[] = [
 		{
 			id: "new-session",
 			label: "Start new session",
-			description: formatKeyHints(options.keybindings.getKeys("app.session.new")) || "/new",
+			description: options.keybindings.getDisplayString("app.session.new"),
 			keywords: ["new", "session", "fresh", "clear", "start", "conversation"],
 			execute: options.newSession,
 		},
@@ -383,23 +395,30 @@ export function createPromptActionAutocompleteProvider(
 		{
 			id: "copy-line",
 			label: "Copy current line",
-			description: formatKeyHints(options.keybindings.getKeys("app.clipboard.copyLine")),
+			description: options.keybindings.getDisplayString("app.clipboard.copyLine"),
 			keywords: ["copy", "line", "clipboard", "current"],
 			execute: options.copyCurrentLine,
 		},
 		{
 			id: "copy-prompt",
 			label: "Copy whole prompt",
-			description: formatKeyHints(options.keybindings.getKeys("app.clipboard.copyPrompt")),
+			description: options.keybindings.getDisplayString("app.clipboard.copyPrompt"),
 			keywords: ["copy", "prompt", "clipboard", "message"],
 			execute: options.copyPrompt,
 		},
 		{
 			id: "paste-image",
 			label: "Paste image from clipboard",
-			description: formatKeyHints(options.keybindings.getKeys("app.clipboard.pasteImage")),
+			description: options.keybindings.getDisplayString("app.clipboard.pasteImage"),
 			keywords: ["paste", "image", "clipboard", "screenshot", "attach", "vision"],
 			execute: options.pasteImage,
+		},
+		{
+			id: "paste-text",
+			label: "Paste text from configured clipboard",
+			description: "requires --clipboard-transport ssh",
+			keywords: ["paste", "text", "clipboard", "ssh", "pbpaste", "mac"],
+			execute: options.pasteText,
 		},
 		{
 			id: "tmux-previous-user-input",
@@ -411,7 +430,7 @@ export function createPromptActionAutocompleteProvider(
 		{
 			id: "undo",
 			label: "Undo",
-			description: formatKeyHints(editorKeybindings.getKeys("tui.editor.undo")),
+			description: options.keybindings.getDisplayString("tui.editor.undo"),
 			keywords: ["undo", "revert", "edit", "history"],
 			execute: options.undo,
 		},
@@ -432,18 +451,23 @@ export function createPromptActionAutocompleteProvider(
 		{
 			id: "cursor-line-start",
 			label: "Move cursor to beginning of line",
-			description: formatKeyHints(editorKeybindings.getKeys("tui.editor.cursorLineStart")),
+			description: options.keybindings.getDisplayString("tui.editor.cursorLineStart"),
 			keywords: ["move", "cursor", "line", "start", "beginning", "home"],
 			execute: options.moveCursorToLineStart,
 		},
 		{
 			id: "cursor-line-end",
 			label: "Move cursor to end of line",
-			description: formatKeyHints(editorKeybindings.getKeys("tui.editor.cursorLineEnd")),
+			description: options.keybindings.getDisplayString("tui.editor.cursorLineEnd"),
 			keywords: ["move", "cursor", "line", "end"],
 			execute: options.moveCursorToLineEnd,
 		},
 	];
 
-	return new PromptActionAutocompleteProvider(options.commands, options.basePath, actions);
+	return new PromptActionAutocompleteProvider(
+		options.commands,
+		options.basePath,
+		actions,
+		options.getPromptSuggestion,
+	);
 }

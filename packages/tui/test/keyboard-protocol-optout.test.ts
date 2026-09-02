@@ -5,6 +5,12 @@ const stdinIsTtyDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isT
 const stdoutIsTtyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
 const stdinSetRawModeDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "setRawMode");
 const originalKeyboardProtocolEnv = Bun.env.GJC_TUI_KEYBOARD_PROTOCOL;
+const originalTermProgram = Bun.env.TERM_PROGRAM;
+const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+
+function setPlatform(platform: NodeJS.Platform): void {
+	Object.defineProperty(process, "platform", { value: platform, configurable: true });
+}
 
 // Kitty keyboard protocol query and the xterm modifyOtherKeys level-2 fallback.
 const KITTY_QUERY = "\x1b[?u";
@@ -31,6 +37,7 @@ describe("ProcessTerminal keyboard-protocol opt-out (GJC_TUI_KEYBOARD_PROTOCOL)"
 		Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
 		Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
 		Object.defineProperty(process.stdin, "setRawMode", { value: vi.fn(), configurable: true });
+		delete Bun.env.TERM_PROGRAM;
 	});
 
 	afterEach(() => {
@@ -40,6 +47,8 @@ describe("ProcessTerminal keyboard-protocol opt-out (GJC_TUI_KEYBOARD_PROTOCOL)"
 		restoreProperty(process.stdout, "isTTY", stdoutIsTtyDescriptor);
 		restoreProperty(process.stdin, "setRawMode", stdinSetRawModeDescriptor);
 		restoreEnv("GJC_TUI_KEYBOARD_PROTOCOL", originalKeyboardProtocolEnv);
+		restoreEnv("TERM_PROGRAM", originalTermProgram);
+		restoreProperty(process, "platform", platformDescriptor);
 	});
 
 	function setupTerminal() {
@@ -63,8 +72,9 @@ describe("ProcessTerminal keyboard-protocol opt-out (GJC_TUI_KEYBOARD_PROTOCOL)"
 		return { terminal, writes, received };
 	}
 
-	it("enables the keyboard protocol by default (query + modifyOtherKeys fallback)", () => {
+	it("enables the keyboard protocol by default on non-win32 (query + modifyOtherKeys fallback)", () => {
 		vi.useFakeTimers();
+		setPlatform("linux");
 		delete Bun.env.GJC_TUI_KEYBOARD_PROTOCOL;
 		expect(keyboardEnhancementEnabled()).toBe(true);
 
@@ -87,6 +97,43 @@ describe("ProcessTerminal keyboard-protocol opt-out (GJC_TUI_KEYBOARD_PROTOCOL)"
 		const { terminal, writes } = setupTerminal();
 
 		expect(writes).not.toContain(KITTY_QUERY);
+
+		vi.advanceTimersByTime(150);
+		expect(writes).not.toContain(MODIFY_OTHER_KEYS);
+
+		terminal.stop();
+	});
+
+	it("skips only the modifyOtherKeys fallback on win32 to preserve IME composition", () => {
+		vi.useFakeTimers();
+		setPlatform("win32");
+		delete Bun.env.GJC_TUI_KEYBOARD_PROTOCOL;
+		expect(keyboardEnhancementEnabled()).toBe(true);
+
+		const { terminal, writes } = setupTerminal();
+
+		// The Kitty query is still emitted (harmless where unsupported), but the
+		// modifyOtherKeys fallback that breaks Windows Hangul/CJK IME is skipped.
+		expect(writes).toContain(KITTY_QUERY);
+
+		vi.advanceTimersByTime(150);
+		expect(writes).not.toContain(MODIFY_OTHER_KEYS);
+
+		terminal.stop();
+	});
+
+	it("skips only the modifyOtherKeys fallback in Apple Terminal to preserve Hangul IME composition", () => {
+		vi.useFakeTimers();
+		setPlatform("darwin");
+		delete Bun.env.GJC_TUI_KEYBOARD_PROTOCOL;
+		Bun.env.TERM_PROGRAM = "Apple_Terminal";
+		expect(keyboardEnhancementEnabled()).toBe(true);
+
+		const { terminal, writes } = setupTerminal();
+
+		// Apple Terminal does not answer the Kitty query. Its modifyOtherKeys mode
+		// breaks CJK/Hangul IME composition, so only the fallback is withheld.
+		expect(writes).toContain(KITTY_QUERY);
 
 		vi.advanceTimersByTime(150);
 		expect(writes).not.toContain(MODIFY_OTHER_KEYS);

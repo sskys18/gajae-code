@@ -10,12 +10,15 @@ import { Agent, AgentBusyError, type AgentTool } from "@gajae-code/agent-core";
 import { type AssistantMessage, getBundledModel, type Message, type ToolCall } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
+import { createAppendOnlyContextManager } from "@gajae-code/coding-agent/append-only-mode";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async";
 import type { Rule } from "@gajae-code/coding-agent/capability/rule";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { TtsrManager } from "@gajae-code/coding-agent/export/ttsr";
 import type { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
+import { submitInteractiveInput } from "@gajae-code/coding-agent/main";
+import type { SubmittedUserInput } from "@gajae-code/coding-agent/modes/types";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
@@ -124,6 +127,85 @@ describe("AgentSession concurrent prompt guard", () => {
 		await firstPrompt.catch(() => {}); // Ignore abort error
 	});
 
+	it("aborts stalled API-key preflight, clears the submission, and accepts the next prompt", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let streamCalls = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: () => {
+				streamCalls += 1;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const message = createAssistantMessage("ok");
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-preflight-cancel.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		const apiKeyGate = Promise.withResolvers<string | undefined>();
+		let stallApiKey = true;
+		let preflightSignal: AbortSignal | undefined;
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (_model, _sessionId, options) => {
+			preflightSignal = options?.signal;
+			return stallApiKey ? apiKeyGate.promise : "test-key";
+		});
+		session = new AgentSession({ agent, sessionManager, settings: Settings.isolated(), modelRegistry });
+
+		const mode = {
+			markPendingSubmissionStarted: vi.fn(() => true),
+			finishPendingSubmission: vi.fn(),
+			showError: vi.fn(),
+			checkShutdownRequested: vi.fn(async () => {}),
+			waitForAgentEnd: vi.fn(() => ({
+				promise: Promise.withResolvers<void>().promise,
+				dispose: vi.fn(),
+			})),
+		};
+		const input: SubmittedUserInput = {
+			text: "cancel during auth",
+			images: undefined,
+			cancelled: false,
+			started: false,
+		};
+		const submission = submitInteractiveInput(mode, session, input);
+		const submissionOutcome = submission.then(() => "settled" as const);
+		let abort: Promise<void> | undefined;
+		try {
+			await waitFor(() => preflightSignal !== undefined);
+
+			abort = session.abort();
+			const outcome = await Promise.race([submissionOutcome, Bun.sleep(100).then(() => "pending" as const)]);
+			apiKeyGate.resolve("test-key");
+			await submission;
+			await abort;
+
+			expect(outcome).toBe("settled");
+			expect(preflightSignal?.aborted).toBe(true);
+			expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
+			expect(mode.showError).not.toHaveBeenCalled();
+			expect(session.isStreaming).toBe(false);
+			expect(
+				agent.state.messages.filter(message => message.role === "user" || message.role === "assistant"),
+			).toEqual([]);
+
+			stallApiKey = false;
+			await session.prompt("after abort");
+
+			expect(streamCalls).toBe(1);
+			expect(agent.state.messages.filter(message => message.role === "user")).toHaveLength(1);
+			expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(1);
+		} finally {
+			apiKeyGate.resolve("test-key");
+			await Promise.allSettled(abort ? [submission, abort] : [submission]);
+		}
+	});
+
 	it("should allow steer() while streaming", async () => {
 		await createSession();
 
@@ -189,10 +271,460 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.abort();
 		await send.catch(() => {});
 	});
+	it("immediate sendUserMessage after abort starts a successor turn instead of parking in steer", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			// Branch on the newest user message, NOT a stream-call counter: the
+			// session reports `isStreaming` before `streamFn` runs, so the aborted
+			// turn's dispatch races the abort. Keyed on a counter, the SUCCESSOR turn
+			// could take the blocking branch and hang the test whenever the first
+			// turn's dispatch had not landed yet.
+			streamFn: (_model, context, options) => {
+				const lastUser = [...(context?.messages ?? [])].reverse().find(message => message.role === "user");
+				const text =
+					lastUser && Array.isArray(lastUser.content)
+						? lastUser.content
+								.map(part => (typeof part === "object" && part.type === "text" ? part.text : ""))
+								.join("")
+						: "";
+				const signal = options?.signal;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (text === "First message") {
+						stream.push({ type: "start", partial: createAssistantMessage("") });
+						const abortStream = () => {
+							stream.push({
+								type: "error",
+								reason: "aborted",
+								error: createAssistantMessage("Aborted"),
+							});
+						};
+						if (signal?.aborted) {
+							abortStream();
+							return;
+						}
+						signal?.addEventListener("abort", abortStream, { once: true });
+						return;
+					}
+					const message = createAssistantMessage("successor ok");
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-abort-immediate.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({ agent, sessionManager, settings: Settings.isolated(), modelRegistry });
+
+		const firstPrompt = session.prompt("First message");
+		await waitFor(() => session.agent.state.isStreaming);
+		const aborting = session.abort();
+		let promoted = 0;
+		const successor = session.sendUserMessage("successor after abort", {
+			queuedAtDispatch: true,
+			onQueuedPromoted: () => {
+				promoted += 1;
+			},
+		});
+		await aborting;
+		await waitFor(() => {
+			const lastUser = [...agent.state.messages].reverse().find(message => message.role === "user");
+			const content = lastUser?.content[0];
+			return Boolean(
+				content && typeof content === "object" && "text" in content && content.text === "successor after abort",
+			);
+		}, 3_000);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+		expect(promoted).toBe(1);
+		await successor.catch(() => {});
+		await firstPrompt.catch(() => {});
+	}, 15_000);
+
+	/**
+	 * Session for abort-lifecycle ordering. The turn whose newest user message is
+	 * `BLOCKING_PROMPT` streams until aborted; any other turn terminates on its
+	 * own. Dispatch is keyed on message CONTENT rather than a call counter: the
+	 * provider dispatch for the aborted turn races the abort itself, so a counter
+	 * cannot reliably identify which turn a stream belongs to. `dispatched`
+	 * therefore doubles as the exact list of turns that actually reached the
+	 * provider, which is what "no successor started" has to assert.
+	 * `successorOutcome` selects whether a successor turn completes or errors.
+	 */
+	const BLOCKING_PROMPT = "First message";
+	async function createAbortLifecycleSession(
+		dbName: string,
+		successorOutcome: "complete" | "error" = "complete",
+	): Promise<{
+		agent: Agent;
+		dispatched: () => string[];
+		userTexts: () => string[];
+	}> {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const dispatched: string[] = [];
+		const textOf = (message: Message | undefined): string =>
+			message && Array.isArray(message.content)
+				? message.content.map(part => (typeof part === "object" && part.type === "text" ? part.text : "")).join("")
+				: "";
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: (_model, context, options) => {
+				const text = textOf([...(context?.messages ?? [])].reverse().find(message => message.role === "user"));
+				dispatched.push(text);
+				const signal = options?.signal;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (text === BLOCKING_PROMPT) {
+						stream.push({ type: "start", partial: createAssistantMessage("") });
+						const abortStream = () => {
+							stream.push({ type: "error", reason: "aborted", error: createAssistantMessage("Aborted") });
+						};
+						if (signal?.aborted) abortStream();
+						else signal?.addEventListener("abort", abortStream, { once: true });
+						return;
+					}
+					const message = createAssistantMessage("successor ok");
+					stream.push({ type: "start", partial: message });
+					if (successorOutcome === "error") {
+						stream.push({ type: "error", reason: "error", error: createAssistantMessage("successor failed") });
+						return;
+					}
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+		});
+		const authStorage = await AuthStorage.create(path.join(tempDir, dbName));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry,
+		});
+		return {
+			agent,
+			dispatched: () => [...dispatched],
+			userTexts: () => agent.state.messages.filter(message => message.role === "user").map(textOf),
+		};
+	}
+
+	/**
+	 * The #4753 overlapping-abort regression. Abort A installs the unwind, prompt P
+	 * is admitted and parks on it, then abort B shares that same physical unwind.
+	 * All three enter synchronously in one tick, so the interleaving is exact and
+	 * does not depend on timers. Before the abort-admission fence, B acknowledged
+	 * success and P then refreshed its generation and started a successor turn:
+	 * the user aborted twice and work began anyway.
+	 */
+	it("a second abort fences a prompt retained by the first abort's unwind (#4753 overlapping abort)", async () => {
+		const { dispatched, userTexts } = await createAbortLifecycleSession("testauth-overlap-abort.db");
+
+		const firstPrompt = session.prompt(BLOCKING_PROMPT);
+		await waitFor(() => session.agent.state.isStreaming);
+
+		const abortA = session.abort({ cause: "user_interrupt" });
+		const retained = session.sendUserMessage("retained prompt", { queuedAtDispatch: true });
+		const abortB = session.abort({ cause: "user_interrupt" });
+
+		// Both aborts acknowledge; abort stays terminal for the prompt between them.
+		await abortA;
+		await abortB;
+		await expect(retained).rejects.toMatchObject({ name: "PromptPreflightCancelledError" });
+
+		// No successor: the retained prompt never reached the provider and never
+		// entered the transcript.
+		await session.waitForIdle();
+		await Bun.sleep(50);
+		expect(dispatched()).not.toContain("retained prompt");
+		expect(userTexts()).not.toContain("retained prompt");
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+		expect(session.isStreaming).toBe(false);
+
+		await firstPrompt.catch(() => {});
+	}, 15_000);
+
+	it("a retained prompt survives a single abort and is delivered exactly once (#4753)", async () => {
+		const { dispatched, userTexts } = await createAbortLifecycleSession("testauth-retained-once.db");
+
+		const firstPrompt = session.prompt(BLOCKING_PROMPT);
+		await waitFor(() => session.agent.state.isStreaming);
+
+		const aborting = session.abort({ cause: "user_interrupt" });
+		let promoted = 0;
+		const retained = session.sendUserMessage("retained prompt", {
+			queuedAtDispatch: true,
+			onQueuedPromoted: () => {
+				promoted += 1;
+			},
+		});
+
+		await aborting;
+		await retained;
+		await session.waitForIdle();
+		await Bun.sleep(50);
+
+		// Delivered once, as exactly one successor turn that reached the provider once.
+		expect(userTexts().filter(text => text === "retained prompt")).toEqual(["retained prompt"]);
+		expect(dispatched().filter(text => text === "retained prompt")).toEqual(["retained prompt"]);
+		expect(promoted).toBe(1);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+
+		await firstPrompt.catch(() => {});
+	}, 20_000);
+
+	it("a queued SDK prompt after an aborted toolResult tail starts a fresh run", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const toolStarted = Promise.withResolvers<void>();
+		const secondProviderStarted = Promise.withResolvers<void>();
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "call_abort_tail",
+			name: "abort_tail_tool",
+			arguments: {},
+		};
+		const tool: AgentTool = {
+			name: "abort_tail_tool",
+			label: "Abort tail tool",
+			description: "Creates a toolResult tail before the turn is aborted.",
+			parameters: z.object({}),
+			execute: async () => {
+				toolStarted.resolve();
+				return { content: [{ type: "text" as const, text: "tool result" }] };
+			},
+		};
+		let streamCalls = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [tool] },
+			streamFn: (_model, _context, options) => {
+				streamCalls += 1;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (streamCalls === 1) {
+						const partial: AssistantMessage = {
+							role: "assistant",
+							content: [toolCall],
+							api: "anthropic-messages",
+							provider: "anthropic",
+							model: "mock",
+							usage: {
+								input: 0,
+								output: 0,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 0,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
+							stopReason: "toolUse",
+							timestamp: Date.now(),
+						};
+						stream.push({ type: "start", partial });
+						stream.push({ type: "toolcall_start", contentIndex: 0, partial });
+						stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial });
+						stream.push({ type: "done", reason: "toolUse", message: partial });
+						return;
+					}
+					if (streamCalls === 2) {
+						secondProviderStarted.resolve();
+						options?.signal?.addEventListener(
+							"abort",
+							() => stream.push({ type: "error", reason: "aborted", error: createAssistantMessage("Aborted") }),
+							{ once: true },
+						);
+						return;
+					}
+					const successor = createAssistantMessage("successor complete");
+					stream.push({ type: "start", partial: successor });
+					stream.push({ type: "done", reason: "stop", message: successor });
+				});
+				return stream;
+			},
+		});
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-abort-tool-tail.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry,
+		});
+
+		const firstPrompt = session.prompt("First message");
+		await toolStarted.promise;
+		await secondProviderStarted.promise;
+		expect(agent.state.messages.at(-1)?.role).toBe("toolResult");
+
+		const aborting = session.abort({ cause: "user_interrupt" });
+		let promoted = 0;
+		const successor = session.sendUserMessage("queued after tool abort", {
+			queuedAtDispatch: true,
+			onQueuedPromoted: () => {
+				promoted += 1;
+			},
+		});
+		await aborting;
+		await successor;
+		await session.waitForIdle();
+		await firstPrompt.catch(() => {});
+
+		expect(streamCalls).toBe(3);
+		expect(
+			agent.state.messages.filter(
+				message =>
+					message.role === "user" &&
+					Array.isArray(message.content) &&
+					message.content.some(
+						content =>
+							typeof content === "object" &&
+							content.type === "text" &&
+							content.text === "queued after tool abort",
+					),
+			),
+		).toHaveLength(1);
+		expect(promoted).toBe(1);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+	}, 20_000);
+
+	it("queued steering is still resumed after an abort unwind (#4753)", async () => {
+		const { userTexts } = await createAbortLifecycleSession("testauth-abort-steering.db");
+
+		const firstPrompt = session.prompt(BLOCKING_PROMPT);
+		await waitFor(() => session.agent.state.isStreaming);
+
+		// Explicit steering is delivered into the aborted turn's queue, then the
+		// abort's user_interrupt resume path promotes it to its own turn.
+		await session.sendUserMessage("queued steer", { deliverAs: "steer" });
+		await session.abort({ cause: "user_interrupt" });
+		await firstPrompt.catch(() => {});
+		await waitFor(() => userTexts().includes("queued steer"), 5_000);
+		await session.waitForIdle();
+
+		expect(userTexts().filter(text => text === "queued steer")).toEqual(["queued steer"]);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+	}, 20_000);
+
+	it("rapid repeated aborts all settle and leave the session idle (#4753)", async () => {
+		const { dispatched } = await createAbortLifecycleSession("testauth-rapid-abort.db");
+
+		const firstPrompt = session.prompt(BLOCKING_PROMPT);
+		await waitFor(() => session.agent.state.isStreaming);
+
+		// Four same-tick aborts share one physical unwind; each must still settle.
+		const aborts = [
+			session.abort({ cause: "user_interrupt" }),
+			session.abort({ cause: "user_interrupt" }),
+			session.abort({ cause: "user_interrupt" }),
+			session.abort({ cause: "user_interrupt" }),
+		];
+		for (const settled of await Promise.allSettled(aborts)) expect(settled.status).toBe("fulfilled");
+		// A later abort, after the shared unwind completed, is still terminal.
+		await session.abort({ cause: "user_interrupt" });
+
+		await session.waitForIdle();
+		expect(session.isStreaming).toBe(false);
+		// No turn other than the aborted one ever reached the provider.
+		expect(dispatched().filter(text => text !== BLOCKING_PROMPT)).toEqual([]);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+
+		await firstPrompt.catch(() => {});
+	}, 15_000);
+
+	it("a prompt admitted after the abort settled runs to execution completion (#4753)", async () => {
+		const { dispatched, userTexts } = await createAbortLifecycleSession("testauth-post-abort.db");
+
+		const firstPrompt = session.prompt(BLOCKING_PROMPT);
+		await waitFor(() => session.agent.state.isStreaming);
+		await session.abort({ cause: "user_interrupt" });
+		await firstPrompt.catch(() => {});
+
+		// The fence is terminal only for prompts admitted BEFORE an abort; a prompt
+		// admitted after it settled runs a normal turn to completion.
+		await session.sendUserMessage("after abort settled");
+		await session.waitForIdle();
+
+		expect(userTexts()).toContain("after abort settled");
+		expect(dispatched().filter(text => text !== BLOCKING_PROMPT)).toEqual(["after abort settled"]);
+		expect(session.isStreaming).toBe(false);
+	}, 15_000);
+
+	it("a successor turn that errors leaves the session idle and abortable (#4753)", async () => {
+		const { dispatched, userTexts } = await createAbortLifecycleSession("testauth-successor-error.db", "error");
+
+		const firstPrompt = session.prompt(BLOCKING_PROMPT);
+		await waitFor(() => session.agent.state.isStreaming);
+		await session.abort({ cause: "user_interrupt" });
+		await firstPrompt.catch(() => {});
+
+		// The successor is admitted and started, then its execution fails.
+		await session.sendUserMessage("failing successor").catch(() => {});
+		await session.waitForIdle();
+
+		expect(userTexts()).toContain("failing successor");
+		expect(dispatched().filter(text => text !== BLOCKING_PROMPT)).toEqual(["failing successor"]);
+		expect(session.isStreaming).toBe(false);
+		// An execution error is not an abort: a later abort still settles cleanly.
+		await session.abort({ cause: "user_interrupt" });
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+	}, 15_000);
+
+	it("sendUserMessage rejects absent content with a typed invalid_input error without crashing", async () => {
+		await createSession();
+
+		// undefined content (the exact #4393 crash vector: previously a TypeError)
+		await expect(session.sendUserMessage(undefined as never)).rejects.toMatchObject({
+			code: "invalid_input",
+		});
+
+		// null content (typeof null === "object", also entered the iterable branch)
+		await expect(session.sendUserMessage(null as never)).rejects.toMatchObject({
+			code: "invalid_input",
+		});
+
+		// The session is still usable after the rejected submissions.
+		expect(session.isStreaming).toBe(false);
+		expect(session.queuedMessageCount).toBe(0);
+	});
+
+	it("sendUserMessage rejects absent content even while streaming (active-turn steering race)", async () => {
+		await createSession();
+
+		// Start a turn that blocks until abort.
+		const firstPrompt = session.prompt("First message");
+		await waitFor(() => session.isStreaming);
+
+		// The exact crash path: SDK steering during an active turn with absent content.
+		// Previously this threw TypeError synchronously inside the promise, crashing the
+		// resident process. It must now reject as a typed nonfatal control error.
+		await expect(session.sendUserMessage(undefined as never, { deliverAs: "steer" })).rejects.toMatchObject({
+			code: "invalid_input",
+		});
+		await expect(session.sendUserMessage(null as never, { deliverAs: "followUp" })).rejects.toMatchObject({
+			code: "invalid_input",
+		});
+
+		// No crash, no queue pollution: session continuity preserved.
+		expect(session.isStreaming).toBe(true);
+		expect(session.queuedMessageCount).toBe(0);
+
+		// Cleanup
+		await session.abort();
+		await firstPrompt.catch(() => {});
+	});
 
 	it("delivers hidden nextTurn stop reactions through the next LLM call without exposing them in the visible queue", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
-		let firstStream: AssistantMessageEventStream | undefined;
+		const firstTurn = Promise.withResolvers<void>();
 		const callMessages: Message[][] = [];
 
 		const agent = new Agent({
@@ -205,15 +737,19 @@ describe("AgentSession concurrent prompt guard", () => {
 			convertToLlm,
 			streamFn: (_model, context) => {
 				callMessages.push([...context.messages]);
+				const callIndex = callMessages.length;
 				const stream = new AssistantMessageEventStream();
 				queueMicrotask(() => {
-					stream.push({ type: "start", partial: createAssistantMessage("") });
-					if (callMessages.length > 1) {
-						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Resumed") });
-						return;
-					}
+					void (async () => {
+						stream.push({ type: "start", partial: createAssistantMessage("") });
+						if (callIndex === 1) await firstTurn.promise;
+						stream.push({
+							type: "done",
+							reason: "stop",
+							message: createAssistantMessage(callIndex === 1 ? "Done" : "Resumed"),
+						});
+					})();
 				});
-				firstStream = stream;
 				return stream;
 			},
 		});
@@ -233,9 +769,9 @@ describe("AgentSession concurrent prompt guard", () => {
 		});
 
 		const firstPrompt = session.prompt("First message");
-		await waitFor(() => session.isStreaming && firstStream !== undefined && callMessages.length === 1);
+		await waitFor(() => session.isStreaming && callMessages.length === 1);
 
-		await session.sendCustomMessage(
+		const hiddenTurn = session.sendCustomMessage(
 			{
 				customType: "autoresearch-resume",
 				content: "Hidden stop reaction",
@@ -248,7 +784,8 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(session.queuedMessageCount).toBe(0);
 		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
 
-		firstStream?.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
+		firstTurn.resolve();
+		await hiddenTurn;
 		await firstPrompt;
 		await session.waitForIdle();
 
@@ -264,6 +801,105 @@ describe("AgentSession concurrent prompt guard", () => {
 				);
 			}),
 		).toBe(true);
+	});
+
+	it("excludes undrained hidden nextTurn context from the drainable queue count after the turn settles", async () => {
+		// The busy-recovery UI gate (#4741) must see only queues its restore/clear
+		// handlers can return. A hidden nextTurn entry queued without triggerTurn
+		// deliberately survives turn completion, so the aggregate count stays
+		// nonzero forever; the drainable count must not, or every Esc/Ctrl+C would
+		// perform a no-op abort and lock the user out of their own input.
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const firstTurn = Promise.withResolvers<void>();
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					void (async () => {
+						stream.push({ type: "start", partial: createAssistantMessage("") });
+						await firstTurn.promise;
+						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
+					})();
+				});
+				return stream;
+			},
+		});
+
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-drainable.db"));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage, path.join(tempDir, "models.yml")),
+		});
+
+		const firstPrompt = session.prompt("First message");
+		await waitFor(() => session.isStreaming);
+
+		// Mirrors the todo_write failure reminder: hidden, agent-attributed, and
+		// explicitly not triggering a turn of its own.
+		session.sendCustomMessage(
+			{
+				customType: "todo-write-failure",
+				content: "Hidden todo reminder",
+				display: false,
+				attribution: "agent",
+			},
+			{ deliverAs: "nextTurn", triggerTurn: false },
+		);
+
+		firstTurn.resolve();
+		await firstPrompt;
+		await session.waitForIdle();
+
+		// The turn settled and the hidden entry was never delivered or drained.
+		expect(session.isStreaming).toBe(false);
+		expect(session.pendingMessageCounts).toEqual({ steering: 0, followUp: 0, nextTurn: 1 });
+		expect(session.queuedMessageCount).toBe(1);
+		// What the recovery gate reads: nothing a key press could drain.
+		expect(session.drainableQueuedMessageCount).toBe(0);
+		// And the drain handlers confirm it: they return nothing and leave it in place.
+		expect(session.getQueuedMessageEntries()).toEqual([]);
+		expect(session.popLastQueuedMessage()).toBeUndefined();
+		expect(session.clearQueue()).toEqual({ steering: [], followUp: [] });
+		expect(session.pendingMessageCounts.nextTurn).toBe(1);
+		expect(session.getPendingNextTurnMessagesForTests()).toHaveLength(1);
+	});
+
+	it("counts steering and follow-up entries as drainable while hidden context coexists", async () => {
+		await createSession();
+
+		const firstPrompt = session.prompt("First message");
+		await waitFor(() => session.isStreaming);
+
+		session.sendCustomMessage(
+			{
+				customType: "todo-write-failure",
+				content: "Hidden todo reminder",
+				display: false,
+				attribution: "agent",
+			},
+			{ deliverAs: "nextTurn", triggerTurn: false },
+		);
+		session.steer("visible steer");
+		session.followUp("visible follow-up");
+
+		expect(session.pendingMessageCounts).toEqual({ steering: 1, followUp: 1, nextTurn: 1 });
+		expect(session.queuedMessageCount).toBe(3);
+		// Both visible queues are drainable; the hidden one is not.
+		expect(session.drainableQueuedMessageCount).toBe(2);
+
+		// Draining returns exactly the drainable entries and preserves hidden order.
+		expect(session.clearQueue()).toEqual({ steering: ["visible steer"], followUp: ["visible follow-up"] });
+		expect(session.drainableQueuedMessageCount).toBe(0);
+		expect(session.pendingMessageCounts.nextTurn).toBe(1);
+
+		session.abort();
+		await firstPrompt.catch(() => {});
 	});
 
 	it("should allow prompt() after previous completes", async () => {
@@ -341,6 +977,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			appendOnlyContext: createAppendOnlyContextManager(model.provider),
 		});
 		const currentSessionManager = SessionManager.create(tempDir, tempDir);
 		const targetSessionManager = SessionManager.create(tempDir, tempDir);
@@ -371,11 +1008,16 @@ describe("AgentSession concurrent prompt guard", () => {
 			modelRegistry,
 			extensionRunner,
 		});
+		const appendOnly = agent.appendOnlyContext;
+		expect(appendOnly).not.toBeUndefined();
+		appendOnly?.syncMessages([{ role: "user", content: "switch-provider-marker" }]);
+		expect(appendOnly?.log.length).toBe(1);
 		await session.steer("pre-switch steering");
 		expect(session.getQueuedMessages().steering).toEqual(["pre-switch steering"]);
 		expect(agent.snapshotSteering()).toHaveLength(1);
 
 		expect(await session.switchSession(targetSessionFile)).toBe(true);
+		expect(appendOnly?.log.length).toBe(0);
 
 		expect(session.getQueuedMessages().steering).toEqual(["queued by switch hook"]);
 		expect(agent.snapshotSteering()).toHaveLength(1);
@@ -389,8 +1031,8 @@ describe("AgentSession concurrent prompt guard", () => {
 	// subscriber observed agent_end while Session.isStreaming was still true (the
 	// agent's own `isStreaming` had flipped, but #promptWithMessage's finally had
 	// not yet decremented the prompt-in-flight counter), and the next prompt
-	// threw AgentBusyError. Surfaced as `RpcCommandError: prompt: Agent is
-	// already processing` from gjc-rpc clients (robogjc triage reminder path).
+	// threw AgentBusyError. Wire clients then received an error that the agent was
+	// already processing.
 	it("subscriber may prompt() synchronously from agent_end without AgentBusyError", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });

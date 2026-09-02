@@ -2,7 +2,7 @@
 
 This document describes the **`bash` tool** runtime path used by agent tool calls, from command normalization to execution, truncation/artifacts, and rendering.
 
-It also calls out where behavior diverges in interactive TUI, print mode, RPC mode, and user-initiated bang (`!`) shell execution.
+It also calls out where behavior diverges in interactive TUI, print mode, ACP, and user-initiated bang (`!`) shell execution.
 
 ## Scope and runtime surfaces
 
@@ -10,8 +10,8 @@ There are two different bash execution surfaces in coding-agent:
 
 1. **Tool-call surface** (`toolName: "bash"`): used when the model calls the bash tool.
    - Entry point: `BashTool.execute()`.
-   - Parameters include `command`, optional `env`, `timeout`, `cwd`, `head`, `tail`, `pty`, and, when `async.enabled` is true, `async`.
-2. **User bang-command surface** (`!cmd` from interactive input or RPC `bash` command): session-level helper path.
+   - Parameters include `command`, optional `env`, `timeout`, `cwd`, `pty`, and, when `async.enabled` is true, `async`.
+2. **User bang-command surface** (`!cmd` from interactive input): session-level helper path.
    - Entry point: `AgentSession.executeBash()`.
 
 Both eventually use `executeBash()` in `src/exec/bash-executor.ts` for non-PTY execution, but only the tool-call path runs normalization/interception, optional managed background-job handling, and tool renderer logic.
@@ -25,9 +25,8 @@ Both eventually use `executeBash()` in `src/exec/bash-executor.ts` for non-PTY e
 - validates optional `env` names against shell-variable syntax,
 - extracts a leading `cd <path> && ...` into `cwd` when `cwd` was not supplied,
 - rejects `async: true` when `async.enabled` is false,
-- uses only explicit `head`/`tail` tool args for post-run filtering.
-
-`normalizeBashCommand()` still exists in `src/tools/bash-normalize.ts`, but `BashTool.execute()` does not call it in the current source. Trailing shell pipes such as `| head -n 50` remain part of the shell command unless the caller uses the structured `head`/`tail` args.
+- optionally removes harmless trailing `| head ...` / `| tail ...` limiters through `applyBashFixups()` when `bash.stripTrailingHeadTail` is enabled,
+- leaves output-window selection to `OutputSink`: a 1 KiB tail by default, an explicitly configured `tools.artifactTailBytes` tail budget, or head+tail when `tools.artifactHeadBytes` is explicitly configured.
 
 ## 2) Optional interception (blocked-command path)
 
@@ -81,7 +80,7 @@ Before execution, the tool allocates an artifact path/id (best-effort) for trunc
 
 Otherwise it uses non-interactive `executeBash()`.
 
-That means print mode and non-UI RPC/tool contexts always use non-PTY.
+That means print mode and non-UI tool contexts always use non-PTY.
 
 ## Non-interactive execution engine (`executeBash`)
 
@@ -155,10 +154,12 @@ Both PTY and non-PTY paths use `OutputSink`.
 
 ## OutputSink semantics
 
-- keeps an in-memory UTF-8-safe tail buffer (`DEFAULT_MAX_BYTES`, currently 50KB),
+- keeps a small in-memory UTF-8-safe tail buffer (1 KiB by default),
+- uses an explicitly configured `tools.artifactTailBytes` value to set the Bash tail budget,
+- retains no head window by default; explicitly configuring `tools.artifactHeadBytes` opts Bash into head+tail middle elision,
 - tracks total bytes/lines seen,
-- if artifact path exists and output overflows (or file already active), writes full stream to artifact file,
-- when memory threshold overflows, trims in-memory buffer to tail (UTF-8 boundary safe),
+- if an artifact path exists and output overflows (or the file is already active), writes the stream up to the artifact hard cap; any omitted bytes are counted and disclosed instead of calling the artifact complete,
+- when memory threshold overflows, trims the in-memory buffer to the tail (UTF-8 boundary safe),
 - marks `truncated` when overflow/file spill occurs.
 
 `dump()` returns:
@@ -168,18 +169,29 @@ Both PTY and non-PTY paths use `OutputSink`.
 - `totalLines/totalBytes`,
 - `outputLines/outputBytes`,
 - `artifactId` if artifact file was active.
+- `artifactTruncatedBytes` when the artifact hard cap omitted bytes.
 
 ### Long-output caveat
 
-Runtime truncation is byte-threshold based in `OutputSink` (50KB default). It does not enforce a hard 2000-line cap in this code path.
+`BashTool` supplies a 1 KiB byte threshold to `OutputSink` by default, overridden by an explicit `tools.artifactTailBytes` setting. Direct user bang commands continue to use the executor's shared 50 KiB tail plus configured head window. Neither path enforces a hard line-count cap.
 
 ## Live tool updates and async jobs
 
-For non-PTY foreground execution, `BashTool` uses a separate `TailBuffer` for partial updates and emits `onUpdate` snapshots while command is running.
+Foreground streamed updates, PTY capture, managed async jobs, and monitor jobs all use the Bash retention policy resolved from the active `ToolSession`: a 1 KiB UTF-8-safe tail by default, an explicit `tools.artifactTailBytes` tail budget, and optional `tools.artifactHeadBytes` head retention for final captured output. Foreground, async, and monitor progress callbacks use bounded tail previews; PTY live rendering remains in the custom overlay while its final capture uses the same `OutputSink` budgets.
 
-For PTY execution, live rendering is handled by custom UI overlay, not by `onUpdate` text chunks.
+When `async.enabled` is true and the call passes `async: true`, `BashTool` starts a managed Bash job, returns a running job result with a job id, and stores bounded completion output through the session managed-job path. Auto-backgrounding can start the same path after `bash.autoBackground.thresholdMs`.
 
-When `async.enabled` is true and the call passes `async: true`, `BashTool` starts a managed bash job, returns a running job result with a job id, and stores completion through the session managed-job path. Auto-backgrounding can also start this path after `bash.autoBackground.thresholdMs`.
+### ACP client-terminal retention
+
+When the connected client owns terminal execution, GJC requests the same bounded Bash output contract through `outputByteLimit`:
+
+- the default request retains the last 1 KiB; ACP truncates from the beginning at a UTF-8 character boundary,
+- an explicit `tools.artifactTailBytes` value sets that requested tail limit,
+- an explicit `tools.artifactHeadBytes` value omits the client-side byte limit so GJC can receive the complete returned stream, apply local head+tail middle elision, and save the full returned output when artifact storage is available,
+- if the client itself reports `truncated: true`, the returned bytes are already incomplete and GJC does not label an artifact made from that partial value as the full capture,
+- poll updates and timeout output use the same local retention policy; a complete oversized timeout capture is saved before the bounded error is surfaced when artifact storage is available.
+
+For an ACP result where the client reports `truncated: true`, a truncation notice without an `artifact://` link means GJC never received the full stream. Separately, when artifact allocation is unavailable, a complete local capture can remain without a link or diagnostic because SDK allocation wrappers may return an empty value; if an artifact writer/save operation is attempted and fails, it emits a bounded diagnostic without inventing an artifact URI.
 
 ## Result shaping, metadata, and error mapping
 
@@ -189,7 +201,7 @@ After execution:
    - if abort signal is aborted -> throw `ToolAbortError` (abort semantics),
    - else -> throw `ToolError` (treated as tool failure).
 2. PTY `timedOut` -> throw `ToolError`.
-3. apply head/tail filters to final output text (`applyHeadTail`, head then tail).
+3. retain only the final 1 KiB output window by default (or use explicit `tools.artifactTailBytes` / `tools.artifactHeadBytes` retention budgets).
 4. empty output becomes `(no output)`.
 5. attach truncation metadata via `toolResult(...).truncationFromSummary(result, { direction: "tail" })`.
 6. exit-code mapping:
@@ -205,7 +217,7 @@ Success payload structure:
   - `shownRange`,
   - `artifactId` when available.
 
-Because built-in tools are wrapped with `wrapToolWithMetaNotice()`, truncation notice text is appended to final text content automatically (for example: `Full: artifact://<id>`).
+Because built-in tools are wrapped with `wrapToolWithMetaNotice()`, truncation notice text is appended to final text content automatically; when truncation metadata includes an artifact reference, that notice can include an example such as `Full: artifact://<id>`.
 
 ## Rendering paths
 
@@ -215,7 +227,7 @@ Because built-in tools are wrapped with `wrapToolWithMetaNotice()`, truncation n
 
 - collapsed mode shows visual-line-truncated preview,
 - expanded mode shows all currently available output text,
-- warning line includes truncation reason and `artifact://<id>` when truncated,
+- warning line includes the truncation reason and, when metadata has one, its `artifact://<id>` reference,
 - timeout value (from args) is shown in footer metadata line.
 
 ### Caveat: full artifact expansion
@@ -240,14 +252,13 @@ This component is wired by `CommandController.handleBashCommand()` and fed from 
 | ------------------------------ | ----------------------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------ |
 | Interactive tool call          | `BashTool.execute`                                    | Yes, when `pty=true` and UI exists and `GJC_NO_PTY!=1`                | PTY overlay (interactive) or streamed tail updates                       | Tool errors become `toolResult.isError`          |
 | Print mode tool call           | `BashTool.execute`                                    | No (no UI context)                                                   | No TUI overlay; output appears in event stream/final assistant text flow | Same tool error mapping                          |
-| RPC tool call (agent tooling)  | `BashTool.execute`                                    | Usually no UI -> non-PTY                                             | Structured tool events/results                                           | Same tool error mapping                          |
+| ACP tool call (agent tooling)  | `BashTool.execute`                                    | Usually no UI -> non-PTY                                             | Structured protocol events/results                                      | Same tool error mapping                          |
 | Interactive bang command (`!`) | `AgentSession.executeBash` + `BashExecutionComponent` | No (uses executor directly)                                          | Dedicated bash execution component                                       | Controller catches exceptions and shows UI error |
-| RPC `bash` command             | `rpc-mode` -> `session.executeBash`                   | No                                                                   | Returns `BashResult` directly                                            | Consumer handles returned fields                 |
 
 ## Operational caveats
 
 - Interceptor only blocks commands when suggested tool is currently available in context.
-- If artifact allocation fails, truncation still occurs but no `artifact://` back-reference is available.
+- If artifact allocation/storage is unavailable before a writer/save operation is attempted, truncation still occurs without an `artifact://` back-reference and may have no diagnostic because SDK allocation wrappers can return an empty value. If a writer/save operation is attempted and fails, Bash emits a bounded diagnostic; it never fabricates a reference.
 - Shell session cache has no explicit eviction in this module; lifetime is process-scoped.
 - PTY and non-PTY timeout surfaces differ:
   - PTY exposes explicit `timedOut` result field,
@@ -256,7 +267,7 @@ This component is wired by `CommandController.handleBashCommand()` and fed from 
 ## Implementation files
 
 - [`src/tools/bash.ts`](../packages/coding-agent/src/tools/bash.ts) — tool entrypoint, input handling/interception, async and PTY/non-PTY selection, result/error mapping, bash tool renderer.
-- [`src/tools/bash-normalize.ts`](../packages/coding-agent/src/tools/bash-normalize.ts) — post-run head/tail filtering; also contains an unused command-normalization helper.
+- [`src/tools/bash-command-fixup.ts`](../packages/coding-agent/src/tools/bash-command-fixup.ts) — optional removal of harmless trailing `head`/`tail` limiters before execution.
 - [`src/tools/bash-interceptor.ts`](../packages/coding-agent/src/tools/bash-interceptor.ts) — interceptor rule matching and blocked-command messages.
 - [`src/exec/bash-executor.ts`](../packages/coding-agent/src/exec/bash-executor.ts) — non-PTY executor, shell session reuse, cancellation wiring, output sink integration.
 - [`src/tools/bash-interactive.ts`](../packages/coding-agent/src/tools/bash-interactive.ts) — PTY runtime, overlay UI, input normalization, non-interactive env defaults.
@@ -265,5 +276,4 @@ This component is wired by `CommandController.handleBashCommand()` and fed from 
 - [`src/session/agent-session.ts`](../packages/coding-agent/src/session/agent-session.ts) — session-level `executeBash`, message recording, abort lifecycle.
 - [`src/modes/components/bash-execution.ts`](../packages/coding-agent/src/modes/components/bash-execution.ts) — interactive `!` command execution component.
 - [`src/modes/controllers/command-controller.ts`](../packages/coding-agent/src/modes/controllers/command-controller.ts) — wiring for interactive `!` command UI stream/update completion.
-- [`src/modes/rpc/rpc-mode.ts`](../packages/coding-agent/src/modes/rpc/rpc-mode.ts) — RPC `bash` and `abort_bash` command surface.
 - [`src/internal-urls/artifact-protocol.ts`](../packages/coding-agent/src/internal-urls/artifact-protocol.ts) — `artifact://<id>` resolution.

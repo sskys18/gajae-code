@@ -76,8 +76,10 @@ function createRegistry(profiles: Iterable<[string, ModelProfileDefinition]> = [
 		getError: () => undefined,
 		getAvailable: () => [...models],
 		getAll: () => [...models],
+		hasConfiguredProviderAuth: () => false,
 		getProviders: () => [],
 		getCanonicalModels: () => [],
+		getCanonicalModelSelections: () => [],
 		getDiscoverableProviders: () => [],
 		findCanonicalModel: () => undefined,
 		resolveCanonicalModel: options.resolveCanonicalModel ?? (() => undefined),
@@ -247,6 +249,35 @@ describe("custom model preset creation", () => {
 
 		expect(await Bun.file(modelsPath).text()).toBe(original);
 	});
+	it("saves a new preset when an existing mapping uses a colon-tagged concrete model id", async () => {
+		const modelsPath = path.join(tempDir, "models.yml");
+		await Bun.write(
+			modelsPath,
+			[
+				"profiles:",
+				"  repro:",
+				"    required_providers: [ollama-cloud]",
+				"    model_mapping:",
+				"      default: ollama-cloud/deepseek-v4-flash:0731",
+				"",
+			].join("\n"),
+		);
+		const registry = new ModelRegistry(authStorage, modelsPath);
+
+		await expect(
+			registry.saveCustomModelProfile("my-fast", {
+				display_name: "my-fast",
+				required_providers: ["my-oai"],
+				model_mapping: { default: "my-oai/gpt-custom:low" },
+			}),
+		).resolves.toBeDefined();
+
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			profiles: Record<string, { model_mapping: Record<string, string> }>;
+		};
+		expect(parsed.profiles.repro.model_mapping.default).toBe("ollama-cloud/deepseek-v4-flash:0731");
+		expect(parsed.profiles["my-fast"].model_mapping.default).toBe("my-oai/gpt-custom:low");
+	});
 
 	it("rejects duplicate custom preset ids without overwriting existing profiles or providers", async () => {
 		const modelsPath = path.join(tempDir, "models.yml");
@@ -290,30 +321,46 @@ describe("custom model preset creation", () => {
 		expect(parsed.profiles["my-fast"]?.model_mapping.default).toBe("my-oai/original");
 	});
 
-	it("rejects custom preset ids that shadow built-in presets", async () => {
+	it("allows user presets to override embedded or registry preset ids", async () => {
 		const modelsPath = path.join(tempDir, "models.yml");
 		const registry = new ModelRegistry(authStorage, modelsPath);
 
-		await expect(
-			registry.saveCustomModelProfile("codex-medium", {
-				display_name: "Shadow Codex",
-				required_providers: ["my-oai"],
-				model_mapping: { default: "my-oai/gpt-custom:low" },
-			}),
-		).rejects.toThrow("Custom model profile already exists: codex-medium");
-		await expect(Bun.file(modelsPath).exists()).resolves.toBe(false);
+		await registry.saveCustomModelProfile("codex-medium", {
+			display_name: "Shadow Codex",
+			required_providers: ["my-oai"],
+			model_mapping: { default: "my-oai/gpt-custom:low" },
+		});
+		expect(registry.getModelProfile("codex-medium")).toMatchObject({
+			displayName: "Shadow Codex",
+			source: "user",
+			modelMapping: { default: "my-oai/gpt-custom:low" },
+		});
 	});
 
-	it("rejects invalid persisted profile selectors with clear messages", async () => {
-		const registry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+	it("rejects invalid profile mappings before persistence without changing existing profiles", async () => {
+		const modelsPath = path.join(tempDir, "models.yml");
+		await Bun.write(
+			modelsPath,
+			[
+				"profiles:",
+				"  existing:",
+				"    required_providers: [my-oai]",
+				"    model_mapping:",
+				"      default: my-oai/original",
+				"",
+			].join("\n"),
+		);
+		const before = await Bun.file(modelsPath).text();
+		const registry = new ModelRegistry(authStorage, modelsPath);
 
 		await expect(
 			registry.saveCustomModelProfile("broken", {
 				display_name: "Broken",
 				required_providers: ["my-oai"],
-				model_mapping: { default: "missing-provider-slash" },
+				model_mapping: { default: "missing,selector" },
 			}),
-		).rejects.toThrow("Expected provider/modelId with optional :effort suffix");
+		).rejects.toThrow("Expected modelId or provider/modelId with optional :effort suffix");
+		expect(await Bun.file(modelsPath).text()).toBe(before);
 	});
 
 	it("surfaces create custom preset with the generated current model snapshot", async () => {
@@ -505,6 +552,61 @@ describe("custom model preset creation", () => {
 		selector.handleInput("\n");
 		expect(selections).toEqual([]);
 	});
+	it("keeps same-head different-tail profiles distinct and captures every fallback provider", async () => {
+		const sameHeadDifferentTail: ModelProfileDefinition = {
+			name: "same-head-different-tail",
+			displayName: "Same head, different tail",
+			requiredProviders: ["anthropic", "my-oai", "other-provider"],
+			modelMapping: {
+				default: "my-oai/gpt-custom:low",
+				executor: ["anthropic/claude:high", "other-provider/different-tail:max"],
+			},
+			source: "user",
+		};
+		const selections: ModelSelectorSelection[] = [];
+		const selector = new ModelSelectorComponent(
+			{ requestRender: () => {} } as unknown as TUI,
+			currentModel("my-oai", "gpt-custom"),
+			Settings.isolated({
+				"task.agentModelOverrides": {
+					executor: ["anthropic/claude:high", "other-provider/tail:max"],
+				},
+			}),
+			createRegistry([[sameHeadDifferentTail.name, sameHeadDifferentTail]], {
+				models: [
+					currentModel("my-oai", "gpt-custom"),
+					currentModel("anthropic", "claude"),
+					currentModel("other-provider", "tail"),
+				],
+			}),
+			[],
+			selection => {
+				selections.push(selection);
+			},
+			() => {},
+			{ currentThinkingLevel: ThinkingLevel.Low },
+		);
+		await Bun.sleep(0);
+
+		const text = normalizeRenderedText(selector.render(180).join("\n"));
+		expect(text).toContain("Create custom preset");
+		expect(text).not.toContain("Already saved as Same head, different tail");
+
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+		expect(selections).toEqual([
+			{
+				kind: "createProfile",
+				profile: {
+					required_providers: ["anthropic", "my-oai", "other-provider"],
+					model_mapping: {
+						default: "my-oai/gpt-custom:low",
+						executor: ["anthropic/claude:high", "other-provider/tail:max"],
+					},
+				},
+			},
+		]);
+	});
 	it("emits custom preset rename and delete actions from preset rows", async () => {
 		const customProfile: ModelProfileDefinition = {
 			name: "custom-row",
@@ -616,6 +718,9 @@ describe("custom model preset creation", () => {
 			model: currentModel("other", "active"),
 			thinkingLevel: undefined,
 			sessionId: "session",
+			getConfiguredModelChain: () => undefined,
+			setConfiguredModelChain: () => {},
+
 			setActiveModelProfile: (profileName: string | undefined) => {
 				activeProfiles.push(profileName);
 			},
@@ -659,12 +764,14 @@ describe("custom model preset creation", () => {
 			model: currentModel("other", "active"),
 			thinkingLevel: undefined,
 			sessionId: "session",
+			getConfiguredModelChain: () => undefined,
+			setConfiguredModelChain: () => {},
 			setActiveModelProfile: (profileName: string | undefined) => {
 				activeProfiles.push(profileName);
 			},
 			getActiveModelProfile: () => activeProfiles.at(-1),
 		};
-		const flushSpy = spyOn(settings, "flush").mockRejectedValueOnce(new Error("flush failed"));
+		const flushSpy = spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
 
 		try {
 			await expect(
@@ -749,6 +856,7 @@ describe("custom model preset creation", () => {
 			ui: { setFocus: () => {}, requestRender: () => {} },
 			editorContainer: {
 				clear: () => {},
+				detachChild: () => {},
 				addChild: (child: unknown) => {
 					if (child instanceof ModelSelectorComponent) selector = child;
 				},
@@ -759,6 +867,8 @@ describe("custom model preset creation", () => {
 				model: currentModel("my-oai", "gpt-custom"),
 				thinkingLevel: ThinkingLevel.Low,
 				sessionId: "session",
+				getConfiguredModelChain: () => undefined,
+				setConfiguredModelChain: () => {},
 				scopedModels: [],
 				modelRegistry: registry,
 				setActiveModelProfile: (profileName: string | undefined) => activeProfiles.push(profileName),

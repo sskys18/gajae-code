@@ -4,6 +4,7 @@ export * from "./auth-broker";
 export { type AuthGatewayBootOptions, type ModelResolver, startAuthGateway } from "./auth-gateway/server";
 export * from "./auth-gateway/types";
 export * from "./auth-storage";
+export * from "./context-cap-policy";
 export * from "./model-cache";
 export * from "./model-manager";
 export * from "./model-thinking";
@@ -23,6 +24,7 @@ export * from "./providers/mock";
 export * from "./providers/ollama";
 export * from "./providers/openai-codex-responses";
 export * from "./providers/openai-completions";
+export * from "./providers/openai-opencodex-responses";
 export * from "./providers/openai-responses";
 export * from "./providers/synthetic";
 export * from "./rate-limit-utils";
@@ -41,16 +43,20 @@ export * from "./usage/zai";
 export * from "./utils/anthropic-auth";
 export * from "./utils/discovery";
 export * from "./utils/event-stream";
+export * from "./utils/fallback-transport";
 export * from "./utils/h2-fetch";
 export * from "./utils/oauth";
 export type {
 	OAuthCredentials,
+	OAuthLoginOptions,
 	OAuthProvider,
 	OAuthProviderId,
 	OAuthProviderInfo,
 } from "./utils/oauth/types";
 export * from "./utils/overflow";
+export * from "./utils/provider-safety-stop";
 export * from "./utils/retry";
 export * from "./utils/schema";
+export * from "./utils/sqlite-errors";
 export * from "./utils/tool-choice-capability";
 export * from "./utils/validation";

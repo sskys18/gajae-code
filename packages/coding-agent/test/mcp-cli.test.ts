@@ -57,15 +57,21 @@ describe("gjc mcp CLI helpers", () => {
 			command: "npx",
 			args: ["-y", "@upstash/context7-mcp"],
 			env: { API_TOKEN: "super-secret" },
+			sharing: "per-session",
 		});
 		expect(stdoutText(stdout)).toContain('"API_TOKEN": "<redacted>"');
 		expect(stdoutText(stdout)).not.toContain("super-secret");
+		expect(stdoutText(stdout)).toContain('"runtimeStatus": "autoload"');
+		expect(stdoutText(stdout)).toContain('"runtimeNote": "Loaded by ordinary standalone gjc sessions at startup."');
 
 		stdout.mockClear();
 		await runMCPCommand({ action: "list", flags: { json: true }, cwd: projectDir });
 		expect(stdoutText(stdout)).toContain('"name": "context7"');
 		expect(stdoutText(stdout)).toContain('"API_TOKEN": "<redacted>"');
 		expect(stdoutText(stdout)).not.toContain("super-secret");
+		expect(stdoutText(stdout)).toContain('"runtimeStatus": "autoload"');
+		expect(stdoutText(stdout)).toContain('"runtimeNote": "Loaded by ordinary standalone gjc sessions at startup."');
+		expect(stdoutText(stdout)).toContain('"scope": "user"');
 
 		stdout.mockClear();
 		await runMCPCommand({ action: "remove", name: "context7", flags: { json: true }, cwd: projectDir });
@@ -102,11 +108,56 @@ describe("gjc mcp CLI helpers", () => {
 			},
 		});
 		const output = stdoutText(stdout);
-		expect(output).toContain("docs\thttp\thttps://example.test/mcp");
+		expect(output).toContain("docs\thttp\thttps://example.test/%3Credacted%3E");
+		expect(output).toContain("Runtime: Loaded by ordinary standalone gjc sessions at startup.");
 		expect(output).toContain('"Authorization": "<redacted>"');
 		expect(output).toContain('"X-Public": "<redacted>"');
 		expect(output).not.toContain("Bearer real-token");
 		expect(output).not.toContain('"X-Public": "value"');
+
+		stdout.mockClear();
+		await runMCPCommand({ action: "remove", name: "docs", flags: { project: true }, cwd: projectDir });
+		expect(stdoutText(stdout)).toContain('Removed MCP server "docs"');
+	});
+
+	it("redacts URL and stdio argument secrets from public output", async () => {
+		const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+		await runMCPCommand({
+			action: "add",
+			name: "urlsecret",
+			flags: {
+				type: "http",
+				url: "https://user:pass@example.test/path-token-secret?apiKey=url-secret&plain=value#frag",
+			},
+			cwd: projectDir,
+		});
+		await runMCPCommand({ action: "list", flags: {}, cwd: projectDir });
+
+		let output = stdoutText(stdout);
+		expect(output).toContain("apiKey=%3Credacted%3E");
+		expect(output).not.toContain("user:pass");
+		expect(output).not.toContain("path-token-secret");
+		expect(output).not.toContain("url-secret");
+		expect(output).not.toContain("plain=value");
+		expect(output).not.toContain("#frag");
+
+		stdout.mockClear();
+		await runMCPCommand({
+			action: "add",
+			name: "argsecret",
+			commandArgs: ["tool", "--api-key", "arg-secret", "--token=arg-token", "normal"],
+			flags: {},
+			cwd: projectDir,
+		});
+		await runMCPCommand({ action: "list", flags: {}, cwd: projectDir });
+
+		output = stdoutText(stdout);
+		expect(output).toContain("--api-key <redacted>");
+		expect(output).toContain("--token=<redacted>");
+		expect(output).toContain("normal");
+		expect(output).not.toContain("arg-secret");
+		expect(output).not.toContain("arg-token");
 	});
 
 	it("does not overwrite an existing server unless force is set", async () => {
@@ -183,9 +234,62 @@ describe("gjc mcp CLI helpers", () => {
 		const output = stdoutText(stdout);
 		expect(output).toContain('"credentialId": "<redacted>"');
 		expect(output).toContain('"clientSecret": "<redacted>"');
-		expect(output).toContain('"redirectUri": "http://127.0.0.1/callback"');
+		expect(output).toContain('"redirectUri": "http://127.0.0.1/%3Credacted%3E"');
 		expect(output).not.toContain("future-secret");
 		expect(output).not.toContain("future-oauth-secret");
 		expect(output).not.toContain("raw-secret");
+	});
+
+	it("reports deterministic autoload status: autoload, autoload-off, and disabled", async () => {
+		const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		const configPath = getMCPConfigPath("user", projectDir);
+		await fs.mkdir(path.dirname(configPath), { recursive: true });
+		await fs.writeFile(
+			configPath,
+			JSON.stringify({
+				mcpServers: {
+					alpha: { type: "stdio", command: "alpha-bin" },
+					disabled: { type: "stdio", command: "disabled-bin", enabled: false },
+					denied: { type: "stdio", command: "denied-bin" },
+					lazy: { type: "stdio", command: "lazy-bin", autoload: false },
+				},
+				disabledServers: ["denied"],
+			}),
+		);
+
+		await runMCPCommand({ action: "list", flags: { json: true }, cwd: projectDir });
+
+		const output = stdoutText(stdout);
+		const parsed = JSON.parse(output);
+		const byName = Object.fromEntries(parsed.servers.map((entry: { name: string }) => [entry.name, entry]));
+		expect(byName.alpha.runtimeStatus).toBe("autoload");
+		expect(byName.alpha.runtimeNote).toBe("Loaded by ordinary standalone gjc sessions at startup.");
+		expect(byName.disabled.runtimeStatus).toBe("disabled");
+		expect(byName.disabled.runtimeNote).toBe("Disabled; not loaded by sessions. Re-enable to autoload.");
+		expect(byName.denied.runtimeStatus).toBe("disabled");
+		expect(byName.lazy.runtimeStatus).toBe("autoload-off");
+		expect(byName.lazy.runtimeNote).toBe(
+			"Configured but not auto-loaded at startup (autoload: false); connect on demand via /mcp.",
+		);
+		expect(byName.alpha.scope).toBe("user");
+		expect(byName.alpha.path).toBe(configPath);
+	});
+
+	it("add reports autoload status in text output without claiming storage-only", async () => {
+		const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+		await runMCPCommand({
+			action: "add",
+			name: "demo",
+			commandArgs: ["demo-bin"],
+			flags: { project: true },
+			cwd: projectDir,
+		});
+
+		const output = stdoutText(stdout);
+		expect(output).toContain('MCP server "demo" added in project config');
+		expect(output).toContain("Runtime: Loaded by ordinary standalone gjc sessions at startup.");
+		expect(output).not.toContain("storage-only");
+		expect(output).not.toContain("do not load stored MCP registrations today");
 	});
 });

@@ -1,123 +1,81 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getAgentDir, getConfigRootDir } from "./dirs";
+import { canonicalEnvKey, getAgentDir, getConfigRootDir, getTrustedHomeDir } from "./dirs";
 import { isSafeEnvName, isSafeEnvValue } from "./spawn-env";
 
 export { filterProcessEnv, isSafeEnvName, isSafeEnvValue } from "./spawn-env";
 
-const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+import { parseEnvFile, parseEnvFileContent, parseShellEnvFile } from "./env-file";
 
-/**
- * Strict shell-identifier shape. Used for dotenv keys we accept into
- * `Bun.env` — those should be referenceable as `$NAME` from POSIX shells,
- * so we reject anything outside `[A-Za-z_][A-Za-z0-9_]*`.
- */
-export function isValidEnvName(name: string): boolean {
-	return ENV_NAME_RE.test(name);
-}
+// Re-exported so the public surface of this module is unchanged.
+export { isValidEnvName, parseEnvFile, parseShellEnvFile } from "./env-file";
 
-function stripInlineShellComment(value: string): string {
-	let quote: '"' | "'" | undefined;
-	for (let i = 0; i < value.length; i++) {
-		const char = value[i];
-		if (char === "\\") {
-			i++;
-			continue;
-		}
-		if ((char === '"' || char === "'") && (!quote || quote === char)) {
-			quote = quote ? undefined : char;
-			continue;
-		}
-		if (char === "#" && !quote && (i === 0 || /\s/.test(value[i - 1] ?? ""))) {
-			return value.slice(0, i).trimEnd();
+function loadProjectEnv(): { values: Record<string, string>; dynamic: Set<string> } {
+	const cwd = process.cwd();
+	const nodeEnv = process.env.NODE_ENV || Bun.env.NODE_ENV;
+	// Match Bun's dotenv precedence. Validate before interpolation so a hostile
+	// NODE_ENV cannot introduce separators or `..` path segments.
+	const validNodeEnv = nodeEnv && /^[A-Za-z0-9_-]+$/.test(nodeEnv) ? nodeEnv : undefined;
+	const files = [
+		".env",
+		...(validNodeEnv ? [`.env.${validNodeEnv}`] : []),
+		...(validNodeEnv !== "test" ? [".env.local"] : []),
+		...(validNodeEnv ? [`.env.${validNodeEnv}.local`] : []),
+	];
+	const values: Record<string, string> = {};
+	const dynamic = new Set<string>();
+	for (const file of files) {
+		const parsed = parseEnvFile(path.join(cwd, file));
+		for (const [rawKey, value] of Object.entries(parsed)) {
+			// Windows environment names are case-insensitive, so the guard lookups
+			// below must see the same key Bun loaded into `process.env`.
+			const key = canonicalEnvKey(rawKey);
+			values[key] = value;
+			// Track dynamic provenance only for the winning declaration.
+			if (/[$`]/.test(value)) dynamic.add(key);
+			else dynamic.delete(key);
 		}
 	}
-	return value.trimEnd();
-}
-
-/**
- * Parses simple POSIX shell environment assignments from files such as
- * ~/.zshrc without executing user shell code. Supports `export KEY=value` and
- * `KEY=value`, including single/double quoted literal values. Dynamic shell
- * expressions are intentionally ignored because evaluating startup files would
- * run arbitrary code during CLI startup.
- */
-export function parseShellEnvFile(filePath: string): Record<string, string> {
-	const result: Record<string, string> = {};
-	try {
-		const content = fs.readFileSync(filePath, "utf-8");
-		for (const line of content.split("\n")) {
-			const trimmed = line.trim();
-			if (!trimmed || trimmed.startsWith("#")) continue;
-
-			const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(trimmed);
-			if (!match) continue;
-
-			const key = match[1];
-			if (!isValidEnvName(key)) continue;
-
-			let value = stripInlineShellComment(match[2] ?? "").trim();
-			if (value.endsWith(";")) value = value.slice(0, -1).trimEnd();
-			if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-				value = value.slice(1, -1);
-			}
-			if (!isSafeEnvValue(value)) continue;
-			if (/[$`]/.test(value)) continue;
-
-			result[key] = value;
-		}
-	} catch {
-		// File doesn't exist or can't be read - return empty result
-	}
-
-	return result;
-}
-
-/**
- * Parses a .env file synchronously and extracts key-value string pairs.
- * Ignores lines that are empty or start with '#'. Trims whitespace.
- * Allows values to be quoted with single or double quotes.
- * Returns an object of key-value pairs.
- */
-export function parseEnvFile(filePath: string): Record<string, string> {
-	const result: Record<string, string> = {};
-	try {
-		const content = fs.readFileSync(filePath, "utf-8");
-		for (const line of content.split("\n")) {
-			const trimmed = line.trim();
-			// Skip comments and blank lines
-			if (!trimmed || trimmed.startsWith("#")) continue;
-
-			const eqIndex = trimmed.indexOf("=");
-			if (eqIndex === -1) continue;
-
-			const key = trimmed.slice(0, eqIndex).trim();
-			if (!isValidEnvName(key)) continue;
-
-			let value = trimmed.slice(eqIndex + 1).trim();
-
-			// Remove surrounding quotes (" or ')
-			if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-				value = value.slice(1, -1);
-			}
-			if (!isSafeEnvValue(value)) continue;
-
-			result[key] = value;
-		}
-	} catch {
-		// File doesn't exist or can't be read - return empty result
-	}
-
-	return result;
+	return { values, dynamic };
 }
 
 function resolveFileEnvValue(file: Record<string, string>, name: string): string | undefined {
 	if (!isSafeEnvName(name)) return undefined;
-	const value = file[name];
+	const value = file[canonicalEnvKey(name)];
 	if (value === undefined || !isSafeEnvValue(value)) return undefined;
 	const trimmed = value.trim();
 	return trimmed.length > 0 ? trimmed : undefined;
+}
+
+type TrustedAgentEnvRead =
+	| { status: "missing"; values: Record<string, string> }
+	| { status: "unavailable"; values: Record<string, string> }
+	| { status: "ok"; values: Record<string, string> };
+
+function readTrustedAgentEnv(): TrustedAgentEnvRead {
+	let filePath: string;
+	try {
+		filePath = path.join(getAgentDir(), ".env");
+	} catch {
+		return { status: "unavailable", values: {} };
+	}
+	let fileDescriptor: number | undefined;
+	try {
+		const linkStats = fs.lstatSync(filePath);
+		if (!linkStats.isFile()) return { status: "unavailable", values: {} };
+		const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+		fileDescriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
+		const fileStats = fs.fstatSync(fileDescriptor);
+		if (!fileStats.isFile()) return { status: "unavailable", values: {} };
+		const content = fs.readFileSync(fileDescriptor, "utf-8");
+		return { status: "ok", values: parseEnvFileContent(content) };
+	} catch (error) {
+		const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+		return code === "ENOENT" ? { status: "missing", values: {} } : { status: "unavailable", values: {} };
+	} finally {
+		if (fileDescriptor !== undefined) fs.closeSync(fileDescriptor);
+	}
 }
 
 function filterCredentialInheritedEnv(env: Record<string, string | undefined>): Record<string, string> {
@@ -127,34 +85,82 @@ function filterCredentialInheritedEnv(env: Record<string, string | undefined>): 
 		if (!isSafeEnvName(key) || value === undefined || !isSafeEnvValue(value)) continue;
 
 		// Bun may have already loaded cwd/.env before JS runs. It does not expose the
-		// source of each entry, so an exact match with projectEnv is ambiguous. Use
-		// the safer credential rule: ambiguous project matches are excluded from the
-		// credential-only inherited snapshot, while remaining available through $env.
+		// source of each entry, so a matching project declaration is ambiguous. A
+		// dynamic dotenv declaration is also ambiguous even when expansion changes
+		// its runtime value. Exclude those from the credential-only snapshot while
+		// keeping them available through $env.
 		const projectValue = resolveFileEnvValue(projectEnv, key);
-		if (projectValue !== undefined && projectValue === value) continue;
+		if (projectValue !== undefined && (projectSnapshot.dynamic.has(canonicalEnvKey(key)) || projectValue === value))
+			continue;
 
 		result[key] = value;
 	}
 	return result;
 }
 
-// Eagerly parse the user's $HOME/.env and the current project's .env (from cwd)
-const homeShellEnv = {
-	...parseShellEnvFile(path.join(os.homedir(), ".zshenv")),
-	...parseShellEnvFile(path.join(os.homedir(), ".zprofile")),
-	...parseShellEnvFile(path.join(os.homedir(), ".zshrc")),
-	...parseShellEnvFile(path.join(os.homedir(), ".bash_profile")),
-	...parseShellEnvFile(path.join(os.homedir(), ".bashrc")),
-};
-const homeEnv = parseEnvFile(path.join(os.homedir(), ".env"));
-const piEnv = parseEnvFile(path.join(getConfigRootDir(), ".env"));
-const agentEnv = parseEnvFile(path.join(getAgentDir(), ".env"));
-const projectEnv = parseEnvFile(path.join(process.cwd(), ".env"));
+// Parse the current project's .env first. Bun may have overlaid HOME from it
+// before this module runs, so a declared HOME must never select user credential
+// files for the credential-only snapshot.
+const projectSnapshot = loadProjectEnv();
+const projectEnv = projectSnapshot.values;
+const authoritativeHomeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
+const declaredHomeKey = canonicalEnvKey(authoritativeHomeKey);
+const declaredHome = projectEnv[declaredHomeKey];
+const runtimeHome = process.env[authoritativeHomeKey];
+const rejectProjectHome =
+	declaredHome !== undefined &&
+	runtimeHome !== undefined &&
+	(projectSnapshot.dynamic.has(declaredHomeKey) || declaredHome === runtimeHome);
+let trustedEnvHome: string | undefined;
+try {
+	trustedEnvHome = rejectProjectHome ? getTrustedHomeDir() : os.homedir();
+} catch {
+	// No trustworthy account home means no user credential files are trusted.
+	trustedEnvHome = undefined;
+}
+
+// Eagerly parse the trusted user's env files and the project .env (from cwd)
+const homeShellEnv = trustedEnvHome
+	? {
+			...parseShellEnvFile(path.join(trustedEnvHome, ".zshenv")),
+			...parseShellEnvFile(path.join(trustedEnvHome, ".zprofile")),
+			...parseShellEnvFile(path.join(trustedEnvHome, ".zshrc")),
+			...parseShellEnvFile(path.join(trustedEnvHome, ".bash_profile")),
+			...parseShellEnvFile(path.join(trustedEnvHome, ".bashrc")),
+		}
+	: {};
+const homeEnv =
+	trustedEnvHome && path.resolve(trustedEnvHome) !== path.resolve(process.cwd())
+		? parseEnvFile(path.join(trustedEnvHome, ".env"))
+		: {};
+let piEnv: Record<string, string> = {};
+let agentEnv: Record<string, string> = {};
+try {
+	piEnv = parseEnvFile(path.join(getConfigRootDir(), ".env"));
+	agentEnv = parseEnvFile(path.join(getAgentDir(), ".env"));
+} catch {
+	// Keep credential resolution fail-closed when trusted user state is unavailable.
+}
+const initialTrustedAgentEnv = readTrustedAgentEnv();
+const projectLoadedEnv: Record<string, string | undefined> = Object.fromEntries(
+	Object.keys(projectEnv).map(key => [key, Bun.env[key]]),
+);
 
 const inheritedEnv = filterCredentialInheritedEnv(Bun.env);
+const rotatingAgentEnvNames = new Set(Object.keys(agentEnv));
 
 export function $inheritedEnv(name: string): string | undefined {
-	return resolveFileEnvValue(inheritedEnv, name);
+	const snapshotValue = resolveFileEnvValue(inheritedEnv, name);
+	if (snapshotValue === undefined) return undefined;
+	// The snapshot records provenance — this key was inherited from the launching
+	// shell rather than the caller's cwd/.env — and pins the value so a later
+	// in-process write cannot swap the credential we authenticate with. It is not
+	// a cache that outlives the variable: once the key is removed from the live
+	// environment it is no longer inherited, so deletion is honoured. Without
+	// this, a credential present at import time can never be suppressed (tests
+	// that clear provider env vars silently keep resolving the real credential).
+	if (Bun.env[name] === undefined) return undefined;
+	return snapshotValue;
 }
 
 function resolveLiveCredentialEnvValue(name: string): string | undefined {
@@ -164,11 +170,12 @@ function resolveLiveCredentialEnvValue(name: string): string | undefined {
 	const trimmed = value.trim();
 	if (trimmed.length === 0) return undefined;
 
-	const projectValue = resolveFileEnvValue(projectEnv, name);
 	if (
-		projectValue !== undefined &&
-		projectValue === trimmed &&
-		resolveFileEnvValue(inheritedEnv, name) === undefined
+		Object.hasOwn(projectEnv, canonicalEnvKey(name)) &&
+		resolveFileEnvValue(inheritedEnv, name) === undefined &&
+		(projectSnapshot.dynamic.has(canonicalEnvKey(name)) ||
+			trimmed === resolveFileEnvValue(projectEnv, name) ||
+			trimmed === projectLoadedEnv[canonicalEnvKey(name)])
 	) {
 		return undefined;
 	}
@@ -229,6 +236,28 @@ export function $credentialEnv(name: string): string | undefined {
 }
 
 /**
+ * Resolve a credential that may rotate in the trusted agent `.env` while this
+ * process remains alive.
+ *
+ * Presence in the agent file establishes that file as the credential's
+ * authority, even when the launching shell inherited an older value. This is
+ * what lets an atomic token rotation repair a long-lived shell instead of
+ * falling back to its revoked snapshot. Removal is authoritative too, so a
+ * deleted token cannot silently reappear from that snapshot. Project `.env`
+ * files are never consulted; shell values retain their normal precedence for
+ * names the agent file does not own.
+ */
+export function $rotatingCredentialEnv(name: string): string | undefined {
+	if (!isSafeEnvName(name)) return undefined;
+	const agentRead = readTrustedAgentEnv();
+	if (agentRead.status === "ok" && Object.hasOwn(agentRead.values, name)) rotatingAgentEnvNames.add(name);
+	if (initialTrustedAgentEnv.status === "unavailable" && !rotatingAgentEnvNames.has(name)) return undefined;
+	if (!rotatingAgentEnvNames.has(name)) return $credentialEnv(name);
+	if (agentRead.status !== "ok") return undefined;
+	return resolveFileEnvValue(agentRead.values, name);
+}
+
+/**
  * Resolve the first credential env value from the given keys, excluding cwd/.env overlays.
  */
 export function $pickCredentialEnv(...keys: string[]): string | undefined {
@@ -239,16 +268,20 @@ export function $pickCredentialEnv(...keys: string[]): string | undefined {
 	return undefined;
 }
 
+function parsePositiveInteger(raw: string | undefined): number | undefined {
+	const value = raw?.trim();
+	if (!value || !/^\d+$/.test(value)) return undefined;
+	const parsed = Number(value);
+	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
 /**
  * Parses a positive decimal integer from `$env[name]`.
- * Empty, invalid, NaN, zero, or negative values return `defaultValue`.
+ * Empty, invalid, unsafe, zero, or negative values return `defaultValue`.
  */
 export function $envpos(name: string, defaultValue: number): number {
-	const raw = $env[name];
-	if (!raw) return defaultValue;
-	const parsed = Number.parseInt(raw, 10);
-	if (Number.isNaN(parsed) || parsed <= 0) return defaultValue;
-	return parsed;
+	const parsed = parsePositiveInteger($env[name]);
+	return parsed ?? defaultValue;
 }
 
 /** True when `BUN_ENV` or `NODE_ENV` is the string `test`. */
@@ -272,7 +305,28 @@ export function isCompiledBinary(): boolean {
 
 const TRUTHY: Dict<boolean> = { "1": true, Y: true, TRUE: true, YES: true, ON: true };
 export function $flag(name: string, def: boolean = false): boolean {
-	const value = $env[name];
+	const value = $env[name]?.trim();
 	if (!value) return def;
-	return TRUTHY[value] === true;
+	// Boolean-like env values are documented as case-insensitive (`1`/`true`/`yes`/`on`),
+	// so normalize before the lookup — otherwise `FOO=true` (the common lowercase spelling)
+	// would silently read as false while only `FOO=TRUE`/`FOO=1` worked.
+	return TRUTHY[value.toUpperCase()] === true;
+}
+
+/** Resolve the first flag among keys that has a set value (GJC-first, PI fallback). Matches $flag semantics per key. */
+export function $pickflag(...keys: string[]): boolean {
+	for (const key of keys) {
+		const value = $env[key]?.trim();
+		if (value) return TRUTHY[value.toUpperCase()] === true;
+	}
+	return false;
+}
+
+/** Resolve the first positive integer among keys, else defaultValue (GJC-first). Set-but-invalid keys are skipped. */
+export function $pickenvpos(keys: string[], defaultValue: number): number {
+	for (const key of keys) {
+		const parsed = parsePositiveInteger($env[key]);
+		if (parsed !== undefined) return parsed;
+	}
+	return defaultValue;
 }

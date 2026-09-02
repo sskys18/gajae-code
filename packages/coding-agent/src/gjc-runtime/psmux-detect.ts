@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+import * as fs from "node:fs";
+
 /**
  * Windows psmux detection and tmux-binary resolution.
  *
@@ -45,8 +48,7 @@ const DEFAULT_BINARY_RESOLVER: BinaryResolver = candidate => {
 	if (!candidate) return null;
 	const stripped = candidate.trim().replace(/^["']|["']$/g, "");
 	if (!stripped) return null;
-	if (Bun.which(stripped)) return stripped;
-	return null;
+	return Bun.which(stripped);
 };
 
 let activeBinaryResolver: BinaryResolver = DEFAULT_BINARY_RESOLVER;
@@ -54,6 +56,49 @@ let activeBinaryResolver: BinaryResolver = DEFAULT_BINARY_RESOLVER;
 /** @internal Test-only seam; production code never calls this. */
 export function __setBinaryResolverForTests(resolver: BinaryResolver | null): void {
 	activeBinaryResolver = resolver ?? DEFAULT_BINARY_RESOLVER;
+}
+
+export type ExecutableIdentityResolver = (path: string) => string | null;
+
+const DEFAULT_EXECUTABLE_IDENTITY_RESOLVER: ExecutableIdentityResolver = executablePath => {
+	try {
+		const realPath = fs.realpathSync.native(executablePath);
+		const fd = fs.openSync(realPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+		try {
+			const before = fs.fstatSync(fd, { bigint: true });
+			if (!before.isFile() || before.dev === 0n || before.ino === 0n) return null;
+			const bytes = fs.readFileSync(fd);
+			const after = fs.fstatSync(fd, { bigint: true });
+			const named = fs.lstatSync(realPath, { bigint: true });
+			if (
+				!named.isFile() ||
+				named.isSymbolicLink() ||
+				after.dev !== before.dev ||
+				after.ino !== before.ino ||
+				after.size !== before.size ||
+				after.mtimeNs !== before.mtimeNs ||
+				after.ctimeNs !== before.ctimeNs ||
+				named.dev !== before.dev ||
+				named.ino !== before.ino ||
+				named.size !== before.size ||
+				named.mtimeNs !== before.mtimeNs ||
+				named.ctimeNs !== before.ctimeNs
+			)
+				return null;
+			return `${before.dev}:${before.ino}:${before.size}:${before.mtimeNs}:${before.ctimeNs}:${createHash("sha256").update(bytes).digest("hex")}`;
+		} finally {
+			fs.closeSync(fd);
+		}
+	} catch {
+		return null;
+	}
+};
+
+let activeExecutableIdentityResolver: ExecutableIdentityResolver = DEFAULT_EXECUTABLE_IDENTITY_RESOLVER;
+
+/** @internal Test-only seam; production code never calls this. */
+export function __setExecutableIdentityResolverForTests(resolver: ExecutableIdentityResolver | null): void {
+	activeExecutableIdentityResolver = resolver ?? DEFAULT_EXECUTABLE_IDENTITY_RESOLVER;
 }
 
 interface CacheEntry {
@@ -115,8 +160,30 @@ function outputMentionsPsmux(output: string): boolean {
 	return PSMUX_VERSION_MARKERS.some(marker => output.includes(marker));
 }
 
+function normalizedCommandBaseName(command: string): string {
+	const normalized = command
+		.trim()
+		.replace(/^['"]|['"]$/g, "")
+		.replace(/\\/g, "/");
+	const basename = normalized.slice(normalized.lastIndexOf("/") + 1).toLowerCase();
+	return basename.endsWith(".exe") ? basename.slice(0, -4) : basename;
+}
+
+function isNamedPsmuxCommand(command: string): boolean {
+	const basename = normalizedCommandBaseName(command);
+	return basename === "psmux" || basename === "pmux";
+}
+
 function resolveBinaryPath(candidate: string): string | null {
 	return activeBinaryResolver(candidate);
+}
+/** Resolve through the same identity-aware seams used by Windows alias detection. */
+export function resolveGjcTmuxExecutablePath(command: string): string | null {
+	return resolveBinaryPath(command);
+}
+
+export function resolveGjcTmuxExecutableIdentity(executablePath: string): string | null {
+	return activeExecutableIdentityResolver(executablePath);
 }
 
 function detectPsmuxForCommand(command: string, runner: PsmuxSpawnRunner): boolean {
@@ -124,6 +191,62 @@ function detectPsmuxForCommand(command: string, runner: PsmuxSpawnRunner): boole
 	if (!resolved) return false;
 	const output = probeVersionOutput(resolved, runner);
 	return outputMentionsPsmux(output);
+}
+
+function classifyWindowsTmuxAlias(command: string, env: NodeJS.ProcessEnv, runner: PsmuxSpawnRunner): boolean {
+	if (isNamedPsmuxCommand(command)) return true;
+	try {
+		if (detectPsmuxForCommand(command, runner)) return true;
+	} catch {
+		throw new Error("gjc_tmux_provider_ambiguous: selected Windows tmux command resolution failed");
+	}
+	if (normalizedCommandBaseName(command) !== "tmux" && !env[GJC_PSMUX_COMMAND_ENV]?.trim()) return false;
+
+	let selectedPath: string | null;
+	try {
+		selectedPath = resolveBinaryPath(command);
+	} catch {
+		throw new Error("gjc_tmux_provider_ambiguous: selected Windows tmux command resolution failed");
+	}
+	if (!selectedPath) {
+		throw new Error("gjc_tmux_provider_ambiguous: selected Windows tmux command could not be resolved");
+	}
+	const selectedIdentity = activeExecutableIdentityResolver(selectedPath);
+	if (!selectedIdentity) {
+		throw new Error("gjc_tmux_provider_ambiguous: selected Windows tmux executable identity is unavailable");
+	}
+
+	const explicitCompanion = env[GJC_PSMUX_COMMAND_ENV]?.trim();
+	const companions = [
+		...new Set([explicitCompanion, "psmux", "pmux"].filter((value): value is string => Boolean(value))),
+	];
+	let matched = false;
+	let distinct = false;
+	for (const companion of companions) {
+		let companionPath: string | null;
+		try {
+			companionPath = resolveBinaryPath(companion);
+		} catch {
+			throw new Error(`gjc_tmux_provider_ambiguous: Windows ${companion} command resolution failed`);
+		}
+		if (!companionPath) {
+			if (companion === explicitCompanion)
+				throw new Error("gjc_tmux_provider_ambiguous: GJC_PSMUX_COMMAND could not be resolved");
+			continue;
+		}
+		const companionIdentity = activeExecutableIdentityResolver(companionPath);
+		if (!companionIdentity) {
+			throw new Error(`gjc_tmux_provider_ambiguous: Windows ${companion} executable identity is unavailable`);
+		}
+		if (companionIdentity === selectedIdentity) matched = true;
+		else {
+			distinct = true;
+			if (companion === explicitCompanion)
+				throw new Error("gjc_tmux_provider_ambiguous: GJC_PSMUX_COMMAND selects a different executable");
+		}
+	}
+	if (matched && distinct) throw new Error("gjc_tmux_provider_ambiguous: Windows psmux companion identities conflict");
+	return matched;
 }
 
 /**
@@ -184,7 +307,7 @@ export interface ResolvedTmuxBinary {
 
 /**
  * Resolve the tmux command GJC should invoke. Honors the existing
- * GJC_TMUX_COMMAND / GJC_TEAM_TMUX_COMMAND overrides; on Windows when no
+ * GJC_TMUX_COMMAND override; on Windows when no
  * override is set, psmux (installed as psmux, pmux, or tmux) is picked
  * automatically so the default gjc --tmux flow lands on a real multiplexer.
  */
@@ -192,18 +315,30 @@ export function resolveGjcTmuxBinary(options: ResolveGjcTmuxBinaryOptions = {}):
 	const env = options.env ?? process.env;
 	const platform = options.platform ?? process.platform;
 	const runner = options.runner ?? readSpawnRunner();
-	const explicit = env.GJC_TMUX_COMMAND?.trim() || env.GJC_TEAM_TMUX_COMMAND?.trim();
+	const explicit = env.GJC_TMUX_COMMAND?.trim();
 	if (explicit) {
-		const isPsmux = detectPsmux(explicit, { env, runner });
+		const isPsmux =
+			platform === "win32"
+				? classifyWindowsTmuxAlias(explicit, env, runner)
+				: detectPsmux(explicit, { env, runner });
 		return { command: explicit, isPsmux, viaExplicitOverride: true };
 	}
 	if (platform === "win32") {
-		for (const candidate of PSMUX_BINARY_NAMES) {
-			if (resolveBinaryPath(candidate)) {
-				const isPsmux = detectPsmux(candidate, { env, runner });
-				return { command: candidate, isPsmux, viaExplicitOverride: false };
-			}
+		for (const command of ["psmux", "pmux"] as const) {
+			const executablePath = resolveBinaryPath(command);
+			if (!executablePath) continue;
+			if (!activeExecutableIdentityResolver(executablePath))
+				throw new Error(`gjc_tmux_provider_ambiguous: Windows ${command} executable identity is unavailable`);
+			return { command, isPsmux: true, viaExplicitOverride: false };
 		}
+		const tmuxPath = resolveBinaryPath("tmux");
+		if (tmuxPath) {
+			const isPsmux = outputMentionsPsmux(probeVersionOutput(tmuxPath, runner));
+			if (isPsmux && !activeExecutableIdentityResolver(tmuxPath))
+				throw new Error("gjc_tmux_provider_ambiguous: Windows tmux executable identity is unavailable");
+			return { command: "tmux", isPsmux, viaExplicitOverride: false };
+		}
+		return { command: "tmux", isPsmux: false, viaExplicitOverride: false };
 	}
 	const tmuxPath = resolveBinaryPath("tmux");
 	if (tmuxPath) {

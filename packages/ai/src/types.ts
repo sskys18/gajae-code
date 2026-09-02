@@ -13,6 +13,20 @@ import type {
 	LsArgs,
 	LsResult,
 	McpResult,
+	PiBashExecArgs,
+	PiBashExecResult,
+	PiEditExecArgs,
+	PiEditExecResult,
+	PiFindExecArgs,
+	PiFindExecResult,
+	PiGrepExecArgs,
+	PiGrepExecResult,
+	PiLsExecArgs,
+	PiLsExecResult,
+	PiReadExecArgs,
+	PiReadExecResult,
+	PiWriteExecArgs,
+	PiWriteExecResult,
 	ReadArgs,
 	ReadResult,
 	ShellArgs,
@@ -23,11 +37,14 @@ import type {
 import type { GoogleOptions } from "./providers/google";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
+import type { KiroCodeWhispererOptions } from "./providers/kiro-codewhisperer";
 import type { OllamaChatOptions } from "./providers/ollama";
 import type { OpenAICodexResponsesOptions } from "./providers/openai-codex-responses";
 import type { OpenAICompletionsOptions } from "./providers/openai-completions";
 import type { OpenAIResponsesOptions } from "./providers/openai-responses";
 import type { AssistantMessageEventStream } from "./utils/event-stream";
+import type { FallbackAttemptToken, TransportFailureFacts } from "./utils/fallback-transport";
+import type { UnicodeEscapeEvidence } from "./utils/json-parse";
 
 export type { AssistantMessageEventStream } from "./utils/event-stream";
 
@@ -42,7 +59,8 @@ export type KnownApi =
 	| "google-gemini-cli"
 	| "google-vertex"
 	| "ollama-chat"
-	| "cursor-agent";
+	| "cursor-agent"
+	| "kiro-codewhisperer-stream";
 export type Api = KnownApi | (string & {});
 export interface ApiOptionsMap {
 	"anthropic-messages": AnthropicOptions;
@@ -56,6 +74,7 @@ export interface ApiOptionsMap {
 	"google-vertex": GoogleVertexOptions;
 	"ollama-chat": OllamaChatOptions;
 	"cursor-agent": CursorOptions;
+	"kiro-codewhisperer-stream": KiroCodeWhispererOptions;
 }
 // Compile-time exhaustiveness check - this will fail if ApiOptionsMap doesn't have all KnownApi keys
 type _CheckExhaustive =
@@ -77,6 +96,23 @@ export type ThinkingControlMode =
 	| "anthropic-adaptive"
 	| "anthropic-budget-effort";
 
+/** Canonical runtime vocabulary for provider thinking transports. */
+export const THINKING_CONTROL_MODES = [
+	"effort",
+	"budget",
+	"google-level",
+	"anthropic-adaptive",
+	"anthropic-budget-effort",
+] as const satisfies readonly ThinkingControlMode[];
+
+type _CheckThinkingControlModes = [
+	Exclude<ThinkingControlMode, (typeof THINKING_CONTROL_MODES)[number]>,
+	Exclude<(typeof THINKING_CONTROL_MODES)[number], ThinkingControlMode>,
+] extends [never, never]
+	? true
+	: false;
+true satisfies _CheckThinkingControlModes;
+
 /** Per-model thinking capabilities used to clamp and map user-facing effort levels. */
 export interface ThinkingConfig {
 	/** Least intensive supported user-facing effort level. */
@@ -95,60 +131,78 @@ export interface ThinkingConfig {
 	mode: ThinkingControlMode;
 }
 
-export type KnownProvider =
-	| "alibaba-coding-plan"
-	| "amazon-bedrock"
-	| "azure-openai"
-	| "anthropic"
-	| "google"
-	| "google-gemini-cli"
-	| "google-antigravity"
-	| "google-vertex"
-	| "openai"
-	| "openai-codex"
-	| "kimi-code"
-	| "minimax-code"
-	| "minimax-code-cn"
-	| "github-copilot"
-	| "fireworks"
-	| "firepass"
-	| "fugu"
-	| "gitlab-duo"
-	| "cursor"
-	| "deepseek"
-	| "deepinfra"
-	| "xai"
-	| "groq"
-	| "cerebras"
-	| "openrouter"
-	| "kilo"
-	| "vercel-ai-gateway"
-	| "zai"
-	| "glm-zcode"
-	| "mistral"
-	| "minimax"
-	| "opencode-go"
-	| "opencode-zen"
-	| "synthetic"
-	| "cloudflare-ai-gateway"
-	| "huggingface"
-	| "litellm"
-	| "moonshot"
-	| "nvidia"
-	| "nanogpt"
-	| "ollama"
-	| "ollama-cloud"
-	| "qianfan"
-	| "qwen-portal"
-	| "together"
-	| "venice"
-	| "vllm"
-	| "xiaomi"
-	| "xiaomi-token-plan-sgp"
-	| "xiaomi-token-plan-ams"
-	| "xiaomi-token-plan-cn"
-	| "zenmux"
-	| "lm-studio";
+export const KNOWN_PROVIDERS = [
+	"alibaba-token-plan",
+	"amazon-bedrock",
+	"kiro",
+	"azure-openai",
+	"anthropic",
+	"google",
+	"google-gemini-cli",
+	"google-antigravity",
+	"google-vertex",
+	"openai",
+	"openai-codex",
+	"opencodex",
+	"kimi-code",
+	"minimax-code",
+	"minimax-code-cn",
+	"github-copilot",
+	"fireworks",
+	"firepass",
+	"fugu",
+	"gitlab-duo",
+	"cursor",
+	"jetbrains-junie",
+	"deepseek",
+	"deepinfra",
+	"xai",
+	"groq",
+	"cerebras",
+	"openrouter",
+	"kilo",
+	"vercel-ai-gateway",
+	"zai",
+	"glm-zcode",
+	"mistral",
+	"minimax",
+	"opencode-go",
+	"commandcode-goat",
+	"opencode-zen",
+	"opengateway",
+	"bizrouter",
+	"mara",
+	"synthetic",
+	"cloudflare-ai-gateway",
+	"huggingface",
+	"litellm",
+	"moonshot",
+	"nvidia",
+	"nanogpt",
+	"ollama",
+	"ollama-cloud",
+	"qianfan",
+	"qwen-portal",
+	"sglang",
+	"together",
+	"venice",
+	"vllm",
+	"xiaomi",
+	"xiaomi-token-plan-sgp",
+	"xiaomi-token-plan-ams",
+	"xiaomi-token-plan-cn",
+	"zenmux",
+	"lm-studio",
+	"omlx",
+] as const;
+
+export type KnownProvider = (typeof KNOWN_PROVIDERS)[number];
+
+const KNOWN_PROVIDER_SET = new Set<string>(KNOWN_PROVIDERS);
+
+export function isKnownProvider(provider: string): provider is KnownProvider {
+	return KNOWN_PROVIDER_SET.has(provider);
+}
 export type Provider = KnownProvider | string;
 
 import type { Effort } from "./model-thinking";
@@ -225,17 +279,38 @@ export function resolveServiceTier(
 
 /**
  * True when the (possibly scoped) tier should be sent as an OpenAI-compatible
- * `service_tier` request field for providers that support it. Unsupported tiers
- * (`"auto"`, `"default"`) and scope mismatches all return false.
+ * `service_tier` request field. Custom providers must explicitly opt in through
+ * `compat.supportsServiceTier`; unknown providers remain fail-closed.
  */
 export function shouldSendServiceTier(
 	serviceTier: ServiceTier | null | undefined,
 	provider: Provider | undefined,
+	supportsServiceTier = false,
 ): boolean {
 	const resolved = resolveServiceTier(serviceTier, provider);
 	if (provider === "deepinfra") return resolved === "priority";
-	if (provider !== "openai" && provider !== "openai-codex") return false;
+	if (provider !== "openai" && provider !== "openai-codex" && !supportsServiceTier) return false;
 	return resolved === "flex" || resolved === "scale" || resolved === "priority";
+}
+
+/**
+ * True when a priority tier is realized as a fast-mode request on the provider's
+ * wire protocol. Custom OpenAI-compatible proxies opt in explicitly rather than
+ * inheriting support merely because their API shape resembles OpenAI.
+ */
+export function isFastModeEffectiveForProvider(
+	serviceTier: ServiceTier | null | undefined,
+	provider: Provider | undefined,
+	supportsServiceTier = false,
+): boolean {
+	if (resolveServiceTier(serviceTier, provider) !== "priority") return false;
+	return (
+		provider === "openai" ||
+		provider === "openai-codex" ||
+		provider === "anthropic" ||
+		provider === "deepinfra" ||
+		supportsServiceTier
+	);
 }
 
 /**
@@ -250,12 +325,7 @@ export function getPriorityPremiumRequests(
 	serviceTier: ServiceTier | null | undefined,
 	provider: Provider | undefined,
 ): number {
-	if (resolveServiceTier(serviceTier, provider) !== "priority") return 0;
-	// Only providers that realize `priority` on the wire bill the user.
-	// Everywhere else, the field is silently dropped and nothing is charged.
-	return provider === "openai" || provider === "openai-codex" || provider === "anthropic" || provider === "deepinfra"
-		? 1
-		: 0;
+	return isFastModeEffectiveForProvider(serviceTier, provider) ? 1 : 0;
 }
 
 export interface ProviderSessionState {
@@ -284,6 +354,19 @@ export type FetchImpl = ((input: string | URL | Request, init?: RequestInit) => 
 	preconnect?: typeof globalThis.fetch.preconnect;
 };
 
+/**
+ * Credential returned by an auth retry resolver.
+ *
+ * The optional admission callback lets an authority-bearing caller retain a
+ * credential lease until the replacement provider request is actually
+ * admitted. Ordinary callers can continue returning a string from
+ * {@link StreamOptions.onAuthError}.
+ */
+export interface AuthRetryCredential {
+	apiKey: string;
+	onStreamCreated?: () => void;
+}
+
 export interface StreamOptions {
 	temperature?: number;
 	topP?: number;
@@ -306,12 +389,20 @@ export interface StreamOptions {
 	maxTokens?: number;
 	signal?: AbortSignal;
 	apiKey?: string;
+	/** Disables all transport-level replay; the fallback controller owns retries. */
+	fallbackManaged?: boolean;
+	/** Opaque token returned by beginAttempt for a managed transport invocation. */
+	fallbackAttempt?: FallbackAttemptToken;
 	/**
 	 * Called when a provider returns 401 before any replay-unsafe assistant
 	 * event has been emitted. Returning a different key retries the provider
 	 * request once.
 	 */
-	onAuthError?: (provider: string, apiKey: string, error: unknown) => Promise<string | undefined>;
+	onAuthError?: (
+		provider: string,
+		apiKey: string,
+		error: unknown,
+	) => Promise<string | AuthRetryCredential | undefined>;
 	cacheRetention?: CacheRetention;
 	/**
 	 * Additional headers to include in provider requests.
@@ -360,19 +451,37 @@ export interface StreamOptions {
 	/**
 	 * Optional callback for inspecting or replacing provider payloads before sending.
 	 * Return undefined to keep the payload unchanged.
+	 * The `scope` parameter carries the per-attempt identity for execution attribution.
 	 */
-	onPayload?: (payload: unknown, model?: Model<Api>) => unknown | undefined | Promise<unknown | undefined>;
+	onPayload?: (
+		payload: unknown,
+		model?: Model<Api>,
+		scope?: AttemptScopeRef,
+	) => unknown | undefined | Promise<unknown | undefined>;
 	/**
 	 * Optional callback for provider response metadata after headers are received.
+	 * The `scope` parameter carries the per-attempt identity for execution attribution.
 	 */
-	onResponse?: (response: ProviderResponseMetadata, model?: Model<Api>) => void | Promise<void>;
+	onResponse?: (
+		response: ProviderResponseMetadata,
+		model?: Model<Api>,
+		scope?: AttemptScopeRef,
+	) => void | Promise<void>;
+	/**
+	 * Internal dispatch-admission hook. Providers invoke this immediately before
+	 * submitting an outbound request; stream forwarding retains a first-response
+	 * fallback for custom providers that do not expose a transport seam.
+	 */
+	onStreamCreated?: () => void;
+	/** Internal authority policy: disable provider-owned retries and corrective replays. */
+	disableProviderRetries?: boolean;
 	/**
 	 * Optional callback for raw Server-Sent Events as they arrive from HTTP streaming providers.
 	 *
 	 * Diagnostic only: provider implementations must ignore callback failures and must not
 	 * let observers alter stream contents.
 	 */
-	onSseEvent?: (event: RawSseEvent, model?: Model<Api>) => void;
+	onSseEvent?: (event: RawSseEvent, model?: Model<Api>, scope?: AttemptScopeRef) => void;
 	/**
 	 * Optional override for the first streamed event watchdog in milliseconds.
 	 * Set to 0 to disable the first-event watchdog for this request.
@@ -402,6 +511,23 @@ export interface StreamOptions {
 	authCredentialType?: "api_key" | "oauth";
 	/** Cursor exec/MCP tool handlers (cursor-agent only). */
 	execHandlers?: CursorExecHandlers;
+	/** Per-attempt identity for execution attribution. Threaded into onPayload/onResponse calls. */
+	attemptScope?: AttemptScopeRef;
+}
+
+/**
+ * Low-level structural carrier for per-attempt identity attribution.
+ *
+ * Defined in `packages/ai` so that {@link SimpleStreamOptions} and provider
+ * hook signatures can carry an attempt identity without a reverse dependency
+ * on `packages/agent`. The concrete `AttemptScope` in `packages/agent` is
+ * structurally assignable to this interface (same `attemptId` + `generation`
+ * + `lineage` fields).
+ */
+export interface AttemptScopeRef {
+	readonly attemptId: string;
+	readonly generation: number;
+	readonly lineage: string;
 }
 
 // Unified options with reasoning passed to streamSimple() and completeSimple()
@@ -466,6 +592,9 @@ export interface ThinkingContent {
 	thinking: string;
 	thinkingSignature?: string; // e.g., for OpenAI responses, the reasoning item ID
 	itemId?: string; // item.id from output_item.added, used to match output_item.done
+	readonly provenance?: "summary" | "raw" | "mixed";
+	readonly summaryText?: string;
+	readonly rawText?: string;
 }
 
 export interface RedactedThinkingContent {
@@ -495,13 +624,46 @@ export interface ToolCall {
 	 */
 	customWireName?: string;
 	/**
-	 * Set when the provider detected the argument JSON was truncated — the model
-	 * hit its output-token limit (or the response was otherwise cut short) before
-	 * emitting a complete arguments object. The `arguments` field then holds a
-	 * best-effort partial parse and must not be executed as-is; the agent loop
-	 * rejects the call with a retryable error instead.
+	 * Set when the provider detected the argument JSON was not safely executable —
+	 * the model hit its output-token limit (or the response was otherwise cut short)
+	 * before emitting a complete arguments object, the terminal payload was malformed,
+	 * the streamed and terminal payloads conflicted, or the tool-call identity was
+	 * ambiguous on the wire. The `arguments` field then holds a best-effort partial
+	 * parse and must not be executed as-is; the agent loop rejects the call with a
+	 * retryable, reason-specific error instead.
 	 */
 	incompleteArguments?: boolean;
+	/**
+	 * When `incompleteArguments` is set, the typed cause so the agent loop can give
+	 * reason-specific recovery guidance:
+	 *  - `"truncated"`: the response was cut short mid-arguments (output-token limit).
+	 *  - `"malformed"`: the terminal arguments did not decode to a valid JSON object.
+	 *  - `"conflicting"`: the streamed and terminal argument payloads disagree.
+	 *  - `"ambiguous"`: the tool-call identity could not be unambiguously resolved
+	 *    (duplicate `call_id`, id/call_id collision, etc.), so attribution is unsafe.
+	 * Absent when `incompleteArguments` is not set. Existing callers that read only
+	 * `incompleteArguments` continue to work.
+	 */
+	incompleteArgumentsReason?: "truncated" | "malformed" | "conflicting" | "ambiguous";
+	/**
+	 * Set by current producers when raw argument JSON carries unsafe Unicode
+	 * data, such as malformed escape evidence or a decoded unpaired surrogate.
+	 * Valid JSON `\uXXXX` escapes are canonical spellings of the decoded string
+	 * and current producers do not set this flag for them.
+	 *
+	 * Legacy producers may still set the flag for any escaped non-ASCII spelling.
+	 * The agent loop keeps its bounded legacy resample/display-safe behavior for
+	 * those calls while consuming the transient evidence below.
+	 */
+	escapedNonAsciiArguments?: boolean;
+	/**
+	 * Bounded, payload-free evidence for raw Unicode argument data. Current
+	 * producers attach it only for unsafe data; legacy producers may attach
+	 * non-malformed positional evidence used by the display-safe compatibility
+	 * path. The agent consumes and removes this transient field before the
+	 * tool-call message can become durable.
+	 */
+	escapedUnicodeArgumentEvidence?: UnicodeEscapeEvidence;
 }
 
 export interface Usage {
@@ -552,6 +714,27 @@ export interface Usage {
 }
 
 export type StopReason = "stop" | "length" | "toolUse" | "error" | "aborted";
+export type AssistantErrorKind = "provider_safety_stop" | "local_snapshot_failure" | "local_buffer_overflow";
+/**
+ * Structured, shape-only staging-buffer overflow diagnostic carried on the
+ * terminal `AssistantMessage`. Attached only by the agent runtime from its own
+ * identity-checked overflow error; every field is a closed vocabulary literal
+ * or a locally synthesized number.
+ */
+export interface AssistantBufferOverflowDiagnostic {
+	/** Rejecting stage from the closed managed-local-failure vocabulary. */
+	stage: string;
+	/** Which provisional cap tripped. */
+	exceeded: "events" | "bytes" | "both";
+	/** Events retained in the batch at rejection (post-compaction). */
+	stagedEventCount: number;
+	/** Bytes retained in the batch at rejection (post-compaction). */
+	stagedBytes: number;
+	/** Serialized size of the event that was rejected. */
+	incomingEventBytes: number;
+	maxStagedEvents: number;
+	maxStagedBytes: number;
+}
 
 export interface OpenAIResponsesHistoryPayload {
 	type: "openaiResponsesHistory";
@@ -594,8 +777,20 @@ export interface AssistantMessage {
 	usage: Usage;
 	stopReason: StopReason;
 	errorMessage?: string;
+	errorKind?: AssistantErrorKind;
+	/**
+	 * Structured, shape-only diagnostic for a terminal local staging-buffer
+	 * overflow (`errorKind: "local_buffer_overflow"`). Attached only by the
+	 * agent runtime from its own identity-checked overflow error, so a
+	 * foreign, self-labeled error cannot populate it. Every field is a closed
+	 * vocabulary literal or a locally synthesized number — parent surfaces
+	 * render this instead of trusting the free-form `errorMessage`.
+	 */
+	bufferOverflow?: AssistantBufferOverflowDiagnostic;
 	/** HTTP status surfaced by the provider when the request failed. Populated by every provider's catch block alongside `errorMessage` so consumers (auth retry, telemetry, UI) can branch without regex-scraping the message. */
 	errorStatus?: number;
+	/** Typed upstream failure facts retained for retry classification without parsing errorMessage. */
+	transportFailure?: TransportFailureFacts;
 	/**
 	 * Stable identifiers for request features the provider silently dropped
 	 * during this turn (e.g. `"priority"`). Set when a server-side rejection
@@ -647,6 +842,11 @@ export interface CursorShellStreamCallbacks {
 	onStderr(data: string): void;
 }
 
+export interface CursorPiCall<TArgs> {
+	args: TArgs;
+	toolCallId: string;
+}
+
 export interface CursorExecHandlers {
 	read?: (args: ReadArgs) => Promise<CursorExecHandlerResult<ReadResult>>;
 	ls?: (args: LsArgs) => Promise<CursorExecHandlerResult<LsResult>>;
@@ -660,6 +860,13 @@ export interface CursorExecHandlers {
 	) => Promise<CursorExecHandlerResult<ShellResult>>;
 	diagnostics?: (args: DiagnosticsArgs) => Promise<CursorExecHandlerResult<DiagnosticsResult>>;
 	mcp?: (call: CursorMcpCall) => Promise<CursorExecHandlerResult<McpResult>>;
+	piRead?: (call: CursorPiCall<PiReadExecArgs>) => Promise<CursorExecHandlerResult<PiReadExecResult>>;
+	piBash?: (call: CursorPiCall<PiBashExecArgs>) => Promise<CursorExecHandlerResult<PiBashExecResult>>;
+	piEdit?: (call: CursorPiCall<PiEditExecArgs>) => Promise<CursorExecHandlerResult<PiEditExecResult>>;
+	piWrite?: (call: CursorPiCall<PiWriteExecArgs>) => Promise<CursorExecHandlerResult<PiWriteExecResult>>;
+	piGrep?: (call: CursorPiCall<PiGrepExecArgs>) => Promise<CursorExecHandlerResult<PiGrepExecResult>>;
+	piFind?: (call: CursorPiCall<PiFindExecArgs>) => Promise<CursorExecHandlerResult<PiFindExecResult>>;
+	piLs?: (call: CursorPiCall<PiLsExecArgs>) => Promise<CursorExecHandlerResult<PiLsExecResult>>;
 	onToolResult?: CursorToolResultHandler;
 }
 
@@ -680,10 +887,46 @@ export type TSchema = ZodType | TJsonSchema;
 /** Resolve parameter types for tool execution / handlers. */
 export type Static<S> = S extends ZodType ? z.infer<S> : S extends { static: infer T } ? T : unknown;
 
+export type RawArgumentRejectionCode =
+	| "ask-deep-interview-question-body-required"
+	| "ask-intent-review-requires-positive-round"
+	| "ask-intent-contract-requires-non-empty-authority"
+	| "ask-deep-interview-metadata-requires-deep-interview-gate"
+	| "ask-round-zero-metadata-requires-full-topology-fields"
+	| "todo-write-unknown-root-key"
+	| "todo-write-unknown-op-entry-key"
+	| "todo-write-unknown-op-value"
+	| "todo-write-done-drop-requires-target"
+	| "todo-write-unknown-init-entry-key";
+
+/**
+ * Optional structured detail attached to a raw-argument rejection. The fixed
+ * per-code guidance in `RAW_ARGUMENT_REJECTION_MESSAGES` explains the shape;
+ * this names what the caller actually sent that was wrong, so a retry can
+ * differ from the failed call.
+ */
+export interface RawArgumentRejectionDetail {
+	/** Offending keys, or the offending value, in payload order. */
+	readonly rejectedKeys?: readonly string[];
+	/**
+	 * Correction for a rejected key whose replacement is exact and
+	 * unambiguous. Never populate this from fuzzy or edit-distance matching:
+	 * a wrong suggestion costs more turns than no suggestion.
+	 */
+	readonly hint?: string;
+}
+
+export type RawArgumentValidationResult =
+	| { outcome: "passthrough" }
+	| { outcome: "accept"; arguments: ToolCall["arguments"] }
+	| { outcome: "reject"; code?: RawArgumentRejectionCode; detail?: RawArgumentRejectionDetail };
+
 export interface Tool<TParameters extends TSchema = TSchema> {
 	name: string;
 	description: string;
 	parameters: TParameters;
+	/** Optional pre-coercion adapter for narrowly scoped raw argument recovery or rejection. */
+	rawArgumentValidation?: (arguments_: ToolCall["arguments"]) => RawArgumentValidationResult;
 	/** If true, tool is strictly typed and validated against the parameters schema before execution */
 	strict?: boolean;
 	/**
@@ -703,6 +946,13 @@ export interface Tool<TParameters extends TSchema = TSchema> {
 	 * calls route correctly. Absent for regular JSON function tools.
 	 */
 	customWireName?: string;
+	/**
+	 * Optional safe projection for tool arguments or results. Extensions use this
+	 * only for explicitly opt-in, display-safe summaries.
+	 */
+	safeSummary?: (kind: "args" | "result", value: unknown) => string | undefined;
+	/** Allowlisted argument/result field names for a safe fallback summary. */
+	safeSummaryFields?: { args?: string[]; result?: string[] };
 }
 
 export interface Context {
@@ -719,6 +969,9 @@ export type AssistantMessageEvent =
 	| { type: "thinking_start"; contentIndex: number; partial: AssistantMessage }
 	| { type: "thinking_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
 	| { type: "thinking_end"; contentIndex: number; content: string; partial: AssistantMessage }
+	| { type: "reasoning_summary_start"; contentIndex: number; partial: AssistantMessage }
+	| { type: "reasoning_summary_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
+	| { type: "reasoning_summary_end"; contentIndex: number; content: string; partial: AssistantMessage }
 	| { type: "toolcall_start"; contentIndex: number; partial: AssistantMessage }
 	| { type: "toolcall_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
 	| { type: "toolcall_end"; contentIndex: number; toolCall: ToolCall; partial: AssistantMessage }
@@ -766,6 +1019,40 @@ export interface OpenAICompat extends ToolChoiceCompat {
 	 * caller already set via `headers`/`requestTransform`.
 	 */
 	sendSessionHeaders?: boolean;
+	/**
+	 * Whether an OpenAI Responses transport may forward the agent session id
+	 * as `session_id` and `x-client-request-id` affinity headers for an
+	 * explicitly configured custom relay. First-party OpenAI uses its canonical
+	 * HTTPS origin automatically; known non-OpenAI providers remain excluded.
+	 */
+	supportsResponsesSessionAffinity?: boolean;
+	/**
+	 * Whether an OpenAI-compatible endpoint accepts the `service_tier` request
+	 * field. Disabled by default for custom providers; opt in only when the proxy
+	 * preserves or intentionally realizes OpenAI priority processing.
+	 */
+	supportsServiceTier?: boolean;
+	/**
+	 * Tool names the provider reserves for its own built-ins and refuses to
+	 * accept as custom function declarations. A colliding tool is **dropped**
+	 * from the declared tools array rather than renamed: a renamed function
+	 * tool would come back as a `function_call` under the wire alias, and that
+	 * path does not populate `Tool.customWireName`, leaving the agent-loop
+	 * dispatcher unable to route it — trading a loud 400 for a silent
+	 * unresolvable call. Dropping the declaration is intentionally a loss of
+	 * capability, leaving the agent in the same state as any provider that
+	 * simply has no such tool. The filter preserves declaration order and does
+	 * not mutate the caller's array.
+	 *
+	 * Without this, one reserved name rejects the ENTIRE tools array with a
+	 * single 400 and no tokens ever stream — every agent carrying that tool
+	 * fails 100% of the time on that provider.
+	 *
+	 * Resolution precedence: an explicit array (including `[]`) on the model's
+	 * `compat` replaces the built-in provider default, so `[]` opts a reserved
+	 * provider out of the drop entirely.
+	 */
+	reservedToolNames?: string[];
 	/**
 	 * Whether the provider's chat-completions endpoint accepts multiple
 	 * leading `system`/`developer` messages. When false, ordered system
@@ -863,6 +1150,14 @@ export interface AnthropicCompat extends ToolChoiceCompat {
 	supportsForcedToolChoice?: boolean;
 	/** Whether long prompt-cache retention (`ttl: "1h"`) is supported. Default: true for canonical Anthropic API. */
 	supportsLongCacheRetention?: boolean;
+	/**
+	 * Prompt-cache transport accepted by this Anthropic-compatible endpoint.
+	 * Canonical Anthropic defaults to `"automatic"`; Claude-family models on
+	 * noncanonical compatible endpoints default to `"explicit"`; non-Claude
+	 * compatible endpoints default to `"none"`. Set `"automatic"` to opt into
+	 * top-level caching, `"none"` to opt out, or `"explicit"` for block markers.
+	 */
+	promptCacheMode?: "none" | "explicit" | "automatic";
 }
 
 /**
@@ -902,6 +1197,22 @@ export interface ModelRequestTransform {
 	extraBody?: Record<string, unknown>;
 }
 
+/** Provenance used when resolving a model's default request output budget. */
+export type ModelMaxTokensSource = "configured" | "discovered";
+
+export interface ModelCost {
+	input: number; // $/million tokens
+	output: number; // $/million tokens
+	cacheRead: number; // $/million tokens
+	cacheWrite: number; // $/million tokens
+}
+
+export interface LongContextPricing {
+	/** Input-token count above which the long-context rates apply to the full request. */
+	threshold: number;
+	cost: ModelCost;
+}
+
 export interface Model<TApi extends Api = any> {
 	id: string;
 	name: string;
@@ -918,16 +1229,15 @@ export interface Model<TApi extends Api = any> {
 	 * provider/id heuristics.
 	 */
 	output?: ("text" | "image")[];
-	cost: {
-		input: number; // $/million tokens
-		output: number; // $/million tokens
-		cacheRead: number; // $/million tokens
-		cacheWrite: number; // $/million tokens
-	};
+	cost: ModelCost;
+	/** Optional long-context rates selected from the request's total input-token count. */
+	longContextPricing?: LongContextPricing;
 	/** Premium Copilot requests charged per user-initiated request (defaults to 1). */
 	premiumMultiplier?: number;
 	contextWindow: number;
 	maxTokens: number;
+	/** Explicit models.yml/model-override authority; absent keeps the safe transport default. */
+	maxTokensSource?: ModelMaxTokensSource;
 	headers?: Record<string, string>;
 	/**
 	 * Streaming transport override. When `"pi-native"`, `streamSimple` routes
@@ -937,10 +1247,9 @@ export interface Model<TApi extends Api = any> {
 	 * (or compatible) host; `headers.Authorization` (or `apiKey` resolved by
 	 * the registry) carries the gateway bearer.
 	 *
-	 * Used by containerized gjc installs (e.g. robogjc slots) to route every
-	 * LLM call through a sidecar gateway that holds the real provider
-	 * credentials. The model's other metadata (pricing, context window,
-	 * thinking config, …) still resolves locally; only the streaming
+	 * Used by containerized GJC installs to route every LLM call through a
+	 * sidecar gateway that holds the real provider credentials. The model's other
+	 * metadata (pricing, context window, thinking config, …) still resolves locally; only the streaming
 	 * dispatch is redirected.
 	 */
 	transport?: "pi-native";
@@ -988,4 +1297,9 @@ export interface Model<TApi extends Api = any> {
 	 * `options.isOAuth = true` for the underlying provider call.
 	 */
 	isOAuth?: boolean;
+}
+
+/** True when a model explicitly opts into OpenAI-compatible `service_tier` forwarding. */
+export function modelSupportsServiceTier(model: Pick<Model, "compat"> | undefined): boolean {
+	return Boolean(model?.compat && "supportsServiceTier" in model.compat && model.compat.supportsServiceTier === true);
 }

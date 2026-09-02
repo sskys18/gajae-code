@@ -2,6 +2,235 @@
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-02
+
+## [0.15.6] - 2026-08-30
+
+## [0.15.5] - 2026-08-29
+
+## [0.15.4] - 2026-08-29
+
+### Added
+
+- Added opt-in adaptive compaction thresholding based on context fullness and recent call rate. The default remains disabled, fixed token thresholds keep precedence, and the bounded tracker resets after successful compaction to avoid repeated immediate compactions.
+
+## [0.15.3] - 2026-08-27
+
+### Changed
+
+- Current provider adapters no longer mark syntactically valid `\uXXXX` arguments as guarded: JSON parsing has already produced the canonical string, so valid escaped Hangul, emoji, ASCII, and other scalars execute like literal UTF-8 in every tool. The existing `displaySafeEscapedArgFields` path remains only for compatibility with legacy producers that still attach non-malformed positional evidence. Malformed evidence, unauthenticated managed evidence, incomplete/conflicting arguments, and unpaired surrogates remain fail-closed.
+### Fixed
+
+- Managed fallback snapshots now convert unauthenticated Unicode evidence into `incompleteArgumentsReason: "malformed"` instead of preserving a boolean-only guard that could lose the evidence needed by terminal validation.
+- Compaction no longer crashes on a persisted tool call whose `arguments` payload is null. `serializeConversation` passed that value straight into `Object.entries`, which threw `TypeError: Object.entries requires that input parameter not be null or undefined`. Because this runs inside compaction — itself the recovery path for context overflow — the failure surfaced as `Context overflow recovery failed: Object.entries requires ...`, and the next request went out uncompacted until the provider rejected it with `prompt is too long`. Malformed argument payloads now serialize as an empty argument list instead of aborting the summary.
+
+## [0.15.2] - 2026-08-25
+
+### Changed
+
+- Version 0.15.1 was tagged but never published: release automation failed while deriving release notes, before any package reached npm. Everything listed under `## [0.15.1]` below ships in this release.
+
+## [0.15.1] - 2026-08-25
+- Display-safe escaped tool calls now require bounded raw escape-position/scalar evidence before the post-resample U+2014 exemption can execute. Printable ASCII escapes are retained too, so one-nibble mutations such as `\u00b7` → `\u0077` and `\u2026` → `\u0026` fail closed instead of disappearing after JSON decoding. Evidence carries only raw/decoded offsets, ordinals, location kinds, process-keyed scalar/path tags, a bounded total, and a process-local integrity tag; it is stripped before discarded, rejected, or executed calls can become durable. Exact decoded U+2014 positions/counts must correspond to the complete envelope. Overflow, malformed or duplicate-key JSON, missing/altered evidence, escaped keys, dotted-key ambiguity, excessive nesting, and every other scalar reject terminally. Existing resample/terminal debug records remain shape-only and never include argument payloads.
+- Escaped-non-ASCII turn discards and terminal per-call rejections are now logged at debug severity with bounded shape-only fields. Diagnostics distinguish managed policy handoff from in-loop resampling, type in-loop attempt/budget values as numbers, cap tool-call counts, and report only fixed booleans for registration/display-field contracts; tool names, call ids, arguments, steering text, and payload content never enter the log. The discarded turn never reaches durable history, so the defect previously left no trace anywhere except the surfaced tool error, and its fire rate could only be recovered by scraping session transcripts.
+- `normalizeTools` now converts every Zod-authored tool schema to the wire JSON schema even when intent tracing is off. Previously the conversion ran only inside the `_i` intent-injection branch, so canonical sub-sessions (role agents spawned via `task`, where `resolveIntentTracingEnabled` forces `_i` off) sent a live `ZodObject` across the provider boundary. On append-only context providers (`anthropic`, `deepseek`; auto-enabled) the stable-prefix clone JSON-round-trips tools, and a `ZodObject` without `toJSON` reduces to a bare `{def, type}` object with no `properties`/`required` — the model is then advertised a tool with no parameters and omits required arguments. This is the root cause of issue #4837: every subagent `bash` call failing with `command: Invalid input: expected string, received undefined` while the parent session's identical call worked. Tool argument validation itself is unchanged: executors still validate against the original Zod schema.
+- Managed fallback now transfers safety-stop authority only to the adjudicated final assistant shell; intermediate partial snapshots and hostile accessor-backed final messages cannot retain or bypass the provenance boundary (#4777 review).
+
+- Managed assistant reconstruction now copies provider metadata through guarded property reads instead of an unguarded spread, so accessor-trapped metadata degrades without aborting the attempt or creating managed retry authority (#4777 review).
+- Hostile Proxy-wrapped final messages no longer reintroduce a forged `provider_safety_stop` label through the sanitizer fallback shell; discarded failure outcomes are now label-free before session policy can suppress provider fallback (#4777 review).
+
+
+## [0.15.0] - 2026-08-22
+
+### Fixed
+- Staged-payload sizing no longer materializes what it is bounding (#4602 fix-forward of the exact-head 078e22c0 review). All staging measurements now walk the JSON surface directly: exact byte counts come from a code-point walk (quotes, escapes, separators, delimiters, nulls, array holes, and keys all charged) instead of building the full `JSON.stringify` string plus its UTF-8 encoding, and lone surrogates are charged as the six-byte `\udXXX` escape JSON emits rather than their three-byte UTF-8 form, closing a ~2x undercount on surrogate-heavy strings. `structuredClone` is additionally preflighted by a clone-surface walk that never dispatches `toJSON`, accessors, or proxy traps: a live payload class whose compact `toJSON` hides an oversized own payload is rejected as the typed `local_buffer_overflow` at `overflow.preMeasure` — before the duplicate is allocated — instead of being cloned first and rejected at `overflow.staged`. Accessors are no longer invoked at all while sizing (a staged witness getter is read zero times), `undefined`-valued record properties are skipped exactly as `JSON.stringify` omits them, an unmeasurable assistant pair now fails closed like its `#stage` twin instead of being retained with a zero-byte charge, the `overflow.preMeasure` diagnostic reports the incoming event's real bounded size instead of a constant fabricated after `discard()`, and above-ceiling clamp warnings are logged once per distinct knob value with a bounded digest. |
+- Queue-removal paths (`queue.message.remove`, positional editing, `clearQueue`, the terminal-abort purge) now fire the stored promotion hook with a removal disposition so an accepted SDK submission terminalizes boundedly instead of staying accepted forever (#4668).
+- Provider safety-stop messages now retain their explicitly allowlisted `errorKind: "provider_safety_stop"` through managed assistant snapshots and remain terminal even when transport facts are present on a multi-model fallback chain, while provider payloads still cannot forge the runtime-owned local diagnostic kinds (#4777).
+- Terminal safety-stop authority is now provenance-bound instead of data-bound: a provider or custom stream payload that self-labels `errorKind: "provider_safety_stop"` without the adapter-minted mark is stripped at the stream exit before any retry/discard gate or the managed snapshot shell reads it, so a compromised provider can no longer force refusal by naming the field (#4777 review). Authenticated first-party envelopes (structured refusal signals parsed by the anthropic, openai-completions, and google adapters) keep terminal treatment, and only the agent loop's module-private rebuild set carries that authority onto its own destination — clones, JSON/persistence round-trips, and re-emitted payloads are all unauthenticated.
+- Safety-stop minting is now limited to the package-private adapter capability, and public AI consumers cannot transfer authority from a genuine marked source to an arbitrary destination. The trailing stream-completion path also sanitizes provenance before rebuilding managed assistant messages, covering streams that end without a `done` or `error` event and keeping forged labels fallback-eligible (#4777 review).
+- Safety-stop authority now expires at every stream dispatch entry: committed assistant messages (including a previously adjudicated stop) are handed to the next — possibly custom — stream through `convertToLlm`, and the dispatch-entry expiry guarantees no live authority mark is ever exposed to a stream, so re-use of a committed stop object cannot forge a terminal failure (#4777 review). The provenance strip is also stopReason-independent and rebuilds frozen or Proxy-trapped final messages as plain mutable copies, so a forged label on a nominally successful response cannot survive into the committed message (where it could skip session compaction checks) and cannot abort the run through a rejection trap.
+- A foreign error that self-declares a local failure kind no longer gets one either (#4618). `errorKind` and the structured `bufferOverflow` shape now come from a single identity-checked extractor (`managedLocalErrorDiagnostic`) used by both terminal-message producers — `managedFailureMessage` and the `Agent` run catch. Previously the shape was identity-gated but the label was not, so a provider or custom-stream failure carrying `errorKind: "local_buffer_overflow"` reached the parent receipt preview as `Local staging-buffer overflow; structured diagnostic unavailable.` and pointed whoever read it at the wrong subsystem.
+- Local diagnostic authority fields are no longer foreign-settable through the managed snapshot shell (#4618). `managedAssistantShell` spreads the provider/stream message snapshot into the rebuilt assistant message; a payload that smuggled a local `errorKind` or `bufferOverflow` through that spread could masquerade as the runtime's own identity-checked diagnostic at the parent boundary. Local kinds and `bufferOverflow` remain stripped from the snapshot spread, while the provider-owned safety-stop kind is copied only through its explicit closed-literal guard.
+
+- Documented the accepted-prompt lifecycle hooks: `onFollowUpConsumed` and `onSteeringConsumed` now report `startsOwnRun` so integrations can distinguish new-run ownership from in-run or maintenance consumption. The agent also emits the typed `agent_failed` lifecycle event before an error terminal, allowing SDK hosts to reconcile failure causes and teardown ownership deterministically.
+- `Agent.waitForSteeringArrival(signal)` resolves when steering is queued without consuming it, so wait-style tools can end their observation early.
+- Managed fallback provisional-buffer caps are now operator-configurable: `GJC_FALLBACK_MAX_STAGED_EVENTS` (default 10000, hard ceiling 2000000) and `GJC_FALLBACK_MAX_STAGED_BYTES` (default 16 MiB, hard ceiling 1 GiB) bound the events/bytes staged by the provisional staging transaction in both managed fallback and ordinary (non-managed lossless) sessions; in non-managed sessions the cap only decides how much reasoning buffers before the batch flushes and streams through. Values are read once per attempt; the trusted environment resolver ignores surrounding whitespace, while invalid or non-positive values fall back to the defaults, and values above the ceiling clamp to it with a warning so the staging guard stays bounded instead of trading a typed `local_buffer_overflow` for a process OOM. Every retained batch item — including the assistant message/event pair staged for streaming callbacks — is measured and charged against the caps BEFORE it is retained, so actual retention can never exceed the counted bounds, and the ceilings are set from total retained memory (2,000,000 events / 1 GiB) at values an ordinary host survives. The knobs resolve from trusted environment sources only (`$credentialEnv`, which excludes the repository `cwd/.env` overlay), so a project cannot weaken or weaponize the staging guard. Raise both to survive reasoning-heavy streaming in long-running sessions and `gjc team` workers (#4602, #4618).
+
+### Fixed
+- The escaped-non-ASCII argument guard keeps its fail-closed terminal rejection and its unconditional two-resample budget for every tool and every field. After the budget is spent, one narrowly scoped exemption applies: a tool that enumerated its user-facing display fields (`displaySafeEscapedArgFields`; `ask` exempts only `questions.question` and `questions.options.label`) executes when every non-ASCII character lives inside those fields and is benign typographic punctuation (curated set: U+2014 em-dash). Escaped non-ASCII anywhere else — ids, deep-interview metadata, persisted records, non-ASCII object keys — and every other tool stays rejected terminally (#4627, reduced per both maintainer reviews: guard retained, exemption post-budget and field-scoped).
+
+- Escaped-non-ASCII turn resamples are now steered instead of blind: each unmanaged resample carries a transient synthetic instruction naming the `\uXXXX` defect and demanding literal UTF-8, so a model that escapes deterministically (observed with Hangul-heavy `ask` payloads exhausting the whole resample budget every turn) has a reason to change its spelling on the retry. The instruction never lands in durable history, tools stay enabled, and the captured logical-turn tool choice is still replayed across the steered attempts; a pending one-shot malformed-tool-call recovery is never displaced by the steering. Managed fallback retries receive the same steering: the typed `escaped_arguments_discarded` outcome now reports whether the discarded attempt still lacked an instruction, and the session's retry continuation attaches the same transient message through the new `transientRecoveryMessage` prompt option, so coding-agent sessions (which run managed) also get exactly one steered re-request before the budget ends.
+
+## [0.14.1] - 2026-08-18
+- Compaction pruning no longer kills the turn when a persisted `toolCall.arguments` is `null`. Sessions written by an earlier cold-spill eviction path store `null` where the spill sentinel belongs, and the staleness index dereferenced that payload unguarded, so reloading such a session threw `null is not an object (evaluating 'args.path')` as a turn-fatal error instead of skipping the one unusable call. `ToolCall.arguments` is typed non-nullable, so no type check flagged the gap. Every read of a persisted argument bag — path extraction, `apply_patch` header parsing, idempotent-bash keys, and search target keys — now treats a non-object payload as absent. The original arguments are not lost: the eviction marker still names the blob and rehydration restores them.
+- Managed fallback attempt snapshots no longer fail the whole run on benign provider shape variations: an assistant message whose `content` is a bare string, is missing, or is a primitive scalar (null/number/boolean) now degrades to an empty content array; staged `*_delta`/`*_end` events whose `delta`/`content` is missing or a primitive scalar degrade to an empty string; and staged assistant events with out-of-vocabulary `done`/`error` reasons or an unknown string `type` degrade to schema-valid values instead of throwing a non-retryable `ManagedAttemptSnapshotError`. Object-shaped or other plain-object `content`/`delta` stays fail-closed under the named `shell.content`/`event.delta`/`event.content` diagnostic, as does sanitizer-sentinel string content (`[unserializable]`/`[accessor]`/`[truncated]`/`[Circular]`, which marks a non-cloneable original rather than provider string variance — degrading those would silently drop real tool-call or streamed content behind a successful empty turn), and hostile inputs keep failing fast with no retry authority: a live proxy root, a throwing `get`/`getOwnPropertyDescriptor` trap, and a non-string event `type` all remain local snapshot failures.
+
+### Added
+
+- `toolFailureEnvelope` / `isToolFailureEnvelope` / `ToolFailureEnvelope` name the result details the loop attaches when a tool call fails without the tool returning details of its own. The guard matches only that envelope, so a consumer can tell it apart from a tool that reports a `failureKind` alongside its own details before dereferencing a tool-owned detail shape.
+- `ManagedAttemptBufferOverflowError` (`local_buffer_overflow`) now reports its full shape everywhere it can reach: the rejecting `stage`, which cap tripped (`exceeded: events|bytes|both`), the retained post-compaction staged event/byte counts, the rejected event's own serialized size, and both caps. The typed error carries this as a structured object, the terminal `AssistantMessage` carries an identity-checked `bufferOverflow` copy (only the module-private error class can attach it, so a foreign self-labeled error cannot), and the surfaced message keeps its stable prefix and appends the same shape-only values stating this is a local staging-buffer limit that reproduces on re-issue, not a provider or context-window failure. Previously every overflow surfaced as one static sentence with no way to tell an event-cap from a byte-cap trip or to distinguish it from a model-context problem (#4618).
+
+## [0.14.0] - 2026-08-17
+
+### Fixed
+
+- Managed fallback no longer kills a long turn with `Managed fallback attempt exceeded the provisional event buffer limit`. Every staged streaming frame carries the whole accumulated partial (once as `message`, once as `assistantMessageEvent.partial`), so staged bytes grew quadratically with the response length and a reasoning-heavy turn of a few thousand tokens crossed the 16 MiB cap even though no single event came close to it. Reaching the cap now first reclaims the staged `*_delta` increments, whose complete value is re-published by the retained `*_end` and terminal `message_end`/`done` frames, and only a batch that still cannot fit fails. Attempt atomicity is unchanged: nothing is published early, so a discarded attempt stays unobservable, and a single oversized event keeps its pre-clone rejection with no provider-fallback authority.
+- Non-managed lossless response staging now commits its buffered lifecycle and switches to ordinary pass-through publication when the provisional event cap is reached, instead of turning a large reasoning-only response into a fatal `local_snapshot_failure`. Managed fallback attempts keep the strict bounded-buffer rejection required for atomic retry and provider-fallback isolation.
+- Managed snapshot machinery no longer fails runs on benign payload-class or readable-proxy roots: an assistant message or stream event whose fields live on prototype getters (which `structuredClone` drops — it copies only own enumerable properties) or behind a proxy whose gets are readable is repaired through the existing guarded-read path instead of throwing a deterministic `shell.role`/`event.unknownType`/`event.snapshot` local snapshot failure. The run-loop message_update replay also builds its event through the managed event snapshot instead of a naive `{ ...event }` spread, which silently dropped prototype-carried fields before the snapshot boundary could see them. Hostile shapes (throwing get traps, sentinel-marked degraded content, malformed non-string event types) keep their named fail-fast diagnostics with no retry authority.
+
+- Managed fallback now validates and byte-measures the detached event snapshot rather than trusting the live payload's JSON result. Custom payload classes whose prototype `toJSON()` hides bigint state are sanitized after `structuredClone` removes that serializer, so every accepted snapshot stays detached, JSON-serializable, and bounded; residual typed `local_snapshot_failure` diagnostics remain outside provider fallback authority and surface without deterministic retry amplification.
+- Managed fallback buffer overflows now retain a typed `local_buffer_overflow` error kind on the terminal assistant message, so session retry policy surfaces them immediately without provider-fallback attribution instead of admitting them to the bounded `unknown` retry class.
+- Managed local-failure diagnostics: `ManagedAttemptSnapshotError` and `ManagedAttemptBufferOverflowError` now carry a stable `stage` discriminator naming the exact rejecting site (`shell.role`, `shell.content`, `event.snapshot`, `event.contentIndex`, `event.delta`, `event.content`, `event.toolcall`, `event.done.reason`, `event.error.reason`, `event.unknownType`, `staging.losslessSnapshot`, `staging.measure`, `staging.sanitize`, `staging.overflow`, `overflow.preMeasure`, `overflow.staged`), and the run-loop failure boundary emits ONE bounded shape-only `logger.warn` per stream invocation (stage, error kind, model, provider, snapshot mode, staged event count/bytes, and content block count for the content stage). The diagnostic is gated on the module-private local error identities and its stage is whitelisted against the closed vocabulary, so neither a foreign error that self-labels a local failure kind nor an in-module regression can route arbitrary text into the log; it never records raw text, thinking, tool arguments, or any provider payload, and the user-facing message string is unchanged so session-side classification keeps matching. Previously all 14 rejecting sites shared one static message, leaving no way to identify which provider shape a normalizer must be taught to accept.
+- A turn whose tool arguments arrive flagged `escapedNonAsciiArguments` is now resampled instead of being reported as a tool failure: the defective assistant turn is dropped from history and the request is re-issued, up to twice per turn, before the terminal per-call rejection takes over. Hand-spelled `\uXXXX` arguments decode into valid-looking but silently wrong text (observed as garbled Hangul in `ask` prompts) and no post-parse repair can recover them, but the defect is a wire-format accident that resampling clears - surfacing it as a tool error instead burned the whole turn and fed the literal escape syntax back into the context the model samples from next. Scoped to the non-managed session path, matching the existing `invalid_prompt` and reasoning-content repairs; managed fallback keeps owning its own retry policy.
+- Visible-text Harmony leak retries now close the already-published assistant lifecycle with an empty aborted terminal stripped of raw provider payload before contaminated history is removed and a replacement request begins, preventing both orphaned streaming updates and leaked control text in durable history or replay.
+- Unmanaged escaped-non-ASCII resampling now stages a detached, provider-metadata-preserving assistant lifecycle until validation, publishes live safety updates before dispatch, and defers terminal `message_end` publication until subscriber-triggered cancellation is resolved so persisted assistant state and aborted tool-result pairing cannot disagree.
+- The agent loop still rejects a tool call flagged `escapedNonAsciiArguments` before execution once the resample budget is spent, with a retryable error telling the model to re-issue the call writing non-ASCII characters literally.
+- Managed fallback attempt snapshots no longer fail the whole run on benign provider shape variations: an assistant message whose `content` is a bare string or is missing now degrades to an empty content array, and staged assistant events with out-of-vocabulary `done`/`error` reasons or an unknown string `type` degrade to schema-valid values instead of throwing a non-retryable `ManagedAttemptSnapshotError`. This matches the closed `StopReason` vocabulary already normalized elsewhere in the shell. Object-shaped and other exotic non-array `content` stays fail-closed under the named `shell.content` diagnostic, as does sanitizer-sentinel string content (`[unserializable]`/`[accessor]`/`[truncated]`/`[Circular]`, which mark a non-cloneable original value such as a proxy-wrapped content array rather than provider string variance — degrading those would silently drop real content behind a successful empty turn), and hostile inputs keep failing fast with no retry authority: a live proxy root, a throwing `get`/`getOwnPropertyDescriptor` trap, and a non-string event `type` all remain local snapshot failures.
+
+### Added
+
+- Reassignable `onFollowUpConsumed` hook on `Agent`: invoked with the follow-up messages the loop dequeues for the next turn, so consumers can attach per-turn state (e.g. a fresh owned-completion lineage) at actual resume admission.
+- `AgentPromptOptions.onRunAccepted` now receives a typed acceptance payload containing `consumedQueuedMessages`, allowing consumers to bind ownership and other per-message state only to the queued messages actually claimed by the accepted run.
+## [0.13.3] - 2026-08-15
+
+### Fixed
+- Emergency compaction now considers managed transcript file size so sessions compact before the managed per-file limit (#4411).
+- Managed runs discard assistant turns whose tool calls carried `\uXXXX`-escaped arguments and report them through the typed `escaped_arguments_discarded` outcome instead of executing unverifiable text; unmanaged runs reject such calls per-call with an actionable error (#4515).
+
+## [0.13.2] - 2026-08-13
+
+## [0.13.1] - 2026-08-11
+
+## [0.12.21] - 2026-08-09
+
+## [0.12.20] - 2026-08-09
+
+## [0.12.19] - 2026-08-08
+
+## [0.12.18] - 2026-08-08
+
+## [0.12.17] - 2026-08-08
+
+## [0.12.16] - 2026-08-08
+
+### Fixed
+
+- Forked-session restore no longer crashes when the seeded append-only prefix includes a tool whose `intent` policy is a deferred function (e.g. `eval`, `bisect`, `checkpoint`, `rewind`). `StablePrefix.importSnapshot` re-normalized the cloned tool JSON, which loses function-valued `intent` fields, so those tools flipped from `omit` to `optional` intent injection and the recomputed fingerprint diverged from the stored one (`StablePrefix.importSnapshot() fingerprint mismatch`). Import now verifies against the stored, already-normalized tools instead of re-normalizing.
+
+## [0.12.15] - 2026-08-06
+
+## [0.12.14] - 2026-08-06
+
+## [0.12.13] - 2026-08-06
+
+### Fixed
+
+- An aborted run whose tool ignores its `AbortSignal` now terminates on its own (#3894). `Promise.allSettled` waited on the unresolved call forever, so the turn only ended when the session's force-abort budget expired; the loop now emits a synthetic aborted result for the outstanding calls and `waitForIdle` settles immediately. Session dispose consequently reaches idle through the cooperative path instead of force-invalidating the run.
+
+### Changed
+
+- Telemetry configured with `spans: false` now skips span and attribute construction while preserving usage and cost hooks.
+
+## [0.12.12] - 2026-08-05
+
+### Fixed
+
+- DeepSeek-family reasoning-content replay 400s are now retryable via a bounded, strip-only circuit breaker. When a proxy strips the encrypted reasoning blob to an empty `encrypted_content`, DeepSeek rejects every follow-up turn with "The `reasoning_content` in the thinking mode must be passed back to the API." Resending the identical history re-triggers this deterministic 400, so the agent loop now strips the unusable `reasoning` items from the Responses history payload in place and resends exactly once (mirroring the `invalid_prompt` poisoned-history breaker). Non-reasoning items are preserved; fail-fast when nothing can be stripped. Budget = one repaired resend.
+
+## [0.12.11] - 2026-08-03
+
+## [0.12.10] - 2026-08-03
+
+### Fixed
+
+- Composer repository-file shell policy rejections now receive one bounded, tool-enabled recovery turn without persisting the synthetic instruction. Generic loops retain their repository tools with `toolChoice: auto`; Cursor remote turns continue only when native tools did not already recover, queued user follow-ups take priority, and a second policy block terminates instead of looping. Existing malformed-tool recovery remains tool-free and does not consume dynamic tool-choice state.
+
+## [0.12.8] - 2026-08-02
+
+## [0.12.7] - 2026-07-31
+
+## [0.12.6] - 2026-07-31
+
+## [0.12.5] - 2026-07-30
+### Fixed
+
+- Proxy streams now fail closed when a `toolcall_end` event references missing or non-tool-call content instead of silently dropping the protocol violation and accepting a later terminal event.
+
+## [0.12.4] - 2026-07-30
+
+## [0.12.3] - 2026-07-30
+
+## [0.12.2] - 2026-07-30
+
+## [0.12.1] - 2026-07-29
+- Agent session configuration can carry an explicit first-event stream timeout while preserving provider defaults when the setting is absent.
+
+### Fixed
+
+- The `invalid_prompt` circuit breaker no longer replays the rejected turn on its repaired resend. The streaming path commits the failed assistant message to the context before the breaker runs, so the one repaired resend re-sent that errored turn as if the model had spoken it — re-triggering `Request blocked (code=invalid_prompt)` and leaving a second assistant tail that no continuation can resume from. The breaker now repairs and resends only the history that preceded the rejection.
+- Compaction pruning now protects the newest two user/`bashExecution` turns, uses conservative read supersession, preserves bounded error-first diagnostics, and exposes reversible artifact-backed originals with exact savings accounting.
+- Cancelling a prompt no longer fails its terminal closed. `agent_end` is published before the run resource ledger is sealed, so the event's own handlers register post-prompt work against an already-sealed run; that late registration was treated as an escaped resource and quarantined the run, making `waitForSettlement` report `unfenced` forever. Cancel therefore never obtained settlement proof and the SDK refused to publish a terminal, surfacing over ACP as `-32603 "Prompt resources did not settle before the terminalization grace expired."` Sealing now only freezes admission of genuinely new work; post-seal registration joins ordinary settlement accounting so the run stays unsettled until it actually completes.
+
+## [0.11.11] - 2026-07-26
+
+### Fixed
+
+- Managed runs now release their logical-run ownership before terminal observers are notified, so terminal overflow recovery cannot leave a stale owner behind.
+- The OpenAI remote-compaction endpoint is now resolved from trusted environment sources only. `OPENAI_BASE_URL` was read through the merged view that includes the caller's `cwd/.env`, so a repository could redirect compaction requests that carry the OpenAI credential; it now uses the non-project resolver, leaving shell and user-level configuration unchanged.
+- Repeated malformed tool calls now get one tool-free recovery response, preventing argument-validation loops from ending without an answer while leaving ordinary execution-error retries unchanged. The recovery turn commits its assistant to the durable context, forces `toolChoice: "none"` alongside an empty tool list without consuming a queued tool choice, and never executes a tool call it did not advertise. Its recovery prompt is request-only, so append-only tool prefixes stay stable and the durable message log is unchanged.
+- Argument-validation loops now reach a deterministic terminal state. If a model keeps emitting only malformed tool calls after the one-shot recovery turn, the run stops with an explanatory error instead of calling the provider indefinitely. The bound counts consecutive all-malformed turns rather than repeated argument signatures, so a model rotating invalid argument shapes is bounded too; any healthy tool turn resets it.
+
+## [0.11.8] - 2026-07-23
+
+### Fixed
+
+- Managed model fallback now accepts `reasoning_summary_start`, `reasoning_summary_delta`, and `reasoning_summary_end` assistant events instead of failing them as local snapshot errors.
+## [0.11.3] - 2026-07-19
+
+### Fixed
+- Pre-compaction pruning now preserves bounded, actionable error evidence instead of discarding it, while enforcing exact positive-savings admission and accounting so a prune is only applied when it demonstrably reduces context cost (#2635).
+
+## [0.11.1] - 2026-07-16
+
+### Fixed
+
+- Hardened the managed fallback attempt snapshot: staged agent events and assistant partials were cloned with a bare `structuredClone`, so a single non-cloneable value in a staged payload (e.g. a live `Headers` inside `transportFailure`) threw `DataCloneError` ("The object can not be cloned."), masked the real provider outcome, and deterministically failed every attempt until the fallback chain exhausted. The snapshot now degrades to a cycle-aware sanitizing deep clone that always returns a detached, JSON-serializable value (unsupported leaves become placeholders), so event-time replay semantics are preserved and no local snapshot failure can masquerade as a provider attempt failure. Byte accounting in the provisional buffer measures the raw event before the snapshot duplicates it (over-limit payloads are rejected pre-clone), re-measures degraded snapshots so the retained sanitized form is what gets accounted, and uses the sanitized detached form as the cycle-safe estimator for cyclic payloads.
+- Enforced the managed fallback authority boundary for local staging failures: `ManagedAttemptBufferOverflowError` no longer carries a synthetic provider-like `503` status, so exceeding the provisional event buffer limit (like any other local snapshot failure) is non-retryable, never converts into `transportFailure { kind: "transport", status: 503 }` evidence, and never rotates or consumes the model fallback chain — it surfaces as an explicit local error instead. Only original typed provider transport facts may authorize provider fallback.
+- Added a bounded, neutralize-only `invalid_prompt` circuit breaker to the agent loop (#2282). A poisoned-history rejection (`Request blocked (code=invalid_prompt)`) is a deterministic content fault: re-sending the same history re-triggers it, so uncontrolled session auto-retry would burn its budget re-poisoning the model. On the first `invalid_prompt` of a run, leaked reserved control tokens are neutralized in place across history (no item is ever dropped). If that changes the outgoing bytes, the turn is resent exactly once with the repaired history; if neutralization cannot change anything, the run fails fast immediately with no resend. The repaired history is persisted for a clean resume, the breaker fires at most once per run (budget = one repaired resend), and it is scoped to the non-managed session path since managed fallback owns its own retry policy.
+
+## [0.10.2] - 2026-07-14
+
+### Fixed
+
+- Extended the gpt-5.6 `Request blocked (code=invalid_prompt)` fix to the compaction paths that bypass the streaming transport. Remote OpenAI compaction (`/responses/compact`, `compaction.remoteEnabled` default on — the "remote compact task" in openai/codex#32028) built its native `input` from reasoning signatures, verbatim history items, and message/tool text without neutralizing leaked Harmony control-token markers (e.g. `<|channel|>analysis`), so gpt-5.6 rejected the compaction request and, on retry, could escalate to account-level blocking. `requestOpenAiRemoteCompaction` now neutralizes reserved control tokens across the whole outgoing `input`, and the generic `requestRemoteCompaction` prompt/systemPrompt are neutralized too. Local summarization was already covered by the streaming-transport request-boundary fix.
+
+### Changed
+
+- `AgentLoopConfig.maintainContext` now receives a required cancellation-aware lifecycle (`signal`, `awaitEventDrain(invocationSignal)`). Agent loops compose the run and maintenance-invocation signals and pass that single signal to EventStream's FIFO consumer-drain barrier, so cancellation removes the pending drain at its owner instead of racing an orphaned wait.
+
+## [0.10.0] - 2026-07-12
+
+### Fixed
+
+- The native-free token heuristic is now script-aware: common-BMP CJK characters (Hangul, unified/compat Han, Kana, CJK punctuation, full-width forms) are charged at 1 token each (measured o200k_base upper bound 0.96 tokens/char) and supplementary code points (surrogate pairs: rare Han extensions, emoji) at 1 token per code point, instead of chars/4 for everything. The old estimate undercounted Korean/CJK-heavy unsent context by 2–4x and could delay threshold compaction past the provider window; ASCII estimates are unchanged. `boundConversationTextForSummary` now derives its truncation cut from the text's own estimated token density, validates the complete assembled excerpt (elision marker included) against the estimator, and fails closed — bare marker only when the marker itself fits the budget, otherwise an empty excerpt, including when the computed input budget is non-positive — instead of assuming 4 chars/token and returning over-budget or unbounded text.
+
+- A tool call for a name absent from the active tool set now appends a recovery hint pointing at `search_tool_bm25` (gated on a callable `search_tool_bm25`, matched by internal name or `customWireName`), so a model no longer abandons a discoverable tool such as `task` after a bare "Tool <name> not found"; the base error wording stays byte-for-byte stable when discovery is unavailable (#2042).
+
+## [0.9.2] - 2026-07-09
+
+### Fixed
+
+- Follow-up queues can now mark individual messages as one-at-a-time, so interactive composer queues can remain sequential without disabling the existing batch mode for other callers.
+
+## [0.8.2] - 2026-07-06
+### Added
+
+- Agent queues now expose ordered move helpers for steering and follow-up messages so callers can reorder pending work without removing and re-adding messages.
+
+### Fixed
+
+- Preserved inherited fork-context seed messages when a compacted child rebase receives only child-local normalized messages, avoiding seed loss after task-child compaction (#1567).
+
 ## [0.7.7] - 2026-06-28
 
 ### Fixed

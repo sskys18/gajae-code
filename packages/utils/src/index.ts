@@ -1,6 +1,10 @@
 export { createAbortableStream, once, untilAborted } from "./abortable";
 export * from "./async";
+export * from "./broken-pipe";
 export * from "./color";
+export * from "./crash-fingerprint";
+export * from "./crash-journal";
+export * from "./crash-redaction";
 export * from "./dirs";
 export * from "./env";
 export * from "./fetch-retry";
@@ -8,6 +12,7 @@ export * from "./format";
 export * from "./frontmatter";
 export * from "./fs-error";
 export * from "./glob";
+export * from "./header-value";
 export * from "./hook-fetch";
 export * from "./json";
 export * as logger from "./logger";

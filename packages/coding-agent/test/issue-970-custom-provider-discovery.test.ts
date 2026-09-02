@@ -2,6 +2,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "bu
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
 import type { ModelRegistry, ProviderDiscoveryState } from "@gajae-code/coding-agent/config/model-registry";
 import { ModelRegistry as ModelRegistryImpl } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -34,8 +35,10 @@ async function createSelector(state: ProviderDiscoveryState): Promise<ModelSelec
 		getError: () => undefined,
 		getAvailable: () => [],
 		getAll: () => [],
+		hasConfiguredProviderAuth: () => false,
 		getDiscoverableProviders: () => [state.provider],
 		getCanonicalModels: () => [],
+		getCanonicalModelSelections: () => [],
 		resolveCanonicalModel: () => undefined,
 		getProviderDiscoveryState: () => state,
 	} as unknown as ModelRegistry;
@@ -83,7 +86,7 @@ describe("issue #970 custom provider discovery", () => {
 		}
 	});
 
-	test("discovers custom openai-compatible models and lets YAML models override discovered fields", async () => {
+	test("preserves same-id YAML fields and discovered-only model overrides", async () => {
 		fs.writeFileSync(
 			modelsPath,
 			[
@@ -100,6 +103,11 @@ describe("issue #970 custom provider discovery", () => {
 				"        name: Qwen3.6",
 				"        contextWindow: 128000",
 				"        maxTokens: 8192",
+				"    modelOverrides:",
+				"      issue-3954-override-context:",
+				"        contextWindow: 64000",
+				"      issue-3954-override-max:",
+				"        maxTokens: 4096",
 			].join("\n"),
 		);
 
@@ -111,17 +119,32 @@ describe("issue #970 custom provider discovery", () => {
 			const headers = init?.headers as Headers | Record<string, string> | undefined;
 			const authHeader = headers instanceof Headers ? headers.get("Authorization") : headers?.Authorization;
 			expect(authHeader).toBe("Bearer sk-1234");
-			return new Response(JSON.stringify({ data: [{ id: "qwen3.6" }, { id: "deepseek-r1" }] }), {
-				status: 200,
-				headers: { "Content-Type": "application/json" },
-			});
+			return new Response(
+				JSON.stringify({
+					data: [
+						{ id: "qwen3.6", context_length: 256000 },
+						{ id: "issue-3954-override-context", context_length: 512000 },
+						{ id: "issue-3954-override-max", context_length: 384000 },
+						{ id: "issue-3954-uncatalogued" },
+					],
+				}),
+				{
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				},
+			);
 		});
 
 		const registry = new ModelRegistryImpl(authStorage, modelsPath);
 		await registry.refreshProvider("vllm");
 
 		const providerModels = registry.getAll().filter(model => model.provider === "vllm");
-		expect(providerModels.map(model => model.id).sort()).toEqual(["deepseek-r1", "qwen3.6"]);
+		expect(providerModels.map(model => model.id).sort()).toEqual([
+			"issue-3954-override-context",
+			"issue-3954-override-max",
+			"issue-3954-uncatalogued",
+			"qwen3.6",
+		]);
 		expect(registry.getProviderDiscoveryState("vllm")?.status).toBe("ok");
 
 		const qwen = registry.find("vllm", "qwen3.6");
@@ -131,12 +154,101 @@ describe("issue #970 custom provider discovery", () => {
 		expect(qwen?.contextWindow).toBe(128000);
 		expect(qwen?.maxTokens).toBe(8192);
 
-		const deepseek = registry.find("vllm", "deepseek-r1");
-		expect(deepseek?.api).toBe("openai-completions");
-		expect(deepseek?.provider).toBe("vllm");
-		expect(deepseek?.name).toBe("deepseek-r1");
-		expect(deepseek?.contextWindow).toBe(128000);
-		expect(deepseek?.maxTokens).toBe(8192);
+		const contextOverride = registry.find("vllm", "issue-3954-override-context");
+		expect(contextOverride?.contextWindow).toBe(64000);
+		expect(contextOverride?.maxTokens).toBe(UNK_MAX_TOKENS);
+
+		const maxTokensOverride = registry.find("vllm", "issue-3954-override-max");
+		expect(maxTokensOverride?.contextWindow).toBe(384000);
+		expect(maxTokensOverride?.maxTokens).toBe(4096);
+
+		const uncatalogued = registry.find("vllm", "issue-3954-uncatalogued");
+		expect(uncatalogued?.contextWindow).toBe(UNK_CONTEXT_WINDOW);
+		expect(uncatalogued?.maxTokens).toBe(UNK_MAX_TOKENS);
+	});
+
+	test("discovers a default vLLM endpoint without credentials", async () => {
+		const previousApiKey = Bun.env.VLLM_API_KEY;
+		const previousBaseUrl = Bun.env.VLLM_BASE_URL;
+		delete Bun.env.VLLM_API_KEY;
+		delete Bun.env.VLLM_BASE_URL;
+		try {
+			const requestedUrls: string[] = [];
+			using _hook = hookFetch((input, init) => {
+				const url = String(input);
+				requestedUrls.push(url);
+				if (url !== "http://127.0.0.1:8000/v1/models") return new Response(null, { status: 404 });
+				const headers = init?.headers as Headers | Record<string, string> | undefined;
+				const authHeader = headers instanceof Headers ? headers.get("Authorization") : headers?.Authorization;
+				expect(authHeader).toBeUndefined();
+				return new Response(JSON.stringify({ data: [{ id: "credentialless-vllm-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistryImpl(authStorage, modelsPath);
+			await registry.refresh();
+
+			expect(requestedUrls).toContain("http://127.0.0.1:8000/v1/models");
+			expect(registry.find("vllm", "credentialless-vllm-model")?.provider).toBe("vllm");
+		} finally {
+			if (previousApiKey === undefined) delete Bun.env.VLLM_API_KEY;
+			else Bun.env.VLLM_API_KEY = previousApiKey;
+			if (previousBaseUrl === undefined) delete Bun.env.VLLM_BASE_URL;
+			else Bun.env.VLLM_BASE_URL = previousBaseUrl;
+		}
+	});
+
+	test("does not discover a configured remote vLLM endpoint without credentials", async () => {
+		const previousApiKey = Bun.env.VLLM_API_KEY;
+		const previousBaseUrl = Bun.env.VLLM_BASE_URL;
+		delete Bun.env.VLLM_API_KEY;
+		Bun.env.VLLM_BASE_URL = "https://vllm.example.test/v1";
+		try {
+			using _hook = hookFetch(input => {
+				if (String(input) === "https://vllm.example.test/v1/models") {
+					throw new Error("credentialless discovery must not probe a remote vLLM endpoint");
+				}
+				return new Response(null, { status: 404 });
+			});
+
+			const registry = new ModelRegistryImpl(authStorage, modelsPath);
+			await registry.refresh();
+
+			expect(registry.find("vllm", "remote-vllm-model")).toBeUndefined();
+		} finally {
+			if (previousApiKey === undefined) delete Bun.env.VLLM_API_KEY;
+			else Bun.env.VLLM_API_KEY = previousApiKey;
+			if (previousBaseUrl === undefined) delete Bun.env.VLLM_BASE_URL;
+			else Bun.env.VLLM_BASE_URL = previousBaseUrl;
+		}
+	});
+
+	test("does not discover a remote configured vLLM provider without credentials", async () => {
+		fs.writeFileSync(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					vllm: {
+						baseUrl: "https://vllm.example.test/v1",
+						api: "openai-completions",
+						auth: "none",
+						discovery: { type: "openai-models-list" },
+					},
+				},
+			}),
+		);
+		let requestedRemote = false;
+		using _hook = hookFetch(input => {
+			if (String(input) === "https://vllm.example.test/v1/models") requestedRemote = true;
+			return new Response(null, { status: 404 });
+		});
+
+		const registry = new ModelRegistryImpl(authStorage, modelsPath);
+		await registry.refresh();
+
+		expect(requestedRemote).toBe(false);
 	});
 
 	test("shows a provider-tab hint when discovery succeeds but returns zero models", async () => {

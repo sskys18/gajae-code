@@ -18,6 +18,22 @@ Use when the user asks for `ultragoal`, `create-goals`, `complete-goals`, durabl
 - `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl` (checkpoint and structured steering audit events)
 
 Existing aggregate plans with the legacy enumerated objective are migrated to the stable pointer objective on read, persisted to `goals.json`, retained in `gjcObjectiveAliases` for already-active hidden goal reconciliation, and audited with an `aggregate_objective_migrated` ledger entry.
+- **Nudge budget setting** — the per-story give-up budget
+  (`gjc.ultragoal.nudgeBudget`, default **10**, non-negative integer) is read
+  through one shared resolver in this exact order (first valid value wins):
+  1. project `.gjc/config.yml`
+  2. user `<agentDir>/config.yml` (normally `~/.gjc/agent/config.yml`, honoring
+     `GJC_CODING_AGENT_DIR`/`PI_CODING_AGENT_DIR`; XDG applies only to categorized data/state/cache subdirs, never the workflow config path)
+  3. built-in default
+  `config.yml` uses the nested (schema) form - `gjc: { ultragoal: { nudgeBudget } }`.
+  Project configuration beats user configuration. The reported `source` is the
+  canonical path of the winning file, or `default`. `config.yml` is the ONLY
+  settings surface: the legacy `settings.json` files (project and config-root)
+  are retired: the config-root `~/.gjc/settings.json` is migrated once into the
+  default global agent `config.yml` and its source removed, while the project
+  `.gjc/settings.json` is retained for non-workflow settings (only its workflow
+  keys are migrated into project `.gjc/config.yml` and no longer read unless a migration target is absent - a migration that could not publish (e.g. a read-only `.gjc`) leaves the retained legacy value effective as the previously configured override until it can publish). Invalid optional settings
+  files continue to the next layer or the default (tolerant).
 
 ## Corrupt current-session state recovery
 
@@ -34,6 +50,8 @@ gjc ultragoal create-goals --brief "<brief>"
 gjc ultragoal create-goals --brief-file <path>
 gjc ultragoal complete-goals
 gjc ultragoal complete-goals --retry-failed
+gjc ultragoal quality-gate source-hash --json
+gjc ultragoal quality-gate validate --quality-gate-json <quality-gate-json-or-path> [--goal-id <id>] [--json]
 gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<evidence>" --quality-gate-json <quality-gate-json-or-path>
 gjc ultragoal checkpoint --goal-id <id> --status failed --evidence "<blocker/evidence>"
 gjc ultragoal record-review-blockers --goal-id <id> --title "Resolve final review blockers" --objective "<blocker-resolution objective>" --evidence "<review findings>"
@@ -49,8 +67,6 @@ goal({"op":"drop"})
 goal({"op":"resume"})
 ```
 `drop` clears the active goal without exiting goal mode; `resume` reactivates a paused goal.
-
-Durable completion is single-source: `goals.json` defines which goals exist and their required state, while `ledger.jsonl` provides the receipt proof used to verify completion. Inline goal state is UX-only and is reconciled by the agent after durable completion, not by CLI checkpoints or hooks.
 
 ## Create goals
 
@@ -87,6 +103,17 @@ Durable completion is single-source: `goals.json` defines which goals exist and 
    - `gjc ultragoal create-goals --gjc-goal-mode per-story --brief "<brief>"` only when one GJC goal context per story is explicitly preferred
 3. Inspect `.gjc/_session-{sessionid}/ultragoal/goals.json` and refine if needed.
 
+### Create-goals granularity: merge validation-coupled stories
+
+Before splitting a brief into many thin stories, check whether the candidate stories are **validation-coupled**. Merge validation-coupled stories into one goal and fan out executor slices inside that goal instead of creating one goal per slice. Two stories are validation-coupled when they share any of:
+
+- the same feature stack (one story's code cannot be meaningfully verified without the other's),
+- the same acceptance surface,
+- the same red-team surface, or
+- the same final review boundary (they can only be signed off as a unit).
+
+Fanning out executor slices inside a single merged goal keeps one review/QA boundary while preserving parallel implementation. When validation-coupled stories must stay as separate goals for scheduling reasons, use an aggregate-mode **validation batch** (below) so the coupled review happens once at the final member.
+
 ## Complete goals
 
 Loop until `gjc ultragoal status` reports all goals complete:
@@ -114,10 +141,12 @@ An active Ultragoal run must not give up on a blocker by pausing the goal and as
 - **`resolvable`** — anything the agent can act on: failing tests, missing implementation, a dependency to install, an ambiguous-but-inferable detail, investigation. **Never pause.** Exhaust autonomous resolution first: investigate, `gjc ultragoal steer --kind add_subgoal --title "Investigate blocker" --objective "..." --evidence "..." --rationale "..."`, delegate an `executor`, or preserve the blocker durably with `gjc ultragoal checkpoint --status blocked` / `gjc ultragoal record-review-blockers` and keep scheduling the next goal.
 - **`human_blocked`** — only the user can act: credentials/secrets, a manual or physical step, an external approval/decision, access the agent lacks. Pause is the last resort and is gated.
 
-`goal({"op":"pause"})` is **blocked at runtime** while an Ultragoal run is active unless the latest durable ledger event classifies the current blocker as `human_blocked`. To pause, record the classification immediately before pausing and cite the human-only dependency as evidence:
+`goal({"op":"pause"})` is **blocked at runtime** while an Ultragoal run is active unless the latest `blocker_classified` ledger event is `human_blocked` and a later bound clean pause terminal critic verdict is recorded for it (see [Terminal critic gate](#terminal-critic-gate)). `assertUltragoalPauseAllowed` first consumes a pre-existing give-up nudge (a durable ledger write) before it runs the read-only pause diagnostic; only `isUltragoalPauseBlocked` is a pure reader. To pause, first record the human-only classification and capture its event id, then record the terminal critic's clean bound pause verdict, and only then pause:
 
 ```sh
 gjc ultragoal classify-blocker --classification human_blocked --evidence "<the specific human-only dependency>" [--goal-id <id>]
+gjc ultragoal record-critic-verdict --terminus pause --classification-event-id <eventId> --verdict OKAY --evidence "<terminal critic evidence>"
+goal({"op":"pause"})
 ```
 
 Recording `--classification resolvable` is an audit note only; it never authorizes a pause. The `ask` tool stays blocked during active runs regardless of classification — record unresolved decisions as durable blockers instead of prompting.
@@ -167,42 +196,92 @@ Ultragoal execution should use GJC's bundled role-agent roster when a durable st
 - Use `architect` for read-only architecture and code-review lanes, including `CLEAR` / `WATCH` / `BLOCK` status.
 - Use `critic` for read-only plan or handoff critique before execution proceeds.
 
-### Mandatory implementation delegation on big scope
+### Implementation delegation guidance
 
-When a story's implementation scope is **big enough**, the Ultragoal leader MUST delegate the implementation to one or more `executor` subagents instead of writing the code inline itself. This is a hard requirement, not a preference: solo inline implementation of a big-scope story is a gate violation, and the completion cleanup/review gate must treat missing delegation on a big-scope story as a blocker.
+Direct inline implementation by the leader is the default. Delegate to `executor` subagents only when the expected diffs land in **genuinely different sub-domains, modules, or systems** — separable surfaces with independent acceptance criteria and no shared-file contention. File count or line count alone does not force delegation; a large change confined to one domain/subsystem is usually better done inline or by a single sequenced `executor`.
 
-A story's implementation scope is **big enough** to force delegation when any of the following hold:
+Delegation is worth it when:
 
-- It spans **3+ files** or **2+ cleanly separable surfaces/modules** that can be implemented against bounded, independent acceptance criteria.
-- It is estimated at **~200+ lines of net implementation change**, or is otherwise large enough that a single inline pass would crowd out the leader's checkpoint/verification duties.
-- It decomposes into **independent slices** that can proceed in parallel without shared-file contention.
-- The leader has already made **2+ inline edit passes** on the same story and implementation is still materially incomplete.
+- The story spans **multiple distinct sub-domains / modules / systems** (e.g. a CLI surface plus an unrelated runtime subsystem plus docs tooling) whose slices can proceed in parallel without coordinating on the same files.
+- Each slice can be bounded with explicit targets and acceptance criteria that are verifiable independently of the other slices.
+- The leader's checkpoint/verification duties would otherwise be crowded out by juggling unrelated domains inline.
 
-Forced-delegation rules:
+When delegating:
 
-- Split the story into cleanly separable slices, give each `executor` bounded targets and explicit acceptance criteria, and keep checkpoint/goal-state ownership in the leader.
-- Prefer **parallel** `executor` subagents for independent slices; sequence only slices with a real dependency.
-- If a big-scope story cannot be cleanly split, record the reason as a durable ledger note and delegate the whole implementation to a single `executor` rather than doing it inline; the leader still owns verification.
-- Small, atomic, single-file changes below these thresholds stay with the leader — do not over-delegate trivial work.
-- After integrating delegated slices, run `architect` / `critic` review lanes; worker agents never mutate `.gjc/_session-{sessionid}/ultragoal` or call goal tools.
+- Give each `executor` bounded targets and explicit acceptance criteria, and keep checkpoint/goal-state ownership in the leader.
+- Parallelize only across genuinely different sub-domains/modules/systems; sequence anything with a real dependency or shared-surface overlap.
+- Work within a single domain/subsystem stays with the leader as direct edits — do not split one cohesive change across subagents, and do not over-delegate trivial work.
+- After integrating delegated slices, you MAY run `architect` / `critic` review lanes for early signal, but treat them as **advisory**: the canonical review is the boundary cohort gate below, and a slice-level lane never substitutes for it or its verdict. Skip slice review entirely when the boundary cohort will cover the same change set shortly. Worker agents never mutate `.gjc/_session-{sessionid}/ultragoal` or call goal tools.
 
 When delegating with native subagents, an await timeout only limits the leader's wait. It is not subagent failure evidence and must not be used as a cancellation reason; inspect or continue independent work, and cancel only when the subagent has actually failed, gone off-track, or become unrecoverably wrong.
 
-If an Ultragoal request has no approved plan or consensus artifact, run `ralplan` first and preserve its PRD, test spec, role roster, and verification guidance in the Ultragoal ledger. Do not silently substitute ad-hoc execution for missing planning.
+### Subagent reuse and resumption (token efficiency)
+
+Fresh spawns re-pay the full context ramp-up (file reads, domain orientation, contract restatement) on every delegation. When a later slice or lane targets the **same sub-domain/module/system** as a prior subagent of the same role, **resume the prior subagent instead of freshly spawning**:
+
+- Track the subagent id per role + domain as it is created; on the next same-domain `executor` slice or same-scope `architect` review lane, resume that id and inject only the delta (new targets, new acceptance criteria, the updated frozen change set) rather than re-briefing from scratch.
+- Reuse is domain-scoped: resume only when the prior context is an asset. A slice in a genuinely different sub-domain/module/system gets a fresh spawn — stale cross-domain context is a liability, not a saving.
+- Resumability requires retained subagent resume metadata and a persistent parent session; use existing `subagent` resume/steer controls only. Route per attempt: `running` → steer/inject to the same id and await; `queued` → retain or await the same id; terminal (`completed`/`failed`/`cancelled`) with context available → resume the same id; `context_unavailable`, `not_found`, `no_runner`, or `resume_failed` → fresh spawn fallback for that slice.
+- A resumed subagent is still the same worker under the same contract: it must not mutate `.gjc/_session-{sessionid}/ultragoal`, call goal tools, or absorb checkpoint/goal-state ownership, and review lanes (`architect`, `critic`) stay read-only when resumed.
+- Resumption never weakens gates: a resumed `architect` review or `executor` QA lane must still evaluate the current frozen change set on its own evidence, not rubber-stamp its earlier verdict.
+
+If an Ultragoal request has no approved plan or consensus artifact **and** the scope genuinely needs one, run `ralplan` first and preserve its PRD, test spec, role roster, and verification guidance in the Ultragoal ledger. Skip `ralplan` for small scope: work that fits a single reviewable PR and is tied to a single domain/subsystem can proceed directly from the brief — record that judgment in the ledger instead of running a planning round. Reach for `ralplan` when the scope spans multiple domains/subsystems, needs cross-cutting sequencing, or would not fit a single PR.
 
 The Ultragoal leader owns `.gjc/_session-{sessionid}/ultragoal/goals.json` and `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl`. Role agents return implementation/review evidence; they do not checkpoint Ultragoal or mutate goal state.
 
-## Use Ultragoal and Team together
+### Native executor parallelism contract
 
-Use ultragoal and team together for a durable Ultragoal story that benefits from one visible tmux worker session. Ultragoal remains leader-owned: `.gjc/_session-{sessionid}/ultragoal/goals.json` stores the story plan and `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl` stores checkpoints. Team is the single-worker tmux execution engine and returns task/evidence status to the leader.
+Native subagent parallelism is a contract for bounded `executor` delegation, not a runtime scheduler:
 
-The leader checkpoints Ultragoal from Team evidence plus the current-session GJC goal snapshot; durable state remains leader-owned in `goals.json` and `ledger.jsonl`:
+- **Use native `executor` parallelism only** when a story's expected diffs fall in genuinely different sub-domains/modules/systems, each boundable by a per-slice coordination contract.
+- **Default to direct leader edits** otherwise; sequence any work with real dependencies, shared-file overlap, or a single-domain footprint, and never parallelize work that lacks a safe contract.
+- Worker agents **MUST NOT mutate `.gjc/_session-{sessionid}/ultragoal`**, call goal tools, make checkpoint decisions, own integration, or own final verification. The Ultragoal leader keeps those responsibilities.
+- Workers must not run `gjc ultragoal checkpoint`: checkpoint authority stays with the leader after worker tasks are terminal. The leader checkpoints from worker evidence plus the current-session GJC goal snapshot, and performs no hidden goal mutation.
 
-```sh
-gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<team evidence mentioning .gjc/_session-{sessionid}/ultragoal and <id>>" --quality-gate-json <quality-gate-json-or-path>
+Before workers start, each per-slice coordination contract MUST name the target files/surfaces, independence assumptions, allowed coordination channel, conflict-escalation rule, expected evidence, and terminal status. Conflict or assignment changes remain leader-owned and must be auditable through durable ledger evidence.
+
+For failed, timed-out, or contract-violating slices, record durable ledger evidence; preserve successful terminal slices only when safe; and reassign, retry, or collapse the invalid work to serial execution under an updated contract. Completion after parallel work still requires terminal worker evidence, leader integration, targeted verification, and the existing cleaner + architect + executor QA/red-team gate before checkpoint complete.
+
+
+## Boundary verification (aggregate default)
+
+Heavyweight review runs **once per boundary**, not once per story. In aggregate mode the whole required-goal set is one implicit boundary by default: every checkpoint before the run's final required goal may present the lightweight `deferredToBatch` gate, and only the final goal carries the full strict gate. Nothing needs to be declared to get this — it is the default.
+
+A deferred gate is just the proof the runtime cannot know: that targeted verification ran. Everything mechanical — `kind`, the batch tuple, `deferredLanes`, and the whole `changeSet` block (`paths`, `changeSetHash`) — is auto-filled from durable state and the computed cumulative git diff. Never hand-compute a hash. The minimal valid gate:
+
+```json
+{
+  "deferredToBatch": {
+    "ranLanes": ["targetedVerification"],
+    "targetedVerification": {
+      "status": "passed",
+      "commands": ["bun test <targeted suite>"],
+      "evidence": "what was verified and how it passed"
+    }
+  }
+}
 ```
 
-Workers do not own ultragoal goal state, do not create worker ultragoal ledgers, and do not checkpoint Ultragoal. Workers must not run `gjc ultragoal checkpoint`; checkpoint authority stays with the leader after worker tasks are terminal. Team launch remains explicit; Ultragoal does not auto-launch Team and performs no hidden goal mutation.
+`deferredToBatch.ranLanes` lists the lanes you actually ran (`targetedVerification`, plus optionally `aiSlopCleaner` / `iteration`); declaration and evidence must match in both directions. `ranLanes` can never claim `architectReview` or `executorQa`, and a deferred gate can never contain `architectReview`, `executorQa`, or `validationBatchClose` — review always belongs to the boundary, and deferring never manufactures approvals. Any optional field you do supply must match reality; a wrong value fails closed. Check with `gjc ultragoal quality-gate validate` before checkpointing.
+
+### Validation batches (explicit phase/module boundaries)
+
+When one ledger is large enough that a single end-of-run boundary is too coarse, use an explicit validation batch to subdivide it into phase/module boundaries, each with its own final member. Validation batches are **aggregate-only**, **explicit-only**, and **fail-closed**. They are created only through `--validation-batch-json`; there is no inference from brief prose, no per-story batching, and no other batching input path.
+
+Create a batch explicitly:
+
+```sh
+gjc ultragoal create-goals --brief-file <path> --validation-batch-json '[{"schemaVersion":1,"batchId":"VB001","memberIds":["G001","G002","G003"],"finalGoalId":"G003"}]'
+```
+
+Checkpoint contract summary — the full contract lives in the `validation-batch-contracts` fragment (`skill-fragments/ultragoal/validation-batch-contracts.md`); load it before checkpointing any batch member:
+
+- **Non-final members** checkpoint `complete` with a single top-level `deferredToBatch` quality gate (kind `validation-batch-deferred`) proving targeted verification, a declaration-matched lane set, and a cumulative-since-base change set — never `architectReview`, `executorQa`, or `validationBatchClose`; deferring never manufactures fake review approvals.
+- **The final member** (`finalGoalId`) checkpoints `complete` with the normal full strict gate PLUS a top-level `validationBatchClose` proof covering all members; out-of-order close is rejected, close state is append-only proof on the final member only, and batch invalidation is fail-closed. Like the deferred gate, every close field except `coverageEvidence` is auto-filled from durable receipts and the computed diff — the minimal close is `{"validationBatchClose":{"coverageEvidence":"..."}}` alongside the strict gate.
+
+### Intra-goal validation-lane parallelism
+
+Cohort lanes are parallel by construction: the boundary gate freezes one `sourceHash` first, so `cleaner`, `architect`, and `qa` can run concurrently against the identical immutable snapshot and then join. Fall back to **sequential** lanes only when code is still changing (nothing can be frozen yet), when the red-team lane depends on architect fixes, or when architect findings gate the QA scope. Either way the lanes must **join before checkpoint** — no lane checkpoints independently, and repair work starts only after the join.
 
 ## Internal Ultragoal sub-skill fragments
 
@@ -212,38 +291,46 @@ The completion-gate cleanup sweep is driven by `ai-slop-cleaner`, an internal Ul
 - It is a read-only detector+reporter over the active story's changed files only: it never edits code, writes files, mutates `.gjc/`, checkpoints, calls goal tools, or spawns workflows.
 - It classifies every finding as blocking or advisory across the full taxonomy (fallback-like masking vs. grounded, duplication, dead code, needless abstraction, boundary violations, UI/design slop, missing tests).
 - The leader and a leader-spawned `executor` own all fixes; the cleaner reruns until zero blocking findings remain. Advisory findings live in the gate report only.
-- Recursion guard: it must not spawn nested `ralplan`/`team`/`deep-interview`/`ultragoal`; broad or architectural findings are handed back to the leader as review blockers.
+- Recursion guard: it must not spawn nested `ralplan`/`deep-interview`/`ultragoal`; broad or architectural findings are handed back to the leader as review blockers.
 
-## Mandatory completion cleanup and review gate
+## Boundary completion cohort gate
 
-An ultragoal story cannot be checkpointed `complete` until the active agent has run the quality gate. The gate is plan-first, contract-driven, and surface-based:
+The heavyweight gate runs **once per boundary generation**, not once per story and not once per review pass. Intermediate stories use the lightweight deferred gate above; this section applies at the boundary (the run's final required goal, or an explicit batch's final member).
 
-1. Run targeted implementation verification for the story.
-2. Run the internal ai-slop-cleaner skill fragment as the final cleanup sweep on the story's changed files only, before verification and red-team so only clean code is reviewed. It is a read-only detector that emits an `AI SLOP CLEANUP REPORT`; if there are no relevant edits it still runs and records a passed/no-op report. Every BLOCKING cleaner finding is a completion blocker: the leader spawns an `executor` to fix blocking findings only, then reruns the cleaner until blocking findings are zero. Advisory findings are included in the gate report only and are not written to the Ultragoal ledger. Carry the report through the existing `qualityGate.iteration.evidence` field; do not add a new top-level quality-gate key.
-3. Rerun verification after the cleaner pass.
+One generation freezes the change set and reviews it exactly once:
+
+1. Run implementation verification for the boundary's cumulative change set.
+2. **Freeze the change set.** Run `gjc ultragoal quality-gate source-hash --json` on the clean reviewed snapshot and use its `sourceHash` exactly. The runtime binds this digest to the integration base, merge base, normalized changed paths, captured diff, and untracked-content digest. Every lane in this generation inspects that same frozen snapshot; a lane verdict carrying a different `sourceHash` is rejected. Any later source or base change requires rerunning this command and starting a new generation.
+3. **Run the cohort lanes on the frozen snapshot** — at most one `cleaner`, one `architect`, and one `qa` lane per generation. They may run in parallel because they share the frozen source; a second architect or QA lane in the same generation is rejected. The `cleaner` lane is the internal ai-slop-cleaner skill fragment run over the frozen change set: a read-only detector that emits an `AI SLOP CLEANUP REPORT`, and it still runs and records a passed/no-op report when there are no relevant edits. Its BLOCKING findings join the cohort findings rather than starting their own fix loop; advisory findings are included in the gate report only and are not written to the Ultragoal ledger.
 4. Delegate an `architect` review covering all three lanes:
    - architecture-side: system boundaries, layering, data/control flow, operational risks.
    - product-side: user-visible behavior, acceptance criteria, edge cases, regressions.
    - code-side: maintainability, tests, integration points, and unsafe shortcuts.
-5. Delegate an `executor` QA/red-team lane to build and run the e2e/read-teaming QA suite appropriate for the story. This lane must try to break the change, not just confirm the happy path. It must start from the approved plan/spec/acceptance criteria, then user-facing contracts, and only then implementation code as supporting evidence. Plan/code mismatches are blockers, not items to paper over with implementation intent.
+5. Delegate an `executor` QA/red-team lane with typed `executionMode: "ultragoal-red-team"` (preferred) — or assignment text that explicitly labels Ultragoal completion QA/red-team — to build and run the e2e/red-teaming QA suite appropriate for the story. A bare `executorQa` field-name mention is not enough to activate the mode. This lane must try to break the change, not just confirm the happy path. It must start from the approved plan/spec/acceptance criteria, then user-facing contracts, and only then implementation code as supporting evidence. Plan/code mismatches are blockers, not items to paper over with implementation intent.
 6. The executor QA/red-team lane must prove evidence by the real surface under test:
    - GUI/web surfaces require a valid automation transcript plus a non-uniform screenshot. Bare `inlineEvidence` text or typed receipts never prove live GUI/web execution.
-   - CLI surfaces require runtime argv replay: `replaySafe: true`, an allowlisted argv `command`, and replayed normalized stdout matching `recordedStdout`. The conservative allowlist is intentionally small: `bun --version`, `node --version`, deterministic `bun/node -e "console.log(...)"`, `npm|pnpm|yarn --version`, `npm|pnpm|yarn list`, read-only `git status|rev-parse|merge-base|diff|show|log` with safe args, and `gjc read|status`. Unsafe, non-deterministic, credentialed, interactive, or otherwise unallowlisted commands require audited `replayExempt` metadata with exact fields `reasonCode`, `reason`, `approvedBy`, and `fallbackArtifactRefs` plus a structurally valid fallback artifact. Allowed `reasonCode` values are exactly `unsafe_side_effect`, `requires_credentials`, `requires_network`, `non_deterministic_external`, `destructive`, `interactive_only`, and `platform_unavailable`.
+   - CLI surfaces require a safe runtime argv replay (`schemaVersion: 1`, `kind: "cli-replay"`, `replaySafe: true`) or the existing audited `replayExempt` path with a screenshot, automation, or PTY structural fallback. Runtime replay is limited to the pinned Bun runtime for `bun --version` or literal `bun -e "console.log(...)"`; the gate never executes model-authored test files. Shells, interpreters with code strings, path-qualified executables, package/git/network mutation commands, `bun test`, and arbitrary argv are rejected. Structured `test-report` fallback remains unsupported pending a separately reviewed provenance design.
    - Native/desktop/tui surfaces require a structurally valid screenshot, PTY capture with terminal control codes, or app-automation transcript.
    - API/package surfaces require a real artifact file or typed receipt whose artifact `kind` contains one of `api`, `package`, `consumer`, `black-box`, or `test-report`; examples: `api-package-test-report`, `package-consumer-report`, `black-box-api-receipt`. Algorithm/math surfaces require a real artifact file or typed receipt whose artifact `kind` contains one of `property`, `boundary`, `edge`, `adversarial`, `failure`, `math`, `algorithm`, or `test-report`; examples: `property-test-report`, `algorithm-boundary-report`. Bare `inlineEvidence` text alone is not sufficient for any surface.
    - The mandatory **computer-use** red-team suite (`kill-switch-bypass`, `suspended-enforcement`, `permission-revoked`, …) is conditional, not universal: require it only when computer/desktop control is genuinely part of the product surface being dogfooded. For every other product type, prove the change through the matching live surface instead — browser-use automation for web/GUI, bash/CLI live invocation or argv replay for CLI, and real artifacts or typed receipts for API/package/algorithm/math. Editing docs, prompts, or skills that merely mention computer-use does not by itself make the computer-use suite applicable; pick the red-team surface that matches what the change actually ships.
+   - **The runtime decides applicability from the change set, and it fails closed.** Judgement about "what the change actually ships" does not override it, so check the paths before assuming the suite is skippable. `gjc ultragoal checkpoint --status complete` requires the suite whenever the computed change set touches computer source (`crates/pi-natives/src/computer/**`), the computer tool (`packages/coding-agent/src/tools/computer.ts`, `packages/coding-agent/src/tools/computer/**`), or a **shared behavior registry** — `packages/coding-agent/src/config/settings-schema.ts`, `packages/coding-agent/src/tools/index.ts`, `packages/coding-agent/src/tools/renderers.ts`. The registries are deliberately unconditional: they mix computer and non-computer entries, and a path-only or uninspectable change cannot prove computer controls were untouched, so *any* edit to them demands the suite even when the diff contains nothing computer-related. The suite is also required whenever change-set capture was incomplete. Generated bindings (`packages/natives/native/index.{d.ts,js}`), prompt/skill/doc files, and every other path do not trigger it on their own.
+   - Practical consequence: a change that is not about computer-use at all — say a new settings key in `settings-schema.ts` — will still be gated on the seven mandatory cases. Do **not** fabricate them to get past the gate, and do not weaken the gate. Either supply a genuine suite, or treat it as a blocker and escalate to the operator (`gjc ultragoal record-critic-gate-override` exists for an authorized override).
 7. The executor QA/red-team lane must report a matrix using `executorQa.contractCoverage`, `executorQa.surfaceEvidence`, `executorQa.adversarialCases`, and `executorQa.artifactRefs`. Not-applicable rows are allowed only in `contractCoverage` and `surfaceEvidence`; each `status: "not_applicable"` row requires `contractRef` plus `reason`. `adversarialCases` rows cannot be not-applicable.
-8. Run a final code review pass and fold it into the strict quality gate. Clean means `architectReview.architectureStatus`, `architectReview.productStatus`, and `architectReview.codeStatus` are all `"CLEAR"`, `architectReview.recommendation` is `"APPROVE"`, executor QA statuses are `"passed"`, iteration is `"passed"` with `fullRerun: true`, every evidence field is non-empty, every required matrix row is present, and every blockers array is empty. `COMMENT`, `WATCH`, `REQUEST CHANGES`, `BLOCK`, missing evidence, missing or shallow matrix rows, plan/code mismatches, or non-empty blockers are non-clean.
-9. If any lane finds an issue, do **not** checkpoint `complete` and do **not** call `goal({"op":"complete"})`. Record durable blocker work instead:
+8. **Join before repairing.** Fold all three lane verdicts and the final code review into the strict gate under `iteration.reviewCohort` (`reviewGeneration`, `sourceHash`, `joined: true`, and the three `lanes`). No lane may checkpoint on its own, and no fix work starts until the findings are joined. Clean means `architectReview.architectureStatus`, `architectReview.productStatus`, and `architectReview.codeStatus` are all `"CLEAR"`, `architectReview.recommendation` is `"APPROVE"`, executor QA statuses are `"passed"`, iteration is `"passed"` with `fullRerun: true`, the cohort is joined with every lane clean and hash-bound, every evidence field is non-empty, every required matrix row is present, and every blockers array is empty. `COMMENT`, `WATCH`, `REQUEST CHANGES`, `BLOCK`, missing evidence, missing or shallow matrix rows, plan/code mismatches, or non-empty blockers are non-clean.
+9. If the joined findings contain any blocker, do **not** checkpoint `complete` and do **not** call `goal({"op":"complete"})`. Record **one consolidated blocker batch** for all findings from the whole cohort instead of one story per lane:
    ```sh
-   gjc ultragoal record-review-blockers --goal-id <id> --title "Resolve verification blockers" --objective "<blocker-resolution objective>" --evidence "<architect/executor findings>"
+   gjc ultragoal record-review-blockers --goal-id <id> --title "Resolve verification blockers" --objective "<blocker-resolution objective>" --evidence "<joined cohort findings>"
    ```
-10. Complete or steer through the blocker story, then rerun the full blocking verification loop. Repeat until all verifier lanes are clean.
-11. Only after the loop is clean, checkpoint the story as complete with a structured quality gate. The checkpoint creates a receipt in `ledger.jsonl`; `goals.json.status` alone is not proof. In aggregate mode, the final aggregate receipt must exist before the agent calls `goal({"op":"complete"})` to reconcile the inline UX goal state.
+
+   Review-blocker recursion cap (#3613): `record-review-blockers` dedups identical-objective blockers (same trimmed objective + same blocked goal + open status) and bounds the number of unresolved review_blocker descents per blocked goal to **3**. Descents 1..3 may exist; an attempt to create a 4th throws a typed `review_blocker_recursion_cap` terminal handoff (CLI exit 1, operator-visible marker) — never silently auto-completing findings. When the cap fires, record a human pause/escalation or resolve existing blockers before recording more.
+10. One consolidated fix batch produces exactly **one new generation**. Re-freeze the fixed source as a new `sourceHash`, bump `reviewGeneration`, and set `deltaOnly: true` with `priorGenerationSourceHash` and the `deltaPaths` actually changed. Generation 2+ reviews are **delta-only**: they may not pull in unrelated scope without an explicit `scopeExpansion` carrying `severity`, `novelty`, and `justification`. Repeat until a generation joins clean.
+11. Only after a generation joins clean, checkpoint the story as complete with a structured quality gate. The terminal critic runs **once** on that final joined generation; when `criticReview.sourceHash` is present it must match the cohort's `sourceHash`. The checkpoint creates a receipt in `ledger.jsonl`; `goals.json.status` alone is not proof. In aggregate mode, the final aggregate receipt must exist before the agent calls `goal({"op":"complete"})` to reconcile the inline UX goal state.
 
 While an Ultragoal run is active, the `ask` tool is blocked for all agents. Record unresolved review decisions as durable blockers with `gjc ultragoal record-review-blockers` instead of prompting interactively.
 
-The native `checkpoint --status complete` command rejects missing or shallow gates. `--quality-gate-json` must include:
+The native `checkpoint --status complete` command rejects missing or shallow gates, and reports **all** structural, evidence, surface, cohort, and declaration errors in one run rather than one per attempt. Each diagnostic carries a stable `path`, a stable machine-readable `code`, and a human `message`.
+
+Validate before you checkpoint. `gjc ultragoal quality-gate validate --quality-gate-json <json-or-path> [--goal-id <id>] [--json]` applies exactly the same rules as `checkpoint --status complete` (including deferred-vs-boundary gate selection and artifact existence checks) but is strictly read-only: it never touches `goals.json`, `ledger.jsonl`, or goal state. It exits non-zero with the full diagnostics list when invalid, so authoring a gate is one pass instead of an edit/retry loop. `--quality-gate-json` must include:
 
 ```json
 {
@@ -282,6 +369,16 @@ The native `checkpoint --status complete` command rejects missing or shallow gat
     "evidence": "blockers absent or resolved and the full loop was rerun cleanly",
     "fullRerun": true,
     "rerunCommands": ["bun test:e2e", "bun test:red-team"],
+    "reviewCohort": {
+      "reviewGeneration": 1,
+      "sourceHash": "sha256:<frozen change-set hash every lane inspected>",
+      "joined": true,
+      "lanes": {
+        "cleaner": { "status": "passed", "sourceHash": "sha256:<same>", "evidence": "AI SLOP CLEANUP REPORT: zero blocking findings", "blockers": [] },
+        "architect": { "status": "CLEAR", "sourceHash": "sha256:<same>", "evidence": "architecture/product/code review of the frozen set", "blockers": [] },
+        "qa": { "status": "passed", "sourceHash": "sha256:<same>", "evidence": "e2e + red-team run against the frozen set", "blockers": [] }
+      }
+    },
     "blockers": []
   }
 }
@@ -289,7 +386,51 @@ The native `checkpoint --status complete` command rejects missing or shallow gat
 
 Provide one `artifactRefs` entry per live surface actually exercised, using the surface-appropriate `kind` and evidence rules from steps 6–7 above; the CLI rejects missing or shallow gates. `status: "not_applicable"` rows are allowed only in `contractCoverage` and `surfaceEvidence` and each requires `contractRef` plus `reason`.
 
-For CLI replay artifacts, the JSON at `path` must be an object like `{"schemaVersion":1,"kind":"cli-replay","replaySafe":true,"command":["bun","-e","console.log(\"ultragoal-cli-ok\")"],"recordedStdout":"ultragoal-cli-ok\n"}`. Use `replayExempt` only for audited unsafe/non-deterministic invocations, with exact fields `reasonCode`, `reason`, `approvedBy`, and `fallbackArtifactRefs`. `reason` must be substantive and audited, `approvedBy` must identify the verifier, and `fallbackArtifactRefs` must reference same-surface structurally valid fallback artifacts. Allowed `reasonCode` values are exactly `unsafe_side_effect`, `requires_credentials`, `requires_network`, `non_deterministic_external`, `destructive`, `interactive_only`, and `platform_unavailable`.
+For safe CLI replay artifacts, the JSON at `path` must be an object like `{"schemaVersion":1,"kind":"cli-replay","replaySafe":true,"command":["bun","-e","console.log(\"ultragoal-cli-ok\")"],"cwd":".","env":{"LC_ALL":"C"},"timeoutMs":30000,"expectedExitCode":0,"recordedStdout":"ultragoal-cli-ok\n","recordedStderr":"","invariants":[{"type":"substring","value":"ultragoal-cli-ok"},{"type":"not_substring","value":"error"}]}`. `replaySafe: true` is required but is never authority by itself: executable replay is limited to the pinned Bun runtime for `bun --version` or deterministic literal `bun -e "console.log(...)"`. Shells, nested interpreters, path-qualified executables, test source, install/publish commands, git mutation, network clients, and every other argv are rejected. The declared cwd and artifact files are realpath-confined beneath the repository, but the safe probe itself runs from a fresh empty temporary cwd/home so repository `bunfig.toml` preloads and user configuration cannot execute. Mixed inline/nested/file-backed rows fail closed, POSIX timeout cleanup signals the replay process group, stdout and stderr are validated after normalization, output is capped at 1 MiB, and the child environment is scrubbed to `CI`, `NO_COLOR`, `GJC_ULTRAGOAL_REPLAY`, trusted temporary `HOME`/`TMPDIR`, plus optional `LANG`, `LC_ALL`, `LC_CTYPE`, and `TZ`.
+
+Compiled GJC binaries fail executable replay closed because their `process.execPath` launches GJC rather than a Bun CLI. Those runs must use the existing audited `replayExempt` structural fallback; the validator never resolves an untrusted `bun` from `PATH`.
+
+Focused `bun test` execution is blocked because repository test source is still arbitrary host code without an operating-system sandbox. The current `replayExempt` contract continues to require an existing screenshot, automation transcript, or PTY structural fallback; a `test-report` or `bun-test-report` JSON file is intentionally not accepted yet. Keep that design work open until test-result provenance, output binding, and consumer authority can be made fail-closed. Allowed `reasonCode` values remain `unsafe_side_effect`, `requires_credentials`, `requires_network`, `non_deterministic_external`, `destructive`, `interactive_only`, and `platform_unavailable`.
+
+## Terminal critic gate
+
+The terminal critic gate is a fail-closed, once-per-run-terminus review. It guards both terminal exits with a read-only `critic` role agent's `OKAY` verdict; it does not run per story. It is additive to, and does not change, the existing per-story `architect` review and `executor` QA/red-team lanes.
+
+### Completion terminus
+
+Before assembling the final-aggregate `--quality-gate-json`, the leader delegates the terminal critic. Only the final-aggregate completion checkpoint requires the additional top-level `criticReview` key; `criticReview` is tolerated but ignored on non-final checkpoints. A clean final aggregate requires `verdict: "OKAY"`, non-empty `evidence`, and an empty `blockers` array:
+
+```json
+{
+  "criticReview": {
+    "verdict": "OKAY",
+    "evidence": "terminal critic review of the final required-goal state",
+    "blockers": []
+  }
+}
+```
+
+### Pause/blocked terminus
+
+At a `human_blocked` terminus, the leader first runs `gjc ultragoal classify-blocker --classification human_blocked` (capturing that classification's ledger `eventId`), then delegates the terminal critic and records its verdict with `gjc ultragoal record-critic-verdict --terminus pause --classification-event-id <eventId>` before calling `goal({"op":"pause"})`. The pause is allowed only when a later fresh `critic_verdict` ledger receipt exists with `terminus: "pause"`, `verdict: "OKAY"`, non-empty evidence, an empty blockers array, the current `planGeneration`, and a `classificationEventId` bound to the latest `blocker_classified` event, which must be `human_blocked`. Freshness is scoped to the final required-goal state, so required-goal or steer changes stale the receipt, and a newer classification supersedes an older verdict.
+
+The critic must verify that the `human_blocked` classification is genuine, including catching false pauses where needed resources exist locally or the asserted blocker is resolvable. A `REJECT` (or `ITERATE`) verdict refuses the terminal pause; the run keeps executing. The pause (`goal({"op":"pause"})`) is the gated terminal park-and-wait exit — a per-goal `gjc ultragoal checkpoint --status blocked` remains available as non-terminal blocker bookkeeping that never signals run completion and keeps the blocker outstanding until resolved.
+
+### Invocation and containment
+
+At each terminus, the leader gives the read-only `critic` role agent `brief.md`, `goals.json`, `ledger.jsonl`, and the cumulative change set. For completion, invoke it before assembling the final-aggregate gate JSON. For pause, invoke it after the `human_blocked` classification and before `goal({"op":"pause"})`. The terminal critic must not spawn nested `ralplan`, `deep-interview`, or `ultragoal` workflows. This creates no interactive surface: `ask` remains blocked while an Ultragoal run is active.
+
+On repeat terminus attempts within the same run (after an `ITERATE`/`REJECT` reopen cycle or a superseded pause classification), **resume the prior terminal-critic subagent when resumable** instead of freshly spawning one: the critic already holds `brief.md`, `goals.json`, the ledger history, and its own prior findings, so re-invocation only needs the delta (new ledger events, the updated cumulative change set, and evidence addressing the prior blockers). Resume via existing `subagent` resume/steer controls; on `context_unavailable`, `not_found`, `no_runner`, or `resume_failed` — or after a process restart — fall back to a fresh `critic` spawn with the full context bundle. A resumed terminal critic remains read-only, keeps the same containment rules, and must issue a fresh verdict against the current state — a prior `ITERATE` is never carried forward as pre-judged, and each verdict is still recorded through `gjc ultragoal record-critic-verdict`.
+
+### Non-OKAY loop and ceiling
+
+For completion-side `ITERATE` or `REJECT`, the leader MUST first record the terminal verdict so the run-level counter observes it: `gjc ultragoal record-critic-verdict --terminus completion --verdict <ITERATE|REJECT> --evidence "<critic findings>"`; then record the findings with `gjc ultragoal record-review-blockers` and reopen the run. The dedicated counter ceiling is 5, independently of the give-up nudge budget, and is **RUN-LEVEL**: it counts every non-OKAY terminal-critic verdict across the whole run and all reopen cycles. On reaching that ceiling, both pause and final completion are blocked until a human or leader records `gjc ultragoal record-critic-gate-override --evidence "<authorization evidence>"`. There is no automatic pause override.
+
+This gate is always fail-closed and has no grandfathering: in-flight runs must obtain a terminal verdict when they reach a terminus.
+
+#### Deferred / out of scope
+
+Gating active-aggregate `goal drop` after nudge exhaustion is a known follow-up not covered by this gate; `drop` remains governed by the existing nudge discipline.
 
 ## Review mode
 
@@ -299,6 +440,7 @@ Receipts are freshness-scoped:
 - Per-goal receipts remain fresh for their target goal unless that goal, its blocker metadata, or its supersession metadata changes.
 - Normal later `goal_started` or clean receipt-backed `goal_checkpointed` events for other goals do not stale older per-goal receipts.
 - Appending required goals or changing final required-goal state stales final aggregate receipts. Final aggregate completion requires a fresh final aggregate receipt proving no incomplete, blocked, or `review_blocked` required goals remain.
+- Deferred per-goal receipts (validation-batch members) are incomplete until a matching fresh batch-close receipt exists on the batch's `finalGoalId`; a story-scope query for a deferred member stays blocked until that close, and mutating a member after close stales the batch-close and final aggregate receipts.
 
 ## Handoff back to planning
 
@@ -319,4 +461,5 @@ The skill tool then dispatches `/skill:ralplan` or `/skill:deep-interview` same-
 - Never call `goal({"op":"complete"})` unless the aggregate run or legacy per-story goal is actually complete.
 - In aggregate mode, intermediate and final story checkpoints update durable `goals.json` state and append receipt proof to `ledger.jsonl`; the final story checkpoint creates the final aggregate receipt before the agent may call `goal({"op":"complete"})`.
 - Completion checkpoints require `--quality-gate-json` only. Shell commands and hooks must not mutate goal state; the agent reconciles inline goal-tool state after durable completion.
+- Final-aggregate completion additionally requires a `criticReview` `OKAY`; a `human_blocked` pause additionally requires a fresh `OKAY` `critic_verdict` receipt.
 - Treat `ledger.jsonl` as the durable audit trail; checkpoint after every success or failure.

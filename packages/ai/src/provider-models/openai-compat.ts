@@ -1,4 +1,4 @@
-import { $env, $inheritedEnv } from "@gajae-code/utils";
+import { $credentialEnv } from "@gajae-code/utils";
 import type { ModelManagerOptions } from "../model-manager";
 import { Effort } from "../model-thinking";
 import { getBundledModels } from "../models";
@@ -8,6 +8,7 @@ import {
 	fetchOpenAICompatibleModels,
 	type OpenAICompatibleModelMapperContext,
 	type OpenAICompatibleModelRecord,
+	resolveLoopbackOpenAIBaseUrl,
 } from "../utils/discovery/openai-compatible";
 import { toFireworksPublicModelId } from "../utils/fireworks-model-id";
 import { getGitHubCopilotBaseUrl, OPENCODE_HEADERS, parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
@@ -226,7 +227,6 @@ function mapLmStudioModel(
 		),
 	};
 }
-
 function normalizeAnthropicBaseUrl(baseUrl: string | undefined, fallback: string): string {
 	const value = baseUrl?.trim();
 	if (!value) {
@@ -553,13 +553,19 @@ export interface OpenAIModelManagerConfig {
 	baseUrl?: string;
 }
 
+/** Base URL for the OpenAI model manager, from trusted env only (`$env` merges the caller's `cwd/.env`). */
+function resolveOpenAIModelManagerBaseUrl(config?: OpenAIModelManagerConfig): string {
+	return config?.baseUrl?.trim() || $credentialEnv("OPENAI_BASE_URL") || OPENAI_DEFAULT_BASE_URL;
+}
+
+/** Test seam: the model-manager base URL as resolved from trusted env. */
+export function resolveOpenAIModelManagerBaseUrlForTest(config?: OpenAIModelManagerConfig): string {
+	return resolveOpenAIModelManagerBaseUrl(config);
+}
+
 export function openaiModelManagerOptions(config?: OpenAIModelManagerConfig): ModelManagerOptions<"openai-responses"> {
 	const apiKey = config?.apiKey;
-	const baseUrl =
-		config?.baseUrl?.trim() ||
-		$inheritedEnv("OPENAI_BASE_URL") ||
-		$env.OPENAI_BASE_URL?.trim() ||
-		OPENAI_DEFAULT_BASE_URL;
+	const baseUrl = resolveOpenAIModelManagerBaseUrl(config);
 	const references = createBundledReferenceMap<"openai-responses">("openai");
 	return {
 		providerId: "openai",
@@ -826,7 +832,7 @@ export interface OpenCodeModelManagerConfig {
 }
 
 function openCodeModelManagerOptions(
-	providerId: "opencode-go" | "opencode-zen",
+	providerId: "opencode-go" | "opencode-zen" | "commandcode-goat",
 	defaultBaseUrl: string,
 	config?: OpenCodeModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
@@ -865,6 +871,46 @@ export function opencodeGoModelManagerOptions(
 	config?: OpenCodeModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
 	return openCodeModelManagerOptions("opencode-go", "https://opencode.ai/zen/go/v1", config);
+}
+
+export function commandCodeModelManagerOptions(config?: OpenCodeModelManagerConfig): ModelManagerOptions<Api> {
+	const apiKey = config?.apiKey;
+	const openAiBaseUrl = config?.baseUrl ?? "https://api.commandcode.ai/provider/v1";
+	const anthropicBaseUrl = openAiBaseUrl.replace(/\/v1\/?$/u, "");
+	return {
+		providerId: "commandcode-goat",
+		...(apiKey && {
+			fetchDynamicModels: () =>
+				fetchOpenAICompatibleModels<Api>({
+					api: "openai-completions",
+					provider: "commandcode-goat",
+					baseUrl: openAiBaseUrl,
+					apiKey,
+					mapModel: (_entry, defaults) => {
+						const isClaude = /(?:^|\/)claude(?:[\w.-]|$)/iu.test(defaults.id);
+						if (isClaude) {
+							return {
+								...defaults,
+								api: "anthropic-messages",
+								baseUrl: anthropicBaseUrl,
+							};
+						}
+						return {
+							...defaults,
+							api: "openai-completions",
+							compat: {
+								...defaults.compat,
+								supportsStore: false,
+								supportsDeveloperRole: false,
+								supportsReasoningEffort: false,
+								maxTokensField: "max_tokens",
+								reasoningContentField: "reasoning_content",
+							},
+						};
+					},
+				}),
+		}),
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -1100,6 +1146,97 @@ export function zenmuxModelManagerOptions(config?: ZenMuxModelManagerConfig): Mo
 }
 
 // ---------------------------------------------------------------------------
+// 10.5.1 OpenGateway by Sionic AI
+// ---------------------------------------------------------------------------
+
+export interface OpenGatewayModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+}
+
+/**
+ * OpenGateway by Sionic AI — an OpenAI-compatible gateway that fronts OpenAI,
+ * Anthropic, and Google models behind one API key. Models are discovered from
+ * the OpenAI-compatible `/v1/models` endpoint.
+ */
+export function opengatewayModelManagerOptions(
+	config?: OpenGatewayModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	return createSimpleOpenAICompletionsOptions("opengateway", "https://apis.opengateway.ai/v1", config);
+}
+
+// ---------------------------------------------------------------------------
+// 10.5.2 BizRouter
+// ---------------------------------------------------------------------------
+
+const BIZROUTER_BASE_URL = "https://api.bizrouter.ai/v1";
+
+function toBizRouterPrice(value: unknown, fallback: number): number {
+	const parsed = toNumber(value);
+	return parsed === undefined || parsed < 0 ? fallback : parsed;
+}
+
+export interface BizRouterModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+}
+
+export function bizrouterModelManagerOptions(
+	config?: BizRouterModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	const apiKey = config?.apiKey;
+	const baseUrl = config?.baseUrl ?? BIZROUTER_BASE_URL;
+	const references = createBundledReferenceMap<"openai-completions">("bizrouter");
+	return {
+		providerId: "bizrouter",
+		...(apiKey && {
+			fetchDynamicModels: () =>
+				fetchOpenAICompatibleModels({
+					api: "openai-completions",
+					provider: "bizrouter",
+					baseUrl,
+					apiKey,
+					mapModel: (entry, defaults) => {
+						const mapped = mapWithBundledReference(entry, defaults, references.get(defaults.id));
+						return {
+							...mapped,
+							name: toModelName(entry.display_name, mapped.name),
+							contextWindow: toPositiveNumber(entry.context_length, mapped.contextWindow),
+							maxTokens: toPositiveNumber(entry.max_output_tokens, mapped.maxTokens),
+							input: toInputCapabilities(entry.input_modalities),
+							cost: {
+								input: toBizRouterPrice(entry.input_price_per_1m_usd, mapped.cost.input),
+								output: toBizRouterPrice(entry.output_price_per_1m_usd, mapped.cost.output),
+								cacheRead: mapped.cost.cacheRead,
+								cacheWrite: mapped.cost.cacheWrite,
+							},
+							api: "openai-completions",
+							provider: "bizrouter",
+							baseUrl,
+						};
+					},
+				}),
+		}),
+	};
+}
+
+// ---------------------------------------------------------------------------
+// 10.5.3 Mara Cloud
+// ---------------------------------------------------------------------------
+
+export interface MaraModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+}
+
+/**
+ * Mara Cloud — an OpenAI-compatible enterprise AI inference platform. Models
+ * are discovered from the OpenAI-compatible `/v1/models` endpoint.
+ */
+export function maraModelManagerOptions(config?: MaraModelManagerConfig): ModelManagerOptions<"openai-completions"> {
+	return createSimpleOpenAICompletionsOptions("mara", "https://api.cloud.mara.com/v1", config);
+}
+// ---------------------------------------------------------------------------
 // 10.6 Kilo Gateway
 // ---------------------------------------------------------------------------
 
@@ -1124,26 +1261,26 @@ export function kiloModelManagerOptions(config?: KiloModelManagerConfig): ModelM
 }
 
 // ---------------------------------------------------------------------------
-// Alibaba Coding Plan
+// Alibaba Token Plan
 // ---------------------------------------------------------------------------
 
-export interface AlibabaCodingPlanModelManagerConfig {
+export interface AlibabaTokenPlanModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
 }
 
-export function alibabaCodingPlanModelManagerOptions(
-	config?: AlibabaCodingPlanModelManagerConfig,
+export function alibabaTokenPlanModelManagerOptions(
+	config?: AlibabaTokenPlanModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? "https://coding-intl.dashscope.aliyuncs.com/v1";
-	const references = createBundledReferenceMap<"openai-completions">("alibaba-coding-plan");
+	const baseUrl = config?.baseUrl ?? "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
+	const references = createBundledReferenceMap<"openai-completions">("alibaba-token-plan");
 	return {
-		providerId: "alibaba-coding-plan",
+		providerId: "alibaba-token-plan",
 		fetchDynamicModels: () =>
 			fetchOpenAICompatibleModels({
 				api: "openai-completions",
-				provider: "alibaba-coding-plan",
+				provider: "alibaba-token-plan",
 				baseUrl,
 				apiKey,
 				mapModel: (entry, defaults) => {
@@ -1297,6 +1434,48 @@ export function lmStudioModelManagerOptions(
 					const reference = references.get(defaults.id);
 					return mapLmStudioModel(entry, defaults, reference);
 				},
+			}),
+	};
+}
+
+// ---------------------------------------------------------------------------
+// 12.6. oMLX (Apple Silicon MLX Local Server)
+// ---------------------------------------------------------------------------
+
+export interface OmlxModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+}
+
+export function omlxModelManagerOptions(config?: OmlxModelManagerConfig): ModelManagerOptions<"openai-completions"> {
+	const apiKey = config?.apiKey;
+	const baseUrl = resolveLoopbackOpenAIBaseUrl(config?.baseUrl ?? Bun.env.OMLX_BASE_URL, "http://127.0.0.1:8080/v1");
+	return {
+		providerId: "omlx",
+		fetchDynamicModels: () =>
+			fetchOpenAICompatibleModels({
+				api: "openai-completions",
+				provider: "omlx",
+				baseUrl,
+				apiKey,
+				mapModel: (_entry, defaults) => ({
+					...defaults,
+					reasoning: true,
+					thinking: {
+						mode: "effort",
+						minLevel: Effort.Low,
+						maxLevel: Effort.High,
+						defaultLevel: Effort.Medium,
+						levels: [Effort.Low, Effort.Medium, Effort.High],
+					},
+					compat: {
+						supportsStore: false,
+						supportsDeveloperRole: false,
+						supportsReasoningEffort: true,
+						thinkingFormat: "qwen-chat-template",
+						reasoningContentField: "reasoning_content",
+					},
+				}),
 			}),
 	};
 }
@@ -1635,6 +1814,7 @@ export interface VllmModelManagerConfig {
 export function vllmModelManagerOptions(config?: VllmModelManagerConfig): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
 	const baseUrl = config?.baseUrl ?? "http://127.0.0.1:8000/v1";
+	const isLoopback = resolveLoopbackOpenAIBaseUrl(baseUrl, "") === baseUrl;
 	const references = createBundledReferenceMap<"openai-completions">("vllm" as Parameters<typeof getBundledModels>[0]);
 	return {
 		providerId: "vllm",
@@ -1644,11 +1824,74 @@ export function vllmModelManagerOptions(config?: VllmModelManagerConfig): ModelM
 				provider: "vllm",
 				baseUrl,
 				apiKey,
+				fetch: (input, init) =>
+					fetch(input, {
+						...init,
+						redirect: "error",
+						signal:
+							isLoopback && init?.signal
+								? AbortSignal.any([init.signal, AbortSignal.timeout(500)])
+								: init?.signal,
+					}),
 				mapModel: (entry, defaults) => {
 					const model = mapWithBundledReference(entry, defaults, references.get(defaults.id));
+					const contextWindow = toNumber(entry.max_model_len);
 					return {
 						...model,
-						contextWindow: toPositiveNumber(entry.max_model_len, model.contextWindow),
+						contextWindow:
+							contextWindow !== undefined && Number.isSafeInteger(contextWindow) && contextWindow > 0
+								? contextWindow
+								: model.contextWindow,
+					};
+				},
+			}),
+	};
+}
+
+// ---------------------------------------------------------------------------
+// 22.5. SGLang
+// ---------------------------------------------------------------------------
+
+export interface SglangModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+}
+
+export function sglangModelManagerOptions(
+	config?: SglangModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	const apiKey = config?.apiKey;
+	const baseUrl = config?.baseUrl ?? "http://127.0.0.1:30000/v1";
+	const isLoopback = resolveLoopbackOpenAIBaseUrl(baseUrl, "") === baseUrl;
+	const references = createBundledReferenceMap<"openai-completions">(
+		"sglang" as Parameters<typeof getBundledModels>[0],
+	);
+	return {
+		providerId: "sglang",
+		fetchDynamicModels: () =>
+			fetchOpenAICompatibleModels({
+				api: "openai-completions",
+				provider: "sglang",
+				baseUrl,
+				apiKey,
+				fetch: (input, init) =>
+					fetch(input, {
+						...init,
+						redirect: "error",
+						signal:
+							isLoopback && init?.signal
+								? AbortSignal.any([init.signal, AbortSignal.timeout(500)])
+								: init?.signal,
+					}),
+				mapModel: (entry, defaults) => {
+					const model = mapWithBundledReference(entry, defaults, references.get(defaults.id));
+					const contextWindow = toNumber(entry.max_model_len);
+					return {
+						...model,
+						contextWindow:
+							contextWindow !== undefined && Number.isSafeInteger(contextWindow) && contextWindow > 0
+								? contextWindow
+								: model.contextWindow,
 					};
 				},
 			}),
@@ -1880,36 +2123,36 @@ export function anthropicModelManagerOptions(
 					.then(payload => mapAnthropicModelsDev(payload, baseUrl))
 					.catch(() => []);
 				const references = buildAnthropicReferenceMap(modelsDevModels);
-				return (
-					fetchOpenAICompatibleModels({
-						api: "anthropic-messages",
-						provider: "anthropic",
-						baseUrl,
-						headers: buildAnthropicDiscoveryHeaders(apiKey),
-						mapModel: (
-							entry: OpenAICompatibleModelRecord,
-							defaults: Model<"anthropic-messages">,
-							_context: OpenAICompatibleModelMapperContext<"anthropic-messages">,
-						): Model<"anthropic-messages"> => {
-							const discoveredName = typeof entry.display_name === "string" ? entry.display_name : defaults.name;
-							const reference = references.get(defaults.id);
-							if (!reference) {
-								return {
-									...defaults,
-									name: discoveredName,
-								};
-							}
+				const models = await fetchOpenAICompatibleModels({
+					api: "anthropic-messages",
+					provider: "anthropic",
+					baseUrl,
+					headers: buildAnthropicDiscoveryHeaders(apiKey),
+					mapModel: (
+						entry: OpenAICompatibleModelRecord,
+						defaults: Model<"anthropic-messages">,
+						_context: OpenAICompatibleModelMapperContext<"anthropic-messages">,
+					): Model<"anthropic-messages"> => {
+						const discoveredName = typeof entry.display_name === "string" ? entry.display_name : defaults.name;
+						const reference = references.get(defaults.id);
+						if (!reference) {
 							return {
-								...reference,
-								id: defaults.id,
+								...defaults,
 								name: discoveredName,
-								api: "anthropic-messages",
-								provider: "anthropic",
-								baseUrl,
 							};
-						},
-					}) ?? null
-				);
+						}
+						return {
+							...reference,
+							id: defaults.id,
+							name: discoveredName,
+							api: "anthropic-messages",
+							provider: "anthropic",
+							baseUrl,
+						};
+					},
+				});
+				if (models === null) return null;
+				return models;
 			},
 		}),
 	};
@@ -2114,11 +2357,15 @@ const OPENCODE_GO_BASE_PATH = "https://opencode.ai/zen/go";
 const OPENCODE_ZEN_API_RESOLUTION = createOpenCodeApiResolution("https://opencode.ai/zen");
 const OPENCODE_GO_CHAT_COMPLETIONS_MODEL_IDS = [
 	"deepseek-v4-flash",
+	"deepseek-v4-flash-vision-exp",
 	"deepseek-v4-pro",
 	"glm-5.1",
 	"glm-5.2",
+	"glm-5.3-flash",
 	"kimi-k2.6",
 	"kimi-k2.7-code",
+	"hy4-preview",
+	"longcat-2.0",
 	"mimo-v2.5",
 	"mimo-v2.5-pro",
 ] as const;
@@ -2129,6 +2376,7 @@ const OPENCODE_GO_MESSAGES_MODEL_IDS = [
 	"qwen3.6-plus",
 	"qwen3.7-max",
 	"qwen3.7-plus",
+	"qwen3.8-flash",
 ] as const;
 const OPENCODE_GO_API_OVERRIDES: Readonly<Record<string, Api>> = {
 	...Object.fromEntries(OPENCODE_GO_CHAT_COMPLETIONS_MODEL_IDS.map(id => [id, "openai-completions"])),
@@ -2356,11 +2604,11 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_CODING_PLANS: readonly ModelsDevProviderDe
 			reasoningContentField: "reasoning_content",
 		},
 	}),
-	// --- Alibaba Coding Plan ---
+	// --- Alibaba Token Plan ---
 	openAiCompletionsDescriptor(
-		"alibaba-coding-plan",
-		"alibaba-coding-plan",
-		"https://coding-intl.dashscope.aliyuncs.com/v1",
+		"alibaba-token-plan",
+		"alibaba-token-plan",
+		"https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
 		{
 			compat: {
 				supportsDeveloperRole: false,
@@ -2448,6 +2696,14 @@ const OPENCODE_GO_OFFICIAL_MODELS: Readonly<Record<string, OpenCodeGoOfficialMod
 		input: ["text", "image"],
 		reasoning: true,
 		cost: { input: 0.95, output: 4, cacheRead: 0.19, cacheWrite: 0 },
+	},
+	"kimi-k3": {
+		name: "Kimi K3 (2x usage)",
+		contextWindow: 1_048_576,
+		maxTokens: 131_072,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 0 },
 	},
 	"minimax-m2.5": {
 		name: "MiniMax M2.5",
@@ -2544,6 +2800,62 @@ const OPENCODE_GO_OFFICIAL_MODELS: Readonly<Record<string, OpenCodeGoOfficialMod
 		input: ["text"],
 		reasoning: true,
 		cost: { input: 0.066, output: 0.26, cacheRead: 0.029, cacheWrite: 0 },
+	},
+	"deepseek-v4-flash-vision-exp": {
+		name: "DeepSeek V4 Flash Vision Exp",
+		contextWindow: 1_000_000,
+		maxTokens: 384_000,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 0.22, output: 0.66, cacheRead: 0.007, cacheWrite: 0 },
+	},
+	"glm-5.3-flash": {
+		name: "GLM-5.3-Flash (2x usage)",
+		contextWindow: 1_000_000,
+		maxTokens: 131_072,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 0.075, output: 0.25, cacheRead: 0.015, cacheWrite: 0 },
+	},
+	"grok-4.6": {
+		name: "Grok 4.6",
+		contextWindow: 500_000,
+		maxTokens: 500_000,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 2, output: 6, cacheRead: 0.5, cacheWrite: 0 },
+	},
+	"hy4-preview": {
+		name: "Hy4 preview",
+		contextWindow: 1_024_000,
+		maxTokens: 64_000,
+		input: ["text"],
+		reasoning: true,
+		cost: { input: 0.834, output: 2.501, cacheRead: 0.042, cacheWrite: 0 },
+	},
+	"longcat-2.0": {
+		name: "LongCat-2.0",
+		contextWindow: 1_000_000,
+		maxTokens: 131_072,
+		input: ["text"],
+		reasoning: true,
+		cost: { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 },
+	},
+	"muse-spark-1.2-contributor": {
+		name: "Muse Spark 1.2 Contributor",
+		contextWindow: 1_048_576,
+		maxTokens: 131_072,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 },
+	},
+	"qwen3.8-flash": {
+		name: "Qwen3.8 Flash",
+		contextWindow: 1_000_000,
+		maxTokens: 131_072,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 0.15, output: 0.47, cacheRead: 0.016, cacheWrite: 0.2 },
 	},
 };
 

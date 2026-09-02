@@ -1,21 +1,19 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { Settings } from "../../src/config/settings";
 import { type GoalModeState, GoalRuntime } from "../../src/goals";
 import { AgentRegistry, MAIN_AGENT_ID } from "../../src/registry/agent-registry";
+import { createAgentSession } from "../../src/sdk/session";
 import type { ToolSession } from "../../src/tools/index";
 import {
-	AskTool,
 	BUILTIN_CAPABILITY_CATALOG,
+	BUILTIN_TOOL_DESCRIPTORS,
 	BUILTIN_TOOLS,
-	ComputerTool,
 	computeEssentialBuiltinNames,
 	createTools,
 	DEFAULT_ESSENTIAL_TOOL_NAMES,
-	IrcTool,
-	JobTool,
-	RecipeTool,
-	SshTool,
-	TelegramSendTool,
 } from "../../src/tools/index";
 
 const allToolsSettings = Settings.isolated({
@@ -65,6 +63,7 @@ const goalRuntime = new GoalRuntime({
 
 const toolSession: ToolSession = {
 	cwd: "/tmp/test",
+	rescopeSessionCwd: async (target: string) => ({ from: "/tmp/test", to: target }),
 	hasUI: false,
 	getSessionFile: () => null,
 	getSessionSpawns: () => null,
@@ -89,6 +88,9 @@ const toolSession: ToolSession = {
 
 async function getToolMetadata(): Promise<Map<string, { loadMode?: string; summary?: string }>> {
 	const tools = await createTools(toolSession, Object.keys(BUILTIN_TOOLS));
+	const { AskTool, ComputerTool, IrcTool, JobTool, RecipeTool, SshTool, TelegramSendTool } = await import(
+		"../../src/tools/implementations"
+	);
 	const metadata = new Map(tools.map(tool => [tool.name, { loadMode: tool.loadMode, summary: tool.summary }]));
 	for (const tool of [
 		new AskTool({ ...toolSession, hasUI: true }),
@@ -115,6 +117,14 @@ describe("BUILTIN_TOOLS public factory map", () => {
 		const metadata = await getToolMetadata();
 		const missing = Object.keys(BUILTIN_TOOLS).filter(name => metadata.get(name)?.loadMode === undefined);
 		expect(missing).toEqual([]);
+	});
+	it("declares loadMode on every BUILTIN_TOOLS descriptor independently of session availability", () => {
+		const missing = Object.keys(BUILTIN_TOOLS).filter(name => {
+			const descriptor = BUILTIN_TOOL_DESCRIPTORS[name];
+			return descriptor?.metadata.loadMode !== "essential" && descriptor?.metadata.loadMode !== "discoverable";
+		});
+		expect(missing).toEqual([]);
+		expect(BUILTIN_TOOL_DESCRIPTORS.move_session?.metadata.loadMode).toBe("essential");
 	});
 
 	it("does not expose memory helpers as public built-in tools", async () => {
@@ -193,6 +203,64 @@ describe("built-in tool loadMode annotations", () => {
 		}
 		expect(missing).toEqual([]);
 	});
+});
+
+describe("alwaysActiveToolNames keeps discoverable coordination tools loaded", () => {
+	async function tempDir(): Promise<string> {
+		return await fs.mkdtemp(path.join(os.tmpdir(), "gjc-always-active-"));
+	}
+
+	it("hides irc from a subagent-style session by default and forces it active when requested", async () => {
+		const cwd = await tempDir();
+		const agentDir = await tempDir();
+
+		// No `toolNames`: this is the executor/generic-subagent path, which inherits the
+		// full builtin set. With tools.discoveryMode="all" (the default), `irc` is
+		// loadMode "discoverable" and must therefore be hidden behind search_tool_bm25.
+		const hidden = await createAgentSession({ cwd, agentDir });
+		expect(hidden.session.getActiveToolNames()).not.toContain("irc");
+
+		const forced = await createAgentSession({ cwd, agentDir, alwaysActiveToolNames: ["irc"] });
+		expect(forced.session.getActiveToolNames()).toContain("irc");
+
+		// Forcing one tool active must not drag the rest of the discoverable set in.
+		expect(forced.session.getActiveToolNames()).not.toContain("browser");
+	}, 60_000);
+});
+
+describe("an explicitly empty tool selection disables every built-in tool", () => {
+	async function tempDir(): Promise<string> {
+		return await fs.mkdtemp(path.join(os.tmpdir(), "gjc-empty-tools-"));
+	}
+
+	it("keeps the goal tool out of an empty selection while preserving it for non-empty ones", async () => {
+		const cwd = await tempDir();
+		const agentDir = await tempDir();
+		try {
+			// `--no-tools` maps to `toolNames: []` (see cli/main.ts). Goal mode is on by
+			// default, so an empty selection is the only signal that the caller wants
+			// zero built-in tools -- it must not be re-populated with `goal`.
+			const none = await createAgentSession({ cwd, agentDir, toolNames: [] });
+			try {
+				expect(none.session.getActiveToolNames()).toEqual([]);
+
+				// A non-empty explicit selection keeps `goal` available as session state.
+				const some = await createAgentSession({ cwd, agentDir, toolNames: ["read"] });
+				try {
+					expect(some.session.getActiveToolNames()).toContain("goal");
+				} finally {
+					await some.session.dispose();
+				}
+			} finally {
+				await none.session.dispose();
+			}
+		} finally {
+			await Promise.all([
+				fs.rm(cwd, { recursive: true, force: true }),
+				fs.rm(agentDir, { recursive: true, force: true }),
+			]);
+		}
+	}, 60_000);
 });
 
 describe("computeEssentialBuiltinNames", () => {

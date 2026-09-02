@@ -94,6 +94,12 @@ impl Process {
 		self.inner.pid()
 	}
 
+	/// Kernel-derived identity evidence for this exact process incarnation.
+	#[napi(getter)]
+	pub fn incarnation(&self) -> String {
+		self.inner.incarnation()
+	}
+
 	/// Parent process id for this process, when available.
 	#[napi(getter)]
 	pub fn ppid(&self) -> Option<i32> {
@@ -104,6 +110,19 @@ impl Process {
 	#[napi]
 	pub fn args(&self) -> Vec<String> {
 		self.inner.args()
+	}
+
+	/// Send `signal` only to this pinned process reference.
+	///
+	/// On Linux this uses the owned pidfd; on Windows it uses the owned process
+	/// handle. macOS has no atomic identity-bound signal primitive, so this
+	/// operation deliberately fails closed there. It never discovers descendants
+	/// or signals a process group. Returns `false` when the pinned process has
+	/// already exited, the platform cannot bind delivery to the process
+	/// identity, or the operating system rejects delivery.
+	#[napi]
+	pub fn signal_root(&self, signal: i32) -> bool {
+		self.inner.signal_root(signal)
 	}
 
 	/// Send `signal` to this process and its descendants, children first.

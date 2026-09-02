@@ -29,7 +29,7 @@ type MetadataViolation = {
 
 const repoRoot = process.cwd();
 
-const expectedBundledWorkflowSkills = ["deep-interview", "ralplan", "team", "ultragoal"] as const;
+const expectedBundledWorkflowSkills = ["autoresearch", "deep-interview", "ralplan", "ultragoal"] as const;
 const expectedBundledRoleAgents = ["architect", "critic", "executor", "planner"] as const;
 const expectedPackageScope = "@gajae-code/";
 const expectedCliBins = ["gjc", "gjc-stats"] as const;
@@ -195,9 +195,7 @@ function scanLegacyHits(): LegacyHit[] {
 		"package.json",
 		"Cargo.toml",
 		"Dockerfile",
-		"Dockerfile.robogjc",
 		"Dockerfile.dockerignore",
-		"Dockerfile.robogjc.dockerignore",
 	];
 	const files = roots.flatMap(root => {
 		const full = path.join(repoRoot, root);

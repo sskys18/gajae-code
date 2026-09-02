@@ -19,31 +19,7 @@ export const GJC_SKILL_KEYWORD_DEFINITIONS: readonly SkillKeywordDefinition[] = 
 		guidance: "Activate GJC deep-interview requirements workflow",
 	},
 	{
-		keyword: "deep interview",
-		skill: "deep-interview",
-		priority: 8,
-		guidance: "Activate GJC deep-interview requirements workflow",
-	},
-	{
-		keyword: "interview me",
-		skill: "deep-interview",
-		priority: 8,
-		guidance: "Activate GJC deep-interview requirements workflow",
-	},
-	{
-		keyword: "don't assume",
-		skill: "deep-interview",
-		priority: 8,
-		guidance: "Activate GJC deep-interview requirements workflow",
-	},
-	{
 		keyword: "$ralplan",
-		skill: "ralplan",
-		priority: 9,
-		guidance: "Activate GJC ralplan planning workflow",
-	},
-	{
-		keyword: "consensus plan",
 		skill: "ralplan",
 		priority: 9,
 		guidance: "Activate GJC ralplan planning workflow",
@@ -55,22 +31,10 @@ export const GJC_SKILL_KEYWORD_DEFINITIONS: readonly SkillKeywordDefinition[] = 
 		guidance: "Activate GJC ultragoal durable goal workflow",
 	},
 	{
-		keyword: "ultragoal",
-		skill: "ultragoal",
+		keyword: "$autoresearch",
+		skill: "autoresearch",
 		priority: 8,
-		guidance: "Activate GJC ultragoal durable goal workflow",
-	},
-	{
-		keyword: "$team",
-		skill: "team",
-		priority: 8,
-		guidance: "Activate GJC team workflow",
-	},
-	{
-		keyword: "coordinated team",
-		skill: "team",
-		priority: 8,
-		guidance: "Activate GJC team workflow",
+		guidance: "Activate GJC autoresearch research-mission workflow",
 	},
 ] as const;
 

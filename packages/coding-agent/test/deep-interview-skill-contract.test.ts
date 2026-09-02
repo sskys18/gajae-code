@@ -71,8 +71,8 @@ describe("deep-interview simple-request escape hatch", () => {
 
 		const suitabilityGate = steps.slice(suitabilityGateIndex, initializeIndex);
 		expect(suitabilityGate).toMatch(/clear,\s+bounded,\s+low-risk/i);
-		expect(suitabilityGate).toContain("gjc state read --mode deep-interview --json");
-		expect(suitabilityGate).toContain("gjc state clear --force --mode deep-interview");
+		expect(suitabilityGate).toContain("gjc deep-interview read --json");
+		expect(suitabilityGate).toContain("gjc deep-interview clear --force");
 		expect(suitabilityGate).toMatch(/newly seeded empty interview/i);
 		expect(suitabilityGate).toMatch(/no recorded `rounds`[\s\S]*no `spec_path`[\s\S]*no `handoff_from`/i);
 		expect(suitabilityGate).toMatch(/If state already contains rounds[\s\S]*do not clear it/i);
@@ -107,9 +107,11 @@ describe("deep-interview self-proofread output rule", () => {
 		expect(skill).toContain("Before emitting the prose lines in this announcement, apply the");
 		expect(skill).toContain("apply the self-proofread once to new prose only");
 		expect(skill).toContain(
-			"apply the self-proofread once to narrative status text, generated prose cells, gaps, and next-target phrasing",
+			"apply the self-proofread once (DIPP-5) to narrative status text, generated prose cells, gaps, and next-target phrasing",
 		);
-		expect(skill).toContain("Apply the self-proofread once to newly generated spec prose before persistence");
+		expect(skill).toContain(
+			"Apply the self-proofread once (DIPP-5) to newly generated spec prose before persistence",
+		);
 	});
 
 	it("adds a Final_Checklist item for the silent self-proofread", () => {
@@ -145,5 +147,85 @@ describe("deep-interview ask clarification contract", () => {
 		);
 		expect(skill).toContain("bypasses Step 2b′ auto-answer, Step 2b″ free-text refine, Step 2c ambiguity scoring");
 		expect(skill).toContain("must not be recorded as a round answer");
+	});
+});
+
+describe("deep-interview ouroboros ooo-interview parity port", () => {
+	it("documents the continuation contract: ordinary answered rounds auto-continue without a generic approval ask (issue #4589)", () => {
+		expect(skill).toMatch(/Step 2f: Check Continuation Contract/i);
+		expect(skill).toMatch(/ordinary answered round NEVER asks for generic continuation approval/i);
+		// The regression this pins: the retired tiered cadence asked
+		// "Continue, or proceed with current clarity" after every ordinary round 4-15
+		// (and 16+), turning the ambiguity gate into per-answer consent friction.
+		expect(skill).not.toMatch(/ask to continue/i);
+		expect(skill).not.toMatch(/Continue, or proceed with current clarity/i);
+		expect(skill).not.toMatch(/Rounds 4-15/i);
+		expect(skill).not.toMatch(/diminishing-returns warning/);
+
+		const steps = extractSection(skill, "Steps");
+		const continuationIndex = steps.indexOf("### Step 2f: Check Continuation Contract");
+		expect(continuationIndex).toBeGreaterThanOrEqual(0);
+		const continuation = steps.slice(continuationIndex, steps.indexOf("## Phase 3:"));
+		// All four legitimate terminal conditions are documented.
+		expect(continuation).toMatch(/Threshold \+ closure gates/);
+		expect(continuation).toMatch(/ambiguity ≤ the resolved threshold/);
+		expect(continuation).toMatch(/Explicit user exit/);
+		expect(continuation).toMatch(/Invocation\/resume suitability ambiguity only/);
+		expect(continuation).toMatch(/Bounded continuation safety recovery/);
+		// The resume choice is invocation-boundary-only and never re-asked mid-interview.
+		expect(continuation).toMatch(/never re-asked inside an active interview/);
+		// Hard cancellations are never delayed by the pre-round-3 early-proceed guard.
+		expect(continuation).toMatch(/Hard cancellation/);
+		expect(continuation).toMatch(/stops immediately at any round/);
+		expect(continuation).toMatch(/Never turn a hard cancellation into a clarifying question/);
+		expect(continuation).toMatch(/Early proceed/);
+		expect(continuation).toMatch(/Before round 3, ask one targeted clarifying question/);
+		expect(continuation).toMatch(/do not treat that early-proceed intent as a hard cancellation/);
+		// Passive exit control is preserved with the two intent classes kept distinct.
+		expect(continuation).toMatch(/any answer, option, or free-text reply can carry an exit intent/);
+		expect(continuation).toMatch(/Hard cancellations are honored immediately/);
+	});
+
+	it("keeps the hard cap and explicit early-exit controls after retiring the tiered cadence (issue #4589)", () => {
+		expect(skill).toContain("Round 100");
+		expect(skill).toMatch(/Hard cap at 100 rounds/i);
+		expect(skill).toMatch(/Early exit \(round 3\+\)/i);
+		expect(skill).toMatch(/User says "stop", "cancel", "abort"/i);
+		expect(skill).toMatch(/stop immediately, save state for resume/i);
+	});
+
+	it("documents advisory fanout lanes distinct from the milestone panel (feature C)", () => {
+		expect(skill).toMatch(/advisory fanout/i);
+		expect(skill).toMatch(/distinct from the milestone panel/i);
+		for (const lane of [
+			"code_context",
+			"web_context",
+			"ambiguity_contrarian",
+			"answer_simplifier",
+			"architecture_implications",
+		])
+			expect(skill).toContain(lane);
+	});
+
+	it("documents the confused_terms/references non-behavioral contract (feature A)", () => {
+		expect(skill).toContain("confused_terms");
+		expect(skill).toContain("references");
+		expect(skill).toMatch(/MUST NOT alter the first question/i);
+		expect(skill).toMatch(/never auto-fetched/i);
+	});
+
+	it("documents the FREETEXT_FIELDS allowlist + input size caps (feature D)", () => {
+		expect(skill).toContain("FREETEXT_FIELDS");
+		expect(skill).toMatch(/shell metacharacters/i);
+		expect(skill).toMatch(/50,000/);
+		expect(skill).toMatch(/10,000/);
+		expect(skill).toMatch(/character-count/i);
+	});
+});
+
+describe("deep-interview invocation arguments contract", () => {
+	it("refers to the loader-appended user request without an unresolved placeholder", () => {
+		expect(skill).toContain("the appended `User:` request");
+		expect(skill).not.toContain("{{ARGUMENTS}}");
 	});
 });

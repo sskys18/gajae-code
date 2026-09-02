@@ -16,6 +16,7 @@
  */
 
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
+import type { RawArgumentValidationResult } from "@gajae-code/ai/types";
 import {
 	type Component,
 	Container,
@@ -27,7 +28,6 @@ import {
 	wrapTextWithAnsi,
 } from "@gajae-code/tui";
 import { logger, prompt, untilAborted } from "@gajae-code/utils";
-import * as z from "zod/v4";
 import {
 	formatDeepInterviewSelectorPrompt,
 	isDeepInterviewAskQuestion,
@@ -36,11 +36,42 @@ import {
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { appendOrMergeDeepInterviewRound, syncDeepInterviewRecorderHud } from "../gjc-runtime/deep-interview-recorder";
 import { deepInterviewStatePath } from "../gjc-runtime/deep-interview-runtime";
-import { gateAnswerToResult, questionToGate } from "../modes/shared/agent-wire/deep-interview-gate";
+import {
+	assertDeepInterviewInputWithinLimit,
+	assertDeepInterviewStructuredResponseWithinLimit,
+	MAX_USER_RESPONSE_LENGTH,
+} from "../gjc-runtime/deep-interview-state";
+import {
+	type AskGateQuestion,
+	gateAnswerToResult,
+	questionToGate,
+} from "../modes/shared/agent-wire/deep-interview-gate";
+
 import { getMarkdownTheme, type Theme, theme } from "../modes/theme/theme";
 import askDescription from "../prompts/tools/ask.md" with { type: "text" };
 import { renderStatusLine } from "../tui";
-import type { ToolSession } from ".";
+import type {
+	AskAnswerRequest,
+	AskRemoteControl,
+	AskRemoteInteraction,
+	AskRemoteReceipt,
+	AskSettlement,
+	AskSettlementResult,
+	ToolSession,
+} from ".";
+import { GJC_ASK_TIMEOUT_CODE } from "./ask-answer-registry";
+
+import {
+	type AskParametersSchema,
+	type AskToolInput,
+	intentContract,
+	intentReview,
+	recoverRoundZeroIntentContract,
+	selectAskParameters,
+} from "./ask-contract";
+
+export { askSchema } from "./ask-contract";
+
 import { formatErrorMessage, formatMeta, formatTitle } from "./render-utils";
 import { ToolAbortError } from "./tool-errors";
 import { assertUltragoalAskAllowed } from "./ultragoal-ask-guard";
@@ -48,40 +79,6 @@ import { assertUltragoalAskAllowed } from "./ultragoal-ask-guard";
 // =============================================================================
 // Types
 // =============================================================================
-
-const OptionItem = z.object({
-	label: z.string().describe("display label"),
-});
-
-/** Optional structured deep-interview round metadata; when present the round is recorded automatically. */
-const DeepInterviewMeta = z.object({
-	round_id: z.string().describe("stable optional round identity").optional(),
-	round: z.number().int().nonnegative().describe("round number"),
-	component: z.string().min(1).describe("targeted topology component"),
-	dimension: z.string().min(1).describe("targeted clarity dimension"),
-	ambiguity: z.number().min(0).max(1).describe("ambiguity at ask time (0..1)"),
-});
-
-const WorkflowGateMeta = z.object({
-	stage: z.enum(["deep-interview", "ralplan", "ultragoal"]).describe("workflow gate stage"),
-	kind: z.enum(["question", "approval", "execution"]).describe("workflow gate kind"),
-});
-
-const QuestionItem = z.object({
-	id: z.string().describe("question id"),
-	question: z.string().describe("question text"),
-	options: z.array(OptionItem).describe("available options"),
-	multi: z.boolean().describe("allow multiple selections").optional(),
-	recommended: z.number().describe("recommended option index").optional(),
-	deepInterview: DeepInterviewMeta.describe("optional deep-interview round metadata").optional(),
-	workflowGate: WorkflowGateMeta.describe("optional workflow gate stage/kind override").optional(),
-});
-
-export const askSchema = z.object({
-	questions: z.array(QuestionItem).min(1).describe("questions to ask"),
-});
-
-export type AskToolInput = z.infer<typeof askSchema>;
 
 /** Result for a single question */
 export interface QuestionResult {
@@ -109,17 +106,34 @@ export interface AskToolDetails {
 // Constants
 // =============================================================================
 
-const OTHER_OPTION = "Other (type your own)";
-const ASK_CLARIFICATION_OPTION = "Ask about these choices";
-const RECOMMENDED_SUFFIX = " (Recommended)";
+export const OTHER_OPTION = "Other (type your own)";
+export const ASK_CLARIFICATION_OPTION = "Ask about these choices";
+export const RECOMMENDED_SUFFIX = " (Recommended)";
+const REMOTE_NAVIGATION_FORWARD = "\u0000ask-navigation-forward";
+const HEADLESS_CHECKBOX_CHECKED = "[x]";
+const HEADLESS_CHECKBOX_UNCHECKED = "[ ]";
 const DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS = Number.MAX_SAFE_INTEGER;
 const DEEP_INTERVIEW_RECORDER_AWAIT_TIMEOUT_MS = 250;
+export const MAX_EMPTY_CUSTOM_ATTEMPTS = 3;
+const EMPTY_CUSTOM_RETRY_MESSAGE = "Custom input cannot be empty. Enter text or cancel the ask.";
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
-async function awaitDeepInterviewRecorderPersistence(persistence: Promise<void>): Promise<void> {
+function nonEmptyCustomInput(value: string | undefined): string | undefined {
+	return value !== undefined && value.trim().length > 0 ? value : undefined;
+}
+
+function isAskTimeoutError(error: unknown): boolean {
+	return typeof error === "object" && error !== null && (error as { code?: unknown }).code === GJC_ASK_TIMEOUT_CODE;
+}
+
+async function awaitDeepInterviewRecorderPersistence(persistence: Promise<void>, required: boolean): Promise<void> {
+	if (required) {
+		await persistence;
+		return;
+	}
 	let timeout: ReturnType<typeof setTimeout> | undefined;
 	try {
 		await Promise.race([
@@ -133,13 +147,25 @@ async function awaitDeepInterviewRecorderPersistence(persistence: Promise<void>)
 		]);
 	} catch (error) {
 		logger.warn(`ask: deep-interview round recording failed: ${errorMessage(error)}`);
+		if (required) throw error;
 	} finally {
 		if (timeout) clearTimeout(timeout);
 	}
 }
 
 function getDoneOptionLabel(): string {
-	return `${theme.status.success} Done selecting`;
+	const success = theme?.status?.success;
+	return success ? `${success} Done selecting` : "Done selecting";
+}
+
+function validRecommendedIndex(recommended: number | undefined, optionCount: number): number | undefined {
+	return typeof recommended === "number" &&
+		Number.isFinite(recommended) &&
+		Number.isInteger(recommended) &&
+		recommended >= 0 &&
+		recommended < optionCount
+		? recommended
+		: undefined;
 }
 
 /** Add "(Recommended)" suffix to the option at the given index if not already present */
@@ -179,6 +205,79 @@ function numberOptionLabels(labels: string[]): string[] {
 	return labels.map(formatNumberedOptionLabel);
 }
 
+/** The only remote navigation control; labels are presentation, never protocol. */
+export function askRemoteControls(input: {
+	multi: boolean;
+	questionIndex: number;
+	questionCount: number;
+	selectedCount: number;
+	hasNonWhitespaceCustom: boolean;
+}): readonly AskRemoteControl[] {
+	if (!input.multi) return [];
+	const final = input.questionIndex === input.questionCount - 1;
+	return [
+		{
+			id: "navigation_forward",
+			kind: "navigation",
+			label: input.questionCount > 1 && !final ? "Next" : "Done",
+			enabled: input.questionCount > 1 || input.selectedCount > 0 || input.hasNonWhitespaceCustom,
+		},
+	];
+}
+
+/** Classify remote input without looking at option labels used for controls. */
+export function classifyAskRemoteInteraction(input: {
+	interaction: AskRemoteInteraction;
+	options: readonly string[];
+	controls: readonly AskRemoteControl[];
+	multi: boolean;
+	selectedCount: number;
+	customInput?: string;
+	clarification?: boolean;
+}): AskSettlement {
+	const interaction = input.interaction;
+	if (interaction.kind === "control") {
+		const control = input.controls.find(candidate => candidate.id === interaction.controlId);
+		if (!control?.enabled || !input.multi) return { kind: "invalid", reason: "invalid_control" };
+		return input.selectedCount > 0 || (input.customInput?.trim().length ?? 0) > 0
+			? { kind: "commit" }
+			: { kind: "resolve_without_commit", reason: "empty_navigation" };
+	}
+	if (input.clarification) {
+		return interaction.value.trim().length > 0
+			? { kind: "resolve_without_commit", reason: "clarification_submitted" }
+			: { kind: "invalid", reason: "empty_clarification" };
+	}
+	if (input.options.includes(interaction.value))
+		return input.multi ? { kind: "resolve_without_commit", reason: "toggle" } : { kind: "commit" };
+	return interaction.value.trim().length > 0 ? { kind: "commit" } : { kind: "invalid", reason: "empty_custom" };
+}
+
+/** A one-shot local receipt used to normalize legacy string answer sources. */
+export function legacyAskReceipt(value: string): {
+	source: "remote";
+	interaction: AskRemoteInteraction;
+	settle(settlement: AskSettlement): Promise<AskSettlementResult>;
+} {
+	let settled: Promise<AskSettlementResult> | undefined;
+	return {
+		interaction: { kind: "value", value },
+		source: "remote",
+		settle(settlement) {
+			if (!settled) {
+				settled = Promise.resolve(
+					settlement.kind === "commit"
+						? { kind: "committed", ack: { status: "failed", reason: "unsupported" } }
+						: settlement.kind === "invalid"
+							? { kind: "invalid_closed" }
+							: { kind: "resolved_without_commit" },
+				);
+			}
+			return settled;
+		},
+	};
+}
+
 // =============================================================================
 // Question Selection Logic
 // =============================================================================
@@ -206,6 +305,14 @@ interface AskSingleQuestionOptions {
 	scrollTitleRows?: number;
 	otherOptionLabel?: string;
 	clarificationOptionLabel?: string;
+	autoSelectOnTimeout?: boolean;
+	onRemoteState?: (state: {
+		interaction: "selector" | "custom_editor" | "clarification_editor";
+		selectedCount: number;
+		/** Currently selected option labels, so a remote transport can render the selection. */
+		selectedOptions: readonly string[];
+		hasNonWhitespaceCustom: boolean;
+	}) => void;
 }
 
 interface UIContext {
@@ -223,7 +330,7 @@ interface UIContext {
 			onLeft?: () => void;
 			onRight?: () => void;
 			helpText?: string;
-			customInput?: { optionLabel: string; onSubmit: (text: string) => void };
+			customInput?: { optionLabel: string; onSubmit: (text: string) => void; allowEmpty?: boolean };
 			clarificationInput?: { optionLabel: string; onSubmit: (text: string) => void; allowEmpty?: boolean };
 		},
 	): Promise<string | undefined>;
@@ -242,7 +349,15 @@ async function askSingleQuestion(
 	multi: boolean,
 	options: AskSingleQuestionOptions = {},
 ): Promise<SelectionResult> {
-	const { recommended, timeout, signal, initialSelection, navigation, scrollTitleRows } = options;
+	const {
+		recommended,
+		timeout,
+		signal,
+		initialSelection,
+		navigation,
+		scrollTitleRows,
+		autoSelectOnTimeout = true,
+	} = options;
 	const doneLabel = getDoneOptionLabel();
 	const otherOptionLabel = options.otherOptionLabel ?? OTHER_OPTION;
 	const clarificationOptionLabel = options.clarificationOptionLabel;
@@ -291,6 +406,7 @@ async function askSingleQuestion(
 			helpText,
 			customInput: {
 				optionLabel: otherOptionLabel,
+				allowEmpty: false,
 				onSubmit: (text: string) => {
 					inlineInput = text;
 				},
@@ -316,9 +432,22 @@ async function askSingleQuestion(
 				: undefined,
 		};
 		const startMs = Date.now();
-		const choice = signal
-			? await untilAborted(signal, () => ui.select(prompt, optionsToShow, dialogOptions))
-			: await ui.select(prompt, optionsToShow, dialogOptions);
+		let choice: string | undefined;
+		try {
+			choice = signal
+				? await untilAborted(signal, () => ui.select(prompt, optionsToShow, dialogOptions))
+				: await ui.select(prompt, optionsToShow, dialogOptions);
+		} catch (error) {
+			// A remote source signals its own timeout with the marked error; a
+			// genuine cancellation (even past the deadline) is not a timeout and
+			// must not auto-select.
+			if (!signal?.aborted && isAskTimeoutError(error)) {
+				timeoutTriggered = true;
+				choice = undefined;
+			} else {
+				throw error;
+			}
+		}
 		if (!timeoutTriggered && choice === undefined && typeof timeout === "number") {
 			timeoutTriggered = Date.now() - startMs >= timeout;
 		}
@@ -329,14 +458,29 @@ async function askSingleQuestion(
 	// resolve the "Other" label without invoking customInput.onSubmit).
 	const promptForCustomInput = async (): Promise<{ input: string | undefined }> => {
 		const dialogOptions = signal ? { signal } : undefined;
-		const showCustomInput = () => ui.editor("Enter your response:", undefined, dialogOptions, { promptStyle: true });
+		const showCustomInput = () => {
+			options.onRemoteState?.({
+				interaction: "custom_editor",
+				selectedCount: selectedOptions.length,
+				selectedOptions: [...selectedOptions],
+				hasNonWhitespaceCustom: (customInput?.trim().length ?? 0) > 0,
+			});
+			return ui.editor("Enter your response:", undefined, dialogOptions, { promptStyle: true });
+		};
 		const input = signal ? await untilAborted(signal, showCustomInput) : await showCustomInput();
 		return { input };
 	};
 	const promptForClarificationInput = async (): Promise<{ input: string | undefined }> => {
 		const dialogOptions = signal ? { signal } : undefined;
-		const showClarificationInput = () =>
-			ui.editor("Ask a clarification question:", undefined, dialogOptions, { promptStyle: true });
+		const showClarificationInput = () => {
+			options.onRemoteState?.({
+				interaction: "clarification_editor",
+				selectedCount: selectedOptions.length,
+				selectedOptions: [...selectedOptions],
+				hasNonWhitespaceCustom: false,
+			});
+			return ui.editor("Ask a clarification question:", undefined, dialogOptions, { promptStyle: true });
+		};
 		const input = signal ? await untilAborted(signal, showClarificationInput) : await showClarificationInput();
 		return { input: input !== undefined && input.trim() === "" ? undefined : input };
 	};
@@ -344,6 +488,8 @@ async function askSingleQuestion(
 	const promptWithProgress = navigation?.progressText ? `${question} (${navigation.progressText})` : question;
 	if (multi) {
 		const selected = new Set<string>(selectedOptions);
+		const checkedCheckbox = theme?.checkbox?.checked ?? HEADLESS_CHECKBOX_CHECKED;
+		const uncheckedCheckbox = theme?.checkbox?.unchecked ?? HEADLESS_CHECKBOX_UNCHECKED;
 		let cursorIndex = Math.min(Math.max(recommended ?? 0, 0), Math.max(optionLabels.length - 1, 0));
 		const firstSelected = selectedOptions[0];
 		if (firstSelected) {
@@ -354,7 +500,7 @@ async function askSingleQuestion(
 			const opts: string[] = [];
 
 			for (const opt of optionLabels) {
-				const checkbox = selected.has(opt) ? theme.checkbox.checked : theme.checkbox.unchecked;
+				const checkbox = selected.has(opt) ? checkedCheckbox : uncheckedCheckbox;
 				opts.push(`${checkbox} ${opt}`);
 			}
 
@@ -366,6 +512,12 @@ async function askSingleQuestion(
 				opts.push(clarificationOptionLabel);
 			}
 
+			options.onRemoteState?.({
+				interaction: "selector",
+				selectedCount: selected.size,
+				selectedOptions: [...selected],
+				hasNonWhitespaceCustom: (customInput?.trim().length ?? 0) > 0,
+			});
 			const prefix = selected.size > 0 ? `(${selected.size} selected) ` : "";
 			const {
 				choice,
@@ -385,6 +537,10 @@ async function askSingleQuestion(
 				}
 				return { selectedOptions: Array.from(selected), customInput, timedOut, cancelled: true };
 			}
+			if (choice === REMOTE_NAVIGATION_FORWARD) {
+				return { selectedOptions: Array.from(selected), customInput, timedOut, navigation: "forward" };
+			}
+
 			if (choice === doneLabel) break;
 
 			if (choice === otherOptionLabel) {
@@ -392,7 +548,9 @@ async function askSingleQuestion(
 					timedOut = true;
 					break;
 				}
-				const input = inlineInput !== undefined ? inlineInput : (await promptForCustomInput()).input;
+				const input = nonEmptyCustomInput(
+					inlineInput !== undefined ? inlineInput : (await promptForCustomInput()).input,
+				);
 				if (input === undefined) {
 					break;
 				}
@@ -417,13 +575,17 @@ async function askSingleQuestion(
 				cursorIndex = selectedIdx;
 			}
 
-			const checkedPrefix = `${theme.checkbox.checked} `;
-			const uncheckedPrefix = `${theme.checkbox.unchecked} `;
+			const checkedPrefix = `${checkedCheckbox} `;
+			const uncheckedPrefix = `${uncheckedCheckbox} `;
 			let opt: string | undefined;
 			if (choice.startsWith(checkedPrefix)) {
 				opt = choice.slice(checkedPrefix.length);
 			} else if (choice.startsWith(uncheckedPrefix)) {
 				opt = choice.slice(uncheckedPrefix.length);
+			} else if (optionLabels.includes(choice)) {
+				// A headless remote source (e.g. the ACP permission bridge) returns
+				// the raw label without checkbox prefixes.
+				opt = choice;
 			}
 			if (opt) {
 				if (selected.has(opt)) {
@@ -431,6 +593,10 @@ async function askSingleQuestion(
 				} else {
 					selected.add(opt);
 				}
+			}
+			if (!opt && choice.trim().length > 0) {
+				customInput = choice;
+				break;
 			}
 
 			if (selectTimedOut) {
@@ -458,6 +624,12 @@ async function askSingleQuestion(
 			initialIndex = Math.max(0, Math.min(initialIndex, maxIndex));
 		}
 
+		options.onRemoteState?.({
+			interaction: "selector",
+			selectedCount: selectedOptions.length,
+			selectedOptions: [...selectedOptions],
+			hasNonWhitespaceCustom: (customInput?.trim().length ?? 0) > 0,
+		});
 		const {
 			choice,
 			timedOut: selectTimedOut,
@@ -470,13 +642,18 @@ async function askSingleQuestion(
 		if (arrowNavigation) {
 			return { selectedOptions, customInput, timedOut, navigation: arrowNavigation };
 		}
+		if (choice === REMOTE_NAVIGATION_FORWARD) {
+			return { selectedOptions, customInput, timedOut, navigation: "forward" };
+		}
 		if (choice === undefined) {
 			if (!timedOut) {
 				return { selectedOptions, customInput, timedOut, cancelled: true };
 			}
 		} else if (choice === otherOptionLabel) {
 			if (!selectTimedOut) {
-				const input = inlineInput !== undefined ? inlineInput : (await promptForCustomInput()).input;
+				const input = nonEmptyCustomInput(
+					inlineInput !== undefined ? inlineInput : (await promptForCustomInput()).input,
+				);
 				if (input !== undefined) {
 					customInput = input;
 					selectedOptions = [];
@@ -506,12 +683,23 @@ async function askSingleQuestion(
 				selectedOptions = [];
 			}
 		}
+		if (timedOut && !autoSelectOnTimeout) {
+			return {
+				selectedOptions: [],
+				customInput: undefined,
+				timedOut,
+				...(navigation?.allowForward ? { navigation: "forward" as const } : {}),
+			};
+		}
 		if (navigation?.allowForward) {
 			return { selectedOptions, customInput, timedOut, navigation: "forward" };
 		}
 	}
 
-	if (timedOut && selectedOptions.length === 0 && customInput === undefined) {
+	if (timedOut && !autoSelectOnTimeout) {
+		return { selectedOptions: [], customInput: undefined, timedOut };
+	}
+	if (timedOut && selectedOptions.length === 0 && customInput === undefined && autoSelectOnTimeout) {
 		selectedOptions = getAutoSelectionOnTimeout(optionLabels, recommended);
 	}
 
@@ -545,21 +733,34 @@ type AskParams = AskToolInput;
  * Allows gathering user preferences, clarifying instructions, and getting decisions
  * on implementation choices as the agent works.
  */
-export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
+export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 	readonly name = "ask";
 	readonly label = "Ask";
 	readonly summary = "Ask the user a clarifying question";
 	readonly description: string;
-	readonly parameters = askSchema;
+	get parameters(): AskParametersSchema {
+		return selectAskParameters(this.session.getDeepInterviewAskStage?.());
+	}
+	readonly rawArgumentValidation = (arguments_: Record<string, unknown>): RawArgumentValidationResult =>
+		recoverRoundZeroIntentContract(arguments_, this.session.getDeepInterviewAskStage?.());
 	readonly strict = true;
+	/**
+	 * Display-only fields: question text and option labels render to the user
+	 * and carry no executable or persisted meaning, so `\uXXXX`-escaped
+	 * non-ASCII text inside them degrades to a warning instead of failing the
+	 * run (issue #4983). Ids, workflow-gate metadata, and deep-interview
+	 * records stay load-bearing and keep the fail-closed rejection.
+	 */
+	readonly displaySafeEscapedArgFields = ["questions.question", "questions.options.label"] as const;
 	readonly loadMode = "discoverable";
-
 	constructor(private readonly session: ToolSession) {
 		this.description = prompt.render(askDescription);
 	}
 
 	static createIf(session: ToolSession): AskTool | null {
-		return session.hasUI || session.getWorkflowGateEmitter?.() ? new AskTool(session) : null;
+		return session.hasUI || session.workflowGateEligible || session.getWorkflowGateEmitter?.()
+			? new AskTool(session)
+			: null;
 	}
 
 	/** Send terminal notification when ask tool is waiting for input */
@@ -580,7 +781,11 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		customInput: string | undefined,
 	): Promise<void> {
 		const meta = q.deepInterview;
+		if (customInput !== undefined && (meta || isDeepInterviewAskQuestion(q.question)))
+			assertDeepInterviewInputWithinLimit(customInput, MAX_USER_RESPONSE_LENGTH, "user_response");
 		if (!meta) return;
+		if (this.session.getDeepInterviewAskStage?.() === undefined) return;
+		if (q.workflowGate && (q.workflowGate.stage !== "deep-interview" || q.workflowGate.kind !== "question")) return;
 		const cwd = this.session.cwd;
 		const sessionId = this.session.getSessionId?.() ?? undefined;
 		const statePath = deepInterviewStatePath(cwd, sessionId);
@@ -598,11 +803,14 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 					ambiguity: meta.ambiguity,
 					selectedOptions,
 					customInput,
+					intent_contract: intentContract(meta),
+					intent_review: intentReview(meta),
 				},
 				{ sessionId },
 			).then(async () => {
 				await syncDeepInterviewRecorderHud(cwd, statePath, sessionId);
 			}),
+			intentContract(meta) !== undefined || intentReview(meta) !== undefined,
 		);
 	}
 
@@ -613,15 +821,50 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		_onUpdate?: AgentToolUpdateCallback<AskToolDetails>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<AskToolDetails>> {
-		await assertUltragoalAskAllowed(this.session.cwd, {
-			activeSkillState: this.session.getActiveSkillState?.(),
-			sessionId: this.session.getSessionId?.() ?? null,
-		});
+		await assertUltragoalAskAllowed(
+			this.session.cwd,
+			{
+				activeSkillState: this.session.getActiveSkillState?.(),
+				sessionId: this.session.getSessionId?.() ?? null,
+			},
+			this.session.getSessionAgentDir?.() ?? this.session.settings.getAgentDir(),
+		);
+		assertDeepInterviewStructuredResponseWithinLimit(params);
+		let activeRemoteReceipt: AskRemoteReceipt | undefined;
+		let activeRemoteRequest: AskAnswerRequest | undefined;
+		let remoteGeneration = 0;
+		type RemoteRaceResult = {
+			winner: "remote";
+			value: string;
+			receipt: AskRemoteReceipt;
+			settlement?: AskSettlement;
+		};
+		const ignoreRemoteAnswerFailure = (error: unknown): Promise<never> => {
+			if (!(error instanceof Error && error.name === "AbortError")) {
+				logger.warn("Ask remote answer source failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+			return new Promise<never>(() => {});
+		};
+		const settleActiveRemote = async (settlement: AskSettlement): Promise<void> => {
+			const receipt = activeRemoteReceipt;
+			activeRemoteReceipt = undefined;
+			if (receipt) await receipt.settle(settlement);
+		};
 		const gateEmitter = this.session.getWorkflowGateEmitter?.();
-		const canUseWorkflowGate = gateEmitter?.isUnattended() === true;
-
-		// Headless fallback: unattended workflow gates are the non-TUI answer path.
-		if (!canUseWorkflowGate && (!context?.hasUI || !context.ui)) {
+		// A durable workflow-gate emitter now exists for every session, and its
+		// supportsRemoteGateAnswers() is always true, so it can no longer signal
+		// "no local UI". The workflow gate is only the headless (non-TUI) answer
+		// path: when a real interactive UI is present, prefer it — otherwise
+		// attended TUI asks would route to emitGate() and hang forever waiting on
+		// a remote responder.
+		const hasInteractiveUi = context?.hasUI === true && !!context.ui;
+		const initialAnswerSource = this.session.getAskAnswerSource?.();
+		const canUseWorkflowGate =
+			!hasInteractiveUi && !initialAnswerSource && gateEmitter?.supportsRemoteGateAnswers() === true;
+		// Headless fallback: an SDK answer source or workflow gate is the non-TUI answer path.
+		if (!hasInteractiveUi && !initialAnswerSource && !canUseWorkflowGate) {
 			context?.abort();
 			throw new ToolAbortError("Ask tool requires interactive mode");
 		}
@@ -629,72 +872,223 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		const extensionUi = context?.ui;
 		const ui: UIContext = {
 			select: (prompt, options, dialogOptions) => {
-				if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
 				const source = this.session.getAskAnswerSource?.();
-				if (!source) return extensionUi.select(prompt, options, dialogOptions);
-				// Race the local UI against a remote answer (e.g. a Telegram reply via the
-				// notifications SDK) so asks can be answered without RPC mode. When the
-				// local UI wins, abort the remote source so it stops waiting and marks the
-				// action resolved-locally. First valid answer wins.
-				// Race the local UI against a remote answer (e.g. a Telegram reply via the
-				// notifications SDK) so asks can be answered without RPC mode. First valid
-				// answer wins; the loser is aborted so neither side is left hanging:
+				if (!source) {
+					if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
+					return extensionUi.select(prompt, options, dialogOptions);
+				}
+				// Race the local UI against a remote answer (e.g. an SDK reply) so asks
+				// can be answered without local UI interaction. The first valid answer
+				// wins; the loser is aborted so neither side is left hanging:
 				//   - local wins  -> abort the remote source (marks the action resolved-locally)
 				//   - remote wins -> abort the local selector so the TUI dialog actually closes
 				const remoteController = new AbortController();
 				const localController = new AbortController();
-				// Propagate an external cancel (the tool's signal) to the local selector too.
+				const generation = ++remoteGeneration;
+				// Propagate external cancellation to both race legs and invalidate late replies.
 				const toolSignal = dialogOptions?.signal;
-				if (toolSignal) {
-					if (toolSignal.aborted) localController.abort();
-					else toolSignal.addEventListener("abort", () => localController.abort(), { once: true });
-				}
-				const remote = source.awaitAnswer(prompt, options, remoteController.signal).then(answer => {
-					// undefined is not a valid remote answer (registration failed, or the local
-					// UI already won and aborted us): never settle the race, let the local
-					// selector decide instead of cancelling the ask.
-					if (answer === undefined) return new Promise<string | undefined>(() => {});
+				const abortRace = () => {
+					if (generation === remoteGeneration) remoteGeneration++;
 					localController.abort();
-					return answer;
-				});
-				const local = extensionUi
-					.select(prompt, options, { ...dialogOptions, signal: localController.signal })
-					.then(answer => {
-						remoteController.abort();
-						return answer;
+					remoteController.abort();
+				};
+				if (toolSignal) {
+					if (toolSignal.aborted) abortRace();
+					else toolSignal.addEventListener("abort", abortRace, { once: true });
+				}
+				const remote = (
+					source.awaitAnswerRequest
+						? source.awaitAnswerRequest(
+								activeRemoteRequest ?? { question: prompt, options, interaction: "selector", controls: [] },
+								remoteController.signal,
+							)
+						: source.awaitAnswer(prompt, options, remoteController.signal)
+				)
+					.then((answer): RemoteRaceResult | Promise<RemoteRaceResult> => {
+						if (answer === undefined) {
+							if (!extensionUi) throw new ToolAbortError("Ask was cancelled by the remote client");
+							return new Promise<never>(() => {});
+						}
+						const receipt = typeof answer === "string" ? legacyAskReceipt(answer) : answer;
+						if (generation !== remoteGeneration) {
+							return receipt
+								.settle({ kind: "resolve_without_commit", reason: "aborted" })
+								.then(() => new Promise<never>(() => {}));
+						}
+						const remoteValue = receipt.interaction.kind === "value" ? receipt.interaction.value : undefined;
+						const value = remoteValue ?? REMOTE_NAVIGATION_FORWARD;
+						const checkboxPrefixes = theme?.checkbox
+							? [theme.checkbox.checked, theme.checkbox.unchecked].filter(
+									(prefix): prefix is string => typeof prefix === "string",
+								)
+							: [HEADLESS_CHECKBOX_CHECKED, HEADLESS_CHECKBOX_UNCHECKED];
+						const selectedValue =
+							remoteValue === undefined
+								? value
+								: (options.find(
+										option =>
+											option === remoteValue ||
+											checkboxPrefixes.some(prefix => option === `${prefix} ${remoteValue}`),
+									) ?? value);
+						const checkboxPrefix = checkboxPrefixes.find(prefix => remoteValue?.startsWith(`${prefix} `));
+						const normalizedRemoteValue =
+							remoteValue !== undefined && checkboxPrefix
+								? remoteValue.slice(checkboxPrefix.length + 1)
+								: remoteValue;
+						const semanticRemoteValue = normalizedRemoteValue?.replace(/^\s*\d+[.)]\s+/, "");
+						const transitionReason =
+							semanticRemoteValue === OTHER_OPTION
+								? "other_transition"
+								: semanticRemoteValue === ASK_CLARIFICATION_OPTION
+									? "clarification_transition"
+									: undefined;
+						if (transitionReason) {
+							return {
+								winner: "remote" as const,
+								value: selectedValue,
+								receipt,
+								settlement: { kind: "resolve_without_commit", reason: transitionReason },
+							};
+						}
+						if (
+							remoteValue !== undefined &&
+							activeRemoteRequest?.interaction === "selector" &&
+							activeRemoteRequest.controls.length > 0 &&
+							activeRemoteRequest.options.includes(remoteValue)
+						) {
+							return {
+								winner: "remote" as const,
+								value: selectedValue,
+								receipt,
+								settlement: { kind: "resolve_without_commit", reason: "toggle" },
+							};
+						}
+						return { winner: "remote" as const, value: selectedValue, receipt };
+					})
+					.catch(error => {
+						if (!extensionUi) throw error;
+						return ignoreRemoteAnswerFailure(error);
 					});
+
+				const local = extensionUi
+					? extensionUi
+							.select(prompt, options, { ...dialogOptions, signal: localController.signal })
+							.then(answer => {
+								if (generation === remoteGeneration) remoteGeneration++;
+								remoteController.abort();
+								return { winner: "local" as const, value: answer };
+							})
+							.catch(error => {
+								if (generation === remoteGeneration) remoteGeneration++;
+								remoteController.abort();
+								throw error;
+							})
+					: new Promise<never>(() => {});
 				// The losing selector may reject when aborted after the race already settled;
 				// swallow that so it is not an unhandled rejection (the race result is unaffected).
 				void local.catch(() => undefined);
-				return Promise.race([local, remote]);
+				return Promise.race([local, remote])
+					.then(async result => {
+						if (result.winner === "remote") {
+							localController.abort();
+							if (result.settlement) await result.receipt.settle(result.settlement);
+							else activeRemoteReceipt = result.receipt;
+						} else {
+							void remote.then(remoteResult =>
+								remoteResult.receipt.settle({ kind: "resolve_without_commit", reason: "aborted" }),
+							);
+						}
+						return result.value;
+					})
+					.finally(() => toolSignal?.removeEventListener("abort", abortRace));
 			},
 			editor: (title, prefill, dialogOptions, editorOptions) => {
-				if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
 				const source = this.session.getAskAnswerSource?.();
-				if (!source) return extensionUi.editor(title, prefill, dialogOptions, editorOptions);
+				if (!source) {
+					if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
+					return extensionUi.editor(title, prefill, dialogOptions, editorOptions);
+				}
 				// Race the local editor against a remote free-text answer so "Other / type
 				// your own" custom input can be provided remotely (e.g. a typed Telegram
 				// reply) instead of blocking on the local-only editor. Mirrors `select`.
 				const remoteController = new AbortController();
 				const localController = new AbortController();
+				const generation = ++remoteGeneration;
 				const toolSignal = dialogOptions?.signal;
-				if (toolSignal) {
-					if (toolSignal.aborted) localController.abort();
-					else toolSignal.addEventListener("abort", () => localController.abort(), { once: true });
-				}
-				const remote = source.awaitAnswer(title, [], remoteController.signal).then(answer => {
-					if (answer === undefined) return new Promise<string | undefined>(() => {});
+				const abortRace = () => {
+					if (generation === remoteGeneration) remoteGeneration++;
 					localController.abort();
-					return answer;
-				});
-				const local = extensionUi
-					.editor(title, prefill, { ...(dialogOptions ?? {}), signal: localController.signal }, editorOptions)
-					.then(answer => {
-						remoteController.abort();
-						return answer;
+					remoteController.abort();
+				};
+				if (toolSignal) {
+					if (toolSignal.aborted) abortRace();
+					else toolSignal.addEventListener("abort", abortRace, { once: true });
+				}
+				const remote = (
+					source.awaitAnswerRequest
+						? source.awaitAnswerRequest(
+								activeRemoteRequest ?? {
+									question: title,
+									options: [],
+									interaction: "custom_editor",
+									controls: [],
+								},
+								remoteController.signal,
+							)
+						: source.awaitAnswer(title, [], remoteController.signal)
+				)
+					.then((answer): RemoteRaceResult | Promise<RemoteRaceResult> => {
+						if (answer === undefined) {
+							if (!extensionUi) throw new ToolAbortError("Ask was cancelled by the remote client");
+							return new Promise<never>(() => {});
+						}
+						const receipt = typeof answer === "string" ? legacyAskReceipt(answer) : answer;
+						if (generation !== remoteGeneration) {
+							return receipt
+								.settle({ kind: "resolve_without_commit", reason: "aborted" })
+								.then(() => new Promise<never>(() => {}));
+						}
+						const value =
+							receipt.interaction.kind === "control" ? REMOTE_NAVIGATION_FORWARD : receipt.interaction.value;
+						return { winner: "remote" as const, value, receipt };
+					})
+					.catch(error => {
+						if (!extensionUi) throw error;
+						return ignoreRemoteAnswerFailure(error);
 					});
+				const local = extensionUi
+					? extensionUi
+							.editor(
+								title,
+								prefill,
+								{ ...(dialogOptions ?? {}), signal: localController.signal },
+								editorOptions,
+							)
+							.then(answer => {
+								if (generation === remoteGeneration) remoteGeneration++;
+								remoteController.abort();
+								return { winner: "local" as const, value: answer };
+							})
+							.catch(error => {
+								if (generation === remoteGeneration) remoteGeneration++;
+								remoteController.abort();
+								throw error;
+							})
+					: new Promise<never>(() => {});
 				void local.catch(() => undefined);
-				return Promise.race([local, remote]);
+				return Promise.race([local, remote])
+					.then(result => {
+						if (result.winner === "remote") {
+							activeRemoteReceipt = result.receipt;
+							localController.abort();
+						} else {
+							void remote.then(remoteResult =>
+								remoteResult.receipt.settle({ kind: "resolve_without_commit", reason: "aborted" }),
+							);
+						}
+						return result.value;
+					})
+					.finally(() => toolSignal?.removeEventListener("abort", abortRace));
 			},
 		};
 
@@ -717,13 +1111,19 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 
 		const askQuestion = async (
 			q: AskParams["questions"][number],
-			options?: { previous?: QuestionResult; navigation?: NavigationControls },
+			options?: {
+				previous?: QuestionResult;
+				navigation?: NavigationControls;
+				emptyCustomAttempt?: number;
+			},
 		) => {
 			const rawOptionLabels = q.options.map(o => o.label);
-			// Unattended (#316/#323/G011): route the question through the workflow-gate
-			// emitter instead of the interactive UI; the external agent answers over RPC.
+			const questionIndex = params.questions.indexOf(q);
+			const emptyCustomAttempt = options?.emptyCustomAttempt ?? 0;
+			// Route headless asks through the SDK workflow-gate emitter; a connected
+			// SDK responder supplies the durable answer instead of an interactive UI.
 			if (gateEmitter && canUseWorkflowGate) {
-				const gateQuestion = {
+				const gateQuestion: AskGateQuestion = {
 					id: q.id,
 					question: q.question,
 					options: q.options,
@@ -731,6 +1131,8 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 					recommended: q.recommended,
 					deepInterview: q.deepInterview,
 					workflowGate: q.workflowGate,
+					allowEmpty: q.multi === true && params.questions.length > 1,
+					navigationLabel: questionIndex === params.questions.length - 1 ? "Done" : "Next",
 				};
 				const answer = await gateEmitter.emitGate(questionToGate(gateQuestion));
 				const decoded = gateAnswerToResult(gateQuestion, answer);
@@ -747,12 +1149,24 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 			try {
 				const deepInterviewPrompt = formatDeepInterviewSelectorPrompt(q.question);
 				const isDeepInterviewQuestion = deepInterviewPrompt !== null || q.deepInterview !== undefined;
-				const displayQuestion = deepInterviewPrompt ?? q.question;
+				const baseDisplayQuestion = deepInterviewPrompt ?? q.question;
+				const displayQuestion =
+					emptyCustomAttempt > 0
+						? `${baseDisplayQuestion}\n\n${EMPTY_CUSTOM_RETRY_MESSAGE} (attempt ${emptyCustomAttempt + 1} of ${MAX_EMPTY_CUSTOM_ATTEMPTS})`
+						: baseDisplayQuestion;
 				const shouldNumberOptions = isDeepInterviewQuestion || isDeepInterviewAskQuestion(q.question);
 				const optionLabels = shouldNumberOptions ? numberOptionLabels(rawOptionLabels) : rawOptionLabels;
 				const clarificationOptionLabel = shouldNumberOptions
 					? formatNumberedOptionLabel(ASK_CLARIFICATION_OPTION, optionLabels.length + 1)
 					: undefined;
+				const otherOptionLabel = shouldNumberOptions
+					? formatNumberedOptionLabel(OTHER_OPTION, optionLabels.length)
+					: OTHER_OPTION;
+				const remoteSelectorOptions = [
+					...optionLabels,
+					otherOptionLabel,
+					...(clarificationOptionLabel ? [clarificationOptionLabel] : []),
+				];
 				const initialSelection =
 					shouldNumberOptions && options?.previous
 						? {
@@ -763,6 +1177,25 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 								}),
 							}
 						: options?.previous;
+				const recommendedIndex = validRecommendedIndex(q.recommended, rawOptionLabels.length);
+				activeRemoteRequest = {
+					question: displayQuestion,
+					options: remoteSelectorOptions,
+					interaction: "selector",
+					...(recommendedIndex === undefined ? {} : { recommendedIndex }),
+					...(timeout === undefined || timeout === null ? {} : { timeoutMs: timeout }),
+					...(clarificationOptionLabel ? { transitionCount: 2 } : { transitionCount: 1 }),
+					multi: q.multi === true,
+					selectedOptions: [...(initialSelection?.selectedOptions ?? [])],
+					controls: askRemoteControls({
+						multi: q.multi === true,
+						questionIndex,
+						questionCount: params.questions.length,
+						selectedCount: initialSelection?.selectedOptions.length ?? 0,
+						hasNonWhitespaceCustom: (initialSelection?.customInput?.trim().length ?? 0) > 0,
+					}),
+				};
+
 				const {
 					selectedOptions: displaySelectedOptions,
 					customInput,
@@ -776,11 +1209,43 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 					signal,
 					initialSelection,
 					navigation: options?.navigation,
-					scrollTitleRows: isDeepInterviewQuestion ? DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS : undefined,
-					otherOptionLabel: shouldNumberOptions
-						? formatNumberedOptionLabel(OTHER_OPTION, optionLabels.length)
-						: undefined,
+					scrollTitleRows: DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS,
+					otherOptionLabel,
+					autoSelectOnTimeout:
+						!intentContract(q.deepInterview) &&
+						!intentReview(q.deepInterview) &&
+						(q.workflowGate === undefined || q.workflowGate.kind === "question"),
 					clarificationOptionLabel,
+					onRemoteState: state => {
+						activeRemoteRequest = {
+							question: displayQuestion,
+							options: state.interaction === "selector" ? remoteSelectorOptions : [],
+							interaction: state.interaction,
+							...(state.interaction === "selector" && recommendedIndex !== undefined
+								? { recommendedIndex }
+								: {}),
+							...(state.interaction === "selector" && timeout !== undefined && timeout !== null
+								? { timeoutMs: timeout }
+								: {}),
+							...(state.interaction === "selector"
+								? clarificationOptionLabel
+									? { transitionCount: 2 }
+									: { transitionCount: 1 }
+								: {}),
+							multi: q.multi === true,
+							selectedOptions: [...state.selectedOptions],
+							controls:
+								state.interaction === "selector"
+									? askRemoteControls({
+											multi: q.multi === true,
+											questionIndex,
+											questionCount: params.questions.length,
+											selectedCount: state.selectedCount,
+											hasNonWhitespaceCustom: state.hasNonWhitespaceCustom,
+										})
+									: [],
+						};
+					},
 				});
 				const selectedOptions = shouldNumberOptions
 					? displaySelectedOptions.map(selected => {
@@ -788,6 +1253,52 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 							return displayIndex >= 0 ? (rawOptionLabels[displayIndex] ?? selected) : selected;
 						})
 					: displaySelectedOptions;
+				if ((isDeepInterviewQuestion || isDeepInterviewAskQuestion(q.question)) && customInput !== undefined)
+					assertDeepInterviewInputWithinLimit(customInput, MAX_USER_RESPONSE_LENGTH, "user_response");
+				if (activeRemoteReceipt) {
+					const settlement: AskSettlement =
+						clarificationQuestion !== undefined
+							? { kind: "resolve_without_commit", reason: "clarification_submitted" }
+							: customInput !== undefined && customInput.trim().length === 0
+								? { kind: "invalid", reason: "empty_custom" }
+								: cancelled
+									? { kind: "resolve_without_commit", reason: "cancelled" }
+									: timedOut
+										? { kind: "resolve_without_commit", reason: "timed_out" }
+										: navigation === "back"
+											? { kind: "resolve_without_commit", reason: "back_navigation" }
+											: navigation === "forward" &&
+													selectedOptions.length === 0 &&
+													(customInput === undefined || customInput.trim().length === 0)
+												? { kind: "resolve_without_commit", reason: "empty_navigation" }
+												: selectedOptions.length > 0 || (customInput?.trim().length ?? 0) > 0
+													? { kind: "commit" }
+													: { kind: "resolve_without_commit", reason: "cancelled" };
+					await settleActiveRemote(settlement);
+					activeRemoteRequest = undefined;
+					if (settlement.kind === "invalid") {
+						if (emptyCustomAttempt + 1 >= MAX_EMPTY_CUSTOM_ATTEMPTS) {
+							return {
+								optionLabels: rawOptionLabels,
+								selectedOptions: [] as string[],
+								customInput: undefined,
+								clarificationQuestion: undefined,
+								navigation: undefined,
+								cancelled: true,
+								timedOut: false,
+							};
+						}
+						// A remote source may resolve synchronously. Yield to a timer queue
+						// between retries so repeated invalid answers cannot starve the
+						// event loop indefinitely.
+						await Bun.sleep(1);
+						return askQuestion(q, {
+							...options,
+							emptyCustomAttempt: emptyCustomAttempt + 1,
+						});
+					}
+				}
+				activeRemoteRequest = undefined;
 				return {
 					optionLabels: rawOptionLabels,
 					selectedOptions,
@@ -798,6 +1309,15 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 					timedOut,
 				};
 			} catch (error) {
+				await settleActiveRemote(
+					error instanceof Error && error.message.includes("exceeds max length")
+						? { kind: "invalid", reason: "invalid_structured_answer" }
+						: {
+								kind: "resolve_without_commit",
+								reason: error instanceof Error && error.name === "AbortError" ? "aborted" : "exception",
+							},
+				);
+				activeRemoteRequest = undefined;
 				if (error instanceof Error && error.name === "AbortError") {
 					throw new ToolAbortError("Ask input was cancelled");
 				}
@@ -818,7 +1338,10 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 				context?.abort();
 				throw new ToolAbortError("Ask tool was cancelled by the user");
 			}
-			if (clarificationQuestion === undefined) {
+			if (
+				clarificationQuestion === undefined &&
+				!(timedOut && (intentContract(q.deepInterview) || intentReview(q.deepInterview)))
+			) {
 				await this.#recordDeepInterviewRound(q, selectedOptions, customInput);
 			}
 			const details: AskToolDetails = {
@@ -896,7 +1419,10 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 				clarificationQuestion,
 			};
 
-			if (clarificationQuestion === undefined) {
+			if (
+				clarificationQuestion === undefined &&
+				!(timedOut && (intentContract(q.deepInterview) || intentReview(q.deepInterview)))
+			) {
 				await this.#recordDeepInterviewRound(q, selectedOptions, customInput);
 			}
 

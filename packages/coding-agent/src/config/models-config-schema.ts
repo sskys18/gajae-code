@@ -1,4 +1,5 @@
 import * as z from "zod/v4";
+import { stringOrNonEmptyArray } from "./model-selector-value";
 
 const OpenRouterRoutingSchema = z.object({
 	only: z.array(z.string()).optional(),
@@ -19,10 +20,12 @@ const ReasoningEffortMapSchema = z.object({
 	max: z.string().optional(),
 });
 
-export const OpenAICompatSchema = z.object({
+export const ModelCompatSchema = z.object({
 	supportsStore: z.boolean().optional(),
 	supportsDeveloperRole: z.boolean().optional(),
 	sendSessionHeaders: z.boolean().optional(),
+	supportsResponsesSessionAffinity: z.boolean().optional(),
+	supportsServiceTier: z.boolean().optional(),
 	supportsMultipleSystemMessages: z.boolean().optional(),
 	supportsReasoningEffort: z.boolean().optional(),
 	reasoningEffortMap: ReasoningEffortMapSchema.optional(),
@@ -47,9 +50,23 @@ export const OpenAICompatSchema = z.object({
 	extraBody: z.record(z.string(), z.unknown()).optional(),
 	supportsStrictMode: z.boolean().optional(),
 	toolStrictMode: z.enum(["all_strict", "none"]).optional(),
+	supportsLongCacheRetention: z.boolean().optional(),
+	promptCacheMode: z.enum(["none", "explicit", "automatic"]).optional(),
 });
 
-const EffortSchema = z.enum(["minimal", "low", "medium", "high", "xhigh", "max"]);
+// Backward-compatible export for callers that imported the original schema name.
+export const OpenAICompatSchema = ModelCompatSchema;
+
+export const GJC_MODEL_EFFORT_IDS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export const GJC_MODEL_ASSIGNMENT_TARGET_IDS = [
+	"default",
+	"executor",
+	"architect",
+	"planner",
+	"critic",
+	"image",
+] as const;
+export const EffortSchema = z.enum(GJC_MODEL_EFFORT_IDS);
 const CacheRetentionSchema = z.enum(["none", "short", "long"]);
 
 const ThinkingControlModeSchema = z.enum([
@@ -77,38 +94,29 @@ const RequestTransformSchema = z
 	})
 	.strict();
 
-const ModelBindingsSchema = z.object({
-	modelRoles: z.record(z.string(), z.string().min(1)).optional(),
-	agentModelOverrides: z.record(z.string(), z.string().min(1)).optional(),
-});
-export const ProfileRoleSchema = z.enum(["default", "executor", "architect", "planner", "critic"]);
+const PermissiveModelSelectorSchema = z.string().trim().min(1);
 
-function isValidProfileModelSelector(value: string): boolean {
-	if (value.includes(",")) return false;
-	const slashIdx = value.indexOf("/");
-	if (slashIdx <= 0 || slashIdx === value.length - 1) return false;
-	const provider = value.slice(0, slashIdx);
-	const modelId = value.slice(slashIdx + 1);
-	if (!provider || !modelId) return false;
-	const parts = modelId.split(":");
-	if (parts.length > 2) return false;
-	const [base, suffix] = parts;
-	if (!base) return false;
-	return suffix === undefined || ["minimal", "low", "medium", "high", "xhigh", "max"].includes(suffix);
-}
+export const ModelBindingsSchema = z.object({
+	modelRoles: z.record(z.string(), stringOrNonEmptyArray(PermissiveModelSelectorSchema)).optional(),
+	agentModelOverrides: z.record(z.string(), stringOrNonEmptyArray(PermissiveModelSelectorSchema)).optional(),
+});
+
+export const ProfileRoleSchema = z.enum(GJC_MODEL_ASSIGNMENT_TARGET_IDS);
+export const ProfileModelSelectorPattern = "^(?:[^,/]+/[^,]*[^,:]|[^/,]*[^/,:])$";
 
 export const ProfileModelSelectorSchema = z
 	.string()
+	.trim()
 	.min(1)
-	.refine(value => isValidProfileModelSelector(value), {
-		message: "Expected provider/modelId with optional :effort suffix",
-	});
-
-export const ProfileModelMappingSchema = z.partialRecord(ProfileRoleSchema, ProfileModelSelectorSchema);
+	.regex(new RegExp(ProfileModelSelectorPattern), "Expected modelId or provider/modelId with optional :effort suffix");
+export const ProfileModelMappingSchema = z.partialRecord(
+	ProfileRoleSchema,
+	stringOrNonEmptyArray(ProfileModelSelectorSchema),
+);
 
 export const ProfileDefinitionSchema = z
 	.object({
-		required_providers: z.array(z.string().min(1)).min(1),
+		required_providers: z.array(z.string().min(1)),
 		display_name: z.string().min(1).optional(),
 		model_mapping: ProfileModelMappingSchema,
 	})
@@ -150,9 +158,9 @@ const ModelDefinitionSchema = z
 			.optional(),
 		premiumMultiplier: z.number().optional(),
 		contextWindow: z.number().optional(),
-		maxTokens: z.number().optional(),
+		maxTokens: z.number().int().finite().positive().max(Number.MAX_SAFE_INTEGER).optional(),
 		headers: z.record(z.string(), z.string()).optional(),
-		compat: OpenAICompatSchema.optional(),
+		compat: ModelCompatSchema.optional(),
 		contextPromotionTarget: z.string().min(1).optional(),
 		wireModelId: z.string().min(1).optional(),
 		requestTransform: RequestTransformSchema.optional(),
@@ -177,9 +185,9 @@ export const ModelOverrideSchema = z
 			.optional(),
 		premiumMultiplier: z.number().optional(),
 		contextWindow: z.number().optional(),
-		maxTokens: z.number().optional(),
+		maxTokens: z.number().int().finite().positive().max(Number.MAX_SAFE_INTEGER).optional(),
 		headers: z.record(z.string(), z.string()).optional(),
-		compat: OpenAICompatSchema.optional(),
+		compat: ModelCompatSchema.optional(),
 		contextPromotionTarget: z.string().min(1).optional(),
 		wireModelId: z.string().min(1).optional(),
 		requestTransform: RequestTransformSchema.optional(),
@@ -190,7 +198,9 @@ export const ModelOverrideSchema = z
 export type ModelOverride = z.infer<typeof ModelOverrideSchema>;
 
 export const ProviderDiscoverySchema = z.object({
-	type: z.enum(["ollama", "llama.cpp", "lm-studio", "openai-models-list"]),
+	type: z.enum(["ollama", "llama.cpp", "lm-studio", "omlx", "vllm", "sglang", "openai-models-list", "models-dev"]),
+	apiByModelPrefix: z.record(z.string().min(1), z.enum(["openai-completions", "anthropic-messages"])).optional(),
+	modelsDevProvider: z.string().min(1).optional(),
 });
 
 const LocalOpenAICompatSchema = z
@@ -227,7 +237,7 @@ const ProviderConfigSchema = z
 			])
 			.optional(),
 		headers: z.record(z.string(), z.string()).optional(),
-		compat: OpenAICompatSchema.optional(),
+		compat: ModelCompatSchema.optional(),
 		webSearch: z.enum(["on", "off", "auto"]).optional(),
 		authHeader: z.boolean().optional(),
 		auth: ProviderAuthSchema.optional(),

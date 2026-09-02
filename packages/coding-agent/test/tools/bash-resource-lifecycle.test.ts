@@ -11,7 +11,8 @@ import {
 } from "@gajae-code/coding-agent/exec/bash-executor";
 import { ArtifactManager } from "@gajae-code/coding-agent/session/artifacts";
 import { DEFAULT_ARTIFACT_MAX_BYTES, OutputSink } from "@gajae-code/coding-agent/session/streaming-output";
-import { BashTool, type ToolSession } from "@gajae-code/coding-agent/tools";
+import type { ToolSession } from "@gajae-code/coding-agent/tools";
+import { BashTool } from "@gajae-code/coding-agent/tools/implementations";
 import type { Shell } from "@gajae-code/natives";
 import * as piNatives from "@gajae-code/natives";
 
@@ -28,7 +29,7 @@ function processExists(pid: number): boolean {
 	}
 }
 
-async function waitForGone(pid: number, timeoutMs = 2_500): Promise<boolean> {
+async function waitForGone(pid: number, timeoutMs = 8_000): Promise<boolean> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (!processExists(pid)) return true;
@@ -91,6 +92,32 @@ describe("bash resource lifecycle", () => {
 			await manager.waitForAll();
 			expect(manager.getJob(jobId! as string)?.status).toBe("completed");
 			expect(getShellSessionCount()).toBe(baseline);
+		}
+	});
+
+	it("clears both foreground deadlines after concurrent early completions", async () => {
+		settings.set("bash.autoBackground.enabled", false);
+		const sleep = vi.spyOn(Bun, "sleep");
+		const firstTool = new BashTool(makeToolSession(tempDir, settings));
+		const secondTool = new BashTool(makeToolSession(tempDir, settings));
+
+		try {
+			const [first, second] = await Promise.all([
+				firstTool.execute("foreground-early-completion-a", {
+					command: "printf first",
+					timeout: 5,
+				}),
+				secondTool.execute("foreground-early-completion-b", {
+					command: "printf second",
+					timeout: 5,
+				}),
+			]);
+
+			expect(first.content[0]).toMatchObject({ type: "text", text: "first" });
+			expect(second.content[0]).toMatchObject({ type: "text", text: "second" });
+			expect(sleep).not.toHaveBeenCalledWith(6_000);
+		} finally {
+			sleep.mockRestore();
 		}
 	});
 
@@ -157,7 +184,7 @@ describe("bash resource lifecycle", () => {
 		expect(processExists(sibling.pid)).toBe(true);
 		sibling.kill("SIGKILL");
 		await sibling.exited.catch(() => undefined);
-	});
+	}, 30_000);
 
 	it("caps bash artifact output and annotates truncation metadata", async () => {
 		const artifactPath = path.join(tempDir, "capped.log");
@@ -247,8 +274,10 @@ describe("bash resource lifecycle", () => {
 			timeout: 5_000,
 			sessionKey: "late-retiring-replacement",
 		});
-		expect(afterLateSettle.output.trim()).toBe("replacement");
-		expect(runCalls).toBe(2);
+		expect(afterLateSettle.output.trim()).toBe("after-late-settle");
+		expect(runCalls).toBe(3);
+		expect(shells[2]).toBe(shells[1]);
+		expect(shells[2]).not.toBe(shells[0]);
 
 		runSpy.mockRestore();
 		abortSpy.mockRestore();

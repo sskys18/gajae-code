@@ -8,6 +8,7 @@ import { shortenPath } from "../../../tools/render-utils";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../../../utils/session-color";
 import { sanitizeStatusText } from "../../shared";
 import { getContextUsageLevel, getContextUsageThemeColor } from "./context-thresholds";
+import { shortenModelId } from "./model-name";
 import type { RenderedSegment, SegmentContext, StatusLineSegment, StatusLineSegmentId } from "./types";
 
 export type { SegmentContext } from "./types";
@@ -21,7 +22,7 @@ function withIcon(icon: string, text: string): string {
 }
 
 function stripDisplayRoot(pwd: string): string {
-	for (const root of ["/work", path.join(os.homedir(), "Projects")]) {
+	for (const root of displayRoots()) {
 		const relative = relativePathWithinRoot(root, pwd);
 		if (relative) return relative;
 	}
@@ -32,7 +33,15 @@ function normalizePremiumRequests(value: number): number {
 	return Math.round((value + Number.EPSILON) * 100) / 100;
 }
 
-const SCRATCH_ROOTS: readonly string[] = (() => {
+// Display roots take precedence over scratch classification: ~/Projects and
+// /work are deliberate workspaces, never scratch, even when the home directory
+// itself sits under a temp/scratch root (CI harnesses and containers redirect
+// HOME beneath the OS temp dir). Resolved at render time so a preload-rewritten
+// HOME is honored, matching scratchRoots().
+function displayRoots(): readonly string[] {
+	return ["/work", path.join(os.homedir(), "Projects")];
+}
+function scratchRoots(): readonly string[] {
 	const roots = new Set<string>([os.tmpdir(), path.join(os.homedir(), "tmp")]);
 	if (process.platform === "win32") {
 		const { TEMP, TMP, SystemRoot } = process.env;
@@ -48,10 +57,17 @@ const SCRATCH_ROOTS: readonly string[] = (() => {
 		}
 	}
 	return [...roots];
-})();
+}
 
 function classifyProjectDir(pwd: string): { scratch: boolean; relative: string | null } {
-	for (const root of SCRATCH_ROOTS) {
+	// A deliberate display root wins over scratch ancestry: ~/Projects is a
+	// workspace even when HOME itself sits under the OS temp dir (CI and test
+	// harnesses redirect HOME beneath the scratch root). This is more precise
+	// than exempting all of HOME: ~/tmp stays scratch (it is in scratchRoots).
+	for (const root of displayRoots()) {
+		if (pathIsWithin(root, pwd)) return { scratch: false, relative: null };
+	}
+	for (const root of scratchRoots()) {
 		if (pathIsWithin(root, pwd)) {
 			return { scratch: true, relative: relativePathWithinRoot(root, pwd) };
 		}
@@ -84,10 +100,10 @@ const modelSegment: StatusLineSegment = {
 		const state = ctx.session.state;
 		const opts = ctx.options.model ?? {};
 
-		let modelName = state.model?.name || state.model?.id || "no-model";
-		if (modelName.startsWith("Claude ")) {
-			modelName = modelName.slice(7);
-		}
+		// Shortest recognizable id-derived form (`sonnet-4.5`), the same label the
+		// footer renders, so a narrow rail never spends cells on a provider prefix
+		// or a snapshot date.
+		const modelName = shortenModelId(state.model?.id ?? state.model?.name);
 
 		let content = withIcon(theme.icon.model, modelName);
 
@@ -105,6 +121,24 @@ const modelSegment: StatusLineSegment = {
 				}
 			}
 		}
+		// Show the context-window token percentage right next to the model /
+		// reasoning effort (rather than as a trailing segment) so it stays
+		// grouped with the model it describes. Disable per-preset with
+		// `segmentOptions.model.showContextPercent: false`. Suppressed
+		// automatically when a standalone context_pct segment is also in the
+		// active layout, so the value is never shown twice.
+		if (opts.showContextPercent !== false && ctx.contextPctSegmentActive !== true) {
+			const pct = ctx.contextPercent;
+			const window = ctx.contextWindow;
+			if (window > 0) {
+				if (typeof pct === "number" && Number.isFinite(pct)) {
+					const color = getContextUsageThemeColor(getContextUsageLevel(pct, window));
+					content += `${theme.sep.dot}${theme.fg(color, `${pct.toFixed(1)}%`)}`;
+				} else {
+					content += `${theme.sep.dot}${theme.fg("statusLineContext", "?")}`;
+				}
+			}
+		}
 
 		return { content: theme.fg("statusLineModel", content), visible: true };
 	},
@@ -115,9 +149,16 @@ function formatGoalUsage(current: number): string {
 	return used;
 }
 
-function renderGoalMode(ctx: SegmentContext, mode: { enabled: boolean; paused: boolean }): RenderedSegment {
-	const goal = ctx.session.getGoalModeState()?.goal;
-	const status = goal?.status ?? (mode.paused ? "paused" : "active");
+/**
+ * Icon and color for the active goal indicator, or null when goal mode is not
+ * showing. Shared with the narrow-width priority row so the compact glyph keeps
+ * the same status color as the full label.
+ */
+export function goalStatusDisplay(ctx: SegmentContext): { icon: string; color: ThemeColor } | null {
+	const mode = ctx.goalMode;
+	if (!mode || (!mode.enabled && !mode.paused)) return null;
+
+	const status = ctx.session.getGoalModeState?.()?.goal?.status ?? (mode.paused ? "paused" : "active");
 
 	let icon: string = theme.icon.goal;
 	let color: ThemeColor = "accent";
@@ -137,13 +178,19 @@ function renderGoalMode(ctx: SegmentContext, mode: { enabled: boolean; paused: b
 		default:
 			break;
 	}
+	return { icon, color };
+}
 
-	const parts: string[] = [withIcon(icon, "Goal")];
+function renderGoalMode(ctx: SegmentContext, mode: { enabled: boolean; paused: boolean }): RenderedSegment {
+	const display = goalStatusDisplay(ctx) ?? { icon: theme.icon.goal, color: "accent" as ThemeColor };
+	const goal = ctx.session.getGoalModeState?.()?.goal;
+
+	const parts: string[] = [withIcon(display.icon, "Goal")];
 	const showUsage = ctx.session.settings.get("goal.statusInFooter") === true;
 	if (showUsage && goal) {
 		parts.push(formatGoalUsage(goal.tokensUsed));
 	}
-	return { content: theme.fg(color, parts.join(" ")), visible: true };
+	return { content: theme.fg(display.color, parts.join(" ")), visible: mode.enabled || mode.paused };
 }
 
 const modeSegment: StatusLineSegment = {
@@ -274,7 +321,9 @@ const jobsSegment: StatusLineSegment = {
 	id: "jobs",
 	render(ctx) {
 		const { jobs } = ctx;
-		const visible = jobs.activeMonitorCount > 0 || jobs.activeCronCount > 0 || jobs.worstState === "failed";
+		const foldedJobCount = jobs.foldedJobs?.filter(job => job.backgrounded).length ?? 0;
+		const visible =
+			jobs.activeMonitorCount > 0 || jobs.activeCronCount > 0 || foldedJobCount > 0 || jobs.worstState === "failed";
 		if (!visible) {
 			return { content: "", visible: false };
 		}
@@ -284,6 +333,9 @@ const jobsSegment: StatusLineSegment = {
 		}
 		if (jobs.activeCronCount > 0) {
 			parts.push(withIcon(theme.icon.time, `${jobs.activeCronCount}`));
+		}
+		if (foldedJobCount > 0) {
+			parts.push(withIcon(theme.icon.pause || theme.icon.agents, `${foldedJobCount} folded`));
 		}
 		if (parts.length === 0) {
 			// Nothing active but a failure is unacknowledged — keep a drill-in marker.
@@ -368,11 +420,14 @@ const contextPctSegment: StatusLineSegment = {
 	render(ctx) {
 		const pct = ctx.contextPercent;
 		const window = ctx.contextWindow;
+		const knownPct = typeof pct === "number" && Number.isFinite(pct) ? pct : undefined;
 
 		const autoIcon = ctx.autoCompactEnabled && theme.icon.auto ? ` ${theme.icon.auto}` : "";
-		const text = `${pct.toFixed(1)}%/${formatNumber(window)}${autoIcon}`;
-
-		const color = getContextUsageThemeColor(getContextUsageLevel(pct, window));
+		const text = `${knownPct === undefined ? "?" : `${knownPct.toFixed(1)}%`}/${formatNumber(window)}${autoIcon}`;
+		const color =
+			knownPct === undefined
+				? "statusLineContext"
+				: getContextUsageThemeColor(getContextUsageLevel(knownPct, window));
 		const content = withIcon(theme.icon.context, theme.fg(color, text));
 
 		return { content, visible: true };

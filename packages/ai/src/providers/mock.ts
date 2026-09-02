@@ -56,6 +56,7 @@ import type {
 	Usage,
 } from "../types";
 import { AssistantMessageEventStream } from "../utils/event-stream";
+import { attachUnicodeEscapeEvidence, type UnicodeEscapeEvidence } from "../utils/json-parse";
 
 /** The API string this provider serves. */
 export const MOCK_API = "mock" as const;
@@ -75,8 +76,13 @@ export type MockContent =
 			arguments: Record<string, unknown> | string;
 			/** Simulate a provider-flagged truncated call (cut off mid-arguments). */
 			incompleteArguments?: boolean;
+			/** Typed reason matching `ToolCall.incompleteArgumentsReason`. Defaults to `"truncated"`. */
+			incompleteArgumentsReason?: "truncated" | "malformed" | "conflicting" | "ambiguous";
+			/** Simulate a provider-flagged `\uXXXX`-escaped non-ASCII argument payload. */
+			escapedNonAsciiArguments?: boolean;
+			escapedUnicodeArgumentEvidence?: UnicodeEscapeEvidence;
+			thoughtSignature?: string;
 	  };
-
 /** One scripted response. */
 export interface MockResponse {
 	/** Content blocks to emit, in order. Strings become text blocks. */
@@ -87,6 +93,11 @@ export interface MockResponse {
 	usage?: Partial<Omit<Usage, "cost">> & { cost?: Partial<Usage["cost"]> };
 	/** Pre-set responseId. */
 	responseId?: string;
+	/** Optional provider metadata copied onto the final assistant message. */
+	disabledFeatures?: string[];
+	providerPayload?: AssistantMessage["providerPayload"];
+	/** Optional typed provider failure metadata for retry/fallback tests. */
+	transportFailure?: AssistantMessage["transportFailure"];
 	/** If set, the stream emits a terminal error event instead of completing. */
 	throw?: string | Error;
 	/** Delay before any event is emitted. Honors the call's AbortSignal. */
@@ -327,6 +338,7 @@ async function runMock(
 					...(response.responseRequestId !== undefined ? { requestId: response.responseRequestId } : {}),
 				},
 				model,
+				options.attemptScope,
 			);
 		} catch (err) {
 			stream.fail(err);
@@ -362,6 +374,9 @@ async function runMock(
 		provider: model.provider,
 		model: model.id,
 		responseId: response.responseId,
+		disabledFeatures: response.disabledFeatures,
+		providerPayload: response.providerPayload,
+		transportFailure: response.transportFailure,
 		usage: emptyUsage(),
 		stopReason: "stop",
 		timestamp: startedAt,
@@ -413,13 +428,21 @@ function normalizeContent(input: MockContent, state: MockModel): TextContent | T
 		return { type: "text", text: input };
 	}
 	if (input.type === "toolCall") {
-		return {
+		const toolCall = {
 			type: "toolCall",
 			id: input.id ?? generateToolCallId(state),
 			name: input.name,
 			arguments: typeof input.arguments === "string" ? input.arguments : { ...input.arguments },
-			...(input.incompleteArguments ? { incompleteArguments: true } : {}),
+			...(input.incompleteArguments
+				? { incompleteArguments: true, incompleteArgumentsReason: input.incompleteArgumentsReason ?? "truncated" }
+				: {}),
+			...(input.escapedNonAsciiArguments ? { escapedNonAsciiArguments: true } : {}),
+			...(input.thoughtSignature ? { thoughtSignature: input.thoughtSignature } : {}),
 		} as ToolCall;
+		if (input.escapedUnicodeArgumentEvidence) {
+			attachUnicodeEscapeEvidence(toolCall, input.escapedUnicodeArgumentEvidence);
+		}
+		return toolCall;
 	}
 	return input;
 }

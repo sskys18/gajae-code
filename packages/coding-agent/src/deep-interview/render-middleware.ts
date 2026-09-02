@@ -1,4 +1,16 @@
-import { type Component, Container, Markdown, Spacer, Text } from "@gajae-code/tui";
+import {
+	type Component,
+	Container,
+	isViewportAnchorSourceRenderer,
+	Markdown,
+	Spacer,
+	Text,
+	type ViewportAnchorProvider,
+	type ViewportAnchorRender,
+	type ViewportAnchorSource,
+	type ViewportAnchorSourceRenderer,
+} from "@gajae-code/tui";
+import { isLegacyDeepInterviewPlaceholder, isWorkflowPlaceholderText } from "../gjc-runtime/workflow-placeholder";
 import { getMarkdownTheme, type Theme } from "../modes/theme/theme";
 
 interface RoundQuestionModel {
@@ -48,6 +60,60 @@ interface ThresholdModel {
 
 type DeepInterviewModel = RoundQuestionModel | TopologyQuestionModel | ProgressModel | ThresholdModel;
 
+class DeepInterviewSemanticContainer extends Container implements ViewportAnchorProvider, ViewportAnchorSourceRenderer {
+	#nextSource = 0;
+
+	override addChild(component: Component): void {
+		super.addChild(component);
+		if (isViewportAnchorSourceRenderer(component)) {
+			this.setViewportAnchorSource(component, { id: `deep-interview-part:${this.#nextSource++}` });
+		}
+	}
+
+	override renderWithViewportAnchors(width: number): ViewportAnchorRender {
+		const lines = super.renderWithViewportAnchors(width).lines;
+		return { lines, anchors: lines.map(() => null) };
+	}
+
+	renderWithViewportAnchorSource(width: number, source: ViewportAnchorSource): ViewportAnchorRender {
+		const rendered = super.renderWithViewportAnchors(width);
+		const extents = new Map<string, { graphemeEnd: number; cellEnd: number }>();
+		for (const anchor of rendered.anchors) {
+			if (anchor === null) continue;
+			const extent = extents.get(anchor.id);
+			if (extent) {
+				extent.graphemeEnd = Math.max(extent.graphemeEnd, anchor.graphemeEnd);
+				extent.cellEnd = Math.max(extent.cellEnd, anchor.cellEnd);
+			} else {
+				extents.set(anchor.id, { graphemeEnd: anchor.graphemeEnd, cellEnd: anchor.cellEnd });
+			}
+		}
+		const offsets = new Map<string, { grapheme: number; cell: number }>();
+		let grapheme = 0;
+		let cell = 0;
+		for (const [id, extent] of extents) {
+			offsets.set(id, { grapheme, cell });
+			grapheme += extent.graphemeEnd;
+			cell += extent.cellEnd;
+		}
+		return {
+			lines: rendered.lines,
+			anchors: rendered.anchors.map(anchor => {
+				if (anchor === null) return null;
+				const offset = offsets.get(anchor.id);
+				if (!offset) throw new Error(`Missing deep-interview anchor offset for ${anchor.id}`);
+				return {
+					id: source.id,
+					graphemeStart: offset.grapheme + anchor.graphemeStart,
+					graphemeEnd: offset.grapheme + anchor.graphemeEnd,
+					cellStart: offset.cell + anchor.cellStart,
+					cellEnd: offset.cell + anchor.cellEnd,
+				};
+			}),
+		};
+	}
+}
+
 function normalizeText(text: string): string {
 	if (typeof text !== "string") return "";
 	return text.trim().replaceAll("\r\n", "\n");
@@ -67,7 +133,7 @@ function parseRoundQuestion(text: string): RoundQuestionModel | null {
 		.slice(headerIndex + 1)
 		.join("\n")
 		.trim();
-	if (!body) return null;
+	if (isWorkflowPlaceholderText(body)) return null;
 
 	const componentMatch =
 		/^Round\s+(\d+)\s+\|\s+Component:\s*(.*?)\s+\|\s+Targeting:\s*(.*?)\s+\|\s+Why now:\s*(.*?)\s+\|\s+Ambiguity:\s*(.+?)%?\s*$/i.exec(
@@ -139,11 +205,13 @@ function parseTopologyQuestion(text: string): TopologyQuestionModel | null {
 		if (inQuestion) questionLines.push(trimmed);
 		else contextLines.push(trimmed);
 	}
+	const question = questionLines.join("\n");
+	if (isWorkflowPlaceholderText(question)) return null;
 	return {
 		kind: "topology-question",
 		context: contextLines.join("\n") || undefined,
 		components,
-		question: questionLines.join("\n"),
+		question,
 	};
 }
 
@@ -258,7 +326,7 @@ function renderPipeSummary(title: string, value: string | undefined): string | u
 }
 
 function renderModel(model: DeepInterviewModel, uiTheme: Theme): Component {
-	const container = new Container();
+	const container = new DeepInterviewSemanticContainer();
 	if (model.kind === "round-question") {
 		const meta = [
 			`Round ${model.round}`,
@@ -334,6 +402,7 @@ export function renderDeepInterviewAskQuestion(question: string, uiTheme: Theme)
 export function isDeepInterviewAskQuestion(question: string): boolean {
 	if (parseTopologyQuestion(question) ?? parseRoundQuestion(question)) return true;
 	const normalized = normalizeText(question);
+	if (isLegacyDeepInterviewPlaceholder(normalized)) return false;
 	return /(?:^|\n)\s*Round\s+\d+\s*\|.*?\bAmbiguity\b/i.test(normalized);
 }
 

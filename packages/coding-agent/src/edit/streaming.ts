@@ -74,6 +74,128 @@ export interface EditStreamingStrategy<Args = unknown> {
 	 */
 	renderStreamingFallback(args: Args, uiTheme: Theme): string;
 }
+export interface EditRequestTargetInventory {
+	paths: string[];
+	parseError?: string;
+	/** First envelope entry operation, for free-form modes that carry no structured `edits`. */
+	op?: PatchEditEntry["op"];
+	/** First envelope entry rename target, for free-form modes that carry no structured `edits`. */
+	rename?: string;
+}
+function missingApplyPatchEndError(): string {
+	return `The last line of the patch must be '${END_PATCH_MARKER}'`;
+}
+
+export function orderedDistinctPaths(paths: readonly (string | undefined)[]): string[] {
+	const seen = new Set<string>();
+	const distinct: string[] = [];
+	for (const path of paths) {
+		if (!path || seen.has(path)) continue;
+		seen.add(path);
+		distinct.push(path);
+	}
+	return distinct;
+}
+
+function decodePartialJsonStringFragment(fragment: string): string {
+	let text = fragment.replace(/\\u[0-9a-fA-F]{0,3}$/, "");
+	const trailingBackslashes = text.match(/\\+$/)?.[0].length ?? 0;
+	if (trailingBackslashes % 2 === 1) text = text.slice(0, -1);
+	try {
+		return JSON.parse(`"${text}"`) as string;
+	} catch {
+		return text;
+	}
+}
+
+function extractTrailingPartialJsonPath(partialJson: string | undefined): string | undefined {
+	if (!partialJson) return undefined;
+	const pattern = /"(?:file_path|path)"\s*:\s*"((?:\\.|[^"\\])*)/gu;
+	let trailingPath: string | undefined;
+	for (const match of partialJson.matchAll(pattern)) {
+		trailingPath = decodePartialJsonStringFragment(match[1]);
+	}
+	return trailingPath;
+}
+
+function normalizeHashlineTargetPath(rawPath: string): string {
+	const trimmed = rawPath.trim();
+	if (trimmed.length < 2) return trimmed;
+	const first = trimmed[0];
+	const last = trimmed[trimmed.length - 1];
+	return (first === '"' || first === "'") && first === last ? trimmed.slice(1, -1) : trimmed;
+}
+
+function getHashlineTargetPaths(input: string): string[] {
+	const stripped = input.startsWith("\uFEFF") ? input.slice(1) : input;
+	const paths: string[] = [];
+	for (const rawLine of stripped.split("\n")) {
+		const trimmed = rawLine.replace(/\r$/, "").trimEnd();
+		if (trimmed === END_PATCH_MARKER || trimmed === ABORT_MARKER) break;
+		if (isHashlineHeaderLine(trimmed)) paths.push(normalizeHashlineTargetPath(parseHashlineHeaderPath(trimmed)));
+	}
+	return paths.filter(Boolean);
+}
+
+/**
+ * `apply_patch` carries operation metadata inside the envelope rather than in structured `edits`,
+ * so the collapsed card has to read op/rename off the first parsed entry to stay accurate while live.
+ */
+function applyPatchEntryInventory(entries: readonly ApplyPatchEntry[]): EditRequestTargetInventory {
+	const first = entries[0];
+	return {
+		paths: orderedDistinctPaths(entries.map(entry => entry.path)),
+		op: first?.op,
+		rename: first?.rename,
+	};
+}
+
+export function getEditRequestTargetInventory(
+	args: unknown,
+	editMode: EditMode | undefined,
+	options: { isPartial: boolean },
+): EditRequestTargetInventory {
+	if (editMode === "vim") return { paths: [] };
+	const values = args && typeof args === "object" ? (args as Record<string, unknown>) : {};
+	const partialJson = typeof values.__partialJson === "string" ? values.__partialJson : undefined;
+	const topLevelPath =
+		typeof values.file_path === "string"
+			? values.file_path
+			: typeof values.path === "string"
+				? values.path
+				: undefined;
+	const edits = Array.isArray(values.edits) ? values.edits : [];
+
+	if (editMode === "hashline") {
+		const input = typeof values.input === "string" ? values.input : "";
+		const headerPaths = getHashlineTargetPaths(input);
+		// `path` is only a fallback for headerless input; explicit §PATH headers are the full target set.
+		if (headerPaths.length > 0) return { paths: orderedDistinctPaths(headerPaths) };
+		return { paths: orderedDistinctPaths([topLevelPath]) };
+	}
+
+	// Legacy call sites render the shared edit card without threading `renderContext.editMode`;
+	// a free-form `input` string is only ever an apply_patch envelope there.
+	if (editMode === "apply_patch" || (editMode === undefined && typeof values.input === "string")) {
+		const input = typeof values.input === "string" ? values.input : "";
+		try {
+			return applyPatchEntryInventory(expandApplyPatchToEntries({ input }));
+		} catch (err) {
+			const parseError = err instanceof Error ? err.message : String(err);
+			const inventory = applyPatchEntryInventory(expandApplyPatchToPreviewEntries({ input }));
+			if (options.isPartial && parseError === missingApplyPatchEndError()) return inventory;
+			return { ...inventory, parseError };
+		}
+	}
+
+	const editPaths = edits.map(edit => {
+		if (!edit || typeof edit !== "object") return undefined;
+		const entry = edit as Record<string, unknown>;
+		return typeof entry.path === "string" ? entry.path : undefined;
+	});
+	const partialPath = options.isPartial ? extractTrailingPartialJsonPath(partialJson) : undefined;
+	return { paths: orderedDistinctPaths([topLevelPath, ...editPaths, partialPath]) };
+}
 
 const STREAMING_FALLBACK_LINES = 12;
 const STREAMING_FALLBACK_WIDTH = 80;

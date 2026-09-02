@@ -9,10 +9,12 @@ import type { OAuthProvider } from "../utils/oauth/types";
 import { googleModelManagerOptions } from "./google";
 import { ollamaCloudModelManagerOptions } from "./ollama";
 import {
-	alibabaCodingPlanModelManagerOptions,
+	alibabaTokenPlanModelManagerOptions,
 	anthropicModelManagerOptions,
+	bizrouterModelManagerOptions,
 	cerebrasModelManagerOptions,
 	cloudflareAiGatewayModelManagerOptions,
+	commandCodeModelManagerOptions,
 	deepinfraModelManagerOptions,
 	deepseekModelManagerOptions,
 	firepassModelManagerOptions,
@@ -25,17 +27,21 @@ import {
 	kimiCodeModelManagerOptions,
 	litellmModelManagerOptions,
 	lmStudioModelManagerOptions,
+	maraModelManagerOptions,
 	mistralModelManagerOptions,
 	moonshotModelManagerOptions,
 	nanoGptModelManagerOptions,
 	nvidiaModelManagerOptions,
 	ollamaModelManagerOptions,
+	omlxModelManagerOptions,
 	openaiModelManagerOptions,
 	opencodeGoModelManagerOptions,
 	opencodeZenModelManagerOptions,
+	opengatewayModelManagerOptions,
 	openrouterModelManagerOptions,
 	qianfanModelManagerOptions,
 	qwenPortalModelManagerOptions,
+	sglangModelManagerOptions,
 	syntheticModelManagerOptions,
 	togetherModelManagerOptions,
 	veniceModelManagerOptions,
@@ -45,7 +51,14 @@ import {
 	xiaomiModelManagerOptions,
 	zenmuxModelManagerOptions,
 } from "./openai-compat";
-import { cursorModelManagerOptions, glmZcodeModelManagerOptions, zaiModelManagerOptions } from "./special";
+import {
+	cursorModelManagerOptions,
+	glmZcodeModelManagerOptions,
+	jetbrainsJunieModelManagerOptions,
+	kiroModelManagerOptions,
+	openCodexModelManagerOptions,
+	zaiModelManagerOptions,
+} from "./special";
 
 /** Catalog discovery configuration for providers that support endpoint-based model listing. */
 export interface CatalogDiscoveryConfig {
@@ -130,12 +143,13 @@ function catalogDescriptor(
 export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 	descriptor("anthropic", "claude-sonnet-5", config => anthropicModelManagerOptions(config)),
 	catalogDescriptor(
-		"alibaba-coding-plan",
-		"qwen3.5-plus",
-		config => alibabaCodingPlanModelManagerOptions(config),
-		catalog("Alibaba Coding Plan", ["ALIBABA_CODING_PLAN_API_KEY"]),
+		"alibaba-token-plan",
+		"deepseek-v4-pro",
+		config => alibabaTokenPlanModelManagerOptions(config),
+		catalog("Alibaba Token Plan", ["ALIBABA_TOKEN_PLAN_API_KEY"], { oauthProvider: "alibaba-token-plan" }),
 	),
 	descriptor("openai", "gpt-5.4", config => openaiModelManagerOptions(config)),
+	descriptor("opencodex", "gpt-5.4", () => openCodexModelManagerOptions(), { allowUnauthenticated: true }),
 	descriptor("groq", "openai/gpt-oss-120b", config => groqModelManagerOptions(config)),
 	catalogDescriptor(
 		"huggingface",
@@ -190,6 +204,7 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 	),
 	descriptor("opencode-zen", "claude-sonnet-4-6", config => opencodeZenModelManagerOptions(config)),
 	descriptor("opencode-go", "kimi-k2.5", config => opencodeGoModelManagerOptions(config)),
+	descriptor("commandcode-goat", "zai-org/GLM-5.3", config => commandCodeModelManagerOptions(config)),
 	catalogDescriptor(
 		"openrouter",
 		"openai/gpt-5.4",
@@ -258,11 +273,22 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		catalog("LiteLLM", ["LITELLM_API_KEY"], { allowUnauthenticated: true }),
 	),
 	descriptor("lm-studio", "llama-3-8b", config => lmStudioModelManagerOptions(config), { allowUnauthenticated: true }),
+	descriptor("omlx", "Qwen3.5-122B-A10B-Q4", config => omlxModelManagerOptions(config), {
+		allowUnauthenticated: true,
+	}),
 	catalogDescriptor(
 		"vllm",
 		"gpt-oss-20b",
 		config => vllmModelManagerOptions(config),
 		catalog("vLLM", ["VLLM_API_KEY"], { allowUnauthenticated: true }),
+		{ allowUnauthenticated: true },
+	),
+	catalogDescriptor(
+		"sglang",
+		"gpt-oss-20b",
+		config => sglangModelManagerOptions(config),
+		catalog("SGLang", ["SGLANG_API_KEY"], { allowUnauthenticated: true }),
+		{ allowUnauthenticated: true },
 	),
 	catalogDescriptor(
 		"moonshot",
@@ -312,13 +338,32 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		config => zenmuxModelManagerOptions(config),
 		catalog("ZenMux", ["ZENMUX_API_KEY"]),
 	),
-	catalogDescriptor("zai", "glm-5.2", config => zaiModelManagerOptions(config), catalog("zAI", ["ZAI_API_KEY"])),
+	catalogDescriptor(
+		"opengateway",
+		"openai/gpt-4o",
+		config => opengatewayModelManagerOptions(config),
+		catalog("OpenGateway by Sionic AI", ["OPENGATEWAY_API_KEY"]),
+	),
+	catalogDescriptor(
+		"bizrouter",
+		"anthropic/claude-sonnet-4.5",
+		config => bizrouterModelManagerOptions(config),
+		catalog("BizRouter", ["BIZROUTER_API_KEY"]),
+	),
+	catalogDescriptor(
+		"mara",
+		"DeepSeek-V3.1",
+		config => maraModelManagerOptions(config),
+		catalog("Mara Cloud", ["MARA_API_KEY"]),
+	),
+	catalogDescriptor("zai", "glm-5.3", config => zaiModelManagerOptions(config), catalog("zAI", ["ZAI_API_KEY"])),
 	catalogDescriptor(
 		"glm-zcode",
 		"glm-5.2",
 		config => glmZcodeModelManagerOptions(config),
 		catalog("GLM ZCode (unofficial)", ["GLM_ZCODE_API_KEY"], { oauthProvider: "glm-zcode" }),
 	),
+	descriptor("jetbrains-junie", "claude-sonnet-4-6", config => jetbrainsJunieModelManagerOptions(config)),
 	descriptor("github-copilot", "gpt-4o", config => githubCopilotModelManagerOptions(config)),
 	descriptor("google", "gemini-2.5-pro", config => googleModelManagerOptions(config)),
 	catalogDescriptor(
@@ -327,6 +372,7 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		config => cursorModelManagerOptions(config),
 		catalog("Cursor", ["CURSOR_API_KEY"], { oauthProvider: "cursor" }),
 	),
+	descriptor("kiro", "auto", config => kiroModelManagerOptions(config)),
 ] as const;
 
 /** Default model IDs for all known providers, built from descriptors + special providers. */
@@ -334,14 +380,13 @@ export const DEFAULT_MODEL_PER_PROVIDER: Record<KnownProvider, string> = {
 	...Object.fromEntries(PROVIDER_DESCRIPTORS.map(d => [d.providerId, d.defaultModel])),
 	// Providers not in PROVIDER_DESCRIPTORS (special auth or no standard discovery)
 	"azure-openai": "gpt-4.1",
-	"alibaba-coding-plan": "qwen3.5-plus",
 	"amazon-bedrock": "us.anthropic.claude-opus-4-6-v1",
 	"google-antigravity": "gemini-3-pro-high",
 	"google-gemini-cli": "gemini-2.5-pro",
 	"google-vertex": "gemini-3-pro-preview",
-	minimax: "minimax-m3",
-	"minimax-code": "minimax-m3",
-	"minimax-code-cn": "minimax-m3",
+	minimax: "MiniMax-M3",
+	"minimax-code": "MiniMax-M3",
+	"minimax-code-cn": "MiniMax-M3",
 	"openai-codex": "gpt-5.5",
 	"gitlab-duo": "duo-chat-sonnet-4-5",
 } as Record<KnownProvider, string>;

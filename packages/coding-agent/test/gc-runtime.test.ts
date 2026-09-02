@@ -1,7 +1,12 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import type { PathLike } from "node:fs";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
 	collectGcReport,
 	computeExitCode,
+	GC_STORES,
 	type GcContext,
 	type GcPidProbe,
 	type GcRecord,
@@ -10,11 +15,41 @@ import {
 	gcProbeToLeasePidStatus,
 	runGjcGcCommand,
 } from "@gajae-code/coding-agent/gjc-runtime/gc-runtime";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { SessionIndex } from "../src/sdk/broker/session-index";
+
+const originalAgentDir = getAgentDir();
+let perTestAgentDir: string;
+
+beforeEach(async () => {
+	perTestAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gc-runtime-agent-"));
+	setAgentDir(perTestAgentDir);
+});
+
+async function sessionIndexAgentDir(): Promise<string> {
+	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gc-session-index-"));
+	setAgentDir(agentDir);
+	return agentDir;
+}
+
+async function appendSessionIndexEvent(agentDir: string): Promise<void> {
+	const index = await new SessionIndex(agentDir).open();
+	await index.append({
+		type: "host_registered",
+		sessionId: "gc-session",
+		locator: { cwd: "/tmp/repo", worktreeRoot: null, stateRoot: "/tmp/state" },
+		endpointGeneration: 1,
+		pid: process.pid,
+		endpointMtimeMs: Date.now(),
+	});
+}
 
 const originalKill = process.kill.bind(process);
 
-afterEach(() => {
+afterEach(async () => {
 	process.kill = originalKill;
+	setAgentDir(originalAgentDir);
+	await fs.rm(perTestAgentDir, { recursive: true, force: true });
 });
 
 function stubKill(impl: (pid: number) => void): void {
@@ -116,24 +151,86 @@ describe("gcProbeToLeasePidStatus", () => {
 
 describe("computeExitCode", () => {
 	test("dry-run with no errors => 0", () => {
-		expect(computeExitCode({ dry_run: true, stores: {} as never, counts: { failed: 0 } as never, errors: [] })).toBe(
-			0,
-		);
+		expect(
+			computeExitCode({
+				dry_run: true,
+				stores: {} as never,
+				counts: { failed: 0 } as never,
+				errors: [],
+				warnings: [],
+			}),
+		).toBe(0);
 	});
 
 	test("hard discovery errors => 1 (both modes)", () => {
 		const errors = [{ store: "file_locks" as const, scope: "discovery", message: "boom" }];
-		expect(computeExitCode({ dry_run: true, stores: {} as never, counts: { failed: 0 } as never, errors })).toBe(1);
-		expect(computeExitCode({ dry_run: false, stores: {} as never, counts: { failed: 0 } as never, errors })).toBe(1);
+		expect(
+			computeExitCode({
+				dry_run: true,
+				stores: {} as never,
+				counts: { failed: 0 } as never,
+				errors,
+				warnings: [],
+			}),
+		).toBe(1);
+		expect(
+			computeExitCode({
+				dry_run: false,
+				stores: {} as never,
+				counts: { failed: 0 } as never,
+				errors,
+				warnings: [],
+			}),
+		).toBe(1);
+	});
+
+	test("warnings alone never fail the run (#3852)", () => {
+		const warnings = [
+			{
+				store: "file_locks" as const,
+				scope: "/tmp/agent",
+				message: "file lock discovery capped at 20000 entries for root /tmp/agent (scanned 20000)",
+			},
+		];
+		expect(
+			computeExitCode({
+				dry_run: true,
+				stores: {} as never,
+				counts: { failed: 0 } as never,
+				errors: [],
+				warnings,
+			}),
+		).toBe(0);
+		expect(
+			computeExitCode({
+				dry_run: false,
+				stores: {} as never,
+				counts: { failed: 0 } as never,
+				errors: [],
+				warnings,
+			}),
+		).toBe(0);
 	});
 
 	test("prune with a failed intended removal => 1; dry-run ignores failed count", () => {
-		expect(computeExitCode({ dry_run: false, stores: {} as never, counts: { failed: 2 } as never, errors: [] })).toBe(
-			1,
-		);
-		expect(computeExitCode({ dry_run: true, stores: {} as never, counts: { failed: 2 } as never, errors: [] })).toBe(
-			0,
-		);
+		expect(
+			computeExitCode({
+				dry_run: false,
+				stores: {} as never,
+				counts: { failed: 2 } as never,
+				errors: [],
+				warnings: [],
+			}),
+		).toBe(1);
+		expect(
+			computeExitCode({
+				dry_run: true,
+				stores: {} as never,
+				counts: { failed: 2 } as never,
+				errors: [],
+				warnings: [],
+			}),
+		).toBe(0);
 	});
 });
 
@@ -152,11 +249,11 @@ describe("collectGcReport", () => {
 	});
 
 	test("non-removable records are kept (action none) and never pruned", async () => {
-		const adapter = fakeAdapter("team_workers", [
-			record("team_workers", { removable: false, status: "alive", stale: false }),
+		const adapter = fakeAdapter("registry_entries", [
+			record("registry_entries", { removable: false, status: "alive", stale: false }),
 		]);
 		const report = await collectGcReport([adapter], ctx(), true);
-		expect(report.stores.team_workers[0]?.action).toBe("none");
+		expect(report.stores.registry_entries[0]?.action).toBe("none");
 		expect(report.counts.removed).toBe(0);
 	});
 
@@ -199,6 +296,26 @@ describe("collectGcReport", () => {
 		expect(report.errors[0]?.scope).toBe("collect");
 		expect(computeExitCode(report)).toBe(1);
 	});
+
+	test("adapter warnings aggregate without becoming errors (#3852)", async () => {
+		const adapter: GcStoreAdapter = {
+			store: "file_locks",
+			async collect() {
+				return {
+					records: [],
+					errors: [],
+					warnings: [{ store: "file_locks", scope: "/tmp/root", message: "capped" }],
+				};
+			},
+			async prune() {
+				return { removed: false };
+			},
+		};
+		const report = await collectGcReport([adapter], ctx(), false);
+		expect(report.errors).toEqual([]);
+		expect(report.warnings).toEqual([{ store: "file_locks", scope: "/tmp/root", message: "capped" }]);
+		expect(computeExitCode(report)).toBe(0);
+	});
 });
 
 describe("runGjcGcCommand", () => {
@@ -209,19 +326,25 @@ describe("runGjcGcCommand", () => {
 		expect(result.status).toBe(2);
 		expect(result.stderr).toContain("unknown_flag");
 	});
+	test("rejects repair combined with prune or dry-run", async () => {
+		for (const args of [
+			["--repair-session-index", "--prune"],
+			["--repair-session-index", "--dry-run"],
+		]) {
+			const result = await runGjcGcCommand(args, "/tmp", {}, adapters);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("repair_session_index_cannot_combine");
+		}
+	});
 
-	test("--json emits a report with all five store arrays", async () => {
+	test("--json emits a report with an array for every known store", async () => {
 		const result = await runGjcGcCommand(["--json"], "/tmp", {}, adapters);
 		expect(result.status).toBe(0);
 		const parsed = JSON.parse(result.stdout);
 		expect(parsed.dry_run).toBe(true);
-		expect(Object.keys(parsed.stores).sort()).toEqual([
-			"file_locks",
-			"harness_leases",
-			"registry_entries",
-			"team_workers",
-			"tmux_sessions",
-		]);
+		expect(parsed.operation).toBe("dry_run");
+		// Derived from GC_STORES so adding a store cannot silently drop its array.
+		expect(Object.keys(parsed.stores).sort()).toEqual([...GC_STORES].sort());
 	});
 
 	test("default text mode reports dry run", async () => {
@@ -252,5 +375,135 @@ describe("runGjcGcCommand", () => {
 		expect(parsed.dry_run).toBe(false);
 		expect(parsed.counts.removed).toBe(1);
 		expect(result.status).toBe(0);
+	});
+
+	test("preflights NUL manifest roots before any adapter prune", async () => {
+		const manifest = path.join(perTestAgentDir, "nul-root-manifest.json");
+		await fs.writeFile(manifest, JSON.stringify({ roots: [`${perTestAgentDir}\0invalid`] }));
+		let pruned = 0;
+		const adapter = fakeAdapter("harness_leases", [record("harness_leases")], async () => {
+			pruned += 1;
+			return { removed: true };
+		});
+		const result = await runGjcGcCommand(
+			["--prune", "--empty-delete-receipts", "--manifest", manifest],
+			perTestAgentDir,
+			{},
+			[adapter],
+		);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("manifest_root_invalid");
+		expect(pruned).toBe(0);
+	});
+
+	test("preflights invalid explicit empty-delete roots before any adapter prune", async () => {
+		const missingRoot = path.join(perTestAgentDir, "missing-empty-delete-root");
+		let pruned = 0;
+		const adapter = fakeAdapter("harness_leases", [record("harness_leases")], async () => {
+			pruned += 1;
+			return { removed: true };
+		});
+		const result = await runGjcGcCommand(
+			["--prune", "--empty-delete-receipts", "--root", missingRoot, "--json"],
+			perTestAgentDir,
+			{},
+			[adapter],
+		);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain(`${missingRoot}: missing_root`);
+		expect(result.stdout).toBe("");
+		expect(pruned).toBe(0);
+	});
+
+	test("aborts ordinary prune when an explicit empty-delete root races after preflight", async () => {
+		const root = await fs.mkdtemp(path.join(perTestAgentDir, "raced-empty-delete-root-"));
+		const replacement = `${root}-replacement`;
+		let readdirCalls = 0;
+		const realReaddir = fs.readdir;
+		const readdirSpy = spyOn(fs, "readdir");
+		readdirSpy.mockImplementation((async (target: PathLike) => {
+			const entries = await realReaddir(target);
+			if (String(target) === root && readdirCalls++ === 0) await fs.rename(root, replacement);
+			return entries;
+		}) as unknown as typeof fs.readdir);
+		let pruned = 0;
+		const adapter = fakeAdapter("harness_leases", [record("harness_leases")], async () => {
+			pruned += 1;
+			return { removed: true };
+		});
+		try {
+			const result = await runGjcGcCommand(
+				["--prune", "--empty-delete-receipts", "--root", root, "--json"],
+				perTestAgentDir,
+				{},
+				[adapter],
+			);
+			expect(result.status).toBe(1);
+			expect(pruned).toBe(0);
+			const report = JSON.parse(result.stdout) as {
+				dry_run: boolean;
+				empty_delete_receipts?: { errors: string[] };
+			};
+			expect(report.dry_run).toBe(true);
+			expect(report.empty_delete_receipts?.errors).toContain(`${root}: missing_root`);
+		} finally {
+			readdirSpy.mockRestore();
+			await fs.rm(replacement, { recursive: true, force: true });
+		}
+	});
+
+	test("valid explicit empty-delete roots preserve ordinary prune behavior", async () => {
+		const root = await fs.mkdtemp(path.join(perTestAgentDir, "valid-empty-delete-root-"));
+		let pruned = 0;
+		const adapter = fakeAdapter("harness_leases", [record("harness_leases")], async () => {
+			pruned += 1;
+			return { removed: true };
+		});
+		const result = await runGjcGcCommand(
+			["--prune", "--empty-delete-receipts", "--root", root, "--json"],
+			perTestAgentDir,
+			{},
+			[adapter],
+		);
+		expect(result.status).toBe(0);
+		expect(pruned).toBe(1);
+		expect(JSON.parse(result.stdout).empty_delete_receipts.roots).toEqual([root]);
+	});
+
+	test("includes healthy session-index diagnosis in ordinary JSON output", async () => {
+		const agentDir = await sessionIndexAgentDir();
+		await appendSessionIndexEvent(agentDir);
+		const result = await runGjcGcCommand(["--json"], "/tmp", {}, adapters);
+		const report = JSON.parse(result.stdout);
+		expect(report.session_index).toMatchObject({ status: "healthy", valid_prefix_seq: 1 });
+		expect(result.status).toBe(0);
+		await fs.rm(agentDir, { recursive: true, force: true });
+	});
+
+	test("reports corrupt session-index diagnostics without repairing", async () => {
+		const agentDir = await sessionIndexAgentDir();
+		await appendSessionIndexEvent(agentDir);
+		const log = path.join(agentDir, "sdk", "sessions", "index.jsonl");
+		await fs.appendFile(log, "broken\n");
+		const before = await fs.readFile(log, "utf8");
+		const result = await runGjcGcCommand(["--json"], "/tmp", {}, adapters);
+		const report = JSON.parse(result.stdout);
+		expect(report.session_index).toMatchObject({ status: "corrupt", valid_prefix_seq: 1 });
+		expect(await fs.readFile(log, "utf8")).toBe(before);
+		expect(result.status).toBe(1);
+		await fs.rm(agentDir, { recursive: true, force: true });
+	});
+
+	test("fails closed for unsupported session-index versions", async () => {
+		const agentDir = await sessionIndexAgentDir();
+		const log = path.join(agentDir, "sdk", "sessions", "index.jsonl");
+		await fs.mkdir(path.dirname(log), { recursive: true });
+		await fs.writeFile(log, `${JSON.stringify({ version: 99 })}\n`);
+		const result = await runGjcGcCommand(["--json"], "/tmp", {}, adapters);
+		const report = JSON.parse(result.stdout);
+		expect(report.session_index.status).toBe("unsupported");
+		expect(report.session_index.reason).toContain("Unsupported SDK state version");
+		expect(result.status).toBe(1);
+		await fs.rm(agentDir, { recursive: true, force: true });
 	});
 });

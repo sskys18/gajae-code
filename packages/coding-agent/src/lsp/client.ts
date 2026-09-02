@@ -1,4 +1,4 @@
-import { isEnoent, logger, untilAborted } from "@gajae-code/utils";
+import { isEnoent, isKnownSinkPeerClosedError, logger, untilAborted } from "@gajae-code/utils";
 import { formatCrashDiagnosticNotice, writeCrashReport } from "../debug/crash-diagnostics";
 import { registerResourceOwner, spawnOwnedProcess } from "../runtime/process-lifecycle";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
@@ -23,7 +23,16 @@ const clients = new Map<string, LspClient>();
 const killedClients = new WeakSet<LspClient>();
 const clientLocks = new Map<string, Promise<LspClient>>();
 const fileOperationLocks = new Map<string, Promise<void>>();
-const lspCleanupOwner = registerResourceOwner("lsp:clients", shutdownAll);
+const initializingClients = new Set<LspClient>();
+let shutdownGeneration = 0;
+const transportClosedErrors = new WeakMap<LspClient, Error>();
+const LSP_TRANSPORT_CLOSED_MESSAGE = "LSP transport closed";
+let lspCleanupOwner: (() => void) | undefined;
+
+function ensureLspCleanup(): void {
+	if (lspCleanupOwner) return;
+	lspCleanupOwner = registerResourceOwner("lsp:clients", shutdownAll);
+}
 
 // Idle timeout configuration (disabled by default)
 let idleTimeoutMs: number | null = null;
@@ -93,6 +102,21 @@ function evictDeadCachedClient(key: string, client: LspClient): void {
 	deleteCachedClient(key, client);
 	client.resolveProjectLoaded();
 	rejectPendingRequests(client, new Error("LSP server exited"));
+}
+
+function terminalizeTransport(client: LspClient, cause: unknown): Error {
+	const existingError = transportClosedErrors.get(client);
+	if (existingError) return existingError;
+
+	const error = new Error(LSP_TRANSPORT_CLOSED_MESSAGE, { cause });
+	transportClosedErrors.set(client, error);
+	deleteCachedClient(client.name, client);
+	client.resolveProjectLoaded();
+	rejectPendingRequests(client, error);
+	void client.owner?.dispose().catch(disposeError => {
+		logger.debug("Failed to dispose terminal LSP transport owner", { error: String(disposeError) });
+	});
+	return error;
 }
 // =============================================================================
 // Client Capabilities
@@ -250,19 +274,35 @@ function findHeaderEnd(buffer: Uint8Array): number {
 }
 
 async function writeMessage(
-	sink: Bun.FileSink,
+	client: LspClient,
 	message: LspJsonRpcRequest | LspJsonRpcNotification | LspJsonRpcResponse,
 ): Promise<void> {
 	const content = JSON.stringify(message);
-	sink.write(`Content-Length: ${Buffer.byteLength(content, "utf-8")}\r\n\r\n${content}`);
-	await sink.flush();
+	const terminalError = transportClosedErrors.get(client);
+	if (terminalError) throw terminalError;
+
+	try {
+		// FileSink.write() returns `number | Promise<number>`: under backpressure
+		// (e.g. a large didOpen/didChange payload) it returns a promise whose
+		// rejection — typically EPIPE when the server dies mid-write — would
+		// otherwise be discarded here and surface as an unhandled rejection that
+		// takes down the whole process. Await it so every failure mode reaches
+		// the transport-closed mapping below.
+		await client.proc.stdin.write(`Content-Length: ${Buffer.byteLength(content, "utf-8")}\r\n\r\n${content}`);
+		await client.proc.stdin.flush();
+	} catch (error) {
+		if (isKnownSinkPeerClosedError(error)) {
+			throw terminalizeTransport(client, error);
+		}
+		throw error;
+	}
 }
 
 function queueWriteMessage(
 	client: LspClient,
 	message: LspJsonRpcRequest | LspJsonRpcNotification | LspJsonRpcResponse,
 ): Promise<void> {
-	const write = client.writeQueue.catch(() => {}).then(() => writeMessage(client.proc.stdin, message));
+	const write = client.writeQueue.catch(() => {}).then(() => writeMessage(client, message));
 	client.writeQueue = write.catch(() => {});
 	return write;
 }
@@ -477,13 +517,17 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 	// Create new client with lock
 	let clientPromise!: Promise<LspClient>;
 	clientPromise = (async () => {
+		const creationGeneration = shutdownGeneration;
 		const baseCommand = config.resolvedCommand ?? config.command;
 		const baseArgs = config.args ?? [];
 
 		// Wrap with lspmux if available and supported
 		const { command, args, env } = isLspmuxSupported(baseCommand)
-			? await getLspmuxCommand(baseCommand, baseArgs)
+			? await getLspmuxCommand(baseCommand, baseArgs, cwd)
 			: { command: baseCommand, args: baseArgs };
+		if (creationGeneration !== shutdownGeneration) {
+			throw new Error("LSP client shutdown");
+		}
 
 		const owner = spawnOwnedProcess([command, ...args], {
 			cwd,
@@ -529,7 +573,12 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 			killedClients.add(client);
 			return originalKill(...args);
 		};
-		clients.set(key, client);
+		initializingClients.add(client);
+		if (creationGeneration !== shutdownGeneration) {
+			initializingClients.delete(client);
+			await shutdownClientInstance(client);
+			throw new Error("LSP client shutdown");
+		}
 
 		// Register crash recovery - remove client on process exit
 		proc.exited.then(async () => {
@@ -601,15 +650,29 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 
 			// Send initialized notification
 			await sendNotification(client, "initialized", {});
+			ensureLspCleanup();
+			const terminalError = transportClosedErrors.get(client);
+			if (terminalError) throw terminalError;
+			if (creationGeneration !== shutdownGeneration) {
+				throw new Error("LSP client shutdown");
+			}
+
+			// Publish to the cache only after the handshake completes: callers that
+			// hit the `clients` map must never observe a client whose initialize is
+			// still in flight. Concurrent callers instead share `clientLocks` and
+			// wait for initialization, so a server that dies mid-handshake rejects
+			// every waiter instead of handing them a transport that is about to
+			// break underneath them.
+			clients.set(key, client);
 
 			return client;
 		} catch (err) {
 			// Clean up on initialization failure
-			deleteCachedClient(key, client);
 			deleteClientLock(key, clientPromise);
 			await shutdownClientInstance(client);
 			throw err;
 		} finally {
+			initializingClients.delete(client);
 			deleteClientLock(key, clientPromise);
 		}
 	})();
@@ -835,6 +898,7 @@ async function shutdownClientInstance(client: LspClient): Promise<void> {
 	await Promise.race([shutdown, Bun.sleep(5_000)]);
 	await client.owner?.dispose();
 	await client.owner?.awaitExit({ timeoutMs: 1_000 });
+	await Promise.race([client.proc.exited.catch(() => undefined), Bun.sleep(1_000)]);
 }
 
 export async function shutdownClient(key: string): Promise<void> {
@@ -861,6 +925,8 @@ export async function sendRequest(
 	signal?: AbortSignal,
 	timeoutMs: number = DEFAULT_REQUEST_TIMEOUT_MS,
 ): Promise<unknown> {
+	const terminalError = transportClosedErrors.get(client);
+	if (terminalError) throw terminalError;
 	// Atomically increment and capture request ID
 	const id = ++client.requestId;
 	if (signal?.aborted) {
@@ -948,7 +1014,12 @@ export async function sendNotification(client: LspClient, method: string, params
 	};
 
 	client.lastActivity = Date.now();
-	await queueWriteMessage(client, notification);
+	try {
+		await queueWriteMessage(client, notification);
+	} catch (error) {
+		if (transportClosedErrors.get(client) === error) return;
+		throw error;
+	}
 }
 
 /**
@@ -956,11 +1027,18 @@ export async function sendNotification(client: LspClient, method: string, params
  */
 export async function shutdownAll(): Promise<void> {
 	stopIdleChecker();
+	shutdownGeneration += 1;
+	const inFlightPromises = Array.from(clientLocks.values());
+	const initializingToShutdown = Array.from(initializingClients);
 	clientLocks.clear();
 	fileOperationLocks.clear();
 	const clientsToShutdown = Array.from(clients.values());
 	clients.clear();
-	await Promise.allSettled(clientsToShutdown.map(client => shutdownClientInstance(client)));
+	await Promise.allSettled([
+		...clientsToShutdown.map(client => shutdownClientInstance(client)),
+		...initializingToShutdown.map(client => shutdownClientInstance(client)),
+		...inFlightPromises,
+	]);
 }
 
 /** Status of an LSP server */
@@ -992,7 +1070,7 @@ if (typeof process !== "undefined") {
 		void shutdownAll();
 	});
 	process.on("exit", () => {
-		lspCleanupOwner();
+		lspCleanupOwner?.();
 		for (const client of clients.values()) {
 			client.proc.kill();
 		}

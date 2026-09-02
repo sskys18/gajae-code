@@ -1,5 +1,358 @@
 {
+  "autoresearch": {
+    "canonicalOverrides": [],
+    "graphLabel": "Autoresearch",
+    "hudFields": [
+      "current_phase",
+      "mode",
+      "intake",
+      "slug",
+      "spec_path",
+      "verdict"
+    ],
+    "initialState": "intake",
+    "phaseLock": [],
+    "retention": [
+      {
+        "category": "state",
+        "keep": 1
+      },
+      {
+        "category": "artifact"
+      },
+      {
+        "category": "ledger"
+      },
+      {
+        "category": "log",
+        "maxAgeDays": 30
+      },
+      {
+        "category": "report",
+        "maxAgeDays": 30
+      },
+      {
+        "category": "prune/delete",
+        "maxAgeDays": 30
+      },
+      {
+        "category": "force",
+        "maxAgeDays": 90
+      }
+    ],
+    "skill": "autoresearch",
+    "states": [
+      {
+        "id": "intake",
+        "initial": true
+      },
+      {
+        "id": "research"
+      },
+      {
+        "id": "verdict"
+      },
+      {
+        "id": "complete",
+        "terminal": true
+      },
+      {
+        "id": "failed",
+        "terminal": true
+      },
+      {
+        "id": "cancelled",
+        "terminal": true
+      },
+      {
+        "id": "handoff",
+        "terminal": true
+      }
+    ],
+    "stopReleasingPhases": [
+      "complete",
+      "completed",
+      "failed",
+      "cancelled",
+      "canceled",
+      "inactive"
+    ],
+    "terminalStates": [
+      "complete",
+      "failed",
+      "cancelled",
+      "handoff"
+    ],
+    "transitions": [
+      {
+        "from": "intake",
+        "to": "research",
+        "verb": "write"
+      },
+      {
+        "from": "research",
+        "to": "verdict",
+        "verb": "write"
+      },
+      {
+        "from": "verdict",
+        "to": "research",
+        "verb": "write"
+      },
+      {
+        "from": "research",
+        "to": "failed",
+        "verb": "write"
+      },
+      {
+        "from": "research",
+        "to": "cancelled",
+        "verb": "write"
+      },
+      {
+        "from": "verdict",
+        "to": "complete",
+        "verb": "clear"
+      },
+      {
+        "from": "research",
+        "to": "complete",
+        "verb": "clear"
+      },
+      {
+        "from": "intake",
+        "to": "complete",
+        "verb": "clear"
+      },
+      {
+        "from": "intake",
+        "to": "handoff",
+        "verb": "handoff"
+      },
+      {
+        "from": "research",
+        "to": "handoff",
+        "verb": "handoff"
+      },
+      {
+        "from": "verdict",
+        "to": "handoff",
+        "verb": "handoff"
+      }
+    ],
+    "typedArgs": [
+      {
+        "appliesToVerbs": [
+          "write",
+          "api"
+        ],
+        "name": "input",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "read",
+          "write",
+          "clear",
+          "contract",
+          "handoff",
+          "doctor"
+        ],
+        "enumValues": [
+          "deep-interview",
+          "ralplan",
+          "ultragoal",
+          "autoresearch"
+        ],
+        "name": "mode",
+        "type": "enum"
+      },
+      {
+        "appliesToVerbs": [
+          "read",
+          "write",
+          "clear",
+          "contract",
+          "handoff",
+          "doctor",
+          "kickoff",
+          "write-spec",
+          "write-artifact",
+          "stage",
+          "check",
+          "apply",
+          "discard",
+          "read",
+          "write"
+        ],
+        "name": "session-id",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "write",
+          "clear",
+          "handoff"
+        ],
+        "name": "thread-id",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "write",
+          "clear",
+          "handoff"
+        ],
+        "name": "turn-id",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "handoff"
+        ],
+        "name": "to",
+        "required": true,
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "write"
+        ],
+        "name": "replace",
+        "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "write",
+          "clear",
+          "handoff"
+        ],
+        "name": "force",
+        "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "doctor"
+        ],
+        "enumValues": [
+          "deep-interview",
+          "ralplan",
+          "ultragoal",
+          "autoresearch"
+        ],
+        "name": "skill",
+        "type": "enum"
+      },
+      {
+        "appliesToVerbs": [
+          "doctor"
+        ],
+        "name": "json",
+        "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "intake"
+        ],
+        "name": "spec",
+        "required": true,
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "write"
+        ],
+        "name": "goal",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "write"
+        ],
+        "enumValues": [
+          "web",
+          "mixed",
+          "data"
+        ],
+        "name": "mode",
+        "required": true,
+        "type": "enum"
+      },
+      {
+        "appliesToVerbs": [
+          "read",
+          "write",
+          "clear",
+          "intake",
+          "handoff"
+        ],
+        "name": "json",
+        "type": "boolean"
+      },
+      {
+        "name": "args",
+        "planned": true,
+        "type": "string"
+      },
+      {
+        "name": "metadata-json",
+        "planned": true,
+        "type": "string"
+      }
+    ],
+    "verbs": [
+      {
+        "name": "read",
+        "surface": "state-action"
+      },
+      {
+        "name": "write",
+        "surface": "state-action"
+      },
+      {
+        "name": "clear",
+        "surface": "state-action"
+      },
+      {
+        "name": "contract",
+        "surface": "state-action"
+      },
+      {
+        "name": "handoff",
+        "surface": "state-action"
+      },
+      {
+        "name": "doctor",
+        "surface": "state-action"
+      },
+      {
+        "name": "intake",
+        "surface": "command-positional"
+      },
+      {
+        "name": "graph",
+        "planned": true,
+        "surface": "state-action"
+      },
+      {
+        "name": "prune",
+        "planned": true,
+        "surface": "state-action"
+      },
+      {
+        "name": "migrate",
+        "planned": true,
+        "surface": "state-action"
+      },
+      {
+        "name": "force-overwrite",
+        "planned": true,
+        "surface": "state-action"
+      }
+    ]
+  },
   "deep-interview": {
+    "canonicalOverrides": [],
     "graphLabel": "Deep Interview",
     "hudFields": [
       "current_phase",
@@ -10,6 +363,7 @@
       "topology"
     ],
     "initialState": "interviewing",
+    "phaseLock": [],
     "retention": [
       {
         "category": "state",
@@ -41,6 +395,14 @@
         "id": "complete",
         "terminal": true
       }
+    ],
+    "stopReleasingPhases": [
+      "complete",
+      "completed",
+      "failed",
+      "cancelled",
+      "canceled",
+      "inactive"
     ],
     "terminalStates": [
       "handoff",
@@ -85,7 +447,7 @@
           "deep-interview",
           "ralplan",
           "ultragoal",
-          "team"
+          "autoresearch"
         ],
         "name": "mode",
         "type": "enum"
@@ -100,7 +462,13 @@
           "doctor",
           "kickoff",
           "write-spec",
-          "write-artifact"
+          "write-artifact",
+          "stage",
+          "check",
+          "apply",
+          "discard",
+          "read",
+          "write"
         ],
         "name": "session-id",
         "type": "string"
@@ -127,15 +495,9 @@
         "appliesToVerbs": [
           "handoff"
         ],
-        "enumValues": [
-          "deep-interview",
-          "ralplan",
-          "ultragoal",
-          "team"
-        ],
         "name": "to",
         "required": true,
-        "type": "enum"
+        "type": "string"
       },
       {
         "appliesToVerbs": [
@@ -161,7 +523,7 @@
           "deep-interview",
           "ralplan",
           "ultragoal",
-          "team"
+          "autoresearch"
         ],
         "name": "skill",
         "type": "enum"
@@ -252,10 +614,48 @@
       },
       {
         "appliesToVerbs": [
-          "write-spec"
+          "write-spec",
+          "stage",
+          "check",
+          "apply",
+          "discard",
+          "read",
+          "write",
+          "clear",
+          "handoff"
         ],
         "name": "json",
         "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "stage",
+          "write"
+        ],
+        "name": "input",
+        "required": true,
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "write"
+        ],
+        "name": "reset",
+        "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "stage"
+        ],
+        "enumValues": [
+          "initialize-context",
+          "record-round",
+          "update-facts",
+          "merge-state"
+        ],
+        "name": "for",
+        "required": true,
+        "type": "enum"
       },
       {
         "name": "args",
@@ -302,6 +702,38 @@
         "surface": "command-flag"
       },
       {
+        "name": "stage",
+        "surface": "command-positional"
+      },
+      {
+        "name": "check",
+        "surface": "command-positional"
+      },
+      {
+        "name": "apply",
+        "surface": "command-positional"
+      },
+      {
+        "name": "discard",
+        "surface": "command-positional"
+      },
+      {
+        "name": "read",
+        "surface": "command-positional"
+      },
+      {
+        "name": "write",
+        "surface": "command-positional"
+      },
+      {
+        "name": "clear",
+        "surface": "command-positional"
+      },
+      {
+        "name": "handoff",
+        "surface": "command-positional"
+      },
+      {
         "name": "graph",
         "planned": true,
         "surface": "state-action"
@@ -324,6 +756,16 @@
     ]
   },
   "ralplan": {
+    "canonicalOverrides": [
+      "final",
+      "handoff",
+      "complete",
+      "completed",
+      "failed",
+      "cancelled",
+      "canceled",
+      "inactive"
+    ],
     "graphLabel": "Ralplan",
     "hudFields": [
       "current_phase",
@@ -334,6 +776,16 @@
       "plan_path"
     ],
     "initialState": "planner",
+    "phaseLock": [
+      "final",
+      "handoff",
+      "complete",
+      "completed",
+      "failed",
+      "cancelled",
+      "canceled",
+      "inactive"
+    ],
     "retention": [
       {
         "category": "state",
@@ -361,10 +813,16 @@
         "initial": true
       },
       {
+        "id": "intent"
+      },
+      {
         "id": "architect"
       },
       {
         "id": "critic"
+      },
+      {
+        "id": "disposition"
       },
       {
         "id": "revision"
@@ -384,6 +842,14 @@
         "terminal": true
       }
     ],
+    "stopReleasingPhases": [
+      "complete",
+      "completed",
+      "failed",
+      "cancelled",
+      "canceled",
+      "inactive"
+    ],
     "terminalStates": [
       "final",
       "handoff"
@@ -391,7 +857,22 @@
     "transitions": [
       {
         "from": "planner",
+        "to": "intent",
+        "verb": "write-artifact"
+      },
+      {
+        "from": "planner",
         "to": "architect",
+        "verb": "write-artifact"
+      },
+      {
+        "from": "intent",
+        "to": "architect",
+        "verb": "write-artifact"
+      },
+      {
+        "from": "intent",
+        "to": "revision",
         "verb": "write-artifact"
       },
       {
@@ -401,7 +882,27 @@
       },
       {
         "from": "critic",
+        "to": "disposition",
+        "verb": "write-artifact"
+      },
+      {
+        "from": "architect",
+        "to": "disposition",
+        "verb": "write-artifact"
+      },
+      {
+        "from": "disposition",
         "to": "revision",
+        "verb": "write-artifact"
+      },
+      {
+        "from": "critic",
+        "to": "revision",
+        "verb": "write-artifact"
+      },
+      {
+        "from": "revision",
+        "to": "intent",
         "verb": "write-artifact"
       },
       {
@@ -411,6 +912,11 @@
       },
       {
         "from": "critic",
+        "to": "post-interview",
+        "verb": "write-artifact"
+      },
+      {
+        "from": "disposition",
         "to": "post-interview",
         "verb": "write-artifact"
       },
@@ -440,12 +946,22 @@
         "verb": "handoff"
       },
       {
+        "from": "intent",
+        "to": "handoff",
+        "verb": "handoff"
+      },
+      {
         "from": "architect",
         "to": "handoff",
         "verb": "handoff"
       },
       {
         "from": "critic",
+        "to": "handoff",
+        "verb": "handoff"
+      },
+      {
+        "from": "disposition",
         "to": "handoff",
         "verb": "handoff"
       },
@@ -487,7 +1003,7 @@
           "deep-interview",
           "ralplan",
           "ultragoal",
-          "team"
+          "autoresearch"
         ],
         "name": "mode",
         "type": "enum"
@@ -502,7 +1018,13 @@
           "doctor",
           "kickoff",
           "write-spec",
-          "write-artifact"
+          "write-artifact",
+          "stage",
+          "check",
+          "apply",
+          "discard",
+          "read",
+          "write"
         ],
         "name": "session-id",
         "type": "string"
@@ -529,15 +1051,9 @@
         "appliesToVerbs": [
           "handoff"
         ],
-        "enumValues": [
-          "deep-interview",
-          "ralplan",
-          "ultragoal",
-          "team"
-        ],
         "name": "to",
         "required": true,
-        "type": "enum"
+        "type": "string"
       },
       {
         "appliesToVerbs": [
@@ -563,7 +1079,7 @@
           "deep-interview",
           "ralplan",
           "ultragoal",
-          "team"
+          "autoresearch"
         ],
         "name": "skill",
         "type": "enum"
@@ -617,8 +1133,10 @@
         ],
         "enumValues": [
           "planner",
+          "intent",
           "architect",
           "critic",
+          "disposition",
           "revision",
           "post-interview",
           "adr",
@@ -715,459 +1233,8 @@
       }
     ]
   },
-  "team": {
-    "graphLabel": "Team",
-    "hudFields": [
-      "current_phase",
-      "team_name",
-      "workers",
-      "task_counts",
-      "phase",
-      "integration"
-    ],
-    "initialState": "starting",
-    "retention": [
-      {
-        "category": "state",
-        "keep": 1
-      },
-      {
-        "category": "artifact"
-      },
-      {
-        "category": "ledger"
-      },
-      {
-        "category": "log",
-        "maxAgeDays": 30
-      },
-      {
-        "category": "report",
-        "maxAgeDays": 30
-      },
-      {
-        "category": "agents"
-      },
-      {
-        "category": "prune/delete",
-        "maxAgeDays": 30
-      },
-      {
-        "category": "force",
-        "maxAgeDays": 90
-      }
-    ],
-    "skill": "team",
-    "states": [
-      {
-        "id": "starting",
-        "initial": true
-      },
-      {
-        "id": "running"
-      },
-      {
-        "id": "awaiting_integration"
-      },
-      {
-        "id": "complete",
-        "terminal": true
-      },
-      {
-        "id": "failed",
-        "terminal": true
-      },
-      {
-        "id": "cancelled",
-        "terminal": true
-      },
-      {
-        "id": "handoff",
-        "terminal": true
-      }
-    ],
-    "terminalStates": [
-      "complete",
-      "failed",
-      "cancelled",
-      "handoff"
-    ],
-    "transitions": [
-      {
-        "from": "starting",
-        "to": "running",
-        "verb": "start"
-      },
-      {
-        "from": "starting",
-        "to": "failed",
-        "verb": "start"
-      },
-      {
-        "from": "running",
-        "to": "awaiting_integration",
-        "verb": "api"
-      },
-      {
-        "from": "running",
-        "to": "complete",
-        "verb": "shutdown"
-      },
-      {
-        "from": "running",
-        "to": "failed",
-        "verb": "shutdown"
-      },
-      {
-        "from": "running",
-        "to": "cancelled",
-        "verb": "shutdown"
-      },
-      {
-        "from": "awaiting_integration",
-        "to": "running",
-        "verb": "resume"
-      },
-      {
-        "from": "awaiting_integration",
-        "to": "complete",
-        "verb": "shutdown"
-      },
-      {
-        "from": "starting",
-        "to": "handoff",
-        "verb": "handoff"
-      },
-      {
-        "from": "running",
-        "to": "handoff",
-        "verb": "handoff"
-      },
-      {
-        "from": "awaiting_integration",
-        "to": "handoff",
-        "verb": "handoff"
-      }
-    ],
-    "typedArgs": [
-      {
-        "appliesToVerbs": [
-          "write",
-          "api"
-        ],
-        "name": "input",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "read",
-          "write",
-          "clear",
-          "contract",
-          "handoff",
-          "doctor"
-        ],
-        "enumValues": [
-          "deep-interview",
-          "ralplan",
-          "ultragoal",
-          "team"
-        ],
-        "name": "mode",
-        "type": "enum"
-      },
-      {
-        "appliesToVerbs": [
-          "read",
-          "write",
-          "clear",
-          "contract",
-          "handoff",
-          "doctor",
-          "kickoff",
-          "write-spec",
-          "write-artifact"
-        ],
-        "name": "session-id",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "write",
-          "clear",
-          "handoff"
-        ],
-        "name": "thread-id",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "write",
-          "clear",
-          "handoff"
-        ],
-        "name": "turn-id",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "handoff"
-        ],
-        "enumValues": [
-          "deep-interview",
-          "ralplan",
-          "ultragoal",
-          "team"
-        ],
-        "name": "to",
-        "required": true,
-        "type": "enum"
-      },
-      {
-        "appliesToVerbs": [
-          "write"
-        ],
-        "name": "replace",
-        "type": "boolean"
-      },
-      {
-        "appliesToVerbs": [
-          "write",
-          "clear",
-          "handoff"
-        ],
-        "name": "force",
-        "type": "boolean"
-      },
-      {
-        "appliesToVerbs": [
-          "doctor"
-        ],
-        "enumValues": [
-          "deep-interview",
-          "ralplan",
-          "ultragoal",
-          "team"
-        ],
-        "name": "skill",
-        "type": "enum"
-      },
-      {
-        "appliesToVerbs": [
-          "doctor"
-        ],
-        "name": "json",
-        "type": "boolean"
-      },
-      {
-        "appliesToVerbs": [
-          "start"
-        ],
-        "name": "dry-run",
-        "type": "boolean"
-      },
-      {
-        "appliesToVerbs": [
-          "start"
-        ],
-        "name": "worktree",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "start"
-        ],
-        "name": "w",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "api"
-        ],
-        "name": "input",
-        "required": true,
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "api"
-        ],
-        "enumValues": [
-          "send-message",
-          "broadcast",
-          "mailbox-list",
-          "mailbox-mark-delivered",
-          "mailbox-mark-notified",
-          "notification-list",
-          "notification-read",
-          "notification-replay",
-          "notification-mark-pane-attempt",
-          "worker-startup-ack",
-          "create-task",
-          "read-task",
-          "list-tasks",
-          "update-task",
-          "claim-task",
-          "transition-task-status",
-          "transition-task",
-          "release-task-claim",
-          "read-config",
-          "read-manifest",
-          "read-worker-status",
-          "read-worker-heartbeat",
-          "update-worker-heartbeat",
-          "write-worker-inbox",
-          "write-worker-identity",
-          "append-event",
-          "read-events",
-          "await-event",
-          "write-shutdown-request",
-          "read-shutdown-ack",
-          "read-monitor-snapshot",
-          "write-monitor-snapshot",
-          "read-task-approval",
-          "write-task-approval"
-        ],
-        "name": "operation",
-        "required": true,
-        "type": "enum"
-      },
-      {
-        "appliesToVerbs": [
-          "api"
-        ],
-        "name": "worker-id",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "api"
-        ],
-        "name": "task-id",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "api"
-        ],
-        "name": "claim-token",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "api"
-        ],
-        "enumValues": [
-          "pending",
-          "blocked",
-          "in_progress",
-          "completed",
-          "failed"
-        ],
-        "name": "status",
-        "type": "enum"
-      },
-      {
-        "appliesToVerbs": [
-          "api"
-        ],
-        "name": "completion_evidence",
-        "type": "object"
-      },
-      {
-        "appliesToVerbs": [
-          "api"
-        ],
-        "name": "completionEvidence",
-        "type": "object"
-      },
-      {
-        "name": "args",
-        "planned": true,
-        "type": "string"
-      },
-      {
-        "name": "metadata-json",
-        "planned": true,
-        "type": "string"
-      }
-    ],
-    "verbs": [
-      {
-        "name": "read",
-        "surface": "state-action"
-      },
-      {
-        "name": "write",
-        "surface": "state-action"
-      },
-      {
-        "name": "clear",
-        "surface": "state-action"
-      },
-      {
-        "name": "contract",
-        "surface": "state-action"
-      },
-      {
-        "name": "handoff",
-        "surface": "state-action"
-      },
-      {
-        "name": "doctor",
-        "surface": "state-action"
-      },
-      {
-        "name": "start",
-        "surface": "command-positional"
-      },
-      {
-        "name": "list",
-        "surface": "command-positional"
-      },
-      {
-        "name": "status",
-        "surface": "command-positional"
-      },
-      {
-        "name": "monitor",
-        "surface": "command-positional"
-      },
-      {
-        "name": "resume",
-        "surface": "command-positional"
-      },
-      {
-        "name": "shutdown",
-        "surface": "command-positional"
-      },
-      {
-        "name": "api",
-        "surface": "command-positional"
-      },
-      {
-        "name": "graph",
-        "planned": true,
-        "surface": "state-action"
-      },
-      {
-        "name": "prune",
-        "planned": true,
-        "surface": "state-action"
-      },
-      {
-        "name": "migrate",
-        "planned": true,
-        "surface": "state-action"
-      },
-      {
-        "name": "force-overwrite",
-        "planned": true,
-        "surface": "state-action"
-      }
-    ]
-  },
   "ultragoal": {
+    "canonicalOverrides": [],
     "graphLabel": "Ultragoal",
     "hudFields": [
       "current_phase",
@@ -1178,6 +1245,7 @@
       "brief_path"
     ],
     "initialState": "goal-planning",
+    "phaseLock": [],
     "retention": [
       {
         "category": "state",
@@ -1229,6 +1297,14 @@
         "id": "handoff",
         "terminal": true
       }
+    ],
+    "stopReleasingPhases": [
+      "complete",
+      "completed",
+      "failed",
+      "cancelled",
+      "canceled",
+      "inactive"
     ],
     "terminalStates": [
       "missing",
@@ -1315,7 +1391,7 @@
           "deep-interview",
           "ralplan",
           "ultragoal",
-          "team"
+          "autoresearch"
         ],
         "name": "mode",
         "type": "enum"
@@ -1330,7 +1406,13 @@
           "doctor",
           "kickoff",
           "write-spec",
-          "write-artifact"
+          "write-artifact",
+          "stage",
+          "check",
+          "apply",
+          "discard",
+          "read",
+          "write"
         ],
         "name": "session-id",
         "type": "string"
@@ -1357,15 +1439,9 @@
         "appliesToVerbs": [
           "handoff"
         ],
-        "enumValues": [
-          "deep-interview",
-          "ralplan",
-          "ultragoal",
-          "team"
-        ],
         "name": "to",
         "required": true,
-        "type": "enum"
+        "type": "string"
       },
       {
         "appliesToVerbs": [
@@ -1391,7 +1467,7 @@
           "deep-interview",
           "ralplan",
           "ultragoal",
-          "team"
+          "autoresearch"
         ],
         "name": "skill",
         "type": "enum"
@@ -1437,6 +1513,13 @@
       },
       {
         "appliesToVerbs": [
+          "create-goals"
+        ],
+        "name": "validation-batch-json",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
           "complete-goals"
         ],
         "name": "retry-failed",
@@ -1473,7 +1556,10 @@
           "checkpoint",
           "record-review-blockers",
           "steer",
-          "classify-blocker"
+          "classify-blocker",
+          "record-critic-verdict",
+          "record-critic-gate-override",
+          "quality-gate"
         ],
         "name": "evidence",
         "required": true,
@@ -1481,9 +1567,63 @@
       },
       {
         "appliesToVerbs": [
-          "checkpoint"
+          "record-critic-verdict"
+        ],
+        "enumValues": [
+          "completion",
+          "pause"
+        ],
+        "name": "terminus",
+        "required": true,
+        "type": "enum"
+      },
+      {
+        "appliesToVerbs": [
+          "record-critic-verdict"
+        ],
+        "enumValues": [
+          "OKAY",
+          "ITERATE",
+          "REJECT"
+        ],
+        "name": "verdict",
+        "required": true,
+        "type": "enum"
+      },
+      {
+        "appliesToVerbs": [
+          "record-critic-verdict"
+        ],
+        "name": "blockers-json",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "record-critic-verdict"
+        ],
+        "name": "goal-id",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "record-critic-verdict"
+        ],
+        "name": "classification-event-id",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "checkpoint",
+          "quality-gate"
         ],
         "name": "quality-gate-json",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "quality-gate"
+        ],
+        "name": "goal-id",
         "type": "string"
       },
       {
@@ -1612,7 +1752,9 @@
           "checkpoint",
           "record-review-blockers",
           "steer",
-          "classify-blocker"
+          "classify-blocker",
+          "record-critic-verdict",
+          "record-critic-gate-override"
         ],
         "name": "json",
         "type": "boolean"
@@ -1695,6 +1837,18 @@
       },
       {
         "name": "classify-blocker",
+        "surface": "command-positional"
+      },
+      {
+        "name": "record-critic-verdict",
+        "surface": "command-positional"
+      },
+      {
+        "name": "record-critic-gate-override",
+        "surface": "command-positional"
+      },
+      {
+        "name": "quality-gate",
         "surface": "command-positional"
       },
       {

@@ -94,4 +94,93 @@ describe("AgentSession.disposeChildSubprocesses (#698 signal teardown)", () => {
 		expect(releaseTabs).toHaveBeenCalledTimes(1);
 		expect(disposeVms).toHaveBeenCalledTimes(1);
 	});
+
+	it("drains tool-registered cleanups so a non-eval owner is not orphaned on signal exit", async () => {
+		// A session Python REPL owns its kernel under `python:<session-id>`, deliberately
+		// distinct from the session eval owner. Before signal teardown drained tool cleanups,
+		// Ctrl-C left that tool-owned subprocess running.
+		const pythonOwner = "python:session-1";
+		const reaped: string[] = [];
+		session!.registerToolSessionCleanup(async () => {
+			reaped.push(pythonOwner);
+		});
+
+		await session!.disposeChildSubprocesses();
+
+		expect(reaped).toEqual([pythonOwner]);
+		// The Python REPL owner is not the eval owner targeted by built-in disposal.
+		expect(disposeKernels.mock.calls[0]?.[0]).not.toBe(pythonOwner);
+	});
+
+	it("drains transition-registered cleanups, which is where the SDK actually puts tool cleanups", async () => {
+		// The SDK binds a tool's `registerSessionCleanup` to
+		// registerToolSessionTransitionCleanup (sdk/session.ts), so a discoverable
+		// builtin session Python REPL (`python:<session-id>`) lands in the TRANSITION
+		// set, not the one registerToolSessionCleanup fills. Draining only the latter
+		// passed every test while still orphaning the kernel on Ctrl-C in production.
+		const pythonOwner = "python:session-2";
+		const reaped: string[] = [];
+		session!.registerToolSessionTransitionCleanup(async () => {
+			reaped.push(pythonOwner);
+		});
+
+		await session!.disposeChildSubprocesses();
+
+		expect(reaped).toEqual([pythonOwner]);
+	});
+
+	it("drains both cleanup sets on a single signal teardown", async () => {
+		const order: string[] = [];
+		session!.registerToolSessionCleanup(() => {
+			order.push("direct");
+		});
+		session!.registerToolSessionTransitionCleanup(() => {
+			order.push("transition");
+		});
+
+		await session!.disposeChildSubprocesses();
+
+		expect(order.sort()).toEqual(["direct", "transition"]);
+	});
+
+	it("stays inside the time box when a transition cleanup hangs", async () => {
+		session!.registerToolSessionTransitionCleanup(() => new Promise<void>(() => {}));
+
+		const start = Date.now();
+		await session!.disposeChildSubprocesses(20);
+
+		expect(Date.now() - start).toBeLessThan(2_000);
+		expect(disposeKernels).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not double-run a tool cleanup that graceful dispose already drained", async () => {
+		let runs = 0;
+		session!.registerToolSessionCleanup(() => {
+			runs += 1;
+		});
+
+		await session!.disposeChildSubprocesses();
+		await session!.disposeChildSubprocesses();
+
+		expect(runs).toBe(1);
+	});
+
+	it("stays inside the time box when a tool cleanup hangs", async () => {
+		session!.registerToolSessionCleanup(() => new Promise<void>(() => {}));
+
+		const start = Date.now();
+		await session!.disposeChildSubprocesses(20);
+
+		expect(Date.now() - start).toBeLessThan(2_000);
+		expect(disposeKernels).toHaveBeenCalledTimes(1);
+	});
+
+	it("never rejects when a tool cleanup throws", async () => {
+		session!.registerToolSessionCleanup(() => {
+			throw new Error("Python REPL kernel dispose boom");
+		});
+
+		await expect(session!.disposeChildSubprocesses()).resolves.toBeUndefined();
+		expect(disposeKernels).toHaveBeenCalledTimes(1);
+	});
 });

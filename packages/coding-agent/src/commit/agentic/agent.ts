@@ -1,5 +1,5 @@
 import { INTENT_FIELD, type ThinkingLevel } from "@gajae-code/agent-core";
-import type { Api, Model } from "@gajae-code/ai";
+import type { Api, Model } from "@gajae-code/ai/core";
 import { Markdown } from "@gajae-code/tui";
 import { prompt } from "@gajae-code/utils";
 import chalk from "chalk";
@@ -65,6 +65,7 @@ export async function runCommitAgentSession(input: CommitAgentInput): Promise<Co
 		enableLsp: false,
 		enableMCP: false,
 		hasUI: false,
+		notificationHostModeSupported: false,
 		spawns,
 		toolNames: ["__none__"],
 		contextFiles: input.contextFiles,

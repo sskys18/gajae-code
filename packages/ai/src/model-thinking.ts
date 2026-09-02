@@ -1,4 +1,11 @@
-import { resolveOpenAICompat } from "./providers/openai-completions-compat";
+import {
+	CODEX_GENERIC_CONTEXT_WINDOW,
+	CODEX_GPT_5_6_CONTEXT_CAP,
+	isCodexGpt56Tier,
+	isCodexProductTransport,
+} from "./context-cap-policy";
+import { applyOpenAIModelPricing } from "./model-pricing";
+import { isAuditedOpenAIReasoningTransport, resolveOpenAICompat } from "./openai-completions-compat";
 import type { Api, Model as ApiModel, ThinkingConfig } from "./types";
 import { isClaudeForcedToolChoiceIncapableModelId } from "./utils/tool-choice-capability";
 
@@ -46,8 +53,16 @@ const DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX: readonly Effort[] = [
 ];
 const GEMINI_3_PRO_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High];
 const GEMINI_3_FLASH_EFFORTS: readonly Effort[] = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High];
+// Gemini 3.7 Flash dropped `minimal`; the official API returns an error for it.
+// https://ai.google.dev/gemini-api/docs/models/gemini-3.7-flash
+const GEMINI_3_7_FLASH_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High];
 const GPT_5_2_PLUS_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh];
+const GPT_5_6_PLUS_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max];
 const GPT_5_5_DEFAULT_EFFORT = Effort.XHigh;
+const KIMI_K3_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High, Effort.Max];
+const DEEPSEEK_V4_FLASH_0731_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High, Effort.Max];
+const GROK_4_5_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High];
+const GROK_4_6_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh];
 
 const GPT_5_1_CODEX_MINI_EFFORTS: readonly Effort[] = [Effort.Medium, Effort.High];
 const CLOUDFLARE_AI_GATEWAY_BASE_URL = "https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/anthropic";
@@ -59,8 +74,19 @@ type SemVer = {
 };
 
 type GeminiKind = "pro" | "flash";
-type AnthropicKind = "opus" | "sonnet";
-type OpenAIVariant = "base" | "codex" | "codex-max" | "codex-mini" | "codex-spark" | "mini" | "max" | "nano";
+type AnthropicKind = "opus" | "sonnet" | "fable";
+type OpenAIVariant =
+	| "base"
+	| "codex"
+	| "codex-max"
+	| "codex-mini"
+	| "codex-spark"
+	| "luna"
+	| "mini"
+	| "max"
+	| "nano"
+	| "sol"
+	| "terra";
 
 const CODEX_GPT_5_4_PRIORITY_BY_VARIANT: Partial<Record<OpenAIVariant, number>> = {
 	base: 0,
@@ -127,6 +153,10 @@ export const CLOUDFLARE_FALLBACK_MODEL: ApiModel<"anthropic-messages"> = {
 const kEnrichedModel = Symbol("model-thinking.enrichedModel");
 type ModelWithEnriched = ApiModel<Api> & { [kEnrichedModel]?: ApiModel<Api> };
 
+export function isGroqCompoundReasoningUnsupported(model: Pick<ApiModel<Api>, "provider" | "id">): boolean {
+	return model.provider === "groq" && (model.id === "groq/compound" || model.id === "groq/compound-mini");
+}
+
 /**
  * Returns a copy of the model with canonical thinking metadata attached.
  *
@@ -141,7 +171,12 @@ export function enrichModelThinking<TApi extends Api>(model: ApiModel<TApi>): Ap
 	}
 	const normalizedThinking = normalizeThinkingConfig(model.thinking);
 	let result: ApiModel<TApi>;
-	if (!model.reasoning) {
+	if (isGroqCompoundReasoningUnsupported(model)) {
+		result =
+			!model.reasoning && normalizedThinking === undefined
+				? model
+				: { ...model, reasoning: false, thinking: undefined };
+	} else if (!model.reasoning || !modelSupportsReasoningControl(model)) {
 		result =
 			normalizedThinking === undefined && model.thinking === undefined ? model : { ...model, thinking: undefined };
 	} else {
@@ -167,13 +202,58 @@ export function enrichModelThinking<TApi extends Api>(model: ApiModel<TApi>): Ap
  * canonical rules, replacing any existing `thinking`.
  */
 export function refreshModelThinking<TApi extends Api>(model: ApiModel<TApi>): ApiModel<TApi> {
-	if (!model.reasoning) {
+	if (isGroqCompoundReasoningUnsupported(model)) {
+		return !model.reasoning && model.thinking === undefined
+			? model
+			: { ...model, reasoning: false, thinking: undefined };
+	}
+	if (!model.reasoning || !modelSupportsReasoningControl(model)) {
 		const normalizedThinking = normalizeThinkingConfig(model.thinking);
 		return normalizedThinking === undefined && model.thinking === undefined
 			? model
 			: { ...model, thinking: undefined };
 	}
 	return { ...model, thinking: inferModelThinking(model) };
+}
+
+/**
+ * Returns whether the configured transport has an audited user-facing reasoning control.
+ *
+ * Custom OpenAI-compatible endpoints fail closed: declaring a model as reasoning-capable
+ * is not enough to prove that the proxy accepts OpenAI reasoning parameters. Unknown
+ * endpoints must opt in with `compat.supportsReasoningEffort: true`; providers using a
+ * non-OpenAI request shape must also declare `compat.thinkingFormat`. Bundled providers
+ * remain governed by their catalog and compatibility metadata.
+ */
+export function modelSupportsReasoningControl<TApi extends Api>(
+	model: ApiModel<TApi>,
+	resolvedBaseUrl?: string,
+): boolean {
+	if (!model.reasoning) return false;
+
+	if (model.api === "openai-completions") {
+		const completionsModel = model as ApiModel<"openai-completions">;
+		const explicitSupport = completionsModel.compat?.supportsReasoningEffort;
+		if (explicitSupport === false) return false;
+		if (explicitSupport !== true && !isAuditedOpenAIReasoningTransport(completionsModel, resolvedBaseUrl))
+			return false;
+		const compat = resolveOpenAICompat(completionsModel, resolvedBaseUrl);
+		return compat.thinkingFormat !== "openai" || compat.supportsReasoningEffort;
+	}
+
+	if (
+		model.api === "openai-responses" ||
+		model.api === "openai-codex-responses" ||
+		model.api === "azure-openai-responses"
+	) {
+		const explicitSupport =
+			model.compat !== undefined && "supportsReasoningEffort" in model.compat
+				? model.compat.supportsReasoningEffort
+				: undefined;
+		return explicitSupport ?? isAuditedOpenAIReasoningTransport(model);
+	}
+
+	return true;
 }
 
 /**
@@ -184,7 +264,29 @@ export function refreshModelThinking<TApi extends Api>(model: ApiModel<TApi>): A
  */
 export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
 	for (let index = 0; index < models.length; index++) {
-		const model = refreshModelThinking(models[index]!);
+		const source = models[index]!;
+		if (source.provider === "xai" && (source.id === "grok-4.5" || source.id === "grok-4.6")) {
+			source.reasoning = true;
+		}
+		if (source.provider === "alibaba-token-plan" && source.id === "deepseek-v4-flash-0731") {
+			source.reasoning = true;
+			source.name = "DeepSeek V4 Flash 0731";
+		}
+		if (source.id.split("/").at(-1)?.toLowerCase() === "muse-spark-1.2") {
+			source.reasoning = true;
+		}
+		if (source.provider === "omlx") {
+			source.reasoning = true;
+		}
+		if (
+			source.provider === "cursor" &&
+			(source.id === "kimi-k3-low" || source.id === "kimi-k3-high" || source.id === "kimi-k3-max")
+		) {
+			// Cursor's GetUsableModels metadata omits numeric context limits for
+			// this family. Keep the measured 1M fallback across regeneration.
+			source.contextWindow = 1_048_576;
+		}
+		const model = refreshModelThinking(source);
 		applyGeneratedModelPolicy(model);
 		models[index] = model;
 	}
@@ -228,7 +330,7 @@ export function linkOpenAIPromotionTargets(models: ApiModel<Api>[]): void {
  * @throws Error when a reasoning-capable model is missing thinking metadata
  */
 export function getSupportedEfforts<TApi extends Api>(model: ApiModel<TApi>): readonly Effort[] {
-	if (!model.reasoning) {
+	if (!modelSupportsReasoningControl(model)) {
 		return [];
 	}
 	if (!model.thinking) {
@@ -249,7 +351,7 @@ export function clampThinkingLevelForModel<TApi extends Api>(
 	if (!model) {
 		return requested;
 	}
-	if (!model.reasoning || requested === undefined) {
+	if (!modelSupportsReasoningControl(model) || requested === undefined) {
 		return undefined;
 	}
 
@@ -275,7 +377,7 @@ export function clampThinkingLevelForModel<TApi extends Api>(
 }
 
 export function requireSupportedEffort<TApi extends Api>(model: ApiModel<TApi>, effort: Effort): Effort {
-	if (!model.reasoning) {
+	if (!modelSupportsReasoningControl(model)) {
 		throw new Error(`Model ${model.provider}/${model.id} does not support thinking`);
 	}
 	const levels = getSupportedEfforts(model);
@@ -336,14 +438,44 @@ export function hasOpus47ApiRestrictions(modelId: string): boolean {
 	return semverGte(parsed.version, "4.7") && parsed.kind === "opus";
 }
 
+/**
+ * Adaptive thinking `display` is supported starting with Anthropic Opus 4.7.
+ * Older adaptive-thinking models (Opus 4.6, Sonnet 4.6+) reject the field.
+ * Fable (5+) postdates Opus 4.7, accepts `display`, and defaults it to
+ * "omitted" — thinking tokens are billed but no content streams back — so it
+ * must opt in like Opus 4.7+ (issue #2791).
+ *
+ * Shares `hasOpus47ApiRestrictions` version parsing on purpose: the two
+ * predicates describe the same API generation, and a private `claude-opus-(\d+)-(\d+)`
+ * regex silently disagreed with it for single-component aliases (`claude-opus-5`
+ * matched nothing while `claude-opus-5-20260101` matched), so the same model sent
+ * a different thinking shape and beta set depending on which id string was used.
+ * Bedrock region/inference-profile prefixes are handled by the canonical parser.
+ */
+export function supportsAnthropicAdaptiveThinkingDisplay(modelId: string): boolean {
+	if (/claude-fable-\d/.test(modelId)) return true;
+	return hasOpus47ApiRestrictions(modelId);
+}
+
 function anthropicModelHasRealXHighEffort<TApi extends Api>(model: ApiModel<TApi>): boolean {
 	if (model.api !== "anthropic-messages") return false;
 	const parsedModel = parseKnownModel(model.id);
-	if (parsedModel.family !== "anthropic" || parsedModel.kind !== "opus") return false;
-	return semverGte(parsedModel.version, "4.7");
+	if (parsedModel.family !== "anthropic") return false;
+	// Explicit capability predicate instead of a generic `kind === opus` gate:
+	// Sonnet 5 officially exposes Anthropic's real xhigh and max presets on
+	// the Messages API just like Opus 4.7+. Older Sonnet generations do not,
+	// so the predicate stays fail-closed for them.
+	if (parsedModel.kind === "opus") {
+		return semverGte(parsedModel.version, "4.7");
+	}
+	if (parsedModel.kind === "sonnet") {
+		return semverGte(parsedModel.version, "5.0");
+	}
+	return false;
 }
 
 function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
+	applyOpenAIModelPricing(model);
 	const copilotLimits = model.provider === "github-copilot" ? COPILOT_GENERATED_LIMITS[model.id] : undefined;
 	if (copilotLimits) {
 		model.contextWindow = copilotLimits.contextWindow;
@@ -362,6 +494,16 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 			reasoningContentField: "reasoning_content",
 		};
 		delete model.compat.thinkingFormat;
+	}
+	if (model.provider === "omlx" && model.api === "openai-completions") {
+		model.compat = {
+			...(model.compat ?? {}),
+			supportsStore: false,
+			supportsDeveloperRole: false,
+			supportsReasoningEffort: true,
+			thinkingFormat: "qwen-chat-template",
+			reasoningContentField: "reasoning_content",
+		};
 	}
 	model.name = scrubGeneratedModelName(model.name);
 	if (
@@ -404,11 +546,84 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 	if (model.provider === "zai" && model.id === "glm-5.2") {
 		model.contextWindow = 1_000_000;
 	}
-	// MiniMax-M3: MiniMax exposes a 1M context tier, but usage beyond 512K is
-	// billed separately. Keep bundled/default metadata at the billing-safe 512K
-	// unless an explicit paid-tier contract is added.
-	if (model.provider !== "opencode-go" && model.id === "minimax-m3") {
-		model.contextWindow = 512_000;
+	// GLM-5.3 always thinks and exposes only low/high/max reasoning_effort.
+	// https://z.ai/blog/glm-5.3#api-changes-in-glm-5-3
+	if (model.provider === "zai" && model.id === "glm-5.3") {
+		model.thinking = {
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Max,
+			levels: [Effort.Low, Effort.High, Effort.Max],
+		};
+	}
+	// GLM-5.3-Flash keeps GLM-5.3's text contract: 1M context, 128K output, and
+	// the same always-on low/high/max reasoning_effort. models.dev currently
+	// lists it with null limits, so pin the contract the same way.
+	// https://docs.z.ai/guides/llm/glm-5.3-flash ("Text parameters are
+	// consistent with GLM-5.3, with support for a 1M-token context window.")
+	if (model.provider === "zai" && model.id === "glm-5.3-flash") {
+		model.contextWindow = 1_000_000;
+		model.maxTokens = 131_072;
+		model.thinking = {
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Max,
+			levels: [Effort.Low, Effort.High, Effort.Max],
+		};
+	}
+	// Groq's agentic `compound` systems reject `reasoning_effort` outright
+	// (400 "`reasoning_effort` is not supported with this model", verified
+	// 2026-08-23), yet models.dev advertises them as reasoning models. Drop the
+	// thinking config so GJC never sends the field.
+	if (isGroqCompoundReasoningUnsupported(model)) {
+		model.reasoning = false;
+		delete model.thinking;
+	}
+	// Kilo's Ox Alpha catalog row advertises reasoning, vision, a 1,048,576-token
+	// context, a 131,072-token output ceiling, and low/high/max variants. Its
+	// OpenAI-compatible `/models` shape exposes those fields outside the generic
+	// discovery parser, so pin the reviewed provider-specific contract here.
+	if (model.provider === "kilo" && model.id === "stealth/ox-alpha") {
+		model.reasoning = true;
+		model.input = ["text", "image"];
+		model.contextWindow = 1_048_576;
+		model.maxTokens = 131_072;
+		model.thinking = {
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Max,
+			levels: [Effort.Low, Effort.High, Effort.Max],
+		};
+	}
+	if (model.provider === "alibaba-token-plan" && model.id === "deepseek-v4-flash-0731") {
+		model.contextWindow = 1_000_000;
+		model.maxTokens = 384_000;
+		model.compat = {
+			...(model.compat ?? {}),
+			supportsDeveloperRole: false,
+			supportsReasoningEffort: true,
+			reasoningContentField: "reasoning_content",
+			requiresReasoningContentForToolCalls: true,
+		};
+	}
+	if (model.provider === "xai" && (model.id === "grok-4.5" || model.id === "grok-4.6")) {
+		model.maxTokens = Math.min(model.maxTokens, 64_000);
+	}
+	// MiniMax-M3's official Token Plan routes expose a 1M context window.
+	// Scope the correction to the four first-class regional MiniMax routes
+	// (canonical id plus the Anthropic Token Plan `[1m]` id); unrelated
+	// catalog aliases and providers keep their own contracts.
+	if (
+		(model.id === "MiniMax-M3" || model.id === "MiniMax-M3[1m]") &&
+		(model.provider === "minimax" ||
+			model.provider === "minimax-cn" ||
+			model.provider === "minimax-code" ||
+			model.provider === "minimax-code-cn")
+	) {
+		model.contextWindow = 1_000_000;
 	}
 }
 
@@ -454,25 +669,46 @@ function inferGeneratedApplyPatchToolType(
 
 function applyGpt55ContextWindow(model: ApiModel<Api>, parsedModel: OpenAIModel): boolean {
 	if (parsedModel.variant === "base" && semverEqual(parsedModel.version, "5.5")) {
+		// JetBrains AI serves GPT through its own gateway, which enforces a probed
+		// 922K prompt cap for every GPT model regardless of the first-party figure.
+		// Its bundled value is measured, so leave it alone.
+		if (model.provider === "jetbrains-junie") {
+			return true;
+		}
 		// The first-party OpenAI GPT-5.5 model advertises a 1M total window, but
 		// the OpenAI code backend request path still enforces the smaller prompt
 		// budget. GJC's `contextWindow` is the usable prompt/input cap, not the
 		// marketing total window; using 1M here delays compaction and makes the UI
 		// promise space that `/responses/compact`/agent turns cannot actually use.
 		model.contextWindow =
-			model.provider === "openai-codex" || model.api === "openai-codex-responses" ? 272_000 : 1_000_000;
+			model.provider === "openai-codex" || model.api === "openai-codex-responses"
+				? CODEX_GENERIC_CONTEXT_WINDOW
+				: 1_000_000;
 		return true;
 	}
 	return false;
+}
+function applyGpt56ContextWindow(model: ApiModel<Api>): boolean {
+	if (!isCodexGpt56Tier(model) || !isCodexProductTransport(model)) {
+		return false;
+	}
+	// Force the enforced 372K window: the OpenAI code backend metadata still
+	// under-reports the GPT-5.6 tier budget, and smaller observed values would
+	// otherwise keep the tier at the old 272K cap. First-party OpenAI is untouched.
+	model.contextWindow = CODEX_GPT_5_6_CONTEXT_CAP.enforced;
+	return true;
 }
 
 function applyOpenAICatalogPolicy(model: ApiModel<Api>, parsedModel: OpenAIModel): void {
 	if (applyGpt55ContextWindow(model, parsedModel)) {
 		return;
 	}
+	if (applyGpt56ContextWindow(model)) {
+		return;
+	}
 	// OpenAI code backend models: 400K figure includes output budget; input window is 272K.
 	if (parsedModel.variant.startsWith("codex") && parsedModel.variant !== "codex-spark") {
-		model.contextWindow = 272000;
+		model.contextWindow = CODEX_GENERIC_CONTEXT_WINDOW;
 		return;
 	}
 	// GPT-5.4 mini/nano use plain OpenAI IDs on the OpenAI code backend transport, but OpenAI code backend still
@@ -485,18 +721,24 @@ function applyOpenAICatalogPolicy(model: ApiModel<Api>, parsedModel: OpenAIModel
 			model.priority = normalizedPriority;
 		}
 		if (parsedModel.variant === "mini" || parsedModel.variant === "nano") {
-			model.contextWindow = 272000;
+			model.contextWindow = CODEX_GENERIC_CONTEXT_WINDOW;
 		}
 	}
 }
 
 function inferDefaultEffort<TApi extends Api>(model: ApiModel<TApi>, parsedModel: ParsedModel): Effort | undefined {
+	if (model.provider === "kimi-code" && model.id === "k3") {
+		return Effort.High;
+	}
 	if (
 		parsedModel.family === "openai" &&
 		model.provider === "openai-codex" &&
 		semverEqual(parsedModel.version, "5.5")
 	) {
 		return GPT_5_5_DEFAULT_EFFORT;
+	}
+	if (model.provider === "omlx") {
+		return Effort.Medium;
 	}
 	return undefined;
 }
@@ -566,6 +808,18 @@ function expandEffortRange(thinking: ThinkingConfig): readonly Effort[] {
 }
 
 function inferSupportedEfforts<TApi extends Api>(parsedModel: ParsedModel, model: ApiModel<TApi>): readonly Effort[] {
+	if (model.provider === "xai" && model.id === "grok-4.5") {
+		return GROK_4_5_EFFORTS;
+	}
+	if (model.provider === "xai" && model.id === "grok-4.6") {
+		return GROK_4_6_EFFORTS;
+	}
+	if (model.provider === "kimi-code" && model.id === "k3") {
+		return KIMI_K3_EFFORTS;
+	}
+	if (model.provider === "alibaba-token-plan" && model.id === "deepseek-v4-flash-0731") {
+		return DEEPSEEK_V4_FLASH_0731_EFFORTS;
+	}
 	switch (parsedModel.family) {
 		case "openai":
 			return inferOpenAISupportedEfforts(parsedModel);
@@ -582,6 +836,9 @@ function inferOpenAISupportedEfforts(model: OpenAIModel): readonly Effort[] {
 	if (model.variant === "codex-mini" && semverEqual(model.version, "5.1")) {
 		return GPT_5_1_CODEX_MINI_EFFORTS;
 	}
+	if (semverGte(model.version, "5.6")) {
+		return GPT_5_6_PLUS_EFFORTS;
+	}
 	if (semverGte(model.version, "5.2")) {
 		return GPT_5_2_PLUS_EFFORTS;
 	}
@@ -592,7 +849,13 @@ function inferGeminiSupportedEfforts(model: GeminiModel): readonly Effort[] {
 	if (!semverGte(model.version, "3.0")) {
 		return DEFAULT_REASONING_EFFORTS;
 	}
-	return model.kind === "pro" ? GEMINI_3_PRO_EFFORTS : GEMINI_3_FLASH_EFFORTS;
+	if (model.kind === "pro") {
+		return GEMINI_3_PRO_EFFORTS;
+	}
+	if (semverGte(model.version, "3.7")) {
+		return GEMINI_3_7_FLASH_EFFORTS;
+	}
+	return GEMINI_3_FLASH_EFFORTS;
 }
 
 function inferAnthropicSupportedEfforts<TApi extends Api>(
@@ -603,15 +866,33 @@ function inferAnthropicSupportedEfforts<TApi extends Api>(
 		(model.api === "anthropic-messages" || model.api === "bedrock-converse-stream") &&
 		semverGte(parsedModel.version, "4.6")
 	) {
-		if (parsedModel.kind !== "opus") return DEFAULT_REASONING_EFFORTS;
-		return anthropicModelHasRealXHighEffort(model)
-			? DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX
-			: DEFAULT_REASONING_EFFORTS_WITH_MAX;
+		if (parsedModel.kind === "fable") {
+			// Fable exposes Anthropic's Messages-only xhigh preset; Bedrock
+			// Converse lacks it (same split as Opus 4.7+ below).
+			return model.api === "anthropic-messages" ? DEFAULT_REASONING_EFFORTS_WITH_XHIGH : DEFAULT_REASONING_EFFORTS;
+		}
+		if (anthropicModelHasRealXHighEffort(model)) {
+			// Opus 4.7+ and Sonnet 5 expose both Anthropic's real xhigh and
+			// max presets on the Messages API.
+			return DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX;
+		}
+		if (parsedModel.kind === "opus") {
+			// Opus 4.6 exposes max but not the newer xhigh literal.
+			return DEFAULT_REASONING_EFFORTS_WITH_MAX;
+		}
+		return DEFAULT_REASONING_EFFORTS;
 	}
 	return inferFallbackEfforts(model);
 }
 
 function inferFallbackEfforts<TApi extends Api>(model: ApiModel<TApi>): readonly Effort[] {
+	// Meta documents Muse Spark 1.2 as accepting the full minimal..xhigh
+	// reasoning range. Keep that capability provider-independent so runtime
+	// model discovery/merge cannot downgrade the bundled OpenRouter entry to
+	// the generic openai-completions ceiling of `high`.
+	if (model.id.split("/").at(-1)?.toLowerCase() === "muse-spark-1.2") {
+		return DEFAULT_REASONING_EFFORTS_WITH_XHIGH;
+	}
 	if (model.api === "anthropic-messages") {
 		return DEFAULT_REASONING_EFFORTS_WITH_XHIGH;
 	}
@@ -622,6 +903,9 @@ function inferFallbackEfforts<TApi extends Api>(model: ApiModel<TApi>): readonly
 		return DEFAULT_REASONING_EFFORTS;
 	}
 	if (model.api === "openai-completions") {
+		if (model.provider === "omlx") {
+			return [Effort.Low, Effort.Medium, Effort.High];
+		}
 		const compat = resolveOpenAICompat(model as ApiModel<"openai-completions">);
 		if (compat.thinkingFormat === "openai" && compat.supportsReasoningEffort) {
 			return DEFAULT_REASONING_EFFORTS_WITH_XHIGH;
@@ -662,7 +946,10 @@ function inferThinkingControlMode<TApi extends Api>(
 
 		case "bedrock-converse-stream":
 			if (parsedModel.family === "anthropic") {
-				if (semverGte(parsedModel.version, "4.6") && parsedModel.kind === "opus") {
+				if (
+					semverGte(parsedModel.version, "4.6") &&
+					(parsedModel.kind === "opus" || parsedModel.kind === "fable")
+				) {
 					return "anthropic-adaptive";
 				}
 				if (semverGte(parsedModel.version, "4.5")) {
@@ -702,7 +989,7 @@ function parseGeminiModel(modelId: string): GeminiModel | null {
 }
 
 function parseAnthropicModel(modelId: string): AnthropicModel | null {
-	const match = /claude-(opus|sonnet)-(\d{1,2}(?:[.-]\d{1,2}){0,2})\b/.exec(modelId);
+	const match = /claude-(opus|sonnet|fable)-(\d{1,2}(?:[.-]\d{1,2}){0,2})\b/.exec(modelId);
 	if (!match) {
 		return null;
 	}
@@ -714,7 +1001,10 @@ function parseAnthropicModel(modelId: string): AnthropicModel | null {
 }
 
 function parseOpenAIModel(modelId: string): OpenAIModel | null {
-	const match = /gpt-(\d+(?:\.\d+){0,2})(?:-(codex-spark|codex-mini|codex-max|codex|mini|max|nano))?$/.exec(modelId);
+	const match =
+		/gpt-(\d+(?:\.\d+){0,2})(?:-(codex-spark|codex-mini|codex-max|codex|luna|mini|max|nano|sol|terra))?$/.exec(
+			modelId,
+		);
 	if (!match) {
 		return null;
 	}

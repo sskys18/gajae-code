@@ -13,13 +13,15 @@ import type {
 	GcPruneOutcome,
 	GcRecord,
 	GcStoreAdapter,
+	GcWarning,
 } from "../gjc-runtime/gc-runtime";
 import { gcPidStatusLabel } from "../gjc-runtime/gc-runtime";
 import { resolveReceiptSpoolDir } from "../harness-control-plane/receipt-spool";
-import { readFileLockInfoForGc, removeFileLockDirForGc } from "./file-lock";
+import { readFileLockObservationForGc, removeFileLockDirForGc } from "./file-lock";
 
 const MAX_WALK_DEPTH = 6;
-const MAX_WALK_ENTRIES = 20_000;
+/** Default per-root walk budget. Truncation is a warning, not a hard error. */
+export const FILE_LOCK_GC_MAX_WALK_ENTRIES = 20_000;
 
 // High-cardinality, lock-free subtrees we never descend into. `.lock` dirs are
 // created next to config files, never inside these.
@@ -28,6 +30,13 @@ const PRUNED_DIR_NAMES = new Set(["sessions", "node_modules", ".git", "blobs", "
 interface WalkState {
 	entries: number;
 	truncated: boolean;
+}
+
+export interface FileLocksGcCollectOptions {
+	/** Override per-root entry budget (tests). Defaults to {@link FILE_LOCK_GC_MAX_WALK_ENTRIES}. */
+	maxWalkEntries?: number;
+	/** Override global lock roots for isolated collection tests. */
+	roots?: readonly string[];
 }
 
 // Global, env-aware GJC lock roots. Per the approved scope this covers the
@@ -59,8 +68,24 @@ function keptMalformedRecord(lockDir: string): GcRecord {
 }
 
 async function collectLockRecord(lockDir: string, ctx: GcContext): Promise<GcRecord> {
-	const info = await readFileLockInfoForGc(lockDir);
+	const observation = await readFileLockObservationForGc(lockDir);
+	const info = observation?.info;
 	if (!info) return keptMalformedRecord(lockDir);
+	if (info.owner_host_id !== undefined) {
+		return {
+			store: "file_locks",
+			id: lockDir,
+			path: lockDir,
+			pid: info.pid,
+			pid_status: "unknown",
+			status: "host_qualified",
+			stale: false,
+			removable: false,
+			action: "none",
+			reason: "host_qualified_lock_requires_owner_reclamation",
+			detail: `timestamp=${info.timestamp}`,
+		};
+	}
 
 	const probeResult = ctx.probe(info.pid);
 	const pidStatus = gcPidStatusLabel(probeResult);
@@ -87,8 +112,9 @@ async function walkForLockDirs(
 	state: WalkState,
 	lockDirs: Set<string>,
 	errors: GcError[],
+	maxWalkEntries: number,
 ): Promise<void> {
-	if (state.entries >= MAX_WALK_ENTRIES) {
+	if (state.entries >= maxWalkEntries) {
 		state.truncated = true;
 		return;
 	}
@@ -122,50 +148,68 @@ async function walkForLockDirs(
 	}
 
 	for (const entry of entries) {
-		if (state.entries >= MAX_WALK_ENTRIES) {
+		if (state.entries >= maxWalkEntries) {
 			state.truncated = true;
 			return;
 		}
 		if (PRUNED_DIR_NAMES.has(entry)) continue;
-		await walkForLockDirs(path.join(dir, entry), depth + 1, state, lockDirs, errors);
+		await walkForLockDirs(path.join(dir, entry), depth + 1, state, lockDirs, errors, maxWalkEntries);
 	}
+}
+
+/**
+ * Discover + classify file-lock records. Each known lock root gets its own walk
+ * budget so truncating one root never skips the others. Caps surface as
+ * warnings (partial results), not hard discovery errors.
+ */
+export async function collectFileLocksForGc(
+	ctx: GcContext,
+	options: FileLocksGcCollectOptions = {},
+): Promise<GcCollectResult> {
+	const maxWalkEntries = options.maxWalkEntries ?? FILE_LOCK_GC_MAX_WALK_ENTRIES;
+	const records: GcRecord[] = [];
+	const errors: GcError[] = [];
+	const warnings: GcWarning[] = [];
+	const lockDirs = new Set<string>();
+
+	const roots = options.roots ?? knownFileLockRoots(ctx);
+	for (const root of Array.from(new Set(roots.map(root => path.resolve(root))))) {
+		// Fresh budget per root so a huge agent dir cannot starve config/spool.
+		const state: WalkState = { entries: 0, truncated: false };
+		await walkForLockDirs(root, 0, state, lockDirs, errors, maxWalkEntries);
+		if (state.truncated) {
+			warnings.push({
+				store: "file_locks",
+				scope: root,
+				message: `file lock discovery capped at ${maxWalkEntries} entries for root ${root} (scanned ${state.entries})`,
+			});
+		}
+	}
+
+	for (const lockDir of lockDirs) {
+		try {
+			records.push(await collectLockRecord(lockDir, ctx));
+		} catch (error) {
+			errors.push({ store: "file_locks", scope: lockDir, message: errorMessage(error) });
+		}
+	}
+
+	return { records, errors, warnings };
 }
 
 export const fileLocksGcAdapter: GcStoreAdapter = {
 	store: "file_locks",
 	async collect(ctx: GcContext): Promise<GcCollectResult> {
-		const records: GcRecord[] = [];
-		const errors: GcError[] = [];
-		const lockDirs = new Set<string>();
-		const state: WalkState = { entries: 0, truncated: false };
-
-		for (const root of knownFileLockRoots(ctx)) {
-			await walkForLockDirs(root, 0, state, lockDirs, errors);
-			if (state.truncated) break;
-		}
-
-		if (state.truncated) {
-			errors.push({
-				store: "file_locks",
-				scope: "discovery",
-				message: `file lock discovery capped at ${MAX_WALK_ENTRIES} entries`,
-			});
-		}
-
-		for (const lockDir of lockDirs) {
-			try {
-				records.push(await collectLockRecord(lockDir, ctx));
-			} catch (error) {
-				errors.push({ store: "file_locks", scope: lockDir, message: errorMessage(error) });
-			}
-		}
-
-		return { records, errors };
+		return collectFileLocksForGc(ctx);
 	},
 	async prune(record: GcRecord, ctx: GcContext): Promise<GcPruneOutcome> {
 		const lockDir = record.path ?? record.id;
-		const info = await readFileLockInfoForGc(lockDir);
+		const observation = await readFileLockObservationForGc(lockDir);
+		const info = observation?.info;
 		if (!info) return { removed: false, skipped: "lock_no_longer_dead_or_missing" };
+		if (info.owner_host_id !== undefined) {
+			return { removed: false, skipped: "host_qualified_lock_requires_owner_reclamation" };
+		}
 
 		const probeResult = ctx.probe(info.pid);
 		if (probeResult.status !== "dead") {
@@ -178,12 +222,15 @@ export const fileLocksGcAdapter: GcStoreAdapter = {
 		// so removal re-verifies the on-disk identity under the unlink and refuses
 		// to delete a recreated LIVE lock (TOCTOU).
 		try {
-			const removal = await removeFileLockDirForGc(lockDir, info);
+			const removal = await removeFileLockDirForGc(lockDir, info, observation?.identity);
 			if (removal === "owner_changed") {
 				return { removed: false, skipped: "file_lock_owner_changed_before_delete" };
 			}
 			if (removal === "missing") {
 				return { removed: false, skipped: "lock_no_longer_dead_or_missing" };
+			}
+			if (removal === "cleanup_failed") {
+				return { removed: false, skipped: "lock_removal_denied_by_native_identity_guard" };
 			}
 			return { removed: true };
 		} catch (error) {

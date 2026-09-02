@@ -8,13 +8,29 @@
 // The `label`/`id` metadata is kept inline so callers needing a display name
 // (error formatting, UI listings) do not force a load.
 
-import type { AuthStorage } from "@gajae-code/ai";
-import type { SearchProvider } from "./providers/base";
+import type { AuthStorage } from "@gajae-code/ai/core";
+import type { Settings } from "../../config/settings";
+import type { SearchProvider, SearchProviderSettings } from "./providers/base";
 import type { ActiveSearchModelContext, SearchProviderId } from "./types";
 import { isConfigurableSearchProviderId } from "./types";
 
-export type { SearchParams } from "./providers/base";
+export type { SearchParams, SearchProviderSettings } from "./providers/base";
 export { SearchProvider } from "./providers/base";
+
+export function searchProviderSettings(settings?: Settings): SearchProviderSettings | undefined {
+	if (!settings) return undefined;
+	return {
+		exa: {
+			enabled: settings.get("exa.enabled"),
+			enableSearch: settings.get("exa.enableSearch"),
+		},
+		searxng: {
+			endpoint: settings.get("searxng.endpoint"),
+			categories: settings.get("searxng.categories"),
+			language: settings.get("searxng.language"),
+		},
+	};
+}
 
 interface ProviderMeta {
 	id: SearchProviderId;
@@ -154,6 +170,17 @@ let fallbackProvIds: SearchProviderId[] = [];
  */
 const CHAIN_CACHE_TTL_MS = 60_000;
 let chainCache = new WeakMap<AuthStorage, Map<string, { ids: SearchProviderId[]; expires: number }>>();
+const settingsCacheIds = new WeakMap<Settings, number>();
+let nextSettingsCacheId = 1;
+
+function settingsCacheId(settings: Settings | undefined): number | undefined {
+	if (!settings) return undefined;
+	const existing = settingsCacheIds.get(settings);
+	if (existing !== undefined) return existing;
+	const id = nextSettingsCacheId++;
+	settingsCacheIds.set(settings, id);
+	return id;
+}
 
 /** Drop every cached resolved chain (settings changed, tests). */
 export function clearResolvedChainCache(): void {
@@ -165,17 +192,31 @@ function chainCacheKey(
 	fallbacks: readonly SearchProviderId[],
 	ctx: ActiveSearchModelContext | undefined,
 	authStorage: AuthStorage,
+	settings: Settings | undefined,
 ): string {
 	// Include the AuthStorage generation so credential changes (login/logout,
 	// key rotation) invalidate cached chains immediately instead of being
 	// masked for up to the TTL. Stubs without getGeneration() key as 0.
 	const generation = (authStorage as { getGeneration?: () => number }).getGeneration?.() ?? 0;
+	const providerSettings = settings
+		? [settings.get("exa.enabled"), settings.get("exa.enableSearch"), settings.get("searxng.endpoint")]
+		: null;
 	return JSON.stringify([
 		generation,
+		settingsCacheId(settings),
+		providerSettings,
 		preferred ?? null,
 		fallbacks,
 		ctx
-			? [ctx.provider, ctx.modelId, ctx.wireModelId ?? null, ctx.api, ctx.baseUrl ?? null, ctx.webSearch ?? null]
+			? [
+					ctx.provider,
+					ctx.modelId,
+					ctx.wireModelId ?? null,
+					ctx.api,
+					ctx.baseUrl ?? null,
+					ctx.webSearch ?? null,
+					ctx.ownerAuthOverride ?? false,
+				]
 			: null,
 	]);
 }
@@ -222,16 +263,18 @@ export interface ResolveProviderChainOptions {
 	preferredProvider?: SearchProviderId | "auto";
 	activeModelContext?: ActiveSearchModelContext;
 	fallbackProviders?: readonly SearchProviderId[];
+	settings?: Settings;
 }
 
 async function appendAvailable(
 	chain: SearchProviderId[],
 	id: SearchProviderId,
 	authStorage: AuthStorage,
+	settings: Settings | undefined,
 ): Promise<void> {
 	if (chain.includes(id)) return;
 	const provider = await getSearchProvider(id);
-	if (await provider.isAvailable(authStorage)) chain.push(id);
+	if (await provider.isAvailable(authStorage, searchProviderSettings(settings))) chain.push(id);
 }
 
 function appendDeduped(chain: SearchProviderId[], id: SearchProviderId): void {
@@ -243,7 +286,17 @@ function isAnthropicWire(api: string): boolean {
 }
 
 function isGoogleWire(api: string): boolean {
-	return api === "google-generative-ai" || api === "google-vertex" || api === "google-gemini-cli";
+	return (
+		api === "google-generative-ai" ||
+		api === "google-generative-language" ||
+		api === "gemini-wire" ||
+		api === "google-vertex" ||
+		api === "google-gemini-cli"
+	);
+}
+
+function isGenerativeLanguageWire(api: string): boolean {
+	return api === "google-generative-ai" || api === "google-generative-language" || api === "gemini-wire";
 }
 
 function isOpenAICompatWire(api: string): boolean {
@@ -268,6 +321,52 @@ function looksXaiModelId(modelId: string | undefined): boolean {
 
 function looksXaiFamilyModelId(ctx: ActiveSearchModelContext): boolean {
 	return looksXaiModelId(ctx.wireModelId) || looksXaiModelId(ctx.modelId);
+}
+
+const OFFICIAL_GEMINI_HOSTS = new Set([
+	"cloudcode-pa.googleapis.com",
+	"daily-cloudcode-pa.googleapis.com",
+	"daily-cloudcode-pa.sandbox.googleapis.com",
+	"generativelanguage.googleapis.com",
+]);
+
+function normalizedHost(baseUrl: string): string | undefined {
+	try {
+		return new URL(baseUrl).hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "").replace(/\.$/, "");
+	} catch {
+		return undefined;
+	}
+}
+
+function isOfficialGeminiBaseUrl(baseUrl: string | undefined): boolean {
+	if (!baseUrl?.trim()) return true;
+	const host = normalizedHost(baseUrl);
+	return host !== undefined && OFFICIAL_GEMINI_HOSTS.has(host);
+}
+
+function isOfficialXaiBaseUrl(baseUrl: string | undefined): boolean {
+	if (!baseUrl?.trim()) return true;
+	return normalizedHost(baseUrl) === "api.x.ai";
+}
+
+const CANONICAL_GEMINI_PROVIDERS = new Set(["google", "gemini", "google-gemini-cli", "google-antigravity"]);
+
+function hasCustomGeminiSearchContext(ctx: ActiveSearchModelContext): boolean {
+	if (!isGoogleWire(ctx.api)) return false;
+	if (ctx.ownerAuthOverride) return true;
+	if (!isOfficialGeminiBaseUrl(ctx.baseUrl)) return true;
+	const provider = ctx.provider.toLowerCase();
+	return Boolean(ctx.resolveCredentials && !CANONICAL_GEMINI_PROVIDERS.has(provider));
+}
+
+function hasCustomXaiSearchContext(ctx: ActiveSearchModelContext): boolean {
+	if (!isOpenAICompatWire(ctx.api)) return false;
+	if (ctx.ownerAuthOverride) return true;
+	const provider = ctx.provider.toLowerCase();
+	if (provider === "xai" && !isOfficialXaiBaseUrl(ctx.baseUrl)) return true;
+	if (!looksXaiFamilyModelId(ctx)) return false;
+	if (!isOfficialXaiBaseUrl(ctx.baseUrl)) return true;
+	return provider !== "xai";
 }
 
 export function isLocalBaseUrl(baseUrl: string | undefined): boolean {
@@ -334,12 +433,29 @@ export function inferNativeProviderFromModel(ctx: ActiveSearchModelContext | und
 	if (!ctx || ctx.webSearch === "off") return undefined;
 	const modelId = (ctx.wireModelId ?? ctx.modelId).toLowerCase();
 	if (modelId.startsWith("claude-") && isAnthropicWire(ctx.api)) return "anthropic";
-	if (modelId.startsWith("gemini-") && isGoogleWire(ctx.api)) return "gemini";
-	if (looksXaiFamilyModelId(ctx) && isOpenAICompatWire(ctx.api)) return "xai";
+	if (modelId.startsWith("gemini-") && isGoogleWire(ctx.api) && !hasCustomGeminiSearchContext(ctx)) return "gemini";
+	// A custom proxy may expose a Grok model through an OpenAI wire while the
+	// process also has canonical xAI credentials. Do not infer the canonical
+	// xAI provider from the model family: that would silently send the search to
+	// api.x.ai with another registry's credentials. Custom active contexts are
+	// dispatched below by activeContextNativeId, where the provider can consume
+	// the active owner-bound resolver instead.
+	if (
+		looksXaiFamilyModelId(ctx) &&
+		isOpenAICompatWire(ctx.api) &&
+		ctx.provider.toLowerCase() === "xai" &&
+		!hasCustomXaiSearchContext(ctx)
+	)
+		return "xai";
 	// `codex` hits the ChatGPT backend with local Codex OAuth, so only infer it
 	// for genuine OpenAI endpoints. Custom/proxy OpenAI-compatible models fall
-	// through to `activeContextNativeId` → `openai-compatible` (their own creds).
-	if (looksOpenAIFamilyModelId(ctx) && isOpenAICompatWire(ctx.api) && isOpenAIOfficialBaseUrl(ctx.baseUrl)) {
+	// through to `activeContextNativeId` and reuse their own credentials.
+	if (
+		!ctx.ownerAuthOverride &&
+		looksOpenAIFamilyModelId(ctx) &&
+		isOpenAICompatWire(ctx.api) &&
+		isOpenAIOfficialBaseUrl(ctx.baseUrl)
+	) {
 		return "codex";
 	}
 	return undefined;
@@ -347,7 +463,10 @@ export function inferNativeProviderFromModel(ctx: ActiveSearchModelContext | und
 
 function canUseDirectProviderMapping(ctx: ActiveSearchModelContext, id: SearchProviderId): boolean {
 	if (ctx.webSearch === "off") return false;
+	if (id === "gemini" && hasCustomGeminiSearchContext(ctx)) return false;
+	if (id === "xai" && hasCustomXaiSearchContext(ctx)) return false;
 	if (id !== "codex") return true;
+	if (ctx.ownerAuthOverride) return false;
 	// Same constraint as inference: the ChatGPT-backed codex provider is valid
 	// only for official OpenAI endpoints, not custom/proxy base URLs.
 	return isOpenAIOfficialBaseUrl(ctx.baseUrl);
@@ -360,12 +479,23 @@ export async function canUseGenericCredentials(
 	signal?: AbortSignal,
 ): Promise<boolean> {
 	if (!ctx) return false;
+	if (ctx.resolveCredentials) {
+		const resolved = await ctx.resolveCredentials({ sessionId, signal });
+		return Boolean(resolved.apiKey) || hasActiveCredentialHeader(resolved.headers);
+	}
 	const key = await authStorage.getApiKey(ctx.provider, sessionId, {
 		baseUrl: ctx.baseUrl,
 		modelId: ctx.modelId,
 		signal,
 	});
 	return Boolean(key);
+}
+
+function hasActiveCredentialHeader(headers: Record<string, string> | undefined): boolean {
+	return Object.keys(headers ?? {}).some(key => {
+		const normalized = key.toLowerCase();
+		return normalized === "authorization" || normalized === "x-api-key" || normalized === "x-goog-api-key";
+	});
 }
 
 /**
@@ -389,13 +519,20 @@ export function activeContextNativeId(ctx: ActiveSearchModelContext | undefined)
 	if (!ctx || ctx.webSearch === "off") return undefined;
 	const modelId = (ctx.wireModelId ?? ctx.modelId).toLowerCase();
 	// Dispatch must match exactly what each provider can service by reusing the
-	// active credential: the OpenAI-compatible adapter only speaks the two plain
-	// OpenAI wires (not azure), and the Gemini active path only speaks the public
-	// Generative Language wire (not vertex/cloud-code). Returning an id the
-	// provider would reject just wastes a guaranteed-fail attempt before DuckDuckGo.
+	// active credential: xAI-family models use the xAI search tools, the
+	// OpenAI-compatible adapter only speaks the two plain OpenAI wires (not
+	// azure), and the Gemini active path only speaks the public Generative
+	// Language wire (not vertex/cloud-code). Returning an id the provider would
+	// reject just wastes a guaranteed-fail attempt before DuckDuckGo.
 	if (isAnthropicWire(ctx.api) && modelId.startsWith("claude-")) return "anthropic";
+	if (isGenerativeLanguageWire(ctx.api) && modelId.startsWith("gemini-")) return "gemini";
+	if (
+		isOpenAICompatWire(ctx.api) &&
+		hasCustomXaiSearchContext(ctx) &&
+		(looksXaiFamilyModelId(ctx) || ctx.provider.toLowerCase() === "xai")
+	)
+		return "xai";
 	if (ctx.api === "openai-responses" || ctx.api === "openai-completions") return "openai-compatible";
-	if (ctx.api === "google-generative-ai" && modelId.startsWith("gemini-")) return "gemini";
 	return undefined;
 }
 
@@ -407,12 +544,26 @@ export async function resolveProviderChain(options: ResolveProviderChainOptions)
 		preferredProvider = preferredProvId,
 		activeModelContext,
 		fallbackProviders = fallbackProvIds,
+		settings,
 	} = options;
 
-	const cacheKey = chainCacheKey(preferredProvider, fallbackProviders, activeModelContext, authStorage);
+	// Resolve the active model before consulting the chain cache. The registry
+	// resolver refreshes rotating apiKeyEnv credentials and updates generated
+	// headers, which also advances AuthStorage's generation when credentials
+	// rotate or disappear.
+	if (preferredProvider === "auto" && activeModelContext?.resolveCredentials) {
+		await activeModelContext.resolveCredentials({ sessionId, signal });
+	}
+	const cacheKey = chainCacheKey(preferredProvider, fallbackProviders, activeModelContext, authStorage, settings);
 	const perStorage = chainCache.get(authStorage);
+	const now = Date.now();
+	if (perStorage) {
+		for (const [key, entry] of perStorage) {
+			if (entry.expires <= now) perStorage.delete(key);
+		}
+	}
 	const cached = perStorage?.get(cacheKey);
-	if (cached && cached.expires > Date.now()) {
+	if (cached && cached.expires > now) {
 		const cachedProviders: SearchProvider[] = [];
 		for (const id of cached.ids) cachedProviders.push(await getSearchProvider(id));
 		return cachedProviders;
@@ -425,13 +576,13 @@ export async function resolveProviderChain(options: ResolveProviderChainOptions)
 	// never selectable as a forced primary; such inputs fall through to auto
 	// native resolution instead of being injected into the chain.
 	if (preferredProvider !== "auto" && isConfigurableSearchProviderId(preferredProvider)) {
-		await appendAvailable(chain, preferredProvider, authStorage);
+		await appendAvailable(chain, preferredProvider, authStorage, settings);
 	} else if (activeModelContext) {
 		const directId = MODEL_PROVIDER_TO_SEARCH[activeModelContext.provider.toLowerCase()];
 		if (directId && canUseDirectProviderMapping(activeModelContext, directId))
-			await appendAvailable(chain, directId, authStorage);
+			await appendAvailable(chain, directId, authStorage, settings);
 		const inferred = inferNativeProviderFromModel(activeModelContext);
-		if (inferred) await appendAvailable(chain, inferred, authStorage);
+		if (inferred) await appendAvailable(chain, inferred, authStorage, settings);
 		// Native-over-proxy: when no canonical native provider was selected above,
 		// fall back to the model's own credentials (resolved under the active
 		// provider id against its baseUrl) to drive native web search. Gated on
@@ -449,7 +600,7 @@ export async function resolveProviderChain(options: ResolveProviderChainOptions)
 	// fallback list, regardless of how `fallbackProviders` was supplied.
 	for (const id of fallbackProviders) {
 		if (!isConfigurableSearchProviderId(id)) continue;
-		await appendAvailable(chain, id, authStorage);
+		await appendAvailable(chain, id, authStorage, settings);
 	}
 	appendDeduped(chain, "duckduckgo");
 

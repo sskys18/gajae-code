@@ -1,125 +1,144 @@
-# External control surface readiness
+# External control readiness
 
-This document classifies every public GJC surface that an external controller, bot, editor, or harness can use to drive `gjc`. It is intentionally narrower than the generic bot guide: it states what is ready today, what is only editor/client-oriented, and what remains experimental.
+Process-isolated controllers use broker-bound or managed surfaces. The SDK WebSocket
+endpoint is not a public controller interface; endpoint records, transport
+credentials, and raw session transports remain inside SDK core; see
+[SDK machine interfaces](./sdk.md) for the ownership boundary.
 
-## Readiness matrix
+## Supported surfaces
 
-| Surface | Current readiness | Primary command | Use when | Do not use when | Provider-independent smoke path |
-| --- | --- | --- | --- | --- | --- |
-| Coordinator MCP | Preferred multi-session bot/control-plane surface. | `gjc mcp-serve coordinator` | A controller needs to start/register GJC sessions, send bounded turns, answer questions, read artifacts, and write durable status reports across one or more repo/worktree lanes. | The controller only needs one embedded subprocess and can own stdio directly. | `gjc mcp-serve coordinator --check --json`; `packages/coding-agent/test/coordinator-mcp.test.ts`; `packages/coding-agent/test/setup-cli.test.ts`. |
-| RPC stdio | Stable subprocess worker surface. | `gjc --mode rpc` | A host embeds one GJC worker process, sends JSONL commands over stdin, consumes stdout frames, and optionally uses `python/gjc-rpc`. | The host needs remote HTTPS, multi-session orchestration, or MCP tool discovery. | `packages/coding-agent/test/rpc-unattended-stdio.test.ts`; `packages/coding-agent/test/rpc-client.start.test.ts`; `packages/coding-agent/test/rpc-host-tools.test.ts`; `packages/coding-agent/test/rpc-host-uris.test.ts`. |
-| ACP mode | Editor/ACP client surface with tested protocol initialization, session lifecycle, client-owned MCP, file/terminal client bridges, permission routing, and stdout hygiene. | `gjc --mode acp` or `gjc acp` | An editor or ACP-compatible client wants to drive GJC through the Agent Client Protocol over stdio. | A bot needs a generic multi-session control plane; use Coordinator MCP instead. | `packages/coding-agent/test/acp-initialize-conformance.test.ts`; `packages/coding-agent/test/acp-stdout-hygiene.test.ts`; `packages/coding-agent/test/acp-lazy-startup.test.ts`; `packages/coding-agent/test/acp-mcp-isolation.test.ts`; `packages/coding-agent/test/read-acp-fs.test.ts`; `packages/coding-agent/test/write-acp-fs.test.ts`; `packages/coding-agent/test/bash-acp-terminal.test.ts`. |
-| Bridge HTTPS | Experimental, fail-closed remote session-control surface. | `gjc --mode bridge` | A future remote client needs HTTPS protocol scaffolding, authenticated health/help/handshake behavior, or SDK compatibility tests. | Production bot lifecycle, default external-controller integration, or claims that remote session events/commands are enabled by default. | `packages/coding-agent/test/bridge/bridge-auth.test.ts`; `packages/coding-agent/test/bridge/bridge-mode-handler.test.ts`; `packages/coding-agent/test/bridge/bridge-conformance.test.ts`; `packages/bridge-client/test/bridge-client.test.ts`. |
+| Surface | Entrypoint | Use it when |
+| --- | --- | --- |
+| SDK session CLI | `gjc sdk session list|inspect|send|status|tail` or `raw control|query|global` | A local script needs bounded, credential-free session operations. |
+| Coordinator MCP | `gjc mcp-serve coordinator` | A controller needs multi-session orchestration, durable reports, or worktree-scoped lifecycle operations. |
+| Managed adapter | Configured Telegram, Discord, or Slack integration | A provider renders session presentation through opaque Router attachments. |
+| ACP | `gjc --mode acp` or `gjc acp` | An editor or ACP-compatible client supplies the session frontend. |
 
-## Surface details
+`--mode rpc`, `--mode rpc-ui`, `--mode bridge`, and `gjc sdk serve` have been removed;
+they are not compatibility interfaces.
 
-### Standalone TUI and MCP inheritance
+## SDK session CLI readiness
 
-Normal standalone GJC (`gjc`, `gjc --tmux`, and print-mode prompts) does not inherit Claude Code, Codex, Cursor, Gemini, Windsurf, or other tools' MCP servers as a public startup contract. It also does not expose a supported standalone-TUI setting that automatically imports arbitrary MCP servers for the model. See [Standalone GJC MCP support](./standalone-mcp.md) for the user-facing boundary and workarounds.
+The session CLI resolves controls through `SessionRouter` and lifecycle globals
+through `SessionLifecycleService` and the Broker. It emits credential-free JSON;
+review [docs/sdk-session-cli.md](./sdk-session-cli.md) before building a script.
+## ACP readiness
 
-### Coordinator MCP
+ACP remains a stdio editor protocol. Its session control uses the SDK adapter internally; it is not a replacement external bot-control protocol.
 
-Coordinator MCP is the default answer for external bot and orchestration integrations. It exposes a transport-level MCP tool contract for session discovery, managed session start, visible tmux registration, prompt delivery, bounded turn waiting, structured question answering, artifact reads, and explicit completion/failure/cancellation reports.
-It also exposes high-level `gjc_delegate_plan` / `gjc_delegate_execute` / `gjc_delegate_team` tools so a host can delegate a whole GJC workflow (ralplan/ultragoal/team) in one call and consume the durable turn result. The canonical gajae-code plugin bundles under `plugins/` and `gjc setup claude|codex|hermes` package this surface with fail-closed defaults (workdir-scoped roots, mutations off until opt-in). Claude Code is installable through its generated local marketplace; Codex artifacts are preview-only until a versioned Codex local marketplace smoke proves install and runtime activation.
+For the build/run/verify loop when changing ACP code locally, see [ACP local development](./acp-local-development.md).
 
-Readiness claim:
+#### Turn-end termination of owned work
 
-- Ready as the preferred generic external-controller control plane.
-- Provider-independent contract checks exist for server metadata, tool discovery, read-only defaults, mutation gates, setup rendering, and dry-run lifecycle behavior.
-- It is not a provider/model contract. Live model execution remains the operator's environment-specific smoke.
+An ACP `session/cancel` is a C04 terminal abort. By default it stops only the active turn
+(`scope:"turn"`, matching the SDK `turn.abort` default and other ACP clients' cancel
+behavior); exact owned work that turn spawned (background Bash/task jobs, detached
+subagents) keeps running, and its completion can resume the root worker as a fresh turn. A
+cancel with `scope:"owned"` additionally stops exact owned work, so an external client
+such as Paseo that ends a run terminates everything it started instead of leaving
+subagents running in the background. A fresh bounded idempotency key is issued per cancel,
+so retries replay deterministically. A cancel with no active turn is a deterministic
+no-effect (`no_active_turn`), and an unsettled stop reports `uncertain` instead of
+claiming stopped work.
 
-Primary references:
+Owned termination is an explicit opt-in: `_meta.gjc.abortScope: "owned"` on the
+`session/cancel` notification, or `GJC_ACP_ABORT_SCOPE=owned` in the agent environment as
+the process-wide fallback. Paseo keeps owned cancels through its provider config `env`
+(see [Paseo custom agent](#paseo-custom-agent)).
 
-- `docs/bot-integration.md`
-- `docs/hermes-mcp-bridge.md`
-- `packages/coding-agent/src/coordinator/contract.ts`
-- `packages/coding-agent/src/coordinator-mcp/server.ts`
+#### Evidence promotion policy
 
-### RPC stdio
+Ordinary CI runs publish an **ephemeral** report under `$RUNNER_TEMP` and upload it as a
+build artifact with bounded retention; those runs never rewrite tracked evidence.
+`artifacts/acp-core-v1-conformance-baseline.json` is a **deliberately promoted** release
+baseline: it is refreshed only from a successful pinned run for a release candidate, so a
+tracked change to it is an explicit act rather than per-run churn.
 
-RPC mode is the stable embedded-worker surface. It is newline-delimited JSON over stdio and emits a `{ "type": "ready" }` frame before accepting commands. Hosts can drive prompts, state queries, host tools, host URI schemes, workflow gates, extension UI responses, cancellation, and unattended negotiation through the RPC command catalog.
+The conformance workspace passed via `--cwd` must be a real path, not one reached through
+a symlink (on macOS `/tmp` links to `/private/tmp`): the ACP client enforces its session
+cwd root against the resolved path, so a symlinked workspace fails the client-authority
+cases. The wrapper rejects such a `--cwd` up front.
 
-Readiness claim:
+## JetBrains Air custom agent
 
-- Ready for single-process host integration and subprocess workers.
-- The public Python client in `python/gjc-rpc` is the recommended typed client for Python hosts.
-- Multi-session orchestration and MCP tool discovery are out of scope for RPC; use Coordinator MCP for those.
+Add GJC through Air's **Add Custom Agent** action, then configure the Air-managed `acp.json`. With only `["acp"]`, Air shows GJC's existing model list. Add `--mpreset <id>` only when the Air model selector should show the available GJC preset list and create new sessions with that preset.
 
-Primary references:
-
-- `docs/rpc.md`
-- `python/gjc-rpc/README.md`
-- `packages/coding-agent/src/modes/rpc/rpc-mode.ts`
-- `packages/coding-agent/src/modes/rpc/rpc-types.ts`
-
-### ACP mode
-
-ACP mode runs GJC as an Agent Client Protocol server over stdio. It is useful for editor-style clients that own the ACP transport and want session creation, session load/fork/resume/close metadata, prompt handling, client-provided MCP servers, permission prompts, editor file reads/writes, terminal-backed bash, and elicitation support.
-
-Readiness claim:
-
-- ACP is implemented and covered for current editor/client contracts: initialize conformance, agent capability advertisement, lazy startup, stdout JSON-RPC hygiene, client-owned MCP isolation, event mapping, file bridge routing, terminal routing, and permission routing.
-- ACP is not the preferred bot control-plane surface. It is not positioned as a multi-session external bot coordinator, and it does not replace Coordinator MCP reports/artifacts/turn state.
-- A real prompt still depends on the selected provider/model credentials, so required PR smokes should stay on provider-independent initialize, lifecycle, bridge, and mapper tests.
-
-Current entrypoints:
-
-```sh
-gjc --mode acp
-# equivalent ACP subcommand for ACP clients that prefer command-style launch
-gjc acp
-```
-For Zed custom-agent setup, add a custom `agent_servers` entry that launches the same stdio server explicitly:
+The following example starts the `opus-codex` model preset and allows tool calls without permission prompts:
 
 ```json
 {
   "agent_servers": {
-    "gjc": {
-      "type": "custom",
-      "command": "gjc",
-      "args": ["acp"],
-      "env": {}
+    "Gajae-Local-Opus": {
+      "command": "/absolute/path/to/gjc",
+      "args": ["acp", "--mpreset", "opus-codex"],
+      "env": {
+        "GJC_ACP_PERMISSION_MODE": "always-allow"
+      }
     }
   }
 }
 ```
 
-Zed owns the ACP client connection and may forward editor-owned MCP servers over ACP; GJC keeps this isolated from standalone `.mcp.json` discovery and only starts ACP behavior through the explicit entrypoint.
+`always-allow` gives the agent permission to execute gated tools, including shell commands, without an Air approval prompt. Omit `GJC_ACP_PERMISSION_MODE` or set it to `prompt` when manual approval is required. Start a new Air task after changing `acp.json`; restart Air if it reuses an already-running agent process.
 
-Primary references:
+Air supplies MCP servers through ACP session requests. GJC accepts client-supplied stdio, HTTP, and SSE definitions for new sessions and offline resume. Do not add `--mcp-config` to the ACP command: that CLI option is intentionally unsupported for broker-backed ACP. A live session's MCP configuration is immutable; reconnect declarations from Air attach to the existing configuration instead of attempting to replace it. Close or resume the offline session to change its MCP configuration.
+Air clients that advertise form elicitation receive `AskUserQuestion` selections and free-text prompts through ACP; declining or cancelling the form leaves the ask unanswered.
 
-- `packages/coding-agent/src/commands/acp.ts`
-- `packages/coding-agent/src/modes/acp/acp-mode.ts`
-- `packages/coding-agent/src/modes/acp/acp-agent.ts`
-- `packages/coding-agent/src/modes/acp/acp-client-bridge.ts`
-- `packages/coding-agent/src/modes/acp/acp-event-mapper.ts`
+For local development, `bun run restart:sdk-broker` asks the published broker to shut down over its authenticated loopback channel, waits for that broker identity to disappear, and starts a replacement. A broker that predates the `broker.shutdown` operation answers `unknown_operation`; the restart then falls back to a `SIGTERM` sent only when the published pid still carries the published process incarnation. Use `--agent-dir <path>` when testing an isolated agent directory.
 
-### Bridge HTTPS
+Restarting the broker alone leaves the session-host processes it spawned running, so ACP clients keep reattaching to sessions that still execute the previous source. Pass `--close-session-hosts` to close those sessions through the live broker first; only sessions served by a `sdk session-host-internal` process are selected, so interactive sessions publishing their own endpoint are never closed.
 
-Bridge mode is an experimental network protocol surface over HTTPS. Its current public posture is deliberately fail-closed: unauthenticated health/help are available, authenticated handshake is available, and default session-control endpoints advertise no accepted capabilities/scopes and reject with `endpoint_disabled`.
+Air-created Git worktrees are supported because each ACP request's absolute `cwd` becomes the session workspace. Additional ACP workspace roots are not currently supported and are rejected instead of being advertised.
 
-Readiness claim:
+Session title and update metadata are advisory state for the active ACP process. Text, thought, tool-call, and tool-result history is replayed on load, but historical binary image bytes are not replayed.
 
-- Ready as experimental protocol scaffolding with fail-closed behavior and SDK/client conformance tests.
-- Not ready as the default external-bot product surface.
-- Do not document events, commands, controller ownership, UI responses, host tool results, or host URI results as enabled by default. Those names remain in the protocol catalog for internal compatibility and future re-enable work.
+See [Environment Variables](./environment-variables.md#11-acp-permission-handling) for supported values and precedence.
+## Paseo custom agent
 
-Primary references:
+[Paseo](https://github.com/getpaseo/paseo) registers GJC as a generic ACP provider through its custom provider configuration. Add this entry to `$PASEO_HOME/config.json` (default `~/.paseo/config.json`); Paseo then lists **Gajae Code** in its provider picker with GJC's model catalog and Default/Plan modes:
 
-- `docs/bridge.md`
-- `packages/coding-agent/src/modes/bridge/bridge-mode.ts`
-- `packages/coding-agent/src/modes/bridge/auth.ts`
-- `packages/bridge-client/src/index.ts`
+```json
+{
+  "version": 1,
+  "agents": {
+    "providers": {
+      "gjc": {
+        "extends": "acp",
+        "label": "Gajae Code",
+        "command": ["gjc", "acp"],
+        "env": {
+          "GJC_ACP_ABORT_SCOPE": "owned"
+        }
+      }
+    }
+  }
+}
+```
 
-## PR smoke checklist
+The `env` entry keeps Paseo's `stop` (an ACP `session/cancel`) terminating owned subagents and background jobs as well as the turn; without it, a cancel stops only the current turn and leaves owned work running (see [Turn-end termination of owned work](#turn-end-termination-of-owned-work)). Restart the Paseo daemon (`paseo daemon restart`) after editing the config.
 
-For external-control PRs, use this provider-independent checklist before any optional live provider smoke:
+GJC's ACP session configuration carries the spec-defined `category` on the Mode, Model, and Thinking select options (`mode`, `model`, `thought_level`), which lets ACP clients such as Paseo discover models and thinking levels without provider-specific metadata. The model catalog is filtered to providers with usable stored credentials (`providers.list/active`), falling back to the full catalog on session hosts that do not expose that query.
 
-1. **Docs-to-code alignment:** the readiness matrix still matches CLI mode parsing, MCP command registration, ACP command registration, bridge endpoint defaults, and RPC/ACP/Bridge tests.
-2. **Coordinator MCP:** `gjc mcp-serve coordinator --check --json` still reports the coordinator server and tool list, and focused MCP tests pass without provider credentials.
-3. **RPC stdio:** at least one stdio or client contract test proves JSONL startup/command routing without a real provider key.
-4. **ACP mode:** initialize/stdout or conformance tests prove the ACP JSON-RPC entrypoint and capability advertisement without a real provider key.
-5. **Bridge HTTPS:** bridge auth/handler tests prove TLS requirement, authenticated handshake, help/health behavior, and default `endpoint_disabled` session-control posture.
-6. **Local leak audit:** deliverable docs/tests must not contain private profile names, user-home paths, callback artifact paths, local proxy names, terminal app names, or private launch wrappers.
+Model profiles also appear in the ordinary **Model** picker as synthetic entries under the reserved namespace, e.g. `gajae-code/codex-eco` (displayed with the profile label, such as "Codex Eco"). Selecting one through the ACP `Model` select immediately switches the live session to the full profile without persisting `modelProfile.default`; persistence remains an explicit `/model` TUI choice or `gjc --mpreset codex-eco --default`. Only profiles whose providers have usable stored credentials are selectable; synthetic rows are already availability-filtered by the session host, so the Q29 active-provider filter never drops them. An unavailable-but-active profile stays visible as the current readback and, if selected, fails with the existing authentication-required error. The separate ACP startup `--mpreset`/Q27 `Preset` select is likewise session-scoped and non-persistent.
 
-Optional live smokes are useful diagnostics for one operator's model/profile/network setup, but they must not be required for PR readiness unless the PR explicitly changes live provider behavior.
+Sessions launched through an ACP client (e.g. `paseo run --provider gjc/...`) are broker-managed and appear in ACP `session/list`, so Paseo's import flow can attach them. Interactive `gjc` sessions host their own SDK endpoint and are not broker-registered, so they are not listed by ACP clients; use the GJC SDK/notifications surface to control those sessions.
+
+## ACP conformance and Air release gates
+
+CI runs every `required_cases` entry in the pinned external `acpx@0.13.0` `acp-core-v1` corpus at upstream
+commit `47dc1c56b20da3c248a4a1b5c5106f52e65e6594` against `gjc --mode acp`
+through `bun run conformance:run`. The corpus is checked out outside this
+repository; it is not vendored.
+The `acp_conformance` CI job publishes its JSON report and blocks the aggregate
+test status on failure.
+
+JetBrains Air remains a versioned human-only compatibility gate. Before an Air
+release claim, complete [`artifacts/acp-jetbrains-air-smoke.md`](../artifacts/acp-jetbrains-air-smoke.md)
+for the tested Air and GJC builds, attach only redacted logs, and record the
+result with the release evidence. This checklist must not be auto-filled by CI.
+## Verification references
+
+- `packages/coding-agent/test/sdk-*.test.ts`
+- `packages/coding-agent/test/acp-*.test.ts`
+- `packages/coding-agent/test/workflow-gate-broker.test.ts`
+- `packages/coding-agent/test/workflow-gate-schema.test.ts`

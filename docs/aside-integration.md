@@ -1,6 +1,8 @@
 # Aside sidecar evaluation
 
-This note records the safe first-step boundary for evaluating [Aside](https://aside.com/) with Gajae-Code (`gjc`). It is intentionally docs-only: GJC does not ship an Aside adapter, does not auto-discover Aside, and does not enable browser-control behavior by default.
+This note records the safe first-step boundary for evaluating [Aside](https://aside.com/) with Gajae-Code (`gjc`). The search/context sidecar path is intentionally docs-only: GJC does not ship an Aside adapter, does not auto-discover Aside, and does not enable browser-control behavior by default.
+
+The one in-tree CLI ergonomics surface is the explicit `/aside` composer slash command. It probes a user-installed Aside CLI and can run `aside exec` / `aside account` when the operator types it. That command does not restore a GJC browser-tool backend and does not turn Aside on for ordinary browser or search tools.
 
 ## Current public surface
 
@@ -35,13 +37,13 @@ If a task needs any out-of-scope behavior, stop and require a separate explicit 
 
 ## Option A: local Aside MCP command
 
-When the Aside CLI is installed and the operator intentionally wants GJC to see the Aside MCP tools, register the MCP server explicitly:
+When the Aside CLI is installed and the operator wants to record the Aside MCP command for repo-local inspection, store the definition explicitly:
 
 ```sh
 gjc mcp add aside aside mcp --project
 ```
 
-Use `--project` for repo-local evaluation. Omit it only when the operator wants the server available to all local GJC sessions.
+Use `--project` for repo-local evaluation records. Omit it only when the operator intentionally wants the stored definition in the user-level GJC MCP config; both scopes are consumed by ordinary standalone GJC sessions at startup (conventional autoload) unless disabled or opted out with `--no-mcp`.
 
 After registration, inspect the redacted definition:
 
@@ -49,7 +51,8 @@ After registration, inspect the redacted definition:
 gjc mcp list --json
 ```
 
-Do not paste task transcripts, browser screenshots, cookies, saved credential state, or private Aside profile paths into issues or PRs. If you need to share evidence, summarize the tool list and a benign query result.
+`gjc mcp add` makes the stored server definition available to ordinary standalone `gjc`, `gjc --tmux`, and print-mode sessions as runtime tools. Do not paste task transcripts, browser screenshots, cookies, saved credential state, or private Aside profile paths into issues or PRs. If you need to share evidence, summarize the stored definition shape and any benign externally gathered result.
+
 
 Recommended prompt boundary for evaluation:
 
@@ -57,7 +60,32 @@ Recommended prompt boundary for evaluation:
 Use the Aside sidecar only for read-only search/context retrieval. Do not click, submit, sign in, autofill credentials, use payment or billing flows, post messages, write files, or operate internal tools. Return a short answer with source titles/URLs only.
 ```
 
-## Option B: future HTTP/SSE MCP endpoint
+## Option B: `/aside` composer command
+
+Type `/aside` in the GJC composer to probe and use a locally installed Aside CLI. This is operator-initiated and does not enable GJC browser-control by default.
+
+```text
+/aside
+/aside Summarize the current page
+/aside exec --session <id> Continue
+/aside mcp
+/aside account list
+```
+
+Behavior:
+
+- Bare `/aside` prints the resolved CLI path, `aside --version` when available, and usage.
+- `/aside <prompt>` and `/aside exec …` spawn `aside exec` with argv (no shell).
+- `/aside mcp` prints `gjc mcp add aside <resolved-cli> mcp --project`. It does not start `aside mcp` inside GJC, because that command is a stdio server.
+- `/aside repl` is refused inside GJC. Run `aside repl` in a real terminal TTY.
+- If the CLI is missing, GJC prints the searched paths and `curl -fsSL https://releases.aside.com/install.sh | bash`. It never runs the installer.
+- On native Windows, the printed MCP and REPL commands use PowerShell quoting; the documented installer command is for WSL or Git Bash, not PowerShell itself.
+
+Probe order: `~/.local/bin/aside`, then `~/.aside/cli/Aside CLI.app/Contents/MacOS/aside`, then `PATH`.
+
+Keep the same payload boundary as the MCP path: do not paste cookies, screenshots, task transcripts, or private Aside profile paths into issues or PRs.
+
+## Option C: future HTTP/SSE MCP endpoint
 
 If Aside or a wrapper later exposes a narrow search/context MCP endpoint, keep endpoint and credentials user-owned:
 
@@ -81,13 +109,14 @@ A future Aside search endpoint should be accepted only if it is narrower than br
 
 Use this checklist instead of a live login/payment/internal-site scenario:
 
-1. Register the MCP server with `gjc mcp add ... --project`.
+1. Register the MCP server definition with `gjc mcp add ... --project`.
 2. Run `gjc mcp list --json` and confirm secrets are redacted.
-3. Start a GJC session in a disposable repo/worktree.
-4. Ask one public, non-personal query, for example: `Find the Aside public help page that describes MCP support and summarize the documented command names.`
-5. Confirm the response includes only public page titles/URLs or short snippets.
-6. Confirm no API key, Authorization header, cookie, browser profile path, screenshot, raw task transcript, or private session payload appears in terminal output, logs, issue comments, or PR text.
-7. Remove the evaluation server if it is no longer needed:
+3. Confirm the record is project-scoped or user-scoped as intended.
+4. Confirm the registration is consumed by a normal standalone GJC session in that project (tools appear at startup). To verify without a server, use `--no-mcp` or disable the server (`enabled: false` / `disabledServers`) for that session.
+5. If evaluating Aside behavior separately, run one public, non-personal query through the Aside-owned surface, for example: `Find the Aside public help page that describes MCP support and summarize the documented command names.`
+6. Confirm any shared evidence includes only public page titles/URLs or short snippets.
+7. Confirm no API key, Authorization header, cookie, browser profile path, screenshot, raw task transcript, or private session payload appears in terminal output, logs, issue comments, or PR text.
+8. Remove the evaluation server if it is no longer needed:
 
 ```sh
 gjc mcp remove aside --project
@@ -99,13 +128,22 @@ gjc mcp remove aside-search --project
 
 | Symptom | Check |
 | --- | --- |
-| `aside` command not found | Install the Aside CLI from Aside developer settings, then use the concrete CLI path as the MCP `command` if needed. |
-| MCP server does not appear | Re-run `gjc mcp list --json`; confirm whether the registration was user-scoped or project-scoped. |
+| `aside` command not found | Run `/aside` in the GJC composer, or install the Aside CLI from Aside developer settings, then use the concrete CLI path as the MCP `command` if needed. |
+| `/aside` says the CLI was not found | Confirm the installer symlink (`~/.local/bin/aside`) or the `Aside CLI.app` bundle exists and is executable. `/aside` never runs the installer. |
+| `/aside repl` is refused | Expected. GJC cannot attach a TTY to `aside repl`; run that command in a terminal. |
+| MCP server does not appear in `gjc mcp list` | Re-run `gjc mcp list --json`; confirm whether the registration was user-scoped or project-scoped. |
+| Aside tools do not appear in a normal GJC session | Check `gjc mcp list --json`: the server must be `autoload` status (not `enabled: false`, not in `disabledServers`, not `autoload: false`), project scope must not be disabled by an explicit `mcp.enableProjectConfig: false` setting, and the session must not have passed `--no-mcp`. |
 | Auth failure | Rotate or re-enter the Aside-side token/API key. Do not paste it into GJC prompts or issue comments. |
 | Endpoint/network failure | Check the URL, proxy, and TLS path outside GJC with a benign health check; do not dump request headers. |
 | Retrieval misses context | Narrow the query to public sources first. Do not add browser history, cookies, screenshots, or account pages unless a separate approved design covers that data flow. |
-| Tool list includes browser actions | Treat the server as browser automation, not search-only. Keep it disabled for default GJC workflows unless an operator explicitly approves that broader sidecar for the session. |
+| Stored definition points at browser-action tools | Treat the server as browser automation, not search-only. Keep it as recordkeeping only for default GJC workflows unless a separate approved design covers that broader sidecar for runtime use. |
 
 ## Decision
 
-Docs-only is the smallest safe outcome for issue #1097. Existing GJC MCP registration can connect to a user-provided Aside MCP server, and Aside already documents `aside mcp`; no GJC adapter glue is required. The future-safe boundary is to keep Aside external and opt-in, document read/search/context-only use, and require a separate design before GJC claims support for browser actions, login, payment, internal-tool, or private browser-session workflows.
+Docs-only remains the smallest safe outcome for the search/context sidecar in issue #1097: existing GJC MCP registration can store a user-provided Aside MCP server definition for redacted inspection, and Aside already documents `aside mcp`. `/aside` is the separate CLI-ergonomics path: an explicit composer command that probes and optionally execs the user-installed binary, without adapter glue and without restoring the reverted Aside browser-tool backend. The future-safe boundary is to keep Aside external and opt-in, document read/search/context-only use, and require a separate design before GJC claims runtime support for browser actions, login, payment, internal-tool, or private browser-session workflows.
+
+## Option D: `browser.backend: aside` (native routing)
+
+This fork-local setting selects Aside as the browser surface. Set `browser.backend` to `"aside"` to hide GJC's built-in browser tool, auto-register `aside mcp` as an always-on MCP server, and add system-prompt guidance requiring browser work through Aside's persistent live logged-in browser REPL. It does not restore the reverted in-process Aside browser backend, and upstream's boundary decision above remains unchanged.
+
+There is no fallback to the native browser. When the Aside CLI is unavailable, GJC logs a warning naming `browser.backend`, includes the installation command, and starts the session with no browser tool.

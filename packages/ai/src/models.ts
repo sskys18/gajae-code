@@ -1,27 +1,59 @@
+import { readFileSync } from "node:fs";
+import { registerProviderSafetyStopModel } from "./adapter-internals/provider-safety-stop";
+import { getOpenAIModelCost } from "./model-pricing";
+import { isRetiredModelKey } from "./model-retirements";
 import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinking";
-import MODELS from "./models.json" with { type: "json" };
+// `with { type: "file" }` is embedded by `bun build --compile` and resolves to
+// the bunfs path inside standalone binaries (and to the on-disk path in dev).
+// A plain `createRequire` of a `.json` listed as an extra compile entrypoint is
+// NOT emitted into the bunfs, and its cwd-fallback masks the failure whenever
+// the process runs inside a repo checkout — see PR body for the minimal repro.
+import modelsJsonPath from "./models.json" with { type: "file" };
 import type { Api, KnownProvider, Model, Usage } from "./types";
 import { isClaudeForcedToolChoiceIncapableModelId } from "./utils/tool-choice-capability";
 
 /**
- * Static bundled model registry loaded from `models.json`.
+ * Static bundled model registry loaded lazily from `models.json`.
  *
  * This module intentionally exposes compile-time defaults only.
  * It does not include runtime discovery, models.dev overlays, or on-disk cache state.
  *
  * For runtime-aware resolution, use `createModelManager()` / `resolveProviderModels()`.
  */
-const providerNames = Object.keys(MODELS) as KnownProvider[];
+type BundledCatalog = typeof import("./models.json");
+
+let bundledCatalog: BundledCatalog | undefined;
+let providerNames: KnownProvider[] | undefined;
 const providerModelRegistry: Map<string, Map<string, Model<Api>>> = new Map();
+
+function getBundledCatalog(): BundledCatalog {
+	// TS types a .json import as its contents; at runtime `with { type: "file" }`
+	// yields the file path (bunfs path in compiled binaries, disk path in dev).
+	if (bundledCatalog !== undefined) return bundledCatalog;
+	const resource = modelsJsonPath as unknown;
+	if (typeof resource === "string") {
+		bundledCatalog = JSON.parse(readFileSync(resource, "utf8")) as BundledCatalog;
+	} else if (resource !== null && typeof resource === "object") {
+		bundledCatalog = resource as BundledCatalog;
+	} else {
+		throw new Error("Bundled models catalog resource is invalid.");
+	}
+	return bundledCatalog;
+}
 
 function getProviderModels(provider: GeneratedProvider): Map<string, Model<Api>> | undefined {
 	const cached = providerModelRegistry.get(provider);
 	if (cached) return cached;
-	const models = MODELS[provider];
+	const models = getBundledCatalog()[provider];
 	if (!models) return undefined;
 	const providerModels = new Map<string, Model<Api>>();
 	for (const [id, model] of Object.entries(models)) {
-		providerModels.set(id, applyBundledCompatDefaults(enrichModelThinking(model as Model<Api>)));
+		if (isRetiredModelKey(provider, id)) {
+			continue;
+		}
+		const bundledModel = applyBundledCompatDefaults(enrichModelThinking(model as Model<Api>));
+		registerProviderSafetyStopModel(bundledModel);
+		providerModels.set(id, bundledModel);
 	}
 	providerModelRegistry.set(provider, providerModels);
 	return providerModels;
@@ -52,7 +84,7 @@ function applyBundledCompatDefaults(model: Model<Api>): Model<Api> {
 	return policyModels[0] ?? normalized;
 }
 
-export type GeneratedProvider = keyof typeof MODELS;
+export type GeneratedProvider = keyof BundledCatalog;
 
 export function getBundledModel<TApi extends Api = Api>(provider: GeneratedProvider, modelId: string): Model<TApi> {
 	const providerModels = getProviderModels(provider);
@@ -62,6 +94,7 @@ export function getBundledModel<TApi extends Api = Api>(provider: GeneratedProvi
 export function getBundledProviders(): KnownProvider[] {
 	// Defensive copy: the old eager path returned a fresh Array.from(...), so
 	// callers may freely mutate their result without corrupting enumeration.
+	providerNames ??= Object.keys(getBundledCatalog()) as KnownProvider[];
 	return providerNames.slice();
 }
 
@@ -71,10 +104,12 @@ export function getBundledModels(provider: GeneratedProvider): Model<Api>[] {
 }
 
 export function calculateCost<TApi extends Api>(model: Model<TApi>, usage: Usage): Usage["cost"] {
-	usage.cost.input = (model.cost.input / 1000000) * usage.input;
-	usage.cost.output = (model.cost.output / 1000000) * usage.output;
-	usage.cost.cacheRead = (model.cost.cacheRead / 1000000) * usage.cacheRead;
-	usage.cost.cacheWrite = (model.cost.cacheWrite / 1000000) * usage.cacheWrite;
+	const inputTokens = usage.input + usage.cacheRead + usage.cacheWrite;
+	const pricing = getOpenAIModelCost(model, inputTokens) ?? model.cost;
+	usage.cost.input = (pricing.input / 1000000) * usage.input;
+	usage.cost.output = (pricing.output / 1000000) * usage.output;
+	usage.cost.cacheRead = (pricing.cacheRead / 1000000) * usage.cacheRead;
+	usage.cost.cacheWrite = (pricing.cacheWrite / 1000000) * usage.cacheWrite;
 	usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
 	return usage.cost;
 }

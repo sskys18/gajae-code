@@ -52,6 +52,9 @@ export interface SkillManifest {
 	retention: RetentionPolicy[];
 	hudFields: string[];
 	graphLabel: string;
+	stopReleasingPhases: readonly string[];
+	phaseLock: readonly string[];
+	canonicalOverrides: readonly string[];
 }
 
 const STATE_RETENTION: RetentionPolicy = { category: "state", keep: 1 };
@@ -59,7 +62,6 @@ const ARTIFACT_RETENTION: RetentionPolicy = { category: "artifact" };
 const LEDGER_RETENTION: RetentionPolicy = { category: "ledger" };
 const LOG_RETENTION: RetentionPolicy = { category: "log", maxAgeDays: 30 };
 const REPORT_RETENTION: RetentionPolicy = { category: "report", maxAgeDays: 30 };
-const AGENTS_RETENTION: RetentionPolicy = { category: "agents" };
 const PRUNE_RETENTION: RetentionPolicy = { category: "prune/delete", maxAgeDays: 30 };
 const FORCE_RETENTION: RetentionPolicy = { category: "force", maxAgeDays: 90 };
 
@@ -69,16 +71,25 @@ const PLANNED_ADMIN_VERBS = ["graph", "prune", "migrate", "force-overwrite"] as 
 const COMMON_TYPED_ARGS: TypedArgSpec[] = [
 	{ name: "input", type: "string", appliesToVerbs: ["write", "api"] },
 	{ name: "mode", type: "enum", enumValues: [...CANONICAL_GJC_WORKFLOW_SKILLS], appliesToVerbs: [...STATE_VERBS] },
-	{ name: "session-id", type: "string", appliesToVerbs: [...STATE_VERBS, "kickoff", "write-spec", "write-artifact"] },
+	{
+		name: "session-id",
+		type: "string",
+		appliesToVerbs: [
+			...STATE_VERBS,
+			"kickoff",
+			"write-spec",
+			"write-artifact",
+			"stage",
+			"check",
+			"apply",
+			"discard",
+			"read",
+			"write",
+		],
+	},
 	{ name: "thread-id", type: "string", appliesToVerbs: ["write", "clear", "handoff"] },
 	{ name: "turn-id", type: "string", appliesToVerbs: ["write", "clear", "handoff"] },
-	{
-		name: "to",
-		type: "enum",
-		enumValues: [...CANONICAL_GJC_WORKFLOW_SKILLS],
-		required: true,
-		appliesToVerbs: ["handoff"],
-	},
+	{ name: "to", type: "string", required: true, appliesToVerbs: ["handoff"] },
 	{ name: "replace", type: "boolean", appliesToVerbs: ["write"] },
 	{ name: "force", type: "boolean", appliesToVerbs: ["write", "clear", "handoff"] },
 	{ name: "skill", type: "enum", enumValues: [...CANONICAL_GJC_WORKFLOW_SKILLS], appliesToVerbs: ["doctor"] },
@@ -122,6 +133,9 @@ function manifest(input: {
 	retention: RetentionPolicy[];
 	hudFields: string[];
 	graphLabel: string;
+	stopReleasingPhases?: readonly string[];
+	phaseLock?: readonly string[];
+	canonicalOverrides?: readonly string[];
 	initialState?: string;
 }): SkillManifest {
 	const staleInitialState = initialPhaseForSkill(input.skill);
@@ -137,6 +151,16 @@ function manifest(input: {
 		retention: input.retention,
 		hudFields: input.hudFields,
 		graphLabel: input.graphLabel,
+		stopReleasingPhases: input.stopReleasingPhases ?? [
+			"complete",
+			"completed",
+			"failed",
+			"cancelled",
+			"canceled",
+			"inactive",
+		],
+		phaseLock: input.phaseLock ?? [],
+		canonicalOverrides: input.canonicalOverrides ?? [],
 	};
 }
 
@@ -150,7 +174,12 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			{ from: "handoff", to: "complete", verb: "clear" },
 			{ from: "interviewing", to: "complete", verb: "clear" },
 		],
-		verbs: [...stateVerbs(), ...flagVerbs(["kickoff", "write-spec"]), ...plannedVerbs(PLANNED_ADMIN_VERBS)],
+		verbs: [
+			...stateVerbs(),
+			...flagVerbs(["kickoff", "write-spec"]),
+			...positionalVerbs(["stage", "check", "apply", "discard", "read", "write", "clear", "handoff"]),
+			...plannedVerbs(PLANNED_ADMIN_VERBS),
+		],
 		typedArgs: [
 			{ name: "quick", type: "boolean", appliesToVerbs: ["kickoff"] },
 			{ name: "standard", type: "boolean", appliesToVerbs: ["kickoff"] },
@@ -162,7 +191,20 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			{ name: "spec", type: "string", required: true, appliesToVerbs: ["write-spec"] },
 			{ name: "handoff", type: "enum", enumValues: ["ralplan"], appliesToVerbs: ["write-spec"] },
 			{ name: "deliberate", type: "boolean", appliesToVerbs: ["write-spec"] },
-			{ name: "json", type: "boolean", appliesToVerbs: ["write-spec"] },
+			{
+				name: "json",
+				type: "boolean",
+				appliesToVerbs: ["write-spec", "stage", "check", "apply", "discard", "read", "write", "clear", "handoff"],
+			},
+			{ name: "input", type: "string", required: true, appliesToVerbs: ["stage", "write"] },
+			{ name: "reset", type: "boolean", appliesToVerbs: ["write"] },
+			{
+				name: "for",
+				type: "enum",
+				enumValues: ["initialize-context", "record-round", "update-facts", "merge-state"],
+				required: true,
+				appliesToVerbs: ["stage"],
+			},
 			{ name: "args", type: "string", planned: true },
 			{ name: "metadata-json", type: "string", planned: true },
 		],
@@ -172,21 +214,43 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 	}),
 	ralplan: manifest({
 		skill: "ralplan",
-		states: ["planner", "architect", "critic", "revision", "post-interview", "adr", "final", "handoff"],
+		states: [
+			"planner",
+			"intent",
+			"architect",
+			"critic",
+			"disposition",
+			"revision",
+			"post-interview",
+			"adr",
+			"final",
+			"handoff",
+		],
 		terminalStates: ["final", "handoff"],
 		transitions: [
+			{ from: "planner", to: "intent", verb: "write-artifact" },
+			// Legacy in-flight runs may have persisted planner before the intent stage existed.
 			{ from: "planner", to: "architect", verb: "write-artifact" },
+			{ from: "intent", to: "architect", verb: "write-artifact" },
+			{ from: "intent", to: "revision", verb: "write-artifact" },
 			{ from: "architect", to: "critic", verb: "write-artifact" },
+			{ from: "critic", to: "disposition", verb: "write-artifact" },
+			{ from: "architect", to: "disposition", verb: "write-artifact" },
+			{ from: "disposition", to: "revision", verb: "write-artifact" },
 			{ from: "critic", to: "revision", verb: "write-artifact" },
+			{ from: "revision", to: "intent", verb: "write-artifact" },
 			{ from: "revision", to: "post-interview", verb: "write-artifact" },
 			{ from: "critic", to: "post-interview", verb: "write-artifact" },
+			{ from: "disposition", to: "post-interview", verb: "write-artifact" },
 			{ from: "post-interview", to: "revision", verb: "write-artifact" },
 			{ from: "post-interview", to: "adr", verb: "write-artifact" },
 			{ from: "revision", to: "adr", verb: "write-artifact" },
 			{ from: "adr", to: "final", verb: "write-artifact" },
 			{ from: "planner", to: "handoff", verb: "handoff" },
+			{ from: "intent", to: "handoff", verb: "handoff" },
 			{ from: "architect", to: "handoff", verb: "handoff" },
 			{ from: "critic", to: "handoff", verb: "handoff" },
+			{ from: "disposition", to: "handoff", verb: "handoff" },
 			{ from: "revision", to: "handoff", verb: "handoff" },
 			{ from: "adr", to: "handoff", verb: "handoff" },
 			{ from: "post-interview", to: "handoff", verb: "handoff" },
@@ -201,7 +265,17 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			{
 				name: "stage",
 				type: "enum",
-				enumValues: ["planner", "architect", "critic", "revision", "post-interview", "adr", "final"],
+				enumValues: [
+					"planner",
+					"intent",
+					"architect",
+					"critic",
+					"disposition",
+					"revision",
+					"post-interview",
+					"adr",
+					"final",
+				],
 				appliesToVerbs: ["write-artifact"],
 			},
 			{ name: "stage_n", type: "number", appliesToVerbs: ["write-artifact"] },
@@ -213,6 +287,8 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 		retention: [STATE_RETENTION, ARTIFACT_RETENTION, LEDGER_RETENTION, PRUNE_RETENTION, FORCE_RETENTION],
 		hudFields: ["current_phase", "mode", "run_id", "stage", "stage_n", "plan_path"],
 		graphLabel: "Ralplan",
+		phaseLock: ["final", "handoff", "complete", "completed", "failed", "cancelled", "canceled", "inactive"],
+		canonicalOverrides: ["final", "handoff", "complete", "completed", "failed", "cancelled", "canceled", "inactive"],
 	}),
 	ultragoal: manifest({
 		skill: "ultragoal",
@@ -243,6 +319,9 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 				"record-review-blockers",
 				"steer",
 				"classify-blocker",
+				"record-critic-verdict",
+				"record-critic-gate-override",
+				"quality-gate",
 			]),
 			...plannedVerbs(PLANNED_ADMIN_VERBS),
 		],
@@ -256,6 +335,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 				enumValues: ["aggregate", "per-story"],
 				appliesToVerbs: ["create-goals"],
 			},
+			{ name: "validation-batch-json", type: "string", appliesToVerbs: ["create-goals"] },
 			{ name: "retry-failed", type: "boolean", appliesToVerbs: ["complete-goals"] },
 			{ name: "goal-id", type: "string", required: true, appliesToVerbs: ["checkpoint", "record-review-blockers"] },
 			{
@@ -269,9 +349,35 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 				name: "evidence",
 				type: "string",
 				required: true,
-				appliesToVerbs: ["checkpoint", "record-review-blockers", "steer", "classify-blocker"],
+				appliesToVerbs: [
+					"checkpoint",
+					"record-review-blockers",
+					"steer",
+					"classify-blocker",
+					"record-critic-verdict",
+					"record-critic-gate-override",
+					"quality-gate",
+				],
 			},
-			{ name: "quality-gate-json", type: "string", appliesToVerbs: ["checkpoint"] },
+			{
+				name: "terminus",
+				type: "enum",
+				enumValues: ["completion", "pause"],
+				required: true,
+				appliesToVerbs: ["record-critic-verdict"],
+			},
+			{
+				name: "verdict",
+				type: "enum",
+				enumValues: ["OKAY", "ITERATE", "REJECT"],
+				required: true,
+				appliesToVerbs: ["record-critic-verdict"],
+			},
+			{ name: "blockers-json", type: "string", appliesToVerbs: ["record-critic-verdict"] },
+			{ name: "goal-id", type: "string", appliesToVerbs: ["record-critic-verdict"] },
+			{ name: "classification-event-id", type: "string", appliesToVerbs: ["record-critic-verdict"] },
+			{ name: "quality-gate-json", type: "string", appliesToVerbs: ["checkpoint", "quality-gate"] },
+			{ name: "goal-id", type: "string", appliesToVerbs: ["quality-gate"] },
 			{ name: "goal-id", type: "string", appliesToVerbs: ["steer"] },
 			{ name: "goal-id", type: "string", appliesToVerbs: ["classify-blocker"] },
 			{
@@ -321,6 +427,8 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 					"record-review-blockers",
 					"steer",
 					"classify-blocker",
+					"record-critic-verdict",
+					"record-critic-gate-override",
 				],
 			},
 			{ name: "directive-json", type: "string", appliesToVerbs: ["steer"], planned: true },
@@ -331,86 +439,39 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 		hudFields: ["current_phase", "active_goal_id", "status", "counts", "ledger_path", "brief_path"],
 		graphLabel: "Ultragoal",
 	}),
-	team: manifest({
-		skill: "team",
-		states: ["starting", "running", "awaiting_integration", "complete", "failed", "cancelled", "handoff"],
+	autoresearch: manifest({
+		skill: "autoresearch",
+		states: ["intake", "research", "verdict", "complete", "failed", "cancelled", "handoff"],
 		terminalStates: ["complete", "failed", "cancelled", "handoff"],
 		transitions: [
-			{ from: "starting", to: "running", verb: "start" },
-			{ from: "starting", to: "failed", verb: "start" },
-			{ from: "running", to: "awaiting_integration", verb: "api" },
-			{ from: "running", to: "complete", verb: "shutdown" },
-			{ from: "running", to: "failed", verb: "shutdown" },
-			{ from: "running", to: "cancelled", verb: "shutdown" },
-			{ from: "awaiting_integration", to: "running", verb: "resume" },
-			{ from: "awaiting_integration", to: "complete", verb: "shutdown" },
-			{ from: "starting", to: "handoff", verb: "handoff" },
-			{ from: "running", to: "handoff", verb: "handoff" },
-			{ from: "awaiting_integration", to: "handoff", verb: "handoff" },
+			{ from: "intake", to: "research", verb: "write" },
+			{ from: "research", to: "verdict", verb: "write" },
+			{ from: "verdict", to: "research", verb: "write" },
+			{ from: "research", to: "failed", verb: "write" },
+			{ from: "research", to: "cancelled", verb: "write" },
+			{ from: "verdict", to: "complete", verb: "clear" },
+			{ from: "research", to: "complete", verb: "clear" },
+			{ from: "intake", to: "complete", verb: "clear" },
+			{ from: "intake", to: "handoff", verb: "handoff" },
+			{ from: "research", to: "handoff", verb: "handoff" },
+			{ from: "verdict", to: "handoff", verb: "handoff" },
 		],
-		verbs: [
-			...stateVerbs(),
-			...positionalVerbs(["start", "list", "status", "monitor", "resume", "shutdown", "api"]),
-			...plannedVerbs(PLANNED_ADMIN_VERBS),
-		],
+		verbs: [...stateVerbs(), ...positionalVerbs(["intake"]), ...plannedVerbs(PLANNED_ADMIN_VERBS)],
 		typedArgs: [
-			{ name: "dry-run", type: "boolean", appliesToVerbs: ["start"] },
-			{ name: "worktree", type: "string", appliesToVerbs: ["start"] },
-			{ name: "w", type: "string", appliesToVerbs: ["start"] },
-			{ name: "input", type: "string", required: true, appliesToVerbs: ["api"] },
+			{ name: "spec", type: "string", required: true, appliesToVerbs: ["intake"] },
+			{ name: "goal", type: "string", appliesToVerbs: ["write"] },
 			{
-				name: "operation",
+				name: "mode",
 				type: "enum",
-				enumValues: [
-					"send-message",
-					"broadcast",
-					"mailbox-list",
-					"mailbox-mark-delivered",
-					"mailbox-mark-notified",
-					"notification-list",
-					"notification-read",
-					"notification-replay",
-					"notification-mark-pane-attempt",
-					"worker-startup-ack",
-					"create-task",
-					"read-task",
-					"list-tasks",
-					"update-task",
-					"claim-task",
-					"transition-task-status",
-					"transition-task",
-					"release-task-claim",
-					"read-config",
-					"read-manifest",
-					"read-worker-status",
-					"read-worker-heartbeat",
-					"update-worker-heartbeat",
-					"write-worker-inbox",
-					"write-worker-identity",
-					"append-event",
-					"read-events",
-					"await-event",
-					"write-shutdown-request",
-					"read-shutdown-ack",
-					"read-monitor-snapshot",
-					"write-monitor-snapshot",
-					"read-task-approval",
-					"write-task-approval",
-				],
+				enumValues: ["web", "mixed", "data"],
 				required: true,
-				appliesToVerbs: ["api"],
+				appliesToVerbs: ["write"],
 			},
-			{ name: "worker-id", type: "string", appliesToVerbs: ["api"] },
-			{ name: "task-id", type: "string", appliesToVerbs: ["api"] },
-			{ name: "claim-token", type: "string", appliesToVerbs: ["api"] },
 			{
-				name: "status",
-				type: "enum",
-				enumValues: ["pending", "blocked", "in_progress", "completed", "failed"],
-				appliesToVerbs: ["api"],
+				name: "json",
+				type: "boolean",
+				appliesToVerbs: ["read", "write", "clear", "intake", "handoff"],
 			},
-			{ name: "completion_evidence", type: "object", appliesToVerbs: ["api"] },
-			{ name: "completionEvidence", type: "object", appliesToVerbs: ["api"] },
 			{ name: "args", type: "string", planned: true },
 			{ name: "metadata-json", type: "string", planned: true },
 		],
@@ -420,12 +481,11 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			LEDGER_RETENTION,
 			LOG_RETENTION,
 			REPORT_RETENTION,
-			AGENTS_RETENTION,
 			PRUNE_RETENTION,
 			FORCE_RETENTION,
 		],
-		hudFields: ["current_phase", "team_name", "workers", "task_counts", "phase", "integration"],
-		graphLabel: "Team",
+		hudFields: ["current_phase", "mode", "intake", "slug", "spec_path", "verdict"],
+		graphLabel: "Autoresearch",
 	}),
 };
 

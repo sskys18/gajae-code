@@ -2,9 +2,15 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getOrCreateClient, sendRequest, shutdownAll, waitForProjectLoaded } from "../../src/lsp/client";
+import {
+	getOrCreateClient,
+	sendNotification,
+	sendRequest,
+	shutdownAll,
+	waitForProjectLoaded,
+} from "../../src/lsp/client";
 import type { ServerConfig } from "../../src/lsp/types";
-import { disposeAllOwnedProcesses } from "../../src/runtime/process-lifecycle";
+import { disposeAllOwnedProcesses, liveOwnedProcessCount } from "../../src/runtime/process-lifecycle";
 
 const BUN = process.execPath;
 const ORIGINAL_PATH = Bun.env.PATH;
@@ -12,6 +18,16 @@ const ORIGINAL_XDG_CONFIG_HOME = Bun.env.XDG_CONFIG_HOME;
 
 async function tempDir(prefix: string): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), prefix));
+}
+
+async function captureError(promise: Promise<unknown>): Promise<Error> {
+	try {
+		await promise;
+	} catch (error) {
+		if (error instanceof Error) return error;
+		throw error;
+	}
+	throw new Error("Expected promise to reject");
 }
 
 function serverConfig(command: string, args: string[] = []): ServerConfig {
@@ -23,11 +39,11 @@ function serverConfig(command: string, args: string[] = []): ServerConfig {
 	};
 }
 
-async function writeFakeLspServer(dir: string): Promise<string> {
+async function writeFakeLspServer(dir: string, options?: { initDelayMs?: number }): Promise<string> {
 	const script = path.join(dir, "fake-lsp.ts");
 	await Bun.write(
 		script,
-		`let buffer = Buffer.alloc(0);\nfunction write(message) {\n  const body = JSON.stringify(message);\n  process.stdout.write(\`Content-Length: \${Buffer.byteLength(body, "utf8")}\\r\\n\\r\\n\${body}\`);\n}\nfunction handle(message) {\n  if (message.method === "initialize") {\n    write({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });\n    return;\n  }\n  if (message.method === "shutdown") {\n    write({ jsonrpc: "2.0", id: message.id, result: null });\n    process.exit(0);\n    return;\n  }\n}\nprocess.stdin.on("data", chunk => {\n  buffer = Buffer.concat([buffer, chunk]);\n  for (;;) {\n    const headerEnd = buffer.indexOf("\\r\\n\\r\\n");\n    if (headerEnd === -1) return;\n    const header = buffer.subarray(0, headerEnd).toString();\n    const match = /Content-Length: (\\d+)/i.exec(header);\n    if (!match) return;\n    const length = Number(match[1]);\n    const start = headerEnd + 4;\n    const end = start + length;\n    if (buffer.length < end) return;\n    const message = JSON.parse(buffer.subarray(start, end).toString());\n    buffer = buffer.subarray(end);\n    handle(message);\n  }\n});\nsetInterval(() => {}, 1000);\n`,
+		`let buffer = Buffer.alloc(0);\nfunction write(message) {\n  const body = JSON.stringify(message);\n  process.stdout.write(\`Content-Length: \${Buffer.byteLength(body, "utf8")}\\r\\n\\r\\n\${body}\`);\n}\nfunction handle(message) {\n  if (message.method === "initialize") {\n    setTimeout(() => {\n      write({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });\n    }, ${options?.initDelayMs ?? 0});\n    return;\n  }\n  if (message.method === "shutdown") {\n    write({ jsonrpc: "2.0", id: message.id, result: null });\n    process.exit(0);\n    return;\n  }\n}\nprocess.stdin.on("data", chunk => {\n  buffer = Buffer.concat([buffer, chunk]);\n  for (;;) {\n    const headerEnd = buffer.indexOf("\\r\\n\\r\\n");\n    if (headerEnd === -1) return;\n    const header = buffer.subarray(0, headerEnd).toString();\n    const match = /Content-Length: (\\d+)/i.exec(header);\n    if (!match) return;\n    const length = Number(match[1]);\n    const start = headerEnd + 4;\n    const end = start + length;\n    if (buffer.length < end) return;\n    const message = JSON.parse(buffer.subarray(start, end).toString());\n    buffer = buffer.subarray(end);\n    handle(message);\n  }\n});\nsetInterval(() => {}, 1000);\n`,
 	);
 	return script;
 }
@@ -70,9 +86,64 @@ describe("LSP lifecycle behavior", () => {
 			expect(second.proc.killed).toBe(false);
 			expect(cachedAfterFirstExit).toBe(second);
 			await shutdownAll();
-			await second.proc.exited;
-			expect(second.proc.exitCode).not.toBeNull();
+			const secondExitCode = await second.proc.exited;
+			expect(secondExitCode).not.toBeNull();
 			expect(first.pendingRequests.size).toBe(0);
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		"EPIPE",
+		"ERR_STREAM_DESTROYED",
+	] as const)("terminalizes and evicts a client when its owned stdin sink reports %s", async code => {
+		const cwd = await tempDir("gjc-lsp-peer-close-");
+		try {
+			const script = await writeFakeLspServer(cwd);
+			const config = serverConfig(BUN, [script]);
+			const first = await getOrCreateClient(config, cwd, 1_000);
+			const serializationError = Object.assign(new Error("serialization failed"), { code });
+			const params = {
+				toJSON(): never {
+					throw serializationError;
+				},
+			};
+			expect(await captureError(sendNotification(first, "test/serialization", params))).toBe(serializationError);
+
+			const pending = captureError(sendRequest(first, "workspace/neverResponds", null, undefined, 60_000));
+			expect(first.pendingRequests.size).toBe(1);
+			await Bun.sleep(10);
+
+			const unrelatedSinkError = Object.assign(new Error("unrelated sink failure"), { code: "EIO" });
+			Object.defineProperty(first.proc.stdin, "flush", {
+				configurable: true,
+				value: async () => {
+					throw unrelatedSinkError;
+				},
+			});
+			expect(await captureError(sendNotification(first, "test/unrelatedFailure", {}))).toBe(unrelatedSinkError);
+			expect(first.pendingRequests.size).toBe(1);
+
+			const peerClosedError = Object.assign(new Error("peer closed"), { code });
+			Object.defineProperty(first.proc.stdin, "flush", {
+				configurable: true,
+				value: async () => {
+					throw peerClosedError;
+				},
+			});
+			await sendNotification(first, "test/afterClose", {});
+			const pendingError = await pending;
+			expect(pendingError.message).toBe("LSP transport closed");
+			expect(pendingError.cause).toBe(peerClosedError);
+			expect(first.pendingRequests.size).toBe(0);
+
+			const staleRequestError = await captureError(sendRequest(first, "test/stale", null));
+			expect(staleRequestError).toBe(pendingError);
+
+			const second = await getOrCreateClient(config, cwd, 1_000);
+			expect(second).not.toBe(first);
+			expect(second.proc.exitCode).toBeNull();
 		} finally {
 			await fs.rm(cwd, { recursive: true, force: true });
 		}
@@ -116,13 +187,25 @@ describe("LSP lifecycle behavior", () => {
 				runner,
 				`import { detectLspmux } from ${JSON.stringify(path.resolve(import.meta.dir, "../../src/lsp/lspmux.ts"))};\nimport { liveOwnedProcessCount, disposeAllOwnedProcesses } from ${JSON.stringify(path.resolve(import.meta.dir, "../../src/runtime/process-lifecycle.ts"))};\nconst before = liveOwnedProcessCount();\nconst state = await detectLspmux();\nconst after = liveOwnedProcessCount();\nawait disposeAllOwnedProcesses();\nconsole.log(JSON.stringify({ state, before, after }));\n`,
 			);
+			// Hermetic probe: bun test shares one process across test files, so
+			// ambient state left by another file must not reach this probe.
+			// (1) A disable flag in Bun.env (GJC_DISABLE_LSPMUX / PI_DISABLE_LSPMUX)
+			//     would short-circuit detectLspmux() to available:false.
+			// (2) A drifted process.cwd() (an earlier test that chdir'd into a temp
+			//     dir without restoring) would make the trust root a temp ancestor of
+			//     binDir, so the external lspmux is misjudged project-controlled and
+			//     available flips false. Pin cwd to this in-repo test dir so the trust
+			//     root resolves to the repo and binDir (under os.tmpdir()) stays external.
+			const probeEnv: Record<string, string | undefined> = {
+				...Bun.env,
+				PATH: ORIGINAL_PATH ? `${binDir}${path.delimiter}${ORIGINAL_PATH}` : binDir,
+				XDG_CONFIG_HOME: configHome,
+			};
+			delete probeEnv.GJC_DISABLE_LSPMUX;
+			delete probeEnv.PI_DISABLE_LSPMUX;
 			const proc = Bun.spawn([BUN, runner], {
-				cwd: path.resolve("."),
-				env: {
-					...Bun.env,
-					PATH: ORIGINAL_PATH ? `${binDir}${path.delimiter}${ORIGINAL_PATH}` : binDir,
-					XDG_CONFIG_HOME: configHome,
-				},
+				cwd: import.meta.dir,
+				env: probeEnv,
 				stdout: "pipe",
 				stderr: "pipe",
 			});
@@ -145,4 +228,118 @@ describe("LSP lifecycle behavior", () => {
 			await fs.rm(cwd, { recursive: true, force: true });
 		}
 	}, 3_000);
+});
+
+async function writeBusyThenDyingLspServer(dir: string): Promise<string> {
+	// Answers `initialize`, then blocks its event loop without consuming stdin
+	// (like a server busy analyzing a large file), then exits while the client
+	// still has a large in-flight write queued in the socket buffer.
+	const script = path.join(dir, "busy-lsp.ts");
+	await Bun.write(
+		script,
+		`let buffer = Buffer.alloc(0);\nfunction write(message) {\n  const body = JSON.stringify(message);\n  process.stdout.write(\`Content-Length: \${Buffer.byteLength(body, "utf8")}\\r\\n\\r\\n\${body}\`);\n}\nprocess.stdin.on("data", chunk => {\n  buffer = Buffer.concat([buffer, chunk]);\n  for (;;) {\n    const headerEnd = buffer.indexOf("\\r\\n\\r\\n");\n    if (headerEnd === -1) return;\n    const header = buffer.subarray(0, headerEnd).toString();\n    const match = /Content-Length: (\\d+)/i.exec(header);\n    if (!match) return;\n    const length = Number(match[1]);\n    const start = headerEnd + 4;\n    const end = start + length;\n    if (buffer.length < end) return;\n    const message = JSON.parse(buffer.subarray(start, end).toString());\n    buffer = buffer.subarray(end);\n    if (message.method === "initialize") {\n      write({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });\n      // Immediately simulate a server that stops servicing stdin (like one\n      // busy analyzing a large file): the reply is already in the kernel pipe\n      // buffer, so blocking the event loop keeps stdin unconsumed and the\n      // client's next large write stays pending in the kernel socket buffer.\n      const until = Date.now() + 3000;\n      while (Date.now() < until) {}\n      process.exit(1);\n    }\n  }\n});\nsetInterval(() => {}, 1000);\n`,
+	);
+	return script;
+}
+
+describe("LSP transport write failures", () => {
+	it("a large pending write to a dying server is terminalized, not an unhandled rejection", async () => {
+		const cwd = await tempDir("gjc-lsp-epipe-");
+		const unhandled: unknown[] = [];
+		const onUnhandledRejection = (reason: unknown) => {
+			unhandled.push(reason);
+		};
+		process.on("unhandledRejection", onUnhandledRejection);
+		try {
+			const script = await writeBusyThenDyingLspServer(cwd);
+			const config = serverConfig(BUN, [script]);
+			const client = await getOrCreateClient(config, cwd, 5_000);
+
+			// Larger than the kernel socket buffer so FileSink.write() returns a
+			// promise (backpressure) that stays pending while the server is busy.
+			const largeParams = { text: "x".repeat(512 * 1024) };
+			const largeWrite = sendNotification(client, "textDocument/didChange", largeParams);
+			await Bun.sleep(100);
+
+			// Kill the server while the write is still pending, exactly like a
+			// language server that crashes mid-analysis with a large didOpen or
+			// didChange queued: the pending write fails with EPIPE.
+			client.proc.kill();
+			await largeWrite;
+			await Bun.sleep(200);
+
+			expect(unhandled).toEqual([]);
+
+			// The transport must be terminalized: notifications resolve quietly
+			// and later requests reject with the mapped error, not the raw one.
+			await sendNotification(client, "test/afterExit", {});
+			const staleRequestError = await captureError(sendRequest(client, "test/stale", null));
+			expect(staleRequestError.message).toBe("LSP transport closed");
+		} finally {
+			process.off("unhandledRejection", onUnhandledRejection);
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	}, 10_000);
+
+	it("concurrent callers during a slow initialize share the initialized client, never an uninitialized one", async () => {
+		const cwd = await tempDir("gjc-lsp-slow-init-");
+		try {
+			const script = await writeFakeLspServer(cwd, { initDelayMs: 150 });
+			const config = serverConfig(BUN, [script]);
+
+			const firstPromise = getOrCreateClient(config, cwd, 5_000);
+			let secondResolvedBeforeHandshake = false;
+			const secondPromise = getOrCreateClient(config, cwd, 5_000).then(client => {
+				secondResolvedBeforeHandshake = client.serverCapabilities === undefined;
+				return client;
+			});
+			const [first, second] = await Promise.all([firstPromise, secondPromise]);
+
+			expect(second).toBe(first);
+			expect(secondResolvedBeforeHandshake).toBe(false);
+			expect(second.serverCapabilities).toBeDefined();
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	}, 10_000);
+
+	it("concurrent callers observe the same failure when the server dies during initialize", async () => {
+		const cwd = await tempDir("gjc-lsp-dying-init-");
+		try {
+			// A server that exits immediately, like a broken launcher on PATH
+			// (e.g. a Python LSP stub whose interpreter can no longer import it).
+			const script = path.join(cwd, "dying-lsp.ts");
+			await Bun.write(script, "console.error(\"No module named 'fake-lsp'\");\nprocess.exit(1);\n");
+			const config = serverConfig(BUN, [script]);
+
+			const firstPromise = getOrCreateClient(config, cwd, 5_000).catch(error => error);
+			const secondPromise = getOrCreateClient(config, cwd, 5_000).catch(error => error);
+			const [first, second] = await Promise.all([firstPromise, secondPromise]);
+
+			expect(first).toBeInstanceOf(Error);
+			expect(second).toBe(first);
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	}, 10_000);
+
+	it("shutdownAll disposes an in-flight initializer and prevents cache resurrection", async () => {
+		const cwd = await tempDir("gjc-lsp-shutdown-init-");
+		try {
+			const script = await writeFakeLspServer(cwd, { initDelayMs: 500 });
+			const config = serverConfig(BUN, [script]);
+			const before = liveOwnedProcessCount();
+			const initializing = getOrCreateClient(config, cwd, 5_000);
+			await Bun.sleep(50);
+			await shutdownAll();
+			await expect(initializing).rejects.toThrow("LSP client shutdown");
+			await Bun.sleep(100);
+			expect(liveOwnedProcessCount()).toBe(before);
+
+			const retry = await getOrCreateClient(config, cwd, 5_000);
+			expect(retry.proc.exitCode).toBeNull();
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
 });

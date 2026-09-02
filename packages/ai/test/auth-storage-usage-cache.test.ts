@@ -17,11 +17,21 @@ import {
 	AuthStorage,
 	type StoredAuthCredential,
 } from "../src/auth-storage";
-import type { UsageReport } from "../src/usage";
+import type { UsageProvider, UsageReport } from "../src/usage";
 import * as claudeUsage from "../src/usage/claude";
 
 function anthropicReports(reports: UsageReport[] | null): UsageReport[] {
 	return (reports ?? []).filter(r => r.provider === "anthropic");
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (predicate()) return;
+		await Bun.sleep(10);
+	}
+
+	throw new Error("Timed out waiting for condition");
 }
 
 /**
@@ -88,6 +98,9 @@ function makeStore(rows: StoredAuthCredential[]): ObservableStore {
 		},
 		setCache(key, value, expiresAtSec) {
 			cache.set(key, { value, expiresAtSec });
+		},
+		allocateMonotonicSequence() {
+			return 1;
 		},
 		cleanExpiredCache() {},
 	};
@@ -161,6 +174,108 @@ describe("AuthStorage usage cache: last-good failure fallback", () => {
 		expect(second).toHaveLength(1);
 		// Cache hit — provider was NOT called a second time.
 		expect(calls).toBe(1);
+	});
+
+	it("cancels one aggregate caller without stopping its shared local usage fetch", async () => {
+		const gate = Promise.withResolvers<UsageReport | null>();
+		let calls = 0;
+		const goldReport = makeReport("a@example.com");
+		vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockImplementation(async () => {
+			calls += 1;
+			return gate.promise;
+		});
+
+		const controller = new AbortController();
+		const cancelled = storage.fetchUsageReports({ signal: controller.signal });
+		const cancelledOutcome = cancelled.then(
+			() => "resolved" as const,
+			() => "rejected" as const,
+		);
+		let peer: Promise<UsageReport[] | null> | undefined;
+		try {
+			await waitFor(() => calls === 1);
+			peer = storage.fetchUsageReports();
+
+			controller.abort();
+			const outcome = await Promise.race([cancelledOutcome, Bun.sleep(100).then(() => "pending" as const)]);
+			gate.resolve(goldReport);
+			const peerReports = anthropicReports(await peer);
+
+			expect(outcome).toBe("rejected");
+			expect(peerReports).toHaveLength(1);
+			expect(calls).toBe(1);
+		} finally {
+			controller.abort();
+			gate.resolve(goldReport);
+			await Promise.allSettled(peer ? [cancelled, peer] : [cancelled]);
+		}
+	});
+
+	it("does not let an old scoped usage flight delete its replacement", async () => {
+		storage.close();
+		const rows = [oauthRow(1, "a@example.com")];
+		store = makeStore(rows);
+		const firstGate = Promise.withResolvers<UsageReport[] | null>();
+		const secondGate = Promise.withResolvers<UsageReport[] | null>();
+		let calls = 0;
+		storage = new AuthStorage(store, {
+			fetchUsageReports: async () => {
+				calls += 1;
+				return calls === 1 ? firstGate.promise : secondGate.promise;
+			},
+		});
+		await storage.reload();
+		store.removeAuthCredentialsHard = (_provider, targets) => {
+			const ids = targets.map(target => target.id);
+			for (let index = rows.length - 1; index >= 0; index -= 1) {
+				if (ids.includes(rows[index]!.id)) rows.splice(index, 1);
+			}
+			return { kind: "removed", ids };
+		};
+
+		const first = storage.fetchUsageReports();
+		await waitFor(() => calls === 1);
+		const removal = storage.removeAuthCredentialsHard("anthropic", [
+			{ id: 1, provider: "anthropic", expectedRevision: 1 },
+		]);
+		expect(removal.kind).toBe("removed");
+
+		const second = storage.fetchUsageReports();
+		await waitFor(() => calls === 2);
+		const third = storage.fetchUsageReports();
+		await Bun.sleep(0);
+		expect(calls).toBe(2);
+
+		firstGate.resolve([]);
+		await first;
+		secondGate.resolve([]);
+		await Promise.all([second, third]);
+		storage.close();
+	});
+
+	it("suppresses provider and account details for secret-safe callers", async () => {
+		storage.close();
+		const debug = vi.fn();
+		const warn = vi.fn();
+		storage = new AuthStorage(store, {
+			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
+			usageLogger: { debug, warn },
+		});
+		await storage.reload();
+		const secret = "credential-sentinel@example.invalid";
+		vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockImplementation(async (_params, context) => {
+			expect(context.logger).toBeUndefined();
+			return makeReport(secret);
+		});
+
+		const reports = await storage.fetchUsageReports({
+			baseUrlResolver: () => `https://${secret}`,
+			logDetails: false,
+		});
+
+		expect(anthropicReports(reports)).toHaveLength(1);
+		expect(debug).not.toHaveBeenCalled();
+		expect(warn).not.toHaveBeenCalled();
 	});
 
 	it("does NOT cache a failure when no previous good value exists — retries next poll", async () => {
@@ -269,6 +384,82 @@ describe("AuthStorage usage cache: jitter", () => {
 				expect(delta).toBeGreaterThan(3.5 * 60_000);
 				expect(delta).toBeLessThan(6.5 * 60_000);
 			}
+		} finally {
+			storage.close();
+			vi.restoreAllMocks();
+		}
+	});
+});
+
+describe("AuthStorage usage cache: API-key credential display", () => {
+	const zaiProbe: UsageProvider = {
+		id: "zai",
+		fetchUsage: async () => null,
+	};
+
+	function apiKeyRow(id: number): StoredAuthCredential {
+		return {
+			id,
+			provider: "zai",
+			credential: { type: "api_key", key: `sk-test-zai-${id}` },
+			disabledCause: null,
+		};
+	}
+
+	function zaiReport(): UsageReport {
+		return {
+			provider: "zai",
+			fetchedAt: Date.now(),
+			limits: [
+				{
+					id: "zai-request-quota",
+					label: "ZAI Request Quota",
+					scope: { provider: "zai" },
+					window: { id: "month", label: "Monthly" },
+					amount: { used: 60, limit: 3000, unit: "requests" },
+				},
+			],
+		};
+	}
+
+	it("surfaces the report cached by checkCredentials for API-key rows", async () => {
+		const store = makeStore([apiKeyRow(1)]);
+		const storage = new AuthStorage(store, {
+			usageProviderResolver: provider => (provider === "zai" ? zaiProbe : undefined),
+		});
+		await storage.reload();
+		try {
+			// Cache-only lookup before any probe: nothing to display yet.
+			expect(storage.getCachedUsageReport("zai", 1)).toBeUndefined();
+
+			vi.spyOn(zaiProbe, "fetchUsage").mockImplementation(async () => zaiReport());
+
+			const results = await storage.checkCredentials({ provider: "zai" });
+			expect(results[0]?.ok).toBe(true);
+
+			const cached = storage.getCachedUsageReport("zai", 1);
+			expect(cached?.freshness).toBe("fresh");
+			expect(cached?.report.limits[0]?.label).toBe("ZAI Request Quota");
+			expect(cached?.report.limits[0]?.amount.used).toBe(60);
+			// The display observation must never leak credential bytes.
+			expect(JSON.stringify(cached)).not.toContain("sk-test-zai-1");
+		} finally {
+			storage.close();
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("stays undefined when the probe returns no data or the row id is unknown", async () => {
+		const store = makeStore([apiKeyRow(1)]);
+		const storage = new AuthStorage(store, {
+			usageProviderResolver: provider => (provider === "zai" ? zaiProbe : undefined),
+		});
+		await storage.reload();
+		try {
+			const results = await storage.checkCredentials({ provider: "zai" });
+			expect(results[0]?.ok).not.toBe(true);
+			expect(storage.getCachedUsageReport("zai", 1)).toBeUndefined();
+			expect(storage.getCachedUsageReport("zai", 999)).toBeUndefined();
 		} finally {
 			storage.close();
 			vi.restoreAllMocks();

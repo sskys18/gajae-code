@@ -7,7 +7,7 @@
 import path from "node:path";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
-import { formatNumber } from "@gajae-code/utils";
+import { formatNumber, sanitizeDisplayLine, sanitizeText } from "@gajae-code/utils";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import {
@@ -28,6 +28,12 @@ import {
 	type SubmitReviewDetails,
 } from "../tools/review";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine } from "../tui";
+import {
+	collectProviderDegradationGroups,
+	hasActiveProviderRetryInTaskDetails,
+	providerProgressAgeLabel,
+	providerRetryPhaseLabel,
+} from "./provider-retry-status";
 import type { TaskResultReceipt } from "./receipt";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import type { AgentProgress, TaskParams, TaskToolDetails } from "./types";
@@ -121,6 +127,15 @@ function normalizeReportFindings(value: unknown): ReportFindingDetails[] {
 
 function formatModelSubstitutionWarning(warning: { requested: string; effective: string }): string {
 	return `Requested model substituted: ${warning.requested} -> ${warning.effective}`;
+}
+
+function renderProviderDegradationNotices(progress: readonly AgentProgress[], theme: Theme): string[] {
+	return collectProviderDegradationGroups(progress).map(group =>
+		theme.fg(
+			"warning",
+			truncateToWidth(replaceTabs(`provider degraded: ${group.count} subagents retrying on ${group.provider}`), 100),
+		),
+	);
 }
 
 function formatJsonScalar(value: unknown, _theme: Theme): string {
@@ -546,16 +561,13 @@ function renderAgentProgress(
 	const description = progress.description?.trim();
 	const displayId = formatTaskId(progress.id);
 	const titlePart = description ? `${theme.bold(displayId)}: ${description}` : displayId;
-	let statusLine = `${prefix} ${theme.fg(iconColor, icon)} ${theme.fg("accent", titlePart)}`;
+	let statusLine = `${prefix} ${theme.fg(iconColor, icon)} ${theme.fg("accent", titlePart)}${progress.fastMode && theme.icon.fast ? ` ${theme.icon.fast}` : ""}`;
 
-	// Show retry-blocked badge so the parent immediately sees that a child
-	// is sleeping on a provider 429, not silently progressing. Wins over the
-	// generic running spinner because "we're waiting on a quota window" is
-	// the operationally meaningful state.
+	// A provider recovery loop is operationally distinct from normal agent work.
 	if (progress.retryState && progress.status === "running") {
-		statusLine += ` ${formatBadge("retrying", "warning", theme)}`;
+		statusLine += ` ${formatBadge("provider degraded", "warning", theme)}`;
 	} else if (progress.retryFailure && (progress.status === "failed" || progress.status === "aborted")) {
-		statusLine += ` ${formatBadge("rate-limited", "error", theme)}`;
+		statusLine += ` ${formatBadge("provider failed", "error", theme)}`;
 	} else if (progress.status === "failed" || progress.status === "aborted") {
 		const statusLabel = progress.status === "failed" ? "failed" : "aborted";
 		statusLine += ` ${formatBadge(statusLabel, iconColor, theme)}`;
@@ -581,6 +593,10 @@ function renderAgentProgress(
 				truncateToWidth(replaceTabs(formatModelSubstitutionWarning(progress.modelSubstitutionWarning)), 90),
 			)}`,
 		);
+	}
+	if (progress.setupFailure && progress.status !== "running") {
+		const summary = `Setup failure: ${truncateToWidth(replaceTabs(progress.setupFailure.summary), 80)}`;
+		lines.push(`${continuePrefix}${theme.tree.hook} ${theme.fg("error", summary)}`);
 	}
 
 	// Current tool (if running) or most recent completed tool
@@ -615,8 +631,10 @@ function renderAgentProgress(
 	// keep spinning while a child sleeps on a 3-hour provider rate-limit.
 	if (progress.retryState && progress.status === "running") {
 		const attemptLabel = progress.retryState.unbounded
-			? `attempt ${progress.retryState.attempt}`
-			: `${progress.retryState.attempt}/${progress.retryState.maxAttempts}`;
+			? `attempt ${progress.retryState.attempt}, unbounded`
+			: `attempt ${progress.retryState.attempt} of ${progress.retryState.maxAttempts}, bounded`;
+		const phaseLabel = providerRetryPhaseLabel(progress.retryState.kind);
+		const progressAge = staticTime ? "" : ` · ${providerProgressAgeLabel(progress.retryState, Date.now())}`;
 		// `staticTime` omits the wall-clock countdown so a cached await body stays a
 		// pure function of its key (the producer already drops time-only churn).
 		let waitLabel = "";
@@ -624,7 +642,7 @@ function renderAgentProgress(
 			const remainingMs = Math.max(0, progress.retryState.startedAtMs + progress.retryState.delayMs - Date.now());
 			waitLabel = remainingMs > 0 ? ` in ${formatDuration(remainingMs)}` : " now";
 		}
-		const summary = `retrying ${attemptLabel}${waitLabel}: ${truncateToWidth(replaceTabs(progress.retryState.errorMessage), 60)}`;
+		const summary = `${phaseLabel} · retrying ${attemptLabel}${waitLabel}${progressAge}: ${truncateToWidth(replaceTabs(progress.retryState.errorMessage), 60)}`;
 		lines.push(`${continuePrefix}${theme.tree.hook} ${theme.fg("warning", summary)}`);
 	} else if (progress.retryFailure && progress.status !== "running") {
 		const summary = `auto-retry gave up after ${progress.retryFailure.attempt} attempt${
@@ -848,7 +866,7 @@ function renderAgentResult(result: TaskResultReceipt, isLast: boolean, expanded:
 	const description = result.description?.trim();
 	const displayId = formatTaskId(result.id);
 	const titlePart = description ? `${theme.bold(displayId)}: ${description}` : displayId;
-	let statusLine = `${prefix} ${theme.fg(iconColor, icon)} ${theme.fg("accent", titlePart)} ${formatBadge(
+	let statusLine = `${prefix} ${theme.fg(iconColor, icon)} ${theme.fg("accent", titlePart)}${result.fastMode && theme.icon.fast ? ` ${theme.icon.fast}` : ""} ${formatBadge(
 		statusText,
 		iconColor,
 		theme,
@@ -895,8 +913,29 @@ function renderAgentResult(result: TaskResultReceipt, isLast: boolean, expanded:
 			)}`,
 		);
 	}
+	if (result.routing) {
+		const model = result.routing.effectiveModel ?? "not-executed";
+		const note = result.routing.note ? ` ${result.routing.note}` : "";
+		// effectiveModel is provider-reported and note is free-form diagnostic text;
+		// receipt validation bounds neither, and an embedded newline would inject a
+		// row past the width cap, so flatten to a single sanitized line.
+		lines.push(
+			`${continuePrefix}${theme.fg("dim", truncateToWidth(replaceTabs(sanitizeDisplayLine(`Routing: ${model}${note}`)), 90))}`,
+		);
+	}
 	if (result.roi?.lowRoi) {
 		lines.push(`${continuePrefix}${theme.fg("warning", "low ROI: produced no material contribution")}`);
+	}
+
+	if (result.persistence?.recoveryRef) {
+		const label = result.persistence.ownerWorktreeApplied ? "Recovery patch" : "Unapplied recovery patch";
+		const recoveryUri = truncateToWidth(replaceTabs(sanitizeText(result.persistence.recoveryRef.uri)), 80);
+		lines.push(
+			`${continuePrefix}${theme.fg(
+				result.persistence.ownerWorktreeApplied ? "dim" : "warning",
+				`${label}: ${recoveryUri} (${formatBytes(result.persistence.recoveryRef.sizeBytes)})`,
+			)}`,
+		);
 	}
 
 	if (result.outputRef) {
@@ -953,27 +992,37 @@ export function renderResult(
 				.u32(spinnerFrame ?? 0)
 				.u32(width)
 				.digest();
-			if (cached?.key === key) return cached.lines;
+			const hasDynamicRetry = hasActiveProviderRetryInTaskDetails(details);
+			if (!hasDynamicRetry && cached?.key === key) return cached.lines;
 
 			const lines: string[] = [];
 
-			const shouldRenderProgress =
-				Boolean(details.progress && details.progress.length > 0) && (isPartial || details.results.length === 0);
+			// Tool details can be restored from a persisted session or arrive through
+			// a runtime update, so the declared receipt array is not sufficient at
+			// this rendering boundary.
+			const resultsUnavailable = !Array.isArray(details.results);
+			const results = resultsUnavailable ? [] : details.results;
+			const hasProgress = Boolean(details.progress && details.progress.length > 0);
+			const shouldRenderProgress = hasProgress && (isPartial || results.length === 0);
+			const hasResults = results.length > 0;
+			if (hasResults) {
+				results.forEach((res, i) => {
+					const isLast = !shouldRenderProgress && i === results.length - 1;
+					lines.push(...renderAgentResult(res, isLast, expanded, theme));
+				});
+			}
 			if (shouldRenderProgress && details.progress) {
+				lines.push(...renderProviderDegradationNotices(details.progress, theme));
 				details.progress.forEach((progress, i) => {
 					const isLast = i === details.progress!.length - 1;
 					lines.push(...renderAgentProgress(progress, isLast, expanded, theme, spinnerFrame));
 				});
-			} else if (details.results && details.results.length > 0) {
-				details.results.forEach((res, i) => {
-					const isLast = i === details.results.length - 1;
-					lines.push(...renderAgentResult(res, isLast, expanded, theme));
-				});
-
-				const abortedCount = details.results.filter(r => r.status === "aborted").length;
-				const mergeFailedCount = details.results.filter(r => r.status === "merge_failed").length;
-				const successCount = details.results.filter(r => r.status === "completed").length;
-				const failCount = details.results.length - successCount - mergeFailedCount - abortedCount;
+			}
+			if (hasResults && !shouldRenderProgress) {
+				const abortedCount = results.filter(r => r.status === "aborted").length;
+				const mergeFailedCount = results.filter(r => r.status === "merge_failed").length;
+				const successCount = results.filter(r => r.status === "completed").length;
+				const failCount = results.length - successCount - mergeFailedCount - abortedCount;
 				let summary = `${theme.fg("dim", "Total:")} `;
 				if (abortedCount > 0) {
 					summary += theme.fg("error", `${abortedCount} aborted`);
@@ -993,11 +1042,20 @@ export function renderResult(
 				summary += `${theme.sep.dot}${theme.fg("dim", formatDuration(details.totalDurationMs))}`;
 				lines.push(summary);
 			}
+			if (resultsUnavailable && !isPartial) {
+				lines.push(theme.fg("dim", "Task result details unavailable"));
+			}
 
 			if (lines.length === 0) {
-				const text = fallbackText.trim() ? fallbackText : "No results";
+				const text = resultsUnavailable
+					? isPartial
+						? "Task results pending"
+						: "Task result details unavailable"
+					: fallbackText.trim()
+						? fallbackText
+						: "No results";
 				const result = [theme.fg("dim", truncateToWidth(text, width))];
-				cached = { key, lines: result };
+				if (!hasDynamicRetry) cached = { key, lines: result };
 				return result;
 			}
 
@@ -1019,9 +1077,9 @@ export function renderResult(
 			}
 
 			const indented = lines.map(line =>
-				line.length > 0 ? truncateToWidth(`   ${line}`, width, Ellipsis.Omit) : "",
+				line.length > 0 ? truncateToWidth(`   ${replaceTabs(line)}`, width, Ellipsis.Omit) : "",
 			);
-			cached = { key, lines: indented };
+			if (!hasDynamicRetry) cached = { key, lines: indented };
 			return indented;
 		},
 		invalidate() {
@@ -1065,16 +1123,16 @@ function renderNestedTaskTree(
 ): string[] {
 	const lines: string[] = [];
 	for (const details of detailsList) {
-		const hasResults = Boolean(details.results && details.results.length > 0);
-		if (hasResults) {
+		const inflight = details.progress;
+		const hasInflight = Boolean(inflight && inflight.length > 0);
+		if (details.results && details.results.length > 0) {
 			details.results.forEach((result, index) => {
-				const isLast = index === details.results.length - 1;
+				const isLast = !hasInflight && index === details.results.length - 1;
 				lines.push(...renderAgentResult(result, isLast, expanded, theme));
 			});
-			continue;
 		}
-		const inflight = details.progress;
 		if (inflight && inflight.length > 0) {
+			lines.push(...renderProviderDegradationNotices(inflight, theme));
 			inflight.forEach((prog, index) => {
 				const isLast = index === inflight.length - 1;
 				lines.push(...renderAgentProgress(prog, isLast, expanded, theme, spinnerFrame, staticTime));

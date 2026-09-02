@@ -9,9 +9,7 @@ It explicitly excludes context-overflow recovery via auto-compaction. Overflow i
 - [`../src/session/agent-session.ts`](../packages/coding-agent/src/session/agent-session.ts)
 - [`../src/config/settings-schema.ts`](../packages/coding-agent/src/config/settings-schema.ts)
 - [`../src/modes/controllers/event-controller.ts`](../packages/coding-agent/src/modes/controllers/event-controller.ts)
-- [`../src/modes/rpc/rpc-mode.ts`](../packages/coding-agent/src/modes/rpc/rpc-mode.ts)
-- [`../src/modes/rpc/rpc-client.ts`](../packages/coding-agent/src/modes/rpc/rpc-client.ts)
-- [`../src/modes/rpc/rpc-types.ts`](../packages/coding-agent/src/modes/rpc/rpc-types.ts)
+- [`sdk.md`](./sdk.md) for the external machine interface.
 
 ## Scope boundary vs compaction
 
@@ -43,8 +41,35 @@ Current retryable inputs are regex/string-classified:
 - service unavailable / server/internal error
 - provider-suggested retry wording, including OpenAI `retry your request` failures
 - network/connection/socket failures, refused/closed connections, upstream connect/reset-before-headers, socket hang up, timeout/timed out, fetch failed, terminated, retry delay wording, and unexpected socket close messages
+- canonical idle-stream watchdog stalls (`stream stalled while waiting for the next event`); in the legacy single-model path these remain retryable but use the bounded `retry.maxRetries` budget
+- canonical local snapshot failure classification (`errorKind: "local_snapshot_failure"`, or the stable `Managed fallback attempt could not produce a serializable event snapshot` message prefix for restored sessions) is recognized, but only so the failure can be routed to its immediate-surface policy below — it is never re-issued
 
-This is string-pattern classification, not typed provider error codes.
+Managed fallback uses structured transport facts and typed provider error codes when available. A structured classification of `other` becomes the bounded `unknown` fallback class; error prose cannot promote it to quota or transient. Regex classification is retained only as a legacy fallback.
+
+### Bare-default admissions
+
+A session with no explicit `retry.*` settings and a single-model default role (no managed fallback) does not use the classification list above on its own. It admits only these content-free failures:
+
+- canonical first-event and idle-stream watchdog aborts, recognized from the typed timeout fact or an exact canonical sentinel message
+- the OpenAI Codex `server_is_overloaded` event, recognized from that provider's typed overload code
+- the generic OpenAI Responses `server_is_overloaded` terminal envelope, recognized from the exact statusless `openaiErrorCode` and matching `providerCode`
+- Anthropic's typed `overloaded_error` envelope, recognized by parsing the error envelope and requiring both the outer `type` and the nested `error.type` to match
+
+Overload admissions therefore require a provider-specific typed signature, while watchdog admissions accept only their canonical sentinel messages. Every admission additionally requires that the attempt carry no assistant text, thinking, or tool call and no conflicting transport facts; a status-bearing or otherwise typed failure surfaces instead. Untyped or noncanonical overload and timeout wording never authorizes a replay.
+
+### Local snapshot failures (surface immediately, no retry)
+
+`local_snapshot_failure` is a local machinery fault, not provider evidence. The retained producer shape is deterministic, so re-streaming the same request only reproduces the same local defect; it is surfaced immediately instead of being amplified across identical retries:
+
+- Surfaces immediately with the original producer-boundary diagnostic, regardless of `retry.*` settings.
+- Never charges the fallback controller (the started attempt's provisional charge is discarded), never advances models, never emits `model_fallback_switched`, and never mutates or rotates credentials.
+
+### Local buffer overflows (surface immediately, no retry)
+
+`local_buffer_overflow` (`errorKind`, or the stable `Managed fallback attempt exceeded the provisional event buffer limit` message prefix for restored sessions) is the sibling local staging fault: the provisional managed-attempt buffer exceeded its cap. Like snapshot failures, re-streaming the same request reproduces the same oversized response, so it is never retried:
+
+- Surfaces immediately with the original local diagnostic, regardless of `retry.*` settings.
+- Like snapshot failures, it never charges the fallback controller (the started attempt's provisional charge is discarded), never advances models, never emits `model_fallback_switched`, and never mutates or rotates credentials.
 
 ## Retry lifecycle and state transitions
 
@@ -58,13 +83,13 @@ Session state used by retry:
 Flow (`#handleRetryableError`):
 
 1. Read `retry` settings group.
-2. If `retry.enabled === false`, stop immediately (`false`, no retry started).
+2. If `retry.enabled === false`, stop immediately (`false`, no retry started). Managed provider-fallback failures keep their own chain policy; local snapshot and buffer-overflow failures surface immediately regardless of this setting.
 3. Increment `#retryAttempt`.
 4. Create `#retryPromise` once (first attempt in a chain).
-5. If attempt exceeded `retry.maxRetries`, emit final failure event and stop.
-6. Compute base delay: `retry.baseDelayMs * 2^(attempt-1)`.
-7. For usage-limit errors, parse retry hints and call auth storage (`markUsageLimitReached(...)`); if credential switching succeeds, force delay to `0`, otherwise use a larger retry-after/backoff hint when present.
-8. If no credential switch occurred, suppress the current model selector for cooldown, try configured retry model fallback chains, and force delay to `0` on model switch.
+5. In the legacy single-model path, ordinary transient errors retry without an attempt limit. Typed provider-overload replays, canonical idle-stream watchdog stalls, and unknown/no-code errors stop after `retry.maxRetries`. Managed fallback instead uses its controller's per-entry `fallback.maxAttempts` budget.
+6. Compute exponential full-jitter delay capped at `retry.maxDelayMs`; legacy parsed provider retry-after values override computed backoff and are capped at `retry.maxDelayMs`, while managed typed Retry-After values are intentionally uncapped.
+7. For usage-limit errors, call auth storage (`markUsageLimitReached(...)`); if credential switching succeeds, force delay to `0`, otherwise use the applicable backoff.
+8. Eligible ordered role-array fallback chains advance on entry-budget exhaustion. A selected fallback entry remains sticky until the head selector's rate-limit cooldown expires, when `retry.fallbackRevertPolicy: cooldown-expiry` probes it again on a new turn.
 9. Emit `auto_retry_start`.
 10. Remove the trailing assistant error message from agent runtime state (kept in persisted session history).
 11. Sleep with abort support.
@@ -79,6 +104,23 @@ Flow (`#handleRetryableError`):
 - max retries exceeded path
 
 `#retryPromise` resolves/clears when retry chain ends (success, cancellation, or max-exceeded), via `#resolveRetry()`.
+
+## Preferred credential quota fallback
+
+`--prefer-credential <selector>` gives one active stored OAuth credential first priority without pinning it:
+
+```bash
+gjc --prefer-credential id:15
+gjc --prefer-credential email:name@example.com
+gjc --prefer-credential anthropic/id:15
+gjc --resume --prefer-credential id:15
+```
+
+The selector works for any provider backed by a multi-account OAuth credential pool; it is not Anthropic-specific. API-key credentials and runtime `--api-key` overrides are intentionally outside this soft-selection path, and `--credential` (the hard pin) and `--prefer-credential` are mutually exclusive.
+
+A usable preferred credential is placed ahead of candidates ordered by the provider's existing balanced/earliest-reset ranking. A content-free quota or rate-limit failure marks that row blocked, switches immediately to another active candidate, and replays the request with zero delay — the same `markUsageLimitReached` credential-switch path documented above under "What starts a retry", step 7. The fallback row then remains sticky for the session like any other credential switch. Partial assistant output or tool execution still prevents replay, and exhaustion of every row surfaces the final error without a retry loop, including the earliest stored `blockedUntil` as a `retryable at <ISO-8601>` hint. `403 forbidden` remains an authorization failure and never mutates quota state.
+
+An unqualified selector (no `provider/` prefix) must match exactly one active OAuth provider's credential pool; an ambiguous match across providers fails startup and asks for an explicit `provider/<selector>` prefix. Once resolved, the model that the session ends up using must belong to that same provider — a default model, restored session model, or explicit `--model` from a different provider fails closed with an error naming both providers, instead of silently stranding the preference.
 
 ## Backoff and max-attempt semantics
 
@@ -97,13 +139,13 @@ Attempt numbering:
 - start events use current attempt (1-based)
 - max-exceeded end event reports `attempt: this.#retryAttempt - 1` (last attempted retry count)
 
-Backoff sequence with default settings:
+Backoff uses capped exponential full jitter. With default settings the maximum jitter windows are:
 
 - attempt 1: 2000 ms
 - attempt 2: 4000 ms
 - attempt 3: 8000 ms
 
-Delay override inputs can come from parsed retry headers (`retry-after-ms`, `retry-after`, `x-ratelimit-reset-ms`, `x-ratelimit-reset`) or usage-limit backoff. Credential/model fallback switches set delay to `0`; otherwise parsed hints can extend the exponential local delay.
+`retry.maxDelayMs` caps every legacy session retry delay, including provider retry-after hints, which otherwise take precedence over computed backoff. Managed fallback intentionally does not cap typed Retry-After values because it retries within its separate per-entry `fallback.maxAttempts` budget. In the legacy single-model path, transient errors have unbounded attempts except canonical idle-stream watchdog stalls, which are bounded by `retry.maxRetries`; unknown/no-code errors use the same bound.
 
 ## Abort mechanics
 
@@ -143,17 +185,20 @@ Effect:
 
 This prevents callers from treating a retrying turn as complete too early.
 
-## Controls: settings and RPC
+## Controls: settings and SDK actions
 
 ### Configuration knobs
 
-Defined in settings schema under retry group:
+The standard retry controls are defined in the settings schema under `retry`:
 
 - `retry.enabled`
 - `retry.maxRetries`
 - `retry.baseDelayMs`
-- `retry.fallbackChains`
-- `retry.fallbackRevertPolicy` (`"cooldown-expiry"` by default; `"never"` disables automatic restoration)
+- `retry.maxDelayMs`
+
+Fallback candidates are configured as ordered selector arrays on preset `model_mapping` roles, top-level `modelRoles`, or `task.agentModelOverrides`; `fallback.maxAttempts` controls the total request-time attempts per concrete entry. Resolution-time unavailable, unauthenticated, and unknown entries advance immediately without consuming that budget.
+
+On settings load, a source-aware one-shot migration still reads legacy `retry.fallbackChains` and combines the effective role chain with its ordered, deduplicated legacy tail into the corresponding role array. The legacy key is ignored after migration; it is not a retry configuration surface.
 
 Programmatic toggles in session:
 
@@ -161,19 +206,9 @@ Programmatic toggles in session:
 - `autoRetryEnabled` reads `retry.enabled`
 - `isRetrying` reports whether retry lifecycle promise is active
 
-### RPC controls
+### External control
 
-RPC command surface:
-
-- `set_auto_retry` → `session.setAutoRetryEnabled(command.enabled)`
-- `abort_retry` → `session.abortRetry()`
-
-Client helpers:
-
-- `RpcClient.setAutoRetry(enabled)`
-- `RpcClient.abortRetry()`
-
-Both commands return success responses; retry progress/failure details come from streamed session events, not command response payloads.
+External clients observe retry lifecycle through the [SDK machine interface](./sdk.md). The removed RPC command surface and `RpcClient` helpers are not supported.
 
 ## Event emission and failure surfacing
 
@@ -181,42 +216,42 @@ Session-level retry events:
 
 - `auto_retry_start { attempt, maxAttempts, delayMs, errorMessage }`
 - `auto_retry_end { success, attempt, finalError? }`
-- `retry_fallback_applied { from, to, role }`
-- `retry_fallback_succeeded { model, role }`
+- `model_fallback_switched { eventId, from, to, reason, role, scope, activeIndex, chainLength, attemptsUsed }` — emitted once for each real fallback-model switch
 
 Propagation:
 
 - emitted through `AgentSession.subscribe(...)`
 - forwarded to extension runner as extension events
-- in RPC mode, forwarded directly as JSON event objects (`session.subscribe(event => output(event))`)
-- in TUI, consumed by `EventController` for loader/error UI
+- exposed to external clients through SDK event subscriptions
+- in the TUI, `model_fallback_switched` updates the fallback-model status/notice and `EventController` consumes retry lifecycle events for loader/error UI
 
 Final failure surfacing:
 
 - On max-exceeded or cancellation, `auto_retry_end.success === false`
 - TUI shows: `Retry failed after N attempts: <finalError>`
 - Extensions/hooks receive `auto_retry_end` with same fields
-- RPC consumers receive same event object on stdout stream
+- SDK clients receive the same event stream
 
 ## Permanent stop conditions
 
 Retry stops and will not auto-continue when any of these occur:
 
-- `retry.enabled` is false
+- `retry.enabled` is false, or legacy retry settings have not been explicitly configured (`legacyRetryConfigured` fail-closed gate) — except for the bare-default admissions listed above
 - error is not retry-classified
 - error is context overflow (delegated to compaction path)
 - max retries exceeded
-- user cancels retry (`abort_retry` or `Esc` during retry loader)
+- user cancels retry through the session/SDK action or `Esc` during retry loader
 - global abort (`abort`) cancels retry first
 
 A new retry chain can still start later on a future retryable error after counters reset.
 
 ## Operational caveats
 
-- Classification is regex text matching; provider-specific structured errors are not used here.
+- Managed fallback uses typed transport facts and provider error codes; regex text matching is limited to the legacy retry path.
 - Retry strips the failing assistant error from **runtime context** before re-continue, but session history still keeps that error entry.
-- `RpcSessionState` currently exposes `autoCompactionEnabled` but not an `autoRetryEnabled` field; RPC callers must track their own toggle state or query settings through other APIs.
-- Model fallback changes append temporary `model_change` entries and may later restore the primary model when its cooldown expires, depending on `retry.fallbackRevertPolicy`.
+- SDK clients observe retry state through session events and state updates.
+- Fallback state is driven by the configured ordered role array and remains on a selected fallback entry across later user prompts. A real model change emits the canonical `model_fallback_switched` event rather than a legacy retry-fallback event.
+- Temporary provider-session scopes retain and restore their own fallback controller and provider state when unwound; an authoritative model selection commits those temporary scopes.
 
 ## Provider request/stream retry budgets
 

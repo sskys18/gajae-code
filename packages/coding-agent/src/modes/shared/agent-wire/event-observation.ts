@@ -100,6 +100,15 @@ export function observeAgentSessionEvent(event: AgentSessionEvent): AgentWireOwn
 				semantic: true,
 				coalesceKey: null,
 			});
+		case "agent_failed":
+			return obs(event, {
+				kind: "rpc_agent_failed",
+				signal: "error",
+				evidence: {},
+				severity: "critical",
+				semantic: true,
+				coalesceKey: null,
+			});
 		case "turn_start":
 			return obs(event, {
 				kind: "rpc_turn_started",
@@ -197,14 +206,23 @@ export function observeAgentSessionEvent(event: AgentSessionEvent): AgentWireOwn
 				semantic: false,
 				coalesceKey: null,
 			});
-		case "retry_fallback_applied":
-		case "retry_fallback_succeeded":
+		case "model_fallback_switched":
 			return obs(event, {
-				kind: "rpc_retry_fallback",
+				kind: "rpc_model_fallback_switched",
 				signal: null,
-				evidence: { phase: event.type, role: str(event.role) ?? null },
-				severity: "warn",
-				semantic: false,
+				evidence: {
+					eventId: str(event.eventId) ?? null,
+					from: str(event.from) ?? null,
+					to: str(event.to) ?? null,
+					reason: str(event.reason) ?? null,
+					role: str(event.role) ?? null,
+					scope: str(event.scope) ?? null,
+					activeIndex: num(event.activeIndex) ?? null,
+					chainLength: num(event.chainLength) ?? null,
+					attemptsUsed: num(event.attemptsUsed) ?? null,
+				},
+				severity: "info",
+				semantic: true,
 				coalesceKey: null,
 			});
 		case "ttsr_triggered":
@@ -320,7 +338,7 @@ function ownerFrame(
  * frames delegate to {@link observeAgentWireEventPayload}; non-event frames are
  * mapped here so owners never re-parse protocol semantics privately.
  */
-export function observeRpcOutboundFrame(frame: Record<string, unknown>): AgentWireOwnerObservation | null {
+export function observeAgentWireFrame(frame: Record<string, unknown>): AgentWireOwnerObservation | null {
 	const type = str(frame.type);
 	if (!type || type === "ready") return null;
 

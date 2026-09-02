@@ -1,10 +1,26 @@
 import type { Effort } from "@gajae-code/ai/model-thinking";
+import { PET_MODE_IDS, PET_SKIN_IDS, PET_SKINS } from "@gajae-code/tui/components/gajae-pet";
 import { TASK_SIMPLE_MODES } from "../task/simple-mode";
 import { getThinkingLevelMetadata } from "../thinking-metadata";
-import { EDIT_MODES } from "../utils/edit-mode";
+import { DEFAULT_EDIT_MODE_SETTING, EDIT_MODE_SETTINGS, EDIT_MODES, type EditMode } from "../utils/edit-mode";
 import { CONFIGURABLE_SEARCH_PROVIDER_IDS } from "../web/search/types";
+import {
+	AUTOROUTING_SELECTOR_DESCRIPTION,
+	AUTOROUTING_SELECTOR_PATTERN,
+	AUTOROUTING_TIERS,
+	type AutoroutingLocalIssue,
+	type AutoroutingProvenance,
+	type AutoroutingSetup,
+	type AutoroutingTierMapInput,
+	validateAutoroutingLocal,
+	validateAutoroutingProvenance,
+	validateAutoroutingSetup,
+} from "./autorouting-contract";
+import type { ModelSelectorValue } from "./model-selector-value";
+import { UPDATE_CHANNELS } from "./update-channel";
 
 const THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as readonly Effort[];
+const DEFAULT_THINKING_LEVELS = ["off", ...THINKING_EFFORTS] as const;
 
 import {
 	DEFAULT_DISABLED_EXTENSIONS,
@@ -36,7 +52,8 @@ export type SettingTab =
 	| "editing"
 	| "tools"
 	| "tasks"
-	| "providers";
+	| "providers"
+	| "notifications";
 
 /** Tab display metadata - icon is resolved via theme.symbol() */
 export type TabMetadata = { label: string; icon: `tab.${string}` };
@@ -52,6 +69,7 @@ export const SETTING_TABS: SettingTab[] = [
 	"tools",
 	"tasks",
 	"providers",
+	"notifications",
 ];
 
 /** Tab display metadata - icon is a symbol key from theme.ts (tab.*) */
@@ -65,6 +83,7 @@ export const TAB_METADATA: Record<SettingTab, { label: string; icon: `tab.${stri
 	tools: { label: "Tools", icon: "tab.tools" },
 	tasks: { label: "Tasks", icon: "tab.tasks" },
 	providers: { label: "Providers", icon: "tab.providers" },
+	notifications: { label: "Notifications", icon: "tab.providers" },
 };
 
 /** Status line segment identifiers */
@@ -107,6 +126,11 @@ interface UiBase {
 	description: string;
 	/** Condition function name - setting only shown when true */
 	condition?: string;
+	/**
+	 * Persistence owner for settings which must not use the generic immediate
+	 * settings-list write path.
+	 */
+	editing?: "notification-atomic";
 }
 
 interface UiBoolean extends UiBase {}
@@ -136,9 +160,25 @@ export type AnyUiMetadata = UiBase & {
 	options?: ReadonlyArray<SubmenuOption> | "runtime";
 };
 
+/** JSON Schema fragment carried by settings definitions that own nested validation. */
+export type JsonSchemaObject = {
+	[key: string]: unknown;
+	type?: string;
+	properties?: Record<string, JsonSchemaObject>;
+	additionalProperties?: boolean | JsonSchemaObject;
+	items?: JsonSchemaObject;
+	required?: readonly string[];
+	pattern?: string;
+	minItems?: number;
+	minLength?: number;
+	uniqueItems?: boolean;
+	minimum?: number;
+	const?: unknown;
+};
+
 interface BooleanDef {
 	type: "boolean";
-	default: boolean;
+	default?: boolean;
 	ui?: UiBoolean;
 }
 
@@ -169,19 +209,50 @@ interface ArrayDef<T> {
 	ui?: UiBase;
 }
 
-interface RecordDef<T> {
-	type: "record";
-	default: Record<string, T>;
+type RecordValueDef =
+	| { type: "model-selector-value" }
+	| { type: "string-enum"; values: readonly string[] }
+	| { type: "credential-selector" };
+
+interface ConstrainedRecordValueDef {
+	type: "autorouting-selector-value";
+	pattern: string;
+	description: string;
+}
+
+interface ConstrainedRecordDef<T> {
+	type: "constrained-record";
+	default: T;
+	keys: readonly string[];
+	valueSchema: ConstrainedRecordValueDef;
+	description?: string;
 	ui?: UiBase;
 }
 
-type SettingDef =
+interface RecordDef<T> {
+	type: "record";
+	default: Record<string, T>;
+	valueSchema?: RecordValueDef;
+	ui?: UiBase;
+}
+
+export interface OptionalObjectDef<T> {
+	type: "optional-object";
+	default: undefined;
+	jsonSchema: JsonSchemaObject;
+	validate: (value: unknown) => AutoroutingLocalIssue[];
+	_value?: T;
+}
+
+export type SettingDef =
 	| BooleanDef
 	| StringDef
 	| NumberDef
 	| EnumDef<readonly string[]>
 	| ArrayDef<unknown>
-	| RecordDef<unknown>;
+	| RecordDef<unknown>
+	| ConstrainedRecordDef<unknown>
+	| OptionalObjectDef<unknown>;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Schema Definition
@@ -199,7 +270,9 @@ export interface ModelTagsSettings {
 // Typed defaults for array/record settings — named constants avoid `as` casts
 // under `as const` while still letting SettingValue infer the correct element type.
 const EMPTY_STRING_ARRAY: string[] = [];
-const EMPTY_STRING_RECORD: Record<string, string> = {};
+const EMPTY_MODEL_SELECTOR_RECORD: Record<string, ModelSelectorValue> = {};
+const MODEL_SELECTOR_VALUE_SCHEMA = { type: "model-selector-value" } as const;
+const EDIT_MODE_VALUE_SCHEMA = { type: "string-enum", values: EDIT_MODES } as const;
 const DEFAULT_CYCLE_ORDER: string[] = ["default"];
 const EMPTY_MODEL_TAGS_RECORD: ModelTagsSettings = {};
 const HINDSIGHT_RECALL_TYPES_DEFAULT: string[] = ["world", "experience"];
@@ -241,6 +314,56 @@ export const DEFAULT_BASH_INTERCEPTOR_RULES: BashInterceptorRule[] = [
 	},
 ];
 
+const AUTOROUTING_SETUP_JSON_SCHEMA: JsonSchemaObject = {
+	type: "object",
+	properties: {
+		schema: { type: "integer", const: 1 },
+		providers: {
+			type: "array",
+			minItems: 1,
+			uniqueItems: true,
+			items: {
+				type: "string",
+				minLength: 1,
+				pattern: "^[^\\s](?:.*[^\\s])?$",
+			},
+		},
+		models: {
+			type: "array",
+			items: {
+				type: "string",
+				minLength: 1,
+				maxLength: 256,
+				pattern: AUTOROUTING_SELECTOR_PATTERN,
+				not: { pattern: "^\\s*[pP][iI]/" },
+			},
+		},
+	},
+	additionalProperties: false,
+	required: ["schema", "providers"],
+};
+
+const AUTOROUTING_PROVENANCE_JSON_SCHEMA: JsonSchemaObject = {
+	type: "object",
+	properties: {
+		schema: { type: "integer", const: 1 },
+		source: {
+			type: "object",
+			properties: {
+				catalogFingerprint: { type: "string", pattern: "^[0-9a-f]{64}$" },
+				mapFingerprint: { type: "string", pattern: "^[0-9a-f]{64}$" },
+				generatorVersion: { type: "integer", minimum: 1 },
+			},
+			additionalProperties: false,
+			required: ["catalogFingerprint", "mapFingerprint", "generatorVersion"],
+		},
+		declarationFingerprint: { type: "string", pattern: "^[0-9a-f]{64}$" },
+		tiersFingerprint: { type: "string", pattern: "^[0-9a-f]{64}$" },
+	},
+	additionalProperties: false,
+	required: ["schema", "source", "declarationFingerprint", "tiersFingerprint"],
+};
+
 export const SETTINGS_SCHEMA = {
 	// ────────────────────────────────────────────────────────────────────────
 	// General settings (no UI)
@@ -253,20 +376,166 @@ export const SETTINGS_SCHEMA = {
 	// per-machine overrides remain trivial.
 	"auth.broker.url": { type: "string", default: undefined },
 	"auth.broker.token": { type: "string", default: undefined },
+	"auth.credentialRankingMode": {
+		type: "enum",
+		values: ["balanced", "earliest-reset"] as const,
+		default: "balanced",
+		ui: {
+			tab: "providers",
+			label: "Credential Ranking",
+			description: "Choose balanced distribution or earliest-reset-first OAuth account selection.",
+		},
+	},
+	"auth.credentialPins": {
+		type: "record",
+		default: {} as Record<string, string>,
+		valueSchema: { type: "credential-selector" } as const,
+	},
+	"auth.credentialPinStoreIdentity": { type: "string", default: undefined },
+	"session.directoryMigration": {
+		type: "enum",
+		values: ["copy-retain", "disabled"] as const,
+		default: "copy-retain",
+	},
+	"workspaceTree.mode": {
+		type: "enum",
+		values: ["eager", "lazy"] as const,
+		default: "eager",
+		description: "When to scan the workspace tree used by the first prompt.",
+	},
+	"startup.networkPrewarm": {
+		type: "boolean",
+		default: true,
+		description: "Preconnect the model host during startup before the first request.",
+	},
+	// SDK-owned prompt deadline. Hidden from the UI; ACP has no separate timeout.
+	"sdk.promptDeadlineMs": {
+		type: "number",
+		default: 1_800_000,
+		description: "SDK-owned prompt deadline; ACP has no separate timeout.",
+		validate: (value: number) => Number.isSafeInteger(value) && value >= 60_000 && value <= 86_400_000,
+	},
+	"sdk.promptMaxRuntimeMs": {
+		type: "number",
+		default: 21_600_000,
+		description: "Hard maximum runtime for an SDK prompt from acceptance, bounding progress-aware renewals.",
+		validate: (value: number) => Number.isSafeInteger(value) && value >= 60_000 && value <= 86_400_000,
+	},
+	"sdk.masterOrphanGraceMs": {
+		type: "number",
+		default: 120_000,
+		description: "Grace period before a master-spawned child orphaned by confirmed master loss is closed.",
+		validate: (value: number) => Number.isSafeInteger(value) && value >= 60_000 && value <= 3_600_000,
+	},
 
 	// Notifications (shared daemon with Telegram/Discord/Slack presentation adapters)
 	"notifications.enabled": { type: "boolean", default: false },
-	"notifications.telegram.botToken": { type: "string", default: undefined },
+	"notifications.telegram.enabled": { type: "boolean" },
+	"notifications.telegram.botToken": {
+		type: "string",
+		default: undefined,
+		validate: (value: unknown) => typeof value === "string",
+	},
 	"notifications.telegram.chatId": { type: "string", default: undefined },
+	"notifications.telegram.activation": { type: "record", default: {} as Record<string, unknown> },
+	"notifications.telegram.btw.enabled": { type: "boolean", default: true },
+	"notifications.telegram.streaming.enabled": { type: "boolean", default: true },
+	"notifications.telegram.sound": {
+		type: "enum",
+		values: ["all", "important", "none"] as const,
+		default: "all",
+		ui: {
+			tab: "notifications",
+			label: "Telegram Notification Sounds",
+			description: "Choose which Telegram notifications play a sound.",
+			editing: "notification-atomic",
+		},
+	},
+	"notifications.telegram.rich.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "notifications",
+			label: "Telegram Rich Messages",
+			description: "Format Telegram notifications with rich message content.",
+			editing: "notification-atomic",
+		},
+	},
+	"notifications.telegram.richDraft.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "notifications",
+			label: "Telegram Rich Drafts",
+			description: "Include rich draft updates in Telegram notifications.",
+			editing: "notification-atomic",
+		},
+	},
+	"notifications.telegram.toolActivity.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "notifications",
+			label: "Telegram Tool Activity",
+			description: "Send Telegram updates for tool starts and completions.",
+			editing: "notification-atomic",
+		},
+	},
+	"notifications.telegram.topics.nameTemplate": { type: "string", default: undefined },
+	"notifications.discord.enabled": { type: "boolean" },
 	"notifications.discord.botToken": { type: "string", default: undefined },
-	"notifications.discord.channelId": { type: "string", default: undefined },
+	"notifications.discord.applicationId": { type: "string", default: undefined },
+	"notifications.discord.guildId": { type: "string", default: undefined },
+	"notifications.discord.parentChannelId": { type: "string", default: undefined },
+	"notifications.slack.enabled": { type: "boolean" },
 	"notifications.slack.botToken": { type: "string", default: undefined },
+	"notifications.slack.appToken": { type: "string", default: undefined },
+	"notifications.slack.workspaceId": { type: "string", default: undefined },
 	"notifications.slack.channelId": { type: "string", default: undefined },
-	"notifications.redact": { type: "boolean", default: false },
+	"notifications.slack.authorizedUserId": { type: "string", default: undefined },
+	"notifications.redact": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "notifications",
+			label: "Redact Notification Content",
+			description: "Redact sensitive content before notifications are delivered.",
+			editing: "notification-atomic",
+		},
+	},
 	"notifications.verbosity": {
 		type: "string",
 		default: "lean",
 		validate: (value: string) => value === "lean" || value === "verbose",
+		ui: {
+			tab: "notifications",
+			label: "Notification Verbosity",
+			description: "Choose concise or detailed notification messages.",
+			options: [
+				{ value: "lean", label: "Lean", description: "Send concise notification messages" },
+				{ value: "verbose", label: "Verbose", description: "Send detailed notification messages" },
+			],
+			editing: "notification-atomic",
+		},
+	},
+	"notifications.sessionScope": {
+		type: "string",
+		default: "all",
+		validate: (value: string) => value === "all" || value === "primary",
+		ui: {
+			tab: "notifications",
+			label: "Notification Session Scope",
+			description: "Send notifications from all sessions or only the primary session.",
+			options: [
+				{ value: "all", label: "All Sessions", description: "Allow eligible sessions" },
+				{
+					value: "primary",
+					label: "Primary Session",
+					description: "Limit automatic notifications to the primary session",
+				},
+			],
+			editing: "notification-atomic",
+		},
 	},
 	"notifications.daemon.idleTimeoutMs": {
 		type: "number",
@@ -281,7 +550,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "interaction",
 			label: "Terminal Bell",
 			description:
-				"Emit a BEL character for local terminal notifications. Windows Terminal may keep BEL silent depending on profile/system sound settings; use completion.notifyCommand for a PowerShell Console.Beep workaround.",
+				"Emit a BEL character for local terminal notifications. macOS enables this by default unless explicitly disabled. Windows Terminal may keep BEL silent depending on profile/system sound settings; use completion.notifyCommand for a PowerShell Console.Beep workaround.",
 		},
 	},
 	"notifications.bellOnComplete": {
@@ -375,7 +644,7 @@ export const SETTINGS_SCHEMA = {
 
 	disabledExtensions: { type: "array", default: DEFAULT_DISABLED_EXTENSIONS },
 
-	modelRoles: { type: "record", default: EMPTY_STRING_RECORD },
+	modelRoles: { type: "record", default: EMPTY_MODEL_SELECTOR_RECORD, valueSchema: MODEL_SELECTOR_VALUE_SCHEMA },
 	"modelProfile.default": {
 		type: "string",
 		default: undefined,
@@ -386,10 +655,68 @@ export const SETTINGS_SCHEMA = {
 			options: "runtime",
 		},
 	},
+	"modelProfile.proxyProvider": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "model",
+			label: "Proxy Provider",
+			description:
+				"Configured OpenAI-compatible proxy/gateway provider id (e.g. litellm) used by built-in model presets. Leave unset to keep direct provider endpoints.",
+		},
+	},
+	"modelProfile.proxyMode": {
+		type: "enum",
+		values: ["fallback", "always"] as const,
+		default: "fallback",
+		ui: {
+			tab: "model",
+			label: "Proxy Routing Mode",
+			description:
+				"fallback routes only selectors whose direct provider lacks credentials; always routes every proxy-routable built-in preset selector through the configured proxy.",
+			options: [
+				{
+					value: "fallback",
+					label: "Fallback",
+					description: "Use the proxy only when direct provider credentials are unavailable",
+				},
+				{
+					value: "always",
+					label: "Always",
+					description: "Route proxy-routable built-in preset selectors through the proxy",
+				},
+			],
+		},
+	},
+	"session.resumeModelBehavior": {
+		type: "enum",
+		values: ["keepSessionModel", "useCurrentDefault", "ask"] as const,
+		default: "keepSessionModel",
+		ui: {
+			tab: "model",
+			label: "Resume Model Behavior",
+			description:
+				"When resuming a session: keep the model that session last used, switch to the currently configured default model, or ask (TUI only; falls back to keeping the session's model in headless/CLI resume).",
+			options: [
+				{ value: "keepSessionModel", label: "Keep session's saved model" },
+				{ value: "useCurrentDefault", label: "Use current default model" },
+				{ value: "ask", label: "Ask on resume (TUI only)" },
+			],
+		},
+	},
 
 	modelTags: { type: "record", default: EMPTY_MODEL_TAGS_RECORD },
 
-	modelProviderOrder: { type: "array", default: EMPTY_STRING_ARRAY },
+	modelProviderOrder: {
+		type: "array",
+		default: EMPTY_STRING_ARRAY,
+		ui: {
+			tab: "providers",
+			label: "Provider Priority Order",
+			description:
+				"Ordered provider priority for automatic model resolution. Providers listed earlier win ties; omitted providers fall back to curated ranking. Unavailable saved entries are retained and skipped at runtime.",
+		},
+	},
 
 	cycleOrder: { type: "array", default: DEFAULT_CYCLE_ORDER },
 
@@ -398,10 +725,46 @@ export const SETTINGS_SCHEMA = {
 		default: 0.05,
 		validate: (value: number) => Number.isFinite(value) && value > 0 && value <= 1,
 	},
+	"gjc.ralplan.autoHandoff": {
+		type: "enum",
+		values: ["off", "ultragoal", "autoresearch"],
+		default: "off",
+	},
+	"gjc.ralplan.maxIterations": {
+		type: "number",
+		default: 5,
+		validate: (value: number) => Number.isInteger(value) && value >= 1 && value <= 20,
+	},
+	"gjc.ralplan.maxReviewPassesPerLane": {
+		type: "number",
+		default: 1,
+		validate: (value: number) => Number.isInteger(value) && value >= 1 && value <= 10,
+	},
+	"gjc.ultragoal.nudgeBudget": {
+		type: "number",
+		default: 10,
+		validate: (value: number) => Number.isInteger(value) && value >= 0,
+	},
 
 	// ────────────────────────────────────────────────────────────────────────
 	// Appearance
 	// ────────────────────────────────────────────────────────────────────────
+	"ui.language": {
+		type: "enum",
+		values: ["en", "ko", "zh", "ja"] as const,
+		default: "en",
+		ui: {
+			tab: "appearance",
+			label: "Language",
+			description: "Language for human-facing interactive UI text",
+			options: [
+				{ value: "en", label: "English" },
+				{ value: "ko", label: "Korean (한국어)" },
+				{ value: "zh", label: "Chinese (简体中文)" },
+				{ value: "ja", label: "Japanese (日本語)" },
+			],
+		},
+	},
 
 	// Theme
 	"theme.dark": {
@@ -426,6 +789,16 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"theme.watchFiles": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "appearance",
+			label: "Watch Theme Files",
+			description: "Reload custom themes when their files change",
+		},
+	},
+
 	symbolPreset: {
 		type: "enum",
 		values: ["unicode", "nerd", "ascii"] as const,
@@ -442,6 +815,16 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"syntaxHighlighting.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "appearance",
+			label: "Syntax Highlighting",
+			description: "Highlight code blocks and diffs when rendering",
+		},
+	},
+
 	colorBlindMode: {
 		type: "boolean",
 		default: false,
@@ -453,6 +836,15 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	// Status line
+	"statusLine.watchGitHead": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "appearance",
+			label: "Watch Git HEAD",
+			description: "Refresh status-line git data when HEAD changes",
+		},
+	},
 	"statusLine.preset": {
 		type: "enum",
 		values: ["default", "default-usage", "minimal", "compact", "full", "nerd", "ascii", "custom"] as const,
@@ -507,6 +899,40 @@ export const SETTINGS_SCHEMA = {
 			description: "Use the session name color for the editor border and status line gap",
 		},
 	},
+
+	"pet.mode": {
+		type: "enum",
+		values: PET_MODE_IDS,
+		default: "off",
+		ui: {
+			tab: "appearance",
+			label: "Gajae Pet",
+			description: "Animated pet beside the composer (pixel graphics where supported; text cells elsewhere)",
+			options: [
+				{ value: "off", label: "Off", description: "No pet" },
+				...PET_SKIN_IDS.map(id => ({
+					value: id,
+					label: PET_SKINS[id].label,
+					description: PET_SKINS[id].description,
+				})),
+			],
+		},
+	},
+	"statusLine.maxRows": {
+		type: "number",
+		default: 1,
+		ui: {
+			tab: "appearance",
+			label: "Status Line Rows",
+			description:
+				"Maximum rows for the status line. When greater than 1, overflowing segments wrap onto additional rows instead of being dropped.",
+			options: [
+				{ value: "1", label: "1 row", description: "Single line; overflow is truncated (default)" },
+				{ value: "2", label: "2 rows", description: "Wrap overflow onto a second row" },
+				{ value: "3", label: "3 rows", description: "Wrap overflow across up to three rows" },
+			],
+		},
+	},
 	"tools.artifactSpillThreshold": {
 		type: "number",
 		default: 50,
@@ -527,6 +953,52 @@ export const SETTINGS_SCHEMA = {
 				{ value: "200", label: "200 KB", description: "~50K tokens" },
 				{ value: "500", label: "500 KB", description: "~125K tokens" },
 				{ value: "1000", label: "1 MB", description: "~250K tokens" },
+			],
+		},
+	},
+	"tools.preAdmissionArtifactSpill": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tools",
+			label: "Pre-admission artifact spill",
+			description:
+				"Experimental opt-in: save oversized tool results before provider context construction, retaining a UTF-8-safe head, tail, digest, and artifact receipt inline",
+		},
+	},
+
+	"tools.readArtifactSpillThreshold": {
+		type: "number",
+		default: 256,
+		ui: {
+			tab: "tools",
+			label: "Read artifact spill threshold (KB)",
+			description:
+				"Explicit large reads above this combined size are saved as an artifact with a bounded head-and-tail snippet inline. Bare reads, directories, and converted-document receipts remain inline.",
+			options: [
+				{ value: "0", label: "Off", description: "No read-specific spill (backstop only)" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
+				{ value: "100", label: "100 KB", description: "~25K tokens" },
+				{ value: "256", label: "256 KB", description: "Default; ~64K tokens" },
+				{ value: "512", label: "512 KB", description: "~128K tokens" },
+				{ value: "1000", label: "1 MB", description: "~250K tokens" },
+			],
+		},
+	},
+
+	"tools.fileMentionInlineBytes": {
+		type: "number",
+		default: 10,
+		ui: {
+			tab: "tools",
+			label: "File-mention inline cap (KB)",
+			description:
+				"Inline byte cap for auto-read `@path` file mentions, aligned with the 10 KiB bare-read receipt so incidental mentions stay within the same bounded context budget. The full file is still available via the read tool.",
+			options: [
+				{ value: "5", label: "5 KB", description: "~1.25K tokens" },
+				{ value: "10", label: "10 KB", description: "Default; ~2.5K tokens" },
+				{ value: "20", label: "20 KB", description: "~5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens (matches bare-read receipt)" },
 			],
 		},
 	},
@@ -608,6 +1080,25 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"tools.maxInlineResultBytes": {
+		type: "number",
+		default: 0,
+		ui: {
+			tab: "tools",
+			label: "Max inline tool-result size (KB)",
+			description:
+				"Absolute backstop cap on inline tool-result text, enforced after artifact spill for every tool (including read and tools that set their own partial artifact meta). Output above this size is force-saved as an artifact and truncated to head+tail. 0 disables (default; opt-in pending measurement).",
+			options: [
+				{ value: "0", label: "Off", description: "Disabled; no absolute inline cap" },
+				{ value: "20", label: "20 KB", description: "~5K tokens" },
+				{ value: "30", label: "30 KB", description: "~7.5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
+				{ value: "75", label: "75 KB", description: "~19K tokens" },
+				{ value: "100", label: "100 KB", description: "~25K tokens" },
+			],
+		},
+	},
+
 	"statusLine.showHookStatus": {
 		type: "boolean",
 		default: false,
@@ -616,6 +1107,15 @@ export const SETTINGS_SCHEMA = {
 	"statusLine.showSkillHud": {
 		type: "boolean",
 		default: true,
+	},
+	"statusLine.showActionHints": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "appearance",
+			label: "Composer Shortcut Hints",
+			description: "Show contextual keyboard shortcuts in the composer placeholder",
+		},
 	},
 
 	"statusLine.leftSegments": { type: "array", default: [] as StatusLineSegmentId[] },
@@ -732,13 +1232,13 @@ export const SETTINGS_SCHEMA = {
 	// Reasoning and prompts
 	defaultThinkingLevel: {
 		type: "enum",
-		values: THINKING_EFFORTS,
+		values: DEFAULT_THINKING_LEVELS,
 		default: THINKING_EFFORTS[3],
 		ui: {
 			tab: "model",
 			label: "Thinking Level",
 			description: "Reasoning depth for thinking-capable models",
-			options: [...THINKING_EFFORTS.map(getThinkingLevelMetadata)],
+			options: [...DEFAULT_THINKING_LEVELS.map(getThinkingLevelMetadata)],
 		},
 	},
 
@@ -946,6 +1446,12 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"fallback.maxAttempts": {
+		type: "number",
+		default: 3,
+		validate: (value: number) => Number.isInteger(value) && value > 0,
+	},
+
 	// Retries
 	"retry.enabled": { type: "boolean", default: true },
 
@@ -974,7 +1480,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "model",
 			label: "Max Retry Delay",
 			description:
-				"Maximum wait between retries, in ms. When the provider asks us to wait longer than this and no credential or model fallback succeeds, the request fails fast instead of sleeping (e.g. 3-hour Anthropic rate-limit windows).",
+				"Maximum wait between retries, in ms. Legacy retries clamp provider Retry-After hints to this value; managed fallback honors typed Retry-After hints even when they exceed it.",
 		},
 	},
 	"retry.requestMaxRetries": {
@@ -995,6 +1501,16 @@ export const SETTINGS_SCHEMA = {
 			label: "Provider Stream Retries",
 			description:
 				"Maximum provider stream replay retries for replay-safe transient stream failures. Counts retries, not the first attempt. Set to 0 to disable provider stream retries.",
+		},
+	},
+	"retry.streamFirstEventTimeoutMs": {
+		type: "number",
+		default: 100_000,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+		ui: {
+			tab: "model",
+			label: "First Event Timeout",
+			description: "Maximum wait for the first provider stream event, in ms. Set to 0 to disable the watchdog.",
 		},
 	},
 	"retry.fallbackChains": { type: "record", default: {} as Record<string, string[]> },
@@ -1021,6 +1537,25 @@ export const SETTINGS_SCHEMA = {
 	// Interaction
 	// ────────────────────────────────────────────────────────────────────────
 
+	"history.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "interaction",
+			label: "History",
+			description: "Persist and search submitted prompts in local history",
+		},
+	},
+	"mouse.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "interaction",
+			label: "Mouse Support",
+			description:
+				"Enable GJC session scrolling, drag-to-copy text selection, double-click word and triple-click line selection, and overlay row selection with the mouse. Disabled by default to preserve native terminal or tmux scrollback and selection; while enabled, most terminals still reach their own selection with a modifier held (Option on macOS, Shift elsewhere), though that path copies only if the host terminal has its own copy-on-select enabled.",
+		},
+	},
 	// Conversation flow
 	steeringMode: {
 		type: "enum",
@@ -1117,6 +1652,16 @@ export const SETTINGS_SCHEMA = {
 			description: "Suggest emojis from `:name:` shortcodes and expand text emoticons like `:D` or `:-)`",
 		},
 	},
+	promptSuggestions: {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "interaction",
+			label: "Prompt Suggestions",
+			description:
+				"Predict your likely next prompt after each turn (smol-model call) and show it as ghost text; Tab accepts",
+		},
+	},
 
 	"startup.quiet": {
 		type: "boolean",
@@ -1145,13 +1690,51 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"startup.skipLogoAnimation": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "interaction",
+			label: "Skip Startup Logo Animation",
+			description:
+				"Skip the animated startup logo sweep; the welcome surface, its resting logo, and all information rows still render. Applies at the next interactive start.",
+		},
+	},
+
 	"startup.checkUpdate": {
 		type: "boolean",
 		default: true,
 		ui: {
 			tab: "interaction",
 			label: "Check for Updates",
-			description: "If false, skip update check",
+			description:
+				"At interactive startup, notify of newer versions; never install. `gjc update` installs the matching GitHub release binary. Source, linked, and unrecognized installs stay on their original method.",
+		},
+	},
+
+	"startup.updateChannel": {
+		type: "enum",
+		values: UPDATE_CHANNELS,
+		default: "stable",
+		ui: {
+			tab: "interaction",
+			label: "Update Channel",
+			description: "Release channel used by `gjc update` and the startup update check",
+			options: [
+				{ value: "stable", label: "Stable", description: "Track stable GitHub releases" },
+				{ value: "nightly", label: "Nightly", description: "Track nightly GitHub prereleases" },
+			],
+		},
+	},
+
+	"telemetry.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "interaction",
+			label: "Anonymous Usage Telemetry",
+			description:
+				"Send minimal allowlisted update and adoption events. Disabled by default; no prompts, paths, environment, identity, or arbitrary errors are collected.",
 		},
 	},
 
@@ -1162,6 +1745,39 @@ export const SETTINGS_SCHEMA = {
 			tab: "interaction",
 			label: "GitHub Star Reminder",
 			description: "Show the interactive GitHub star reminder when gh is authenticated",
+		},
+	},
+
+	"crashReport.nudge": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "interaction",
+			label: "Crash Report Nudge",
+			description:
+				"At interactive startup, show one rate-limited line when unreported crash signatures exist. Reads local state only; nothing is ever transmitted without the explicit consent flow in `gjc crash report`.",
+		},
+	},
+
+	"crashReport.upstream": {
+		type: "enum",
+		values: ["off", "sentry"] as const,
+		default: "off",
+		ui: {
+			tab: "interaction",
+			label: "Crash Report Upstream (Global)",
+			description:
+				"Global-only opt-in to transmit sanitized crash signatures to an aggregation service for cross-install counting. Off sends nothing. Only fields approved by `sanitizeExternalCrashV1` are sent; prompt text, source code, file contents, and credentials are excluded.",
+		},
+	},
+	"crashReport.upstreamDsn": {
+		type: "string",
+		default: "",
+		ui: {
+			tab: "interaction",
+			label: "Crash Report Upstream DSN (Global)",
+			description:
+				"Global-only Sentry DSN for the opted-in upstream; ignored while Crash Report Upstream is off, and no default destination exists. Only fields approved by `sanitizeExternalCrashV1` are sent; prompt text, source code, file contents, and credentials are excluded.",
 		},
 	},
 
@@ -1342,13 +1958,71 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"compaction.adaptive.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "context",
+			label: "Adaptive Compaction",
+			description: "Adjust compaction frequency by context size and call rate",
+		},
+	},
+	"compaction.adaptive.baseThresholdPercent": {
+		type: "number",
+		default: 85,
+		ui: {
+			tab: "context",
+			label: "Adaptive Base Threshold %",
+			description: "Base context percentage used when adaptive compaction is enabled",
+		},
+	},
+	"compaction.adaptive.aggression": {
+		type: "number",
+		default: 0.15,
+		ui: {
+			tab: "context",
+			label: "Adaptive Aggression",
+			description: "How strongly call rate lowers the compaction threshold; use 0 to 1",
+		},
+	},
+	"compaction.adaptive.turnWindow": {
+		type: "number",
+		default: 15,
+		ui: {
+			tab: "context",
+			label: "Call-Rate Window",
+			description: "Minutes of recent calls considered by adaptive compaction",
+		},
+	},
+	"compaction.adaptive.minThresholdPercent": {
+		type: "number",
+		default: 50,
+		ui: {
+			tab: "context",
+			label: "Adaptive Floor %",
+			description: "Lowest context percentage adaptive compaction may lower the threshold to",
+		},
+	},
+
 	"compaction.handoffSaveToDisk": {
 		type: "boolean",
 		default: false,
 		ui: {
 			tab: "context",
 			label: "Save Handoff Docs",
-			description: "Save generated handoff documents to markdown files for the auto-handoff flow",
+			description:
+				"Save auto-triggered handoff documents as session artifacts (resolvable artifact:// URIs); manual /handoff does not save",
+		},
+	},
+
+	"compaction.handoffPromptExtension": {
+		type: "string",
+		default: "",
+		ui: {
+			tab: "context",
+			label: "Handoff Prompt Extension",
+			description:
+				"Extra guidance appended to the default handoff-generation prompt for both manual /handoff and auto-handoff. It supplements, and never replaces, the built-in safety- and continuity-critical instructions.",
 		},
 	},
 
@@ -1369,6 +2043,15 @@ export const SETTINGS_SCHEMA = {
 	"compaction.autoContinue": { type: "boolean", default: true },
 
 	"compaction.remoteEndpoint": { type: "string", default: undefined },
+
+	// Below-threshold maintenance pruning (Finding 13). Internal/measurement-only:
+	// keep the runtime setting for targeted experiments, but do not expose it in
+	// settings UI. Live layofflabs/gpt-5.5 medium evidence on 2026-07-07 showed no
+	// savings and a cache-hit regression; pruning rewrites already-sent history and
+	// can force a provider cache-epoch reset.
+	"compaction.maintenancePruningEnabled": { type: "boolean", default: false },
+
+	"compaction.maintenancePruningMinSavingsTokens": { type: "number", default: 8000 },
 
 	// Idle compaction
 	"compaction.idleEnabled": {
@@ -1643,7 +2326,8 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "context",
 			label: "TTSR Context Mode",
-			description: "What to do with partial output when TTSR triggers",
+			description:
+				"What to do with partial output when TTSR triggers. 'discard' (recommended) drops the aborted partial turn so it never accumulates in context. 'keep' retains every aborted partial turn, which grows the token footprint each time a rule fires — prefer 'discard' unless you specifically need the partial output.",
 		},
 	},
 
@@ -1692,6 +2376,19 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	// Bounded-memory cold-session offloading. Budgets are fixed implementation
+	// constants in the sidecar primitives, not user-tunable fields. Auto keeps
+	// ordinary sessions on the eager path and routes transcripts above the eager
+	// admission limit through bounded cold-session state.
+	"sessionMemory.mode": {
+		type: "enum",
+		values: ["off", "shadow", "enabled", "auto"] as const,
+		default: "auto",
+	},
+	// Independent runtime switch for AgentSession's async compact-once overflow
+	// recovery. The synchronous bounded context preflight stays always on.
+	"sessionMemory.contextOverflowRecovery": { type: "boolean", default: true },
+
 	// ────────────────────────────────────────────────────────────────────────
 	// Editing
 	// ────────────────────────────────────────────────────────────────────────
@@ -1699,13 +2396,19 @@ export const SETTINGS_SCHEMA = {
 	// Edit tool
 	"edit.mode": {
 		type: "enum",
-		values: EDIT_MODES,
-		default: "hashline",
+		values: EDIT_MODE_SETTINGS,
+		default: DEFAULT_EDIT_MODE_SETTING,
 		ui: {
 			tab: "editing",
 			label: "Edit Mode",
-			description: "Select the edit tool variant (replace, patch, hashline, vim, or apply_patch)",
+			description:
+				"Select the edit tool variant (auto routes by model family; replace, patch, hashline, vim, or apply_patch)",
 		},
+	},
+	"edit.modelVariants": {
+		type: "record",
+		default: {} as Record<string, EditMode>,
+		valueSchema: EDIT_MODE_VALUE_SCHEMA,
 	},
 
 	"edit.fuzzyMatch": {
@@ -1789,13 +2492,75 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "editing",
 			label: "Default Read Limit",
-			description: "Default number of lines returned when agent calls read without a limit",
+			description:
+				"Default collection/selection limit for read operations; bare local receipts use the separate 50-line / 10 KiB receipt budgets",
 			options: [
 				{ value: "200", label: "200 lines" },
 				{ value: "300", label: "300 lines" },
 				{ value: "500", label: "500 lines" },
 				{ value: "1000", label: "1000 lines" },
 				{ value: "5000", label: "5000 lines" },
+			],
+		},
+	},
+	"read.receiptBudgetLines": {
+		type: "number",
+		default: 50,
+		ui: {
+			tab: "editing",
+			label: "Read Receipt Line Budget",
+			description: "Maximum lines included in a bare read receipt before a selector footer is shown",
+			options: [
+				{ value: "25", label: "25 lines" },
+				{ value: "50", label: "50 lines", description: "Default" },
+				{ value: "100", label: "100 lines" },
+				{ value: "200", label: "200 lines" },
+			],
+		},
+	},
+	"read.receiptBudgetBytes": {
+		type: "number",
+		default: 10,
+		ui: {
+			tab: "editing",
+			label: "Read Receipt Byte Budget (KB)",
+			description: "Maximum UTF-8 body size for a bare read receipt before a selector footer is shown",
+			options: [
+				{ value: "5", label: "5 KB", description: "~1.25K tokens" },
+				{ value: "10", label: "10 KB", description: "Default; ~2.5K tokens" },
+				{ value: "20", label: "20 KB", description: "~5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
+			],
+		},
+	},
+	"read.truncation": {
+		type: "enum",
+		values: ["head", "last", "both"] as const,
+		default: "last",
+		ui: {
+			tab: "editing",
+			label: "Read Truncation",
+			description:
+				"Configured default direction for routes that support directional truncation; bare local and archive reads use this value (factory default: last), while explicit truncation always wins",
+			options: [
+				{ value: "head", label: "Head", description: "Keep the first N lines" },
+				{ value: "last", label: "Last", description: "Keep the last N lines (default)" },
+				{ value: "both", label: "Both", description: "Keep the start and the end, elide the middle" },
+			],
+		},
+	},
+	"read.summaryMaxBytes": {
+		type: "number",
+		default: 20,
+		ui: {
+			tab: "editing",
+			label: "Read Summary Size Budget (KB)",
+			description: "Maximum UTF-8 size for a structural read summary before additional units are elided",
+			options: [
+				{ value: "10", label: "10 KB", description: "~2.5K tokens" },
+				{ value: "20", label: "20 KB", description: "Default; ~5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
+				{ value: "100", label: "100 KB", description: "~25K tokens" },
 			],
 		},
 	},
@@ -2081,6 +2846,16 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"irc.sidebar.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			label: "IRC Sidebar",
+			description: "Enable the IRC message sidebar (opens with the toggle key; starts closed)",
+		},
+	},
+
 	// Optional tools
 
 	"renderMermaid.enabled": {
@@ -2156,9 +2931,9 @@ export const SETTINGS_SCHEMA = {
 		default: false,
 		ui: {
 			tab: "tools",
-			label: "Insane Search Fallback",
+			label: "Insane Search Fallback (Compatibility)",
 			description:
-				"Opt in to the vendored insane-search escalation for blocked public URL reads (403/WAF/JS-gated). Off by default. Requires preinstalled python3 + curl_cffi (and node + playwright/stealth for the browser phase); changes network posture by enabling TLS/browser impersonation for public pages.",
+				"Compatibility-only preference. Remote renderer fallback stays disabled because it cannot preserve validated per-hop network routing.",
 		},
 	},
 
@@ -2201,6 +2976,28 @@ export const SETTINGS_SCHEMA = {
 			label: "GitHub cache hard TTL (seconds)",
 			description:
 				"Past soft TTL but within hard TTL, the tool returns the cached row and refreshes it in the background. Past hard TTL, the row is dropped. Default 7 days.",
+		},
+	},
+	"clipboard.transport": {
+		type: "enum",
+		values: ["auto", "native", "osc52", "ssh"] as const,
+		default: "auto",
+		ui: {
+			tab: "tools",
+			label: "Clipboard Transport",
+			description:
+				"auto keeps current OSC52+native best-effort behavior. native/osc52 restrict copy to one mechanism. ssh routes text copy/paste through `ssh <clipboard.sshHost> pbcopy/pbpaste` via argv spawn and never silently falls back to native/OSC52 on failure.",
+		},
+	},
+	"clipboard.sshHost": {
+		type: "string",
+		default: "",
+		validate: (value: string) => value === "" || /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value),
+		ui: {
+			tab: "tools",
+			label: "Clipboard SSH Host",
+			description:
+				"SSH host alias (from ~/.ssh/config) used when clipboard.transport is ssh. Required in that mode.",
 		},
 	},
 
@@ -2246,6 +3043,17 @@ export const SETTINGS_SCHEMA = {
 			description: "Enable the browser tool (Ulixee Hero)",
 		},
 	},
+	"browser.backend": {
+		type: "enum",
+		values: ["native", "aside"] as const,
+		default: "native",
+		ui: {
+			tab: "tools",
+			label: "Browser Backend",
+			description:
+				"Browser surface offered to the model. 'native' exposes the built-in Puppeteer browser tool. 'aside' hides it and auto-registers the Aside CLI MCP server (`aside mcp`) so every browser task runs in your live logged-in Aside browser (requires the Aside CLI).",
+		},
+	},
 
 	"browser.headless": {
 		type: "boolean",
@@ -2264,6 +3072,39 @@ export const SETTINGS_SCHEMA = {
 			label: "Screenshot directory",
 			description:
 				"Directory to save screenshots. If unset, screenshots go to a temp file. Supports ~. Examples: ~/Downloads, ~/Desktop, /sdcard/Download (Android)",
+		},
+	},
+
+	"browser.profileReuse": {
+		type: "string",
+		default: "auto",
+		validate: (value: string) => value === "auto" || value === "opt-in",
+		ui: {
+			tab: "tools",
+			label: "Profile reuse posture",
+			description:
+				"'auto' (default): when a usable real Chrome profile is available, the browser tool uses an isolated copy of it (cookies/session/cache) for stronger stealth, warns, and falls back to synthetic. 'opt-in': stay synthetic unless a real profile is explicitly requested.",
+		},
+	},
+
+	"browser.geo.timezone": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "tools",
+			label: "Geo timezone override",
+			description:
+				"Optional IANA timezone (e.g. 'America/New_York') for headless sessions. Default unset preserves the real timezone. Only set this to a value coherent with your egress (e.g. a proxy region); an incoherent timezone increases bot detection.",
+		},
+	},
+	"browser.geo.locale": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "tools",
+			label: "Geo locale override",
+			description:
+				"Optional UI locale (e.g. 'en-US') for headless sessions. Default unset preserves the real locale. Only set this coherently with your egress region.",
 		},
 	},
 
@@ -2296,6 +3137,29 @@ export const SETTINGS_SCHEMA = {
 			description: "Parent-process RSS (MB) above which idle tabs are opportunistically evicted LRU.",
 		},
 	},
+	// `gjc gc --disk` retention policy. Report-only unless `--prune` is also passed;
+	// these knobs never run implicitly and never affect the PID-liveness axis.
+	"gc.sessions.maxAgeDays": {
+		type: "number",
+		default: 60,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+	},
+	// 0 disables the size axis; only the age axis retires transcripts then.
+	"gc.sessions.maxTotalBytes": {
+		type: "number",
+		default: 0,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+	},
+	"gc.natives.keepVersions": {
+		type: "number",
+		default: 2,
+		validate: (value: number) => Number.isInteger(value) && value >= 0,
+	},
+	"gc.backups.maxAgeDays": {
+		type: "number",
+		default: 30,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+	},
 	"resourceGc.sweepIntervalMs": {
 		type: "number",
 		default: 30_000,
@@ -2305,6 +3169,47 @@ export const SETTINGS_SCHEMA = {
 			label: "Resource GC Sweep Interval (ms)",
 			description: "How often the resource GC sweeps browser tabs and stale screenshot directories.",
 		},
+	},
+	"memoryGuard.enabled": {
+		type: "boolean",
+		default: false,
+	},
+	"memoryGuard.checkIntervalMs": {
+		type: "number",
+		default: 30_000,
+		validate: (value: number) => Number.isFinite(value) && value > 0,
+	},
+	"memoryGuard.gcThresholdPercent": {
+		type: "number",
+		default: 70,
+		validate: (value: number) => Number.isFinite(value) && value >= 0 && value <= 100,
+	},
+	"memoryGuard.restartThresholdPercent": {
+		type: "number",
+		default: 85,
+		validate: (value: number) => Number.isFinite(value) && value >= 0 && value <= 100,
+	},
+	"memoryGuard.restartThresholdWindowMs": {
+		type: "number",
+		default: 90_000,
+		validate: (value: number) => Number.isFinite(value) && value > 0,
+	},
+	"memoryGuard.cooldownMs": {
+		type: "number",
+		default: 600_000,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+	},
+	"memoryGuard.parentReserveMb": {
+		type: "number",
+		default: 1024,
+		validate: (value: number) =>
+			Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER / (1024 * 1024),
+	},
+	"memoryGuard.policyLimitMb": {
+		type: "number",
+		default: 0,
+		validate: (value: number) =>
+			Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER / (1024 * 1024),
 	},
 
 	"computer.enabled": {
@@ -2478,7 +3383,7 @@ export const SETTINGS_SCHEMA = {
 	"tools.discoveryMode": {
 		type: "enum",
 		values: ["off", "all"] as const,
-		default: "off",
+		default: "all",
 		ui: {
 			tab: "tools",
 			label: "Tool Discovery",
@@ -2493,7 +3398,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "tools",
 			label: "Essential Tools Override",
 			description:
-				"Override the always-loaded built-in tools (default: read, bash, edit). Leave empty to use defaults.",
+				"Override the always-loaded built-in tools (default: read, bash, edit, write, search, find). Leave empty to use defaults.",
 		},
 	},
 
@@ -2523,10 +3428,24 @@ export const SETTINGS_SCHEMA = {
 		default: 500,
 	},
 
+	"mcp.sharedPoolIdleMs": {
+		type: "number",
+		default: 300_000,
+	},
+
 	// ────────────────────────────────────────────────────────────────────────
 	// Tasks
 	// ────────────────────────────────────────────────────────────────────────
 
+	"tasksPane.defaultVisible": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			label: "Tasks Pane Visible By Default",
+			description: "Open the unified tasks pane when the interactive UI starts",
+		},
+	},
 	// Plan mode
 	"plan.enabled": {
 		type: "boolean",
@@ -2652,7 +3571,8 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "tasks",
 			label: "Prefer Task Delegation",
-			description: "Encourage the agent to delegate work to subagents unless changes are trivial",
+			description:
+				"Encourage the agent to delegate work to subagents unless changes are trivial (on by default when executor/planner run on a different provider than the default role)",
 		},
 	},
 
@@ -2790,8 +3710,42 @@ export const SETTINGS_SCHEMA = {
 
 	"task.agentModelOverrides": {
 		type: "record",
-		default: {} as Record<string, string>,
+		default: {} as Record<string, ModelSelectorValue>,
+		valueSchema: MODEL_SELECTOR_VALUE_SCHEMA,
 	},
+
+	"task.autorouting.enabled": {
+		type: "boolean",
+		default: false,
+	},
+
+	"task.autorouting.tiers": {
+		type: "constrained-record",
+		default: {} as AutoroutingTierMapInput,
+		keys: AUTOROUTING_TIERS,
+		valueSchema: {
+			type: "autorouting-selector-value",
+			minLength: 1,
+			maxLength: 256,
+			pattern: AUTOROUTING_SELECTOR_PATTERN,
+			description: AUTOROUTING_SELECTOR_DESCRIPTION,
+		},
+		description: AUTOROUTING_SELECTOR_DESCRIPTION,
+	},
+
+	"task.autorouting.setup": {
+		type: "optional-object",
+		default: undefined,
+		jsonSchema: AUTOROUTING_SETUP_JSON_SCHEMA,
+		validate: validateAutoroutingSetup,
+	} as OptionalObjectDef<AutoroutingSetup>,
+
+	"task.autorouting.provenance": {
+		type: "optional-object",
+		default: undefined,
+		jsonSchema: AUTOROUTING_PROVENANCE_JSON_SCHEMA,
+		validate: validateAutoroutingProvenance,
+	} as OptionalObjectDef<AutoroutingProvenance>,
 
 	"tasks.todoClearDelay": {
 		type: "number",
@@ -2826,9 +3780,29 @@ export const SETTINGS_SCHEMA = {
 
 	"skills.enableClaudeProject": { type: "boolean", default: DEFAULT_SKILL_DISCOVERY_SETTINGS.enableClaudeProject },
 
-	"skills.enablePiUser": { type: "boolean", default: DEFAULT_SKILL_DISCOVERY_SETTINGS.enablePiUser },
+	"skills.trustProjectSkills": {
+		type: "boolean",
+		ui: {
+			tab: "customization",
+			label: "Trust Project Skills",
+			description:
+				"Load skills from project .gjc/skills, .claude/skills, and .codex/skills. Set to false to ignore project-controlled skills while keeping user skills.",
+		},
+	},
 
-	"skills.enablePiProject": { type: "boolean", default: DEFAULT_SKILL_DISCOVERY_SETTINGS.enablePiProject },
+	"skills.trustUserSkills": {
+		type: "boolean",
+		ui: {
+			tab: "customization",
+			label: "Trust User Skills",
+			description:
+				"Load skills from ~/.gjc/agent/skills (and legacy ~/.gjc/skills / <config>/skills). Set to false to ignore user-installed skills while keeping project skills.",
+		},
+	},
+
+	"skills.enablePiUser": { type: "boolean", ui: { tab: "customization", label: "Trust User Skills (legacy)" } },
+
+	"skills.enablePiProject": { type: "boolean", ui: { tab: "customization", label: "Trust Project Skills (legacy)" } },
 
 	"skills.customDirectories": { type: "array", default: DEFAULT_SKILL_DISCOVERY_SETTINGS.customDirectories },
 
@@ -2950,28 +3924,6 @@ export const SETTINGS_SCHEMA = {
 			],
 		},
 	},
-	"providers.image": {
-		type: "enum",
-		values: ["auto", "openai", "gemini", "openrouter", "antigravity"] as const,
-		default: "auto",
-		ui: {
-			tab: "providers",
-			label: "Image Provider",
-			description: "Provider for image generation tool",
-			options: [
-				{
-					value: "auto",
-					label: "Auto",
-					description: "Priority: GPT model image tool > Antigravity > OpenRouter > Gemini",
-				},
-				{ value: "openai", label: "OpenAI", description: "Uses the active GPT Responses/Codex model" },
-				{ value: "gemini", label: "Gemini", description: "Requires GEMINI_API_KEY" },
-				{ value: "openrouter", label: "OpenRouter", description: "Requires OPENROUTER_API_KEY" },
-				{ value: "antigravity", label: "Antigravity", description: "Requires login with google-antigravity" },
-			],
-		},
-	},
-
 	"providers.kimiApiFormat": {
 		type: "enum",
 		values: ["openai", "anthropic"] as const,
@@ -3125,25 +4077,32 @@ type Schema = typeof SETTINGS_SCHEMA;
 export type SettingPath = keyof Schema;
 
 /** Infer the value type for a setting path */
-export type SettingValue<P extends SettingPath> = Schema[P] extends { type: "boolean" }
+export type SettingValue<P extends SettingPath> = Schema[P] extends { type: "boolean"; default: boolean }
 	? boolean
-	: Schema[P] extends { type: "string" }
-		? string | undefined
-		: Schema[P] extends { type: "number" }
-			? number
-			: Schema[P] extends { type: "enum"; values: infer V }
-				? V extends readonly string[]
-					? V[number]
-					: never
-				: Schema[P] extends { type: "array"; default: infer D }
-					? D
-					: Schema[P] extends { type: "record"; default: infer D }
+	: Schema[P] extends { type: "boolean" }
+		? boolean | undefined
+		: Schema[P] extends { type: "string" }
+			? string | undefined
+			: Schema[P] extends { type: "number" }
+				? number
+				: Schema[P] extends { type: "enum"; values: infer V }
+					? V extends readonly string[]
+						? V[number]
+						: never
+					: Schema[P] extends { type: "array"; default: infer D }
 						? D
-						: never;
+						: Schema[P] extends { type: "record"; default: infer D }
+							? D
+							: Schema[P] extends { type: "constrained-record"; default: infer D }
+								? D
+								: Schema[P] extends OptionalObjectDef<infer D>
+									? D | undefined
+									: never;
 
 /** Get the default value for a setting path */
 export function getDefault<P extends SettingPath>(path: P): SettingValue<P> {
-	return SETTINGS_SCHEMA[path].default as SettingValue<P>;
+	const definition = SETTINGS_SCHEMA[path];
+	return ("default" in definition ? definition.default : undefined) as SettingValue<P>;
 }
 
 /** Check if a path has UI metadata (should appear in settings panel) */
@@ -3176,6 +4135,256 @@ export function getEnumValues(path: SettingPath): readonly string[] | undefined 
 	return "values" in def ? (def.values as readonly string[]) : undefined;
 }
 
+export { CONFIG_SCHEMA_VERSION } from "./config-schema-version";
+
+export type SettingsSchemaIssue = {
+	path: string;
+	kind: "unknown" | "invalid" | "coerced" | "pending-migration";
+	detail: string;
+};
+
+export type SettingsSchemaReport = { issues: SettingsSchemaIssue[]; valid: boolean };
+
+function schemaValueAtPath(value: Record<string, unknown>, path: string): unknown {
+	let current: unknown = value;
+	for (const segment of path.split(".")) {
+		if (!current || typeof current !== "object" || Array.isArray(current)) return undefined;
+		current = (current as Record<string, unknown>)[segment];
+	}
+	return current;
+}
+
+function schemaSetAtPath(value: Record<string, unknown>, path: string, next: unknown): void {
+	const segments = path.split(".");
+	let current = value;
+	for (const segment of segments.slice(0, -1)) {
+		const child = current[segment];
+		if (!child || typeof child !== "object" || Array.isArray(child)) current[segment] = {};
+		current = current[segment] as Record<string, unknown>;
+	}
+	current[segments.at(-1)!] = next;
+}
+
+function schemaPaths(value: Record<string, unknown>, prefix = ""): string[] {
+	const paths: string[] = [];
+	for (const [key, child] of Object.entries(value)) {
+		const path = prefix ? `${prefix}.${key}` : key;
+		const definition = SETTINGS_SCHEMA[path as SettingPath];
+		// Records intentionally accept user-defined keys; validate their entries below.
+		if (
+			definition?.type === "record" ||
+			definition?.type === "constrained-record" ||
+			definition?.type === "optional-object"
+		) {
+			paths.push(path);
+		} else if (child && typeof child === "object" && !Array.isArray(child)) {
+			paths.push(...schemaPaths(child as Record<string, unknown>, path));
+		} else {
+			paths.push(path);
+		}
+	}
+	return paths;
+}
+
+function validArraySettingValue(value: unknown, allowedValues: readonly string[] | undefined): boolean {
+	if (!Array.isArray(value)) return false;
+	return !allowedValues || value.every(item => typeof item === "string" && allowedValues.includes(item));
+}
+
+function validRecordValue(valueSchema: RecordValueDef, value: unknown): boolean {
+	if (valueSchema.type === "model-selector-value") {
+		return typeof value === "string" || (Array.isArray(value) && value.every(item => typeof item === "string"));
+	}
+	if (valueSchema.type === "credential-selector") {
+		return (
+			typeof value === "string" &&
+			((value.startsWith("id:") && /^[1-9]\d*$/.test(value.slice(3))) ||
+				/^email:[^@\s]+@[^@\s]+$/.test(value) ||
+				/^account:\S+$/.test(value))
+		);
+	}
+	return typeof value === "string" && valueSchema.values.includes(value);
+}
+
+function validSettingValue(definition: (typeof SETTINGS_SCHEMA)[SettingPath], value: unknown): boolean {
+	return (
+		(definition.type === "boolean" && typeof value === "boolean") ||
+		(definition.type === "string" && typeof value === "string") ||
+		(definition.type === "number" &&
+			typeof value === "number" &&
+			Number.isFinite(value) &&
+			(!("validate" in definition) || !definition.validate || definition.validate(value))) ||
+		(definition.type === "enum" &&
+			typeof value === "string" &&
+			(definition.values as readonly string[]).includes(value)) ||
+		(definition.type === "array" &&
+			validArraySettingValue(value, "items" in definition ? definition.items?.enum : undefined)) ||
+		((definition.type === "record" || definition.type === "constrained-record") &&
+			!!value &&
+			typeof value === "object" &&
+			!Array.isArray(value)) ||
+		(definition.type === "optional-object" &&
+			!!value &&
+			typeof value === "object" &&
+			!Array.isArray(value) &&
+			definition.validate(value).length === 0)
+	);
+}
+
+/**
+ * Validate an external (SDK `config.patch`) path/value set against the
+ * settings schema before any durable write. Dotted sub-paths of record
+ * settings (e.g. `modelRoles.default`) are validated against the record's
+ * value schema. Returns the offending entries so the caller can reject the
+ * whole patch without durable side effects.
+ */
+export function validateSettingPatch(patch: Record<string, unknown>): Array<{ path: string; detail: string }> {
+	const issues: Array<{ path: string; detail: string }> = [];
+	const knownPaths = new Set(Object.keys(SETTINGS_SCHEMA));
+	for (const [path, value] of Object.entries(patch)) {
+		const definition = SETTINGS_SCHEMA[path as SettingPath];
+		if (!definition) {
+			const recordParent = [...knownPaths].find(known => known !== path && path.startsWith(`${known}.`));
+			if (!recordParent) {
+				issues.push({ path, detail: "Setting is not recognized by this version." });
+				continue;
+			}
+			const parentDef = SETTINGS_SCHEMA[recordParent as SettingPath];
+			if (parentDef.type !== "record" || !("valueSchema" in parentDef) || !parentDef.valueSchema) {
+				issues.push({ path, detail: "Setting is not a valid record sub-path." });
+				continue;
+			}
+			if (!validRecordValue(parentDef.valueSchema, value)) {
+				issues.push({ path, detail: `Expected ${parentDef.valueSchema.type}.` });
+			}
+			continue;
+		}
+		if (!validSettingValue(definition, value)) {
+			// `Expected array.` is wrong for a real array carrying bad elements, and an
+			// SDK client reaching this through `config.patch` cannot act on it. Name the
+			// element constraint that actually failed.
+			const arrayItemEnum =
+				definition.type === "array" && Array.isArray(value) && "items" in definition
+					? definition.items?.enum
+					: undefined;
+			const detail = arrayItemEnum
+				? `Expected array items to be one of: ${arrayItemEnum.join(", ")}.`
+				: definition.type === "array" && Array.isArray(value)
+					? "Expected array items to be strings."
+					: `Expected ${definition.type}.`;
+			issues.push({ path, detail });
+			continue;
+		}
+		if (definition.type === "constrained-record" && path === "task.autorouting.tiers") {
+			for (const issue of validateAutoroutingLocal({ tiers: value })) {
+				const nestedPath = issue.path.replace(/^tiers\./u, "");
+				issues.push({
+					path: nestedPath ? `task.autorouting.tiers.${nestedPath}` : "task.autorouting.tiers",
+					detail: issue.detail,
+				});
+			}
+			continue;
+		}
+		if (definition.type === "record" && "valueSchema" in definition && definition.valueSchema) {
+			for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+				if (!validRecordValue(definition.valueSchema, entry)) {
+					issues.push({ path: `${path}.${key}`, detail: `Expected ${definition.valueSchema.type}.` });
+				}
+			}
+		}
+	}
+	return issues;
+}
+
+/** Coerce supported scalar legacy values and report unknown or invalid settings without dropping them. */
+export function reconcileSettingsSchema(raw: Record<string, unknown>): {
+	settings: Record<string, unknown>;
+	report: SettingsSchemaReport;
+} {
+	const settings = structuredClone(raw);
+	const issues: SettingsSchemaIssue[] = [];
+	const knownPaths = new Set(Object.keys(SETTINGS_SCHEMA));
+	for (const path of schemaPaths(settings)) {
+		if (path === "configSchemaVersion" || knownPaths.has(path)) continue;
+		if (![...knownPaths].some(known => known.startsWith(`${path}.`))) {
+			issues.push({ path, kind: "unknown", detail: "Setting is not recognized by this version." });
+		}
+	}
+	for (const path of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
+		const value = schemaValueAtPath(settings, path);
+		if (value === undefined) continue;
+		const definition = SETTINGS_SCHEMA[path];
+		let next = value;
+		if (definition.type === "boolean" && (value === "true" || value === "false")) next = value === "true";
+		if (
+			definition.type === "number" &&
+			typeof value === "string" &&
+			value.trim() !== "" &&
+			Number.isFinite(Number(value))
+		) {
+			next = Number(value);
+		}
+		if (next !== value) {
+			schemaSetAtPath(settings, path, next);
+			issues.push({ path, kind: "coerced", detail: `Coerced ${typeof value} to ${definition.type}.` });
+		}
+		if (definition.type === "optional-object") {
+			for (const localIssue of definition.validate(next)) {
+				issues.push({
+					path: localIssue.path ? `${path}.${localIssue.path}` : path,
+					kind: "invalid",
+					detail: localIssue.detail,
+				});
+			}
+			continue;
+		}
+		if (definition.type === "constrained-record") {
+			const autorouting = schemaValueAtPath(settings, "task.autorouting");
+			const tiersFragment =
+				autorouting && typeof autorouting === "object" && !Array.isArray(autorouting)
+					? Object.fromEntries(
+							Object.entries(autorouting).filter(([key]) => key !== "setup" && key !== "provenance"),
+						)
+					: autorouting;
+			for (const localIssue of validateAutoroutingLocal(tiersFragment)) {
+				issues.push({
+					path: localIssue.path ? `task.autorouting.${localIssue.path}` : "task.autorouting",
+					kind: "invalid",
+					detail: localIssue.detail,
+				});
+			}
+			continue;
+		}
+		if (!validSettingValue(definition, next)) {
+			const arrayItemEnum =
+				definition.type === "array" && Array.isArray(next) && "items" in definition
+					? definition.items?.enum
+					: undefined;
+			const detail = arrayItemEnum
+				? `Expected array items to be one of: ${arrayItemEnum.join(", ")}.`
+				: `Expected ${definition.type}.`;
+			issues.push({ path, kind: "invalid", detail });
+		}
+		if (
+			definition.type === "record" &&
+			"valueSchema" in definition &&
+			definition.valueSchema &&
+			validSettingValue(definition, next)
+		) {
+			for (const [key, entry] of Object.entries(next as Record<string, unknown>)) {
+				if (!validRecordValue(definition.valueSchema, entry)) {
+					issues.push({
+						path: `${path}.${key}`,
+						kind: "invalid",
+						detail: `Expected ${definition.valueSchema.type}.`,
+					});
+				}
+			}
+		}
+	}
+	return { settings, report: { issues, valid: !issues.some(issue => issue.kind === "invalid") } };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Derived Types from Schema
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3198,12 +4407,22 @@ export interface CompactionSettings {
 	strategy: "context-full" | "handoff" | "off";
 	thresholdPercent: number;
 	thresholdTokens: number;
+	adaptive: {
+		enabled: boolean;
+		baseThresholdPercent: number;
+		aggression: number;
+		turnWindow: number;
+		minThresholdPercent: number;
+	};
 	reserveTokens: number;
 	keepRecentTokens: number;
 	handoffSaveToDisk: boolean;
+	handoffPromptExtension: string;
 	autoContinue: boolean;
 	remoteEnabled: boolean;
 	remoteEndpoint: string | undefined;
+	maintenancePruningEnabled: boolean;
+	maintenancePruningMinSavingsTokens: number;
 	idleEnabled: boolean;
 	idleThresholdTokens: number;
 	idleTimeoutSeconds: number;
@@ -3219,6 +4438,7 @@ export interface RetrySettings {
 	maxDelayMs: number;
 	requestMaxRetries: number;
 	streamMaxRetries: number;
+	streamFirstEventTimeoutMs: number;
 }
 
 export interface MemoriesSettings {
@@ -3280,8 +4500,10 @@ export interface ExaSettings {
 export interface StatusLineSettings {
 	preset: StatusLinePreset;
 	separator: StatusLineSeparatorStyle;
+	maxRows: number;
 	showHookStatus: boolean;
 	showSkillHud: boolean;
+	showActionHints: boolean;
 	leftSegments: StatusLineSegmentId[];
 	rightSegments: StatusLineSegmentId[];
 	segmentOptions: Record<string, unknown>;
@@ -3320,21 +4542,66 @@ export interface ShellMinimizerSettings {
 	maxCaptureBytes: number;
 }
 
+export interface SessionMemorySettings {
+	mode: "off" | "shadow" | "enabled" | "auto";
+	contextOverflowRecovery: boolean;
+}
+
+export interface MemoryGuardSettings {
+	enabled: boolean;
+	checkIntervalMs: number;
+	gcThresholdPercent: number;
+	restartThresholdPercent: number;
+	restartThresholdWindowMs: number;
+	cooldownMs: number;
+	parentReserveMb: number;
+	policyLimitMb: number;
+}
+
 export interface NotificationsSettings {
 	enabled: boolean;
 	telegram: {
+		enabled?: boolean;
 		botToken: string | undefined;
 		chatId: string | undefined;
+		sound: "all" | "important" | "none";
+		btw: {
+			enabled: boolean;
+		};
+		rich: {
+			enabled: boolean;
+		};
+		richDraft: {
+			enabled: boolean;
+		};
+		toolActivity: {
+			enabled: boolean;
+		};
+		streaming: {
+			enabled: boolean;
+		};
+		topics: {
+			nameTemplate: string | undefined;
+		};
 	};
 	discord: {
+		enabled?: boolean;
 		botToken: string | undefined;
-		channelId: string | undefined;
+		applicationId: string | undefined;
+		guildId: string | undefined;
+		parentChannelId: string | undefined;
 	};
 	slack: {
+		enabled?: boolean;
 		botToken: string | undefined;
+		appToken: string | undefined;
+		workspaceId: string | undefined;
 		channelId: string | undefined;
+		authorizedUserId: string | undefined;
 	};
 	redact: boolean;
+	verbosity: "lean" | "verbose";
+	sessionScope: "all" | "primary";
 	daemon: {
 		idleTimeoutMs: number;
 	};
@@ -3354,7 +4621,9 @@ export interface GroupTypeMap {
 	statusLine: StatusLineSettings;
 	thinkingBudgets: ThinkingBudgetsSettings;
 	stt: SttSettings;
-	modelRoles: Record<string, string>;
+	memoryGuard: MemoryGuardSettings;
+	sessionMemory: SessionMemorySettings;
+	modelRoles: Record<string, ModelSelectorValue>;
 	modelTags: ModelTagsSettings;
 	cycleOrder: string[];
 	shellMinimizer: ShellMinimizerSettings;

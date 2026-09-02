@@ -1,11 +1,169 @@
 import { describe, expect, it } from "bun:test";
 import { Agent, type AgentTool, ThinkingLevel } from "@gajae-code/agent-core";
-import type { SimpleStreamOptions } from "@gajae-code/ai";
+import type { ImageContent, SimpleStreamOptions } from "@gajae-code/ai";
 import { z } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { createAssistantMessage } from "./helpers";
 
 describe("Agent", () => {
+	it("sanitizes provider details before publishing agent_failed", async () => {
+		const secret = "provider-token=super-secret request-body-password=hunter2";
+		const agent = new Agent({
+			streamFn: () => {
+				throw Object.assign(new Error(secret), { code: "provider_down", request: { secret } });
+			},
+		});
+		const failures: Array<{ code?: string; message?: string }> = [];
+		agent.subscribe(event => {
+			if (event.type === "agent_failed") failures.push(event.error as { code?: string; message?: string });
+		});
+		await agent.prompt("trigger failure", { fallbackManaged: true });
+		expect(failures).toHaveLength(1);
+		expect(failures[0]).toEqual({ code: "provider_down", message: "Agent run failed." });
+		expect(JSON.stringify(failures[0])).not.toContain("super-secret");
+		expect(JSON.stringify(failures[0])).not.toContain("hunter2");
+	});
+
+	it.each([
+		{ status: 402, code: "provider_http_402" },
+		{ status: 429, code: "provider_http_429" },
+		{ status: 500, code: "provider_rejected" },
+	])("preserves structured HTTP provider status %status in agent_failed", async ({ status, code }) => {
+		const agent = new Agent({
+			streamFn: () => {
+				throw Object.assign(new Error(`HTTP ${status}`), { status });
+			},
+		});
+		const failures: Array<{ code?: string; message?: string }> = [];
+		agent.subscribe(event => {
+			if (event.type === "agent_failed") failures.push(event.error);
+		});
+
+		await agent.prompt("trigger status failure", { fallbackManaged: true });
+
+		expect(failures).toEqual([{ code, message: "Agent run failed." }]);
+	});
+
+	it.each([
+		{ status: 402, code: "provider_http_402" },
+		{ status: 429, code: "provider_http_429" },
+		{ status: 500, code: "provider_rejected" },
+	])("preserves carrier-only HTTP status %status in agent_failed", async ({ status, code }) => {
+		const agent = new Agent({
+			streamFn: () => {
+				throw Object.assign(new Error(`carrier HTTP ${status}`), { transportFailure: { status } });
+			},
+		});
+		const failures: Array<{ code?: string; message?: string }> = [];
+		agent.subscribe(event => {
+			if (event.type === "agent_failed") failures.push(event.error);
+		});
+
+		await agent.prompt("trigger carrier status failure", { fallbackManaged: false });
+
+		expect(failures).toEqual([{ code, message: "Agent run failed." }]);
+	});
+
+	it("maps provider-forged lifecycle classifiers to the generic failure class", async () => {
+		// Exact-head review P1: a provider error self-declaring "aborted" (or any
+		// runtime-owned lifecycle classifier) must never be classified as such;
+		// only the runtime itself can authenticate those codes.
+		const agent = new Agent({
+			streamFn: () => {
+				throw Object.assign(new Error("provider claims cancellation"), { code: "aborted" });
+			},
+		});
+		const failures: Array<{ code?: string }> = [];
+		agent.subscribe(event => {
+			if (event.type === "agent_failed") failures.push(event.error);
+		});
+		await agent.prompt("trigger forged classifier", { fallbackManaged: true });
+		expect(failures).toHaveLength(1);
+		expect(failures[0]?.code).toBe("agent_failed");
+	});
+
+	it("a throwing subscriber cannot suppress the failure terminal boundary", async () => {
+		// Exact-head review P1: listener exceptions must be isolated so the
+		// agent_failed → agent_end catch path always completes terminalization.
+		const agent = new Agent({
+			streamFn: () => {
+				throw Object.assign(new Error("provider down"), { code: "provider_down" });
+			},
+		});
+		agent.subscribe(() => {
+			throw new Error("misbehaving subscriber");
+		});
+		await agent.prompt("trigger with hostile listener", { fallbackManaged: true });
+		// The run still terminalized on error despite the throwing subscriber.
+		const last = agent.state.messages.at(-1) as { stopReason?: string } | undefined;
+		expect(last?.stopReason).toBe("error");
+	});
+
+	it("terminal state and history never contain raw provider error text", async () => {
+		// Exact-head review P1: a provider error message may carry request bodies or
+		// credentials; the catch path must store only the sanitized message in
+		// state.error and the terminal assistant message.
+		const secret = "sk-SECRET-TOKEN-do-not-log";
+		const agent = new Agent({
+			streamFn: () => {
+				throw Object.assign(new Error(`provider exploded: ${secret}`), { code: "provider_down" });
+			},
+		});
+		await agent.prompt("trigger terminal failure", { fallbackManaged: true });
+		expect(JSON.stringify(agent.state.messages)).not.toContain(secret);
+		expect(JSON.stringify(agent.state.error ?? "")).not.toContain(secret);
+	});
+
+	it("persists only trusted error classifiers and constructor names", async () => {
+		const secret = "sk-live-should-never-land-in-jsonl";
+		const error = Object.assign(new TypeError(`provider exploded: ${secret}`), { code: "provider_down" });
+		Object.defineProperty(error, "name", { configurable: true, value: `Custom${secret}Error` });
+		const agent = new Agent({
+			streamFn: () => {
+				throw error;
+			},
+		});
+		await agent.prompt("trigger classified failure", { fallbackManaged: true });
+		const last = agent.state.messages.at(-1) as { errorMessage?: string; errorCode?: string; errorName?: string };
+		expect(last).toMatchObject({
+			errorMessage: "Agent run failed.",
+			errorCode: "provider_down",
+			errorName: "TypeError",
+		});
+		expect(JSON.stringify(last)).not.toContain(secret);
+	});
+
+	it("terminalizes when an error name getter throws", async () => {
+		const error = Object.assign(new Error("provider exploded"), { code: "provider_down" });
+		Object.defineProperty(error, "name", {
+			get() {
+				throw new Error("hostile getter");
+			},
+		});
+		const agent = new Agent({
+			streamFn: () => {
+				throw error;
+			},
+		});
+		await agent.prompt("trigger hostile name getter", { fallbackManaged: true });
+		const last = agent.state.messages.at(-1) as { stopReason?: string; errorCode?: string; errorName?: string };
+		expect(last).toMatchObject({ stopReason: "error", errorName: "Error" });
+	});
+
+	it("preserves first-event timeout options and runtime mutations", () => {
+		const absent = new Agent();
+		expect(absent.streamFirstEventTimeoutMs).toBeUndefined();
+
+		const explicitZero = new Agent({ streamFirstEventTimeoutMs: 0 });
+		expect(explicitZero.streamFirstEventTimeoutMs).toBe(0);
+
+		const positive = new Agent({ streamFirstEventTimeoutMs: 12_345 });
+		expect(positive.streamFirstEventTimeoutMs).toBe(12_345);
+		positive.streamFirstEventTimeoutMs = 0;
+		expect(positive.streamFirstEventTimeoutMs).toBe(0);
+		positive.streamFirstEventTimeoutMs = undefined;
+		expect(positive.streamFirstEventTimeoutMs).toBeUndefined();
+	});
 	it("should support steering message queueing", async () => {
 		const agent = new Agent();
 
@@ -47,6 +205,45 @@ describe("Agent", () => {
 		expect(agent.state.messages[agent.state.messages.length - 1].role).toBe("assistant");
 	});
 
+	it("continue() honors forced one-at-a-time follow-ups even when batching is enabled", async () => {
+		const mock = createMockModel({
+			responses: [{ content: ["Processed 1"] }, { content: ["Processed 2"] }],
+		});
+		const agent = new Agent({ streamFn: mock.stream, followUpMode: "all" });
+
+		agent.replaceMessages([
+			{
+				role: "user",
+				content: [{ type: "text", text: "Initial" }],
+				timestamp: Date.now() - 10,
+			},
+			createAssistantMessage([{ type: "text", text: "Initial response" }]),
+		]);
+
+		agent.followUp(
+			{
+				role: "user",
+				content: [{ type: "text", text: "Queued follow-up 1" }],
+				timestamp: Date.now(),
+			},
+			{ forceOneAtATime: true },
+		);
+		agent.followUp(
+			{
+				role: "user",
+				content: [{ type: "text", text: "Queued follow-up 2" }],
+				timestamp: Date.now() + 1,
+			},
+			{ forceOneAtATime: true },
+		);
+
+		await expect(agent.continue()).resolves.toBeUndefined();
+
+		const recentMessages = agent.state.messages.slice(-4);
+		expect(recentMessages.map(m => m.role)).toEqual(["user", "assistant", "user", "assistant"]);
+		expect(mock.calls.length).toBe(2);
+	});
+
 	it("continue() should keep one-at-a-time steering semantics from assistant tail", async () => {
 		const mock = createMockModel({
 			responses: [{ content: ["Processed 1"] }, { content: ["Processed 2"] }],
@@ -80,6 +277,34 @@ describe("Agent", () => {
 		expect(mock.calls.length).toBe(2);
 	});
 
+	it("prompt() rejects image-placeholder-only text without image payload", async () => {
+		const mock = createMockModel({ responses: [{ content: ["unreachable"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+
+		await expect(agent.prompt("[image 1]")).rejects.toThrow("#paste-image");
+		await expect(agent.prompt("[image 1]\n[image 2]", [])).rejects.toThrow("@path/to/image.png");
+		expect(mock.calls).toHaveLength(0);
+	});
+
+	it("prompt() allows image-placeholder-only text when image payload is attached", async () => {
+		const mock = createMockModel({ responses: [{ content: ["ok"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+		const image: ImageContent = { type: "image", data: "aW1hZ2U=", mimeType: "image/png" };
+
+		await expect(agent.prompt("[image 1]", [image])).resolves.toBeUndefined();
+
+		expect(mock.calls).toHaveLength(1);
+		expect(mock.calls[0].context.messages[0].content).toEqual([{ type: "text", text: "[image 1]" }, image]);
+	});
+
+	it("prompt() allows normal text that mentions an image placeholder", async () => {
+		const mock = createMockModel({ responses: [{ content: ["ok"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+
+		await expect(agent.prompt("Please explain why [image 1] is missing.")).resolves.toBeUndefined();
+
+		expect(mock.calls).toHaveLength(1);
+	});
 	it("prompt() refreshes tools and system prompt between same-turn model calls", async () => {
 		const toolSchema = z.object({ value: z.string() });
 		type Details = { value: string };
@@ -297,5 +522,39 @@ describe("Agent", () => {
 		agent.setMetadataResolver(undefined);
 		expect(agent.metadataForProvider("any")).toEqual({ user_id: "static" });
 		expect(agent.metadata).toEqual({ user_id: "static" });
+	});
+	it("preserves HTTP status from thrown transport errors", async () => {
+		for (const [property, status] of [
+			["errorStatus", 401],
+			["status", 502],
+		] as const) {
+			const mock = createMockModel();
+			const streamFn = async () => {
+				throw Object.assign(new Error("transport failed"), { [property]: status });
+			};
+			const agent = new Agent({ initialState: { model: mock.model }, streamFn });
+
+			await agent.prompt("hello");
+
+			const message = agent.state.messages.at(-1);
+			expect(message?.role).toBe("assistant");
+			if (message?.role !== "assistant") throw new Error("Expected synthesized assistant error");
+			expect(message.errorStatus).toBe(status);
+		}
+	});
+
+	it("prioritizes errorStatus over HTTP status mentioned in a transport error message", async () => {
+		const mock = createMockModel();
+		const streamFn = async () => {
+			throw Object.assign(new Error("request failed after HTTP 502"), { errorStatus: 401 });
+		};
+		const agent = new Agent({ initialState: { model: mock.model }, streamFn });
+
+		await agent.prompt("hello");
+
+		const message = agent.state.messages.at(-1);
+		expect(message?.role).toBe("assistant");
+		if (message?.role !== "assistant") throw new Error("Expected synthesized assistant error");
+		expect(message.errorStatus).toBe(401);
 	});
 });

@@ -11,8 +11,26 @@ import type {
 	AuthCredentialIfAbsentReason,
 	AuthCredentialSnapshot,
 	AuthCredentialSnapshotEntry,
+	MCPOAuthRefreshClient,
 } from "../auth-storage";
 import type { UsageReport } from "../usage";
+
+/** A single credential metadata projection; secret-bearing fields are intentionally absent. */
+export interface CredentialMetadataRecord {
+	id: number;
+	provider: string;
+	type: "oauth" | "api_key";
+	identity: string | null;
+	disabledCause: string | null;
+}
+
+/** GET /v1/credentials/metadata response body. */
+export interface CredentialMetadataResponse {
+	epoch?: string;
+	generation: number;
+	generatedAt: number;
+	credentials: CredentialMetadataRecord[];
+}
 
 /** GET /v1/healthz response body. */
 export interface HealthzResponse {
@@ -33,6 +51,8 @@ export type SnapshotEntry = AuthCredentialSnapshotEntry & {
 
 /** GET /v1/snapshot response body. */
 export interface SnapshotResponse extends Omit<AuthCredentialSnapshot, "credentials"> {
+	/** Stable for one broker process; changes when the broker restarts. */
+	epoch?: string;
 	serverNowMs: number;
 	refresher: RefresherSchedule;
 	credentials: SnapshotEntry[];
@@ -49,9 +69,13 @@ export interface CredentialRefreshResponse {
 	entry: AuthCredentialSnapshotEntry;
 }
 
+/** Optional MCP client metadata; the broker still selects the stored token endpoint. */
+export type CredentialRefreshRequest = MCPOAuthRefreshClient;
+
 /** POST /v1/credential/:id/disable request body. */
 export interface CredentialDisableRequest {
 	cause: string;
+	expectedRevision?: number;
 }
 
 /** POST /v1/credential/:id/disable response body. */
@@ -95,6 +119,7 @@ export interface SnapshotStreamSnapshotEvent extends SnapshotResponse {
 /** Single credential added/changed (upsert or refresh). */
 export interface SnapshotStreamEntryEvent {
 	kind: "entry";
+	epoch?: string;
 	generation: number;
 	serverNowMs: number;
 	refresher: RefresherSchedule;
@@ -104,6 +129,7 @@ export interface SnapshotStreamEntryEvent {
 /** Single credential disabled/deleted. */
 export interface SnapshotStreamRemovedEvent {
 	kind: "removed";
+	epoch?: string;
 	generation: number;
 	serverNowMs: number;
 	refresher: RefresherSchedule;

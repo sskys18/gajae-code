@@ -9,6 +9,7 @@ import * as git from "../../utils/git";
 import { sanitizeStatusText } from "../shared";
 import { getContextUsageLevel, getContextUsageThemeColor } from "./status-line/context-thresholds";
 import { resolveCurrentBranch } from "./status-line/git-utils";
+import { shortenModelId } from "./status-line/model-name";
 
 /**
  * Footer component that shows pwd, token stats, and context usage
@@ -16,6 +17,7 @@ import { resolveCurrentBranch } from "./status-line/git-utils";
 export class FooterComponent implements Component {
 	#cachedBranch: string | null | undefined = undefined; // undefined = not checked yet, null = not in git repo, string = branch name
 	#gitWatcher: fs.FSWatcher | null = null;
+	#gitWatcherGeneration = 0;
 	#onBranchChange: (() => void) | null = null;
 	#autoCompactEnabled: boolean = true;
 	#extensionStatuses: Map<string, string> = new Map();
@@ -51,7 +53,10 @@ export class FooterComponent implements Component {
 	}
 
 	#setupGitWatcher(): void {
-		// Clean up existing watcher
+		// Clean up existing watcher. The generation guard below keeps a stale
+		// in-flight resolve — one that dispose() or a newer setup already
+		// superseded — from installing a watcher nothing would ever close.
+		const generation = ++this.#gitWatcherGeneration;
 		if (this.#gitWatcher) {
 			this.#gitWatcher.close();
 			this.#gitWatcher = null;
@@ -60,7 +65,7 @@ export class FooterComponent implements Component {
 		void git.head
 			.resolve(getProjectDir())
 			.then(head => {
-				if (!head) {
+				if (!head || generation !== this.#gitWatcherGeneration) {
 					return;
 				}
 
@@ -84,6 +89,7 @@ export class FooterComponent implements Component {
 	 * Clean up the file watcher
 	 */
 	dispose(): void {
+		this.#gitWatcherGeneration++;
 		if (this.#gitWatcher) {
 			this.#gitWatcher.close();
 			this.#gitWatcher = null;
@@ -111,31 +117,23 @@ export class FooterComponent implements Component {
 	render(width: number): string[] {
 		const state = this.session.state;
 
-		// Calculate cumulative usage from ALL session entries (not just post-compaction messages)
-		let totalInput = 0;
-		let totalOutput = 0;
-		let totalCacheRead = 0;
-		let totalCacheWrite = 0;
-		let totalCost = 0;
-		let totalPremiumRequests = 0;
-
-		for (const entry of this.session.sessionManager.getEntries()) {
-			if (entry.type === "message" && entry.message.role === "assistant") {
-				totalInput += entry.message.usage.input;
-				totalOutput += entry.message.usage.output;
-				totalCacheRead += entry.message.usage.cacheRead;
-				totalCacheWrite += entry.message.usage.cacheWrite;
-				totalCost += entry.message.usage.cost.total;
-				totalPremiumRequests += entry.message.usage.premiumRequests ?? 0;
-			}
-		}
+		// Use the session manager's cumulative index so parent and task usage are
+		// accounted for consistently without rescanning persisted entries here.
+		const {
+			input: totalInput,
+			output: totalOutput,
+			cacheRead: totalCacheRead,
+			cacheWrite: totalCacheWrite,
+			cost: totalCost,
+			premiumRequests: totalPremiumRequests,
+		} = this.session.sessionManager.getUsageStatistics();
 
 		// Calculate context usage from session (handles compaction correctly).
 		// After compaction, tokens are unknown until the next LLM response.
 		const contextUsage = this.session.getContextUsage();
 		const contextWindow = contextUsage?.contextWindow ?? state.model?.contextWindow ?? 0;
-		const contextPercentValue = contextUsage?.percent ?? 0;
-		const contextPercent = contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";
+		const contextPercentValue = contextUsage?.percent;
+		const contextPercent = typeof contextPercentValue === "number" ? contextPercentValue.toFixed(1) : "?";
 
 		// Replace home directory with ~
 		let pwd = shortenPath(getProjectDir());
@@ -183,7 +181,7 @@ export class FooterComponent implements Component {
 			contextPercent === "?"
 				? `?/${formatNumber(contextWindow)}${autoIndicator}`
 				: `${contextPercent}%/${formatNumber(contextWindow)}${autoIndicator}`;
-		if (contextUsage?.percent !== null && contextUsage?.percent !== undefined) {
+		if (typeof contextPercentValue === "number") {
 			const color = getContextUsageThemeColor(getContextUsageLevel(contextPercentValue, contextWindow));
 			contextPercentStr =
 				color === "statusLineContext" ? contextPercentDisplay : theme.fg(color, contextPercentDisplay);
@@ -194,8 +192,9 @@ export class FooterComponent implements Component {
 
 		let statsLeft = statsParts.join(" ");
 
-		// Add model name on the right side, plus thinking level if model supports it
-		const modelName = state.model?.id || "no-model";
+		// Add model name on the right side, plus thinking level if model supports it.
+		// Same shortest-recognizable form the status rail renders.
+		const modelName = shortenModelId(state.model?.id ?? state.model?.name);
 
 		// Add thinking level hint when the current model advertises supported efforts
 		let rightSide = modelName;

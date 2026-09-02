@@ -2,6 +2,7 @@
 
 import * as path from "node:path";
 import { zodToWireSchema } from "../packages/ai/src/utils/schema/wire";
+import { AUTOROUTING_SELECTOR_MAX_LENGTH } from "../packages/coding-agent/src/config/autorouting-contract";
 import { SETTINGS_SCHEMA } from "../packages/coding-agent/src/config/settings-schema";
 import { ModelsConfigSchema } from "../packages/coding-agent/src/config/models-config-schema";
 
@@ -19,12 +20,19 @@ type JsonSchemaObject = {
 	items?: JsonSchema;
 	enum?: readonly string[];
 	default?: unknown;
+	minItems?: number;
+	minLength?: number;
+	pattern?: string;
+	anyOf?: JsonSchema[];
+	not?: JsonSchema;
 };
 
 type SettingsSchema = typeof SETTINGS_SCHEMA;
 type SettingDefinition = SettingsSchema[keyof SettingsSchema];
 
 const DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema";
+const PERSISTED_CREDENTIAL_SELECTOR_PATTERN =
+	"^(id:[1-9][0-9]*|email:[^@\\s]+@[^@\\s]+|account:\\S+)$";
 export const JSON_SCHEMA_OUTPUTS = [
 	{
 		path: "schemas/config.schema.json",
@@ -50,18 +58,43 @@ function createConfigJsonSchema(): JsonSchemaObject {
 	for (const [settingPath, definition] of Object.entries(SETTINGS_SCHEMA)) {
 		addNestedProperty(root, settingPath.split("."), settingDefinitionToJsonSchema(settingPath, definition));
 	}
+	// This metadata is written alongside persistent pins and is intentionally not
+	// exposed as a user-facing setting. Keep it in the generated public schema so
+	// editors accept the runtime's store-authority binding field.
+	addNestedProperty(root, ["auth", "credentialPinStoreIdentity"], { type: "string" });
 
 	return root;
 }
 
 function createModelsJsonSchema(): JsonSchemaObject {
-	return {
+	const schema: JsonSchemaObject = {
 		$schema: DRAFT_2020_12,
 		$id: "https://gajae.ai/schemas/models.schema.json",
 		title: "GJC models.yml",
 		description: "Custom provider and model configuration for GJC. Generated from packages/coding-agent/src/config/models-config-schema.ts.",
 		...zodToWireSchema(ModelsConfigSchema),
 	};
+	// The shared wire walker strips `maximum: SAFE_INTEGER_MAX` as zod `.int()`
+	// noise (it would flood every tool wire schema). For `models.yml` budget
+	// fields the safe-integer ceiling is contract, so re-encode it explicitly on
+	// the two `maxTokens` leaves after the noise filter ran.
+	stampMaxTokensSafeCeiling(schema);
+	return schema;
+}
+
+function stampMaxTokensSafeCeiling(node: unknown): void {
+	if (Array.isArray(node)) {
+		for (const child of node) stampMaxTokensSafeCeiling(child);
+		return;
+	}
+	if (node === null || typeof node !== "object") return;
+	const obj = node as JsonSchemaObject;
+	const maxTokens = obj.maxTokens;
+	if (maxTokens !== null && typeof maxTokens === "object" && !Array.isArray(maxTokens)) {
+		const leaf = maxTokens as JsonSchemaObject;
+		if (leaf.type === "integer") leaf.maximum = Number.MAX_SAFE_INTEGER;
+	}
+	for (const key in obj) stampMaxTokensSafeCeiling(obj[key]);
 }
 
 function addNestedProperty(root: JsonSchemaObject, segments: string[], schema: JsonSchema): void {
@@ -101,6 +134,30 @@ function settingDefinitionToJsonSchema(settingPath: string, definition: SettingD
 		schema.exclusiveMinimum = 0;
 		schema.maximum = 1;
 	}
+	if (settingPath === "sdk.promptDeadlineMs" || settingPath === "sdk.promptMaxRuntimeMs") {
+		schema.type = "integer";
+		schema.minimum = 60_000;
+		schema.maximum = 86_400_000;
+	}
+	if (settingPath === "sdk.masterOrphanGraceMs") {
+		schema.type = "integer";
+		schema.minimum = 60_000;
+		schema.maximum = 3_600_000;
+	}
+	if (settingPath === "gjc.ultragoal.nudgeBudget") {
+		schema.type = "integer";
+		schema.minimum = 0;
+	}
+	if (settingPath === "gjc.ralplan.maxIterations") {
+		schema.type = "integer";
+		schema.minimum = 1;
+		schema.maximum = 20;
+	}
+	if (settingPath === "gjc.ralplan.maxReviewPassesPerLane") {
+		schema.type = "integer";
+		schema.minimum = 1;
+		schema.maximum = 10;
+	}
 	return schema;
 }
 
@@ -115,10 +172,62 @@ function settingTypeToJsonSchema(definition: SettingDefinition): JsonSchemaObjec
 		case "enum":
 			return { type: "string", enum: definition.values };
 		case "array":
-			return { type: "array", items: arrayItemsSchema(definition.default, definition.items) };
+			return {
+				type: "array",
+				items: arrayItemsSchema(definition.default, "items" in definition ? definition.items : undefined),
+			};
 		case "record":
-			return { type: "object", additionalProperties: true };
+			return {
+				type: "object",
+				additionalProperties: recordValueSchema("valueSchema" in definition ? definition.valueSchema : undefined),
+			};
+		case "constrained-record": {
+			const selector = constrainedRecordSelectorSchema(definition.valueSchema);
+			const properties = Object.fromEntries(
+				definition.keys.map(key => [
+					key,
+					{ anyOf: [selector, { type: "array", minItems: 1, items: selector }] },
+				]),
+			);
+			return { type: "object", properties, additionalProperties: false };
+		}
+		case "optional-object":
+			return structuredClone(definition.jsonSchema);
 	}
+}
+
+function constrainedRecordSelectorSchema(valueSchema: {
+	readonly pattern: string;
+	readonly description: string;
+}): JsonSchemaObject {
+	return {
+		type: "string",
+		minLength: 1,
+		maxLength: AUTOROUTING_SELECTOR_MAX_LENGTH,
+		pattern: valueSchema.pattern,
+		not: { pattern: "^\\s*[pP][iI]/" },
+		description: valueSchema.description,
+	};
+}
+
+function recordValueSchema(
+	valueSchema?:
+		| { readonly type: "model-selector-value" }
+		| { readonly type: "credential-selector" }
+		| { readonly type: "string-enum"; readonly values: readonly string[] },
+): JsonSchema {
+	if (valueSchema?.type === "string-enum") return { type: "string", enum: valueSchema.values };
+	if (valueSchema?.type === "credential-selector") {
+		return {
+			type: "string",
+			pattern: PERSISTED_CREDENTIAL_SELECTOR_PATTERN,
+		};
+	}
+	if (valueSchema?.type !== "model-selector-value") return true;
+	const selector = { type: "string", minLength: 1, pattern: "\\S" };
+	return {
+		anyOf: [selector, { type: "array", minItems: 1, items: selector }],
+	};
 }
 
 function arrayItemsSchema(defaultValue: unknown, items?: { enum?: readonly string[] }): JsonSchema {

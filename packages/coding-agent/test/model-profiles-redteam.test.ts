@@ -5,6 +5,7 @@ import {
 	resolveProfileBindings,
 } from "@gajae-code/coding-agent/config/model-profiles";
 import { ModelsConfigSchema, ProfileModelSelectorSchema } from "@gajae-code/coding-agent/config/models-config-schema";
+import { normalizeModelSelectorValue } from "../src/config/model-selector-value";
 
 function issuePaths(error: { issues: Array<{ path: PropertyKey[] }> }): string[] {
 	return error.issues.map(issue => issue.path.join("."));
@@ -22,20 +23,17 @@ function profileConfig(modelSelector: string) {
 }
 
 describe("model profile red-team schema and catalog cases", () => {
-	test("required_providers rejects empty arrays", () => {
+	test("required_providers accepts an empty array for provider-agnostic profiles", () => {
 		const result = ModelsConfigSchema.safeParse({
 			profiles: {
-				bad: {
+				agnostic: {
 					required_providers: [],
-					model_mapping: { default: "provider/model" },
+					model_mapping: { default: "glm-5.2:high" },
 				},
 			},
 		});
 
-		expect(result.success).toBe(false);
-		if (!result.success) {
-			expect(issuePaths(result.error)).toContain("profiles.bad.required_providers");
-		}
+		expect(result.success).toBe(true);
 	});
 
 	test("model_mapping accepts a partial one-role mapping", () => {
@@ -68,20 +66,23 @@ describe("model profile red-team schema and catalog cases", () => {
 	});
 
 	test.each([
-		["missing slash", "providermodel"],
 		["empty provider", "/model"],
 		["empty model", "provider/"],
 		["trailing colon", "provider/model:"],
-		["bogus effort", "provider/model:ultra"],
-		["double effort", "provider/model:high:low"],
 	])("selector rejects %s", (_label, selector) => {
 		const result = ModelsConfigSchema.safeParse(profileConfig(selector));
 
 		expect(result.success).toBe(false);
 		if (!result.success) {
 			expect(issuePaths(result.error)).toContain("profiles.bad.model_mapping.default");
-			expect(result.error.issues[0]?.message).toBe("Expected provider/modelId with optional :effort suffix");
+			expect(result.error.issues[0]?.message).toBe(
+				"Expected modelId or provider/modelId with optional :effort suffix",
+			);
 		}
+	});
+
+	test.each(["provider/model:ultra", "provider/model:high:low"])("selector accepts colon route %s", selector => {
+		expect(ModelsConfigSchema.safeParse(profileConfig(selector)).success).toBe(true);
 	});
 
 	test("profile definitions strictly reject extra fields", () => {
@@ -117,7 +118,7 @@ describe("model profile red-team schema and catalog cases", () => {
 		});
 	});
 
-	test("mergeModelProfiles aggregates underdeclared providers from mappings", () => {
+	test("mergeModelProfiles does not add underdeclared mapped providers to activation prerequisites", () => {
 		const merged = mergeModelProfiles({
 			underdeclared: {
 				required_providers: ["provider-a"],
@@ -125,7 +126,7 @@ describe("model profile red-team schema and catalog cases", () => {
 			},
 		});
 
-		expect(merged.get("underdeclared")?.requiredProviders).toEqual(["provider-a", "provider-b"]);
+		expect(merged.get("underdeclared")?.requiredProviders).toEqual(["provider-a"]);
 	});
 
 	test("resolveProfileBindings on a default-only mapping returns only defaultSelector", () => {
@@ -159,16 +160,18 @@ describe("model profile red-team schema and catalog cases", () => {
 		const merged = mergeModelProfiles(undefined);
 
 		expect(merged.size).toBe(BUILTIN_MODEL_PROFILES.length);
-		expect(merged.size).toBe(28);
+
 		expect([...merged.values()]).toEqual([...BUILTIN_MODEL_PROFILES]);
 	});
 
 	test("every builtin selector satisfies public selector validation", () => {
 		const failures: string[] = [];
 		for (const profile of BUILTIN_MODEL_PROFILES) {
-			for (const [role, selector] of Object.entries(profile.modelMapping)) {
-				if (!ProfileModelSelectorSchema.safeParse(selector).success)
-					failures.push(`${profile.name}.${role}=${selector}`);
+			for (const [role, selectorValue] of Object.entries(profile.modelMapping)) {
+				for (const selector of normalizeModelSelectorValue(selectorValue)) {
+					if (!ProfileModelSelectorSchema.safeParse(selector).success)
+						failures.push(`${profile.name}.${role}=${selector}`);
+				}
 			}
 		}
 

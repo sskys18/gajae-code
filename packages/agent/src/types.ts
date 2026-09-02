@@ -13,9 +13,12 @@ import type {
 	Tool,
 	ToolChoice,
 	ToolResultMessage,
+	TransportFailureFacts,
 	TSchema,
+	UserMessage,
 } from "@gajae-code/ai";
 import type { AppendOnlyContextManager } from "./append-only-context";
+import type { AttemptMinter, AttemptRunHandle, AttemptScope } from "./attempt-scope";
 import type { HarmonyAuditEvent } from "./harmony-leak";
 import type { AgentRunCoverage, AgentRunSummary } from "./run-collector";
 import type { AgentTelemetryConfig } from "./telemetry";
@@ -26,10 +29,221 @@ export type StreamFn = (
 ) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
 
 /**
+ * Request context supplied to provider-aware metadata resolvers.
+ *
+ * The model is the exact model selected for the concrete request (including
+ * fallback and ephemeral requests), while `transport` distinguishes the
+ * built-in stream path from a caller-supplied stream function. Metadata that
+ * carries provider identity must use both values to fail closed when routing
+ * is not the canonical provider path.
+ */
+export interface AgentMetadataResolverContext {
+	provider: string;
+	model?: Model;
+	transport?: "default" | "custom";
+}
+
+/** Stable identifier for a managed logical run, shared by all of its retry attempts. */
+export type ManagedLogicalRunId = number;
+/** A resource owned by a prompt run until its promise settles. */
+export type RunResourceKind = "provider_factory" | "provider_iterator" | "tool" | "post_prompt";
+
+export interface RunResourceEntry {
+	id: string;
+	kind: RunResourceKind;
+	label: string;
+	registeredAt: number;
+}
+
+export type RunSettlementReason = "unknown_run" | "run_not_sealed" | "resources_pending" | "quarantined";
+export type RunSettlementProof =
+	| { status: "settled" }
+	| { status: "unfenced"; reason: RunSettlementReason; pending: RunResourceEntry[] };
+
+export interface RunCancellationDomain {
+	readonly resourceRunId: string;
+	readonly signal: AbortSignal;
+}
+
+export interface RunCancellationDomainBridge {
+	open(
+		resourceRunId: string,
+	):
+		| { ok: true; domain: RunCancellationDomain; created: boolean }
+		| { ok: false; reason: "duplicate_identity" | "quarantined" };
+	lookup(resourceRunId: string): RunCancellationDomain | undefined;
+	abort(
+		resourceRunId: string,
+		reason?: unknown,
+	): { ok: true; newlyAborted: boolean } | { ok: false; reason: "unknown_run" | "quarantined" };
+	release(resourceRunId: string, disposition: "settled" | "quarantined"): void;
+}
+
+export type ReserveProducerResult =
+	| { ok: true; lease: RunResourceProducerLease }
+	| { ok: false; reason: "unknown_run" | "sealed" | "quarantined" | "domain_mismatch" };
+export type ClaimProducerResult =
+	| { ok: true; lease: RunResourceProducerLease }
+	| { ok: false; reason: "already_claimed" | "handle_mismatch" | "domain_mismatch" | "closed" | "quarantined" };
+export type ForkProducerResult =
+	| { ok: true; lease: RunResourceProducerLease }
+	| { ok: false; reason: "parent_closed" | "quarantined" | "domain_mismatch" };
+
+export interface RunResourceProducerLease {
+	readonly resourceRunId: string;
+	readonly domain: RunCancellationDomain;
+	readonly signal: AbortSignal;
+	track(kind: RunResourceKind, label: string, settled: PromiseLike<unknown>): boolean;
+	fork(expectedDomain: RunCancellationDomain, kind: RunResourceKind, label: string): ForkProducerResult;
+	closeDiscovery(): void;
+}
+
+export interface AgentTerminalOwnerContext {
+	readonly resourceRunId: string;
+	readonly domain: RunCancellationDomain;
+}
+
+const terminalOwnerContexts = new WeakMap<object, AgentTerminalOwnerContext>();
+
+export function setAgentTerminalOwnerContext(event: object, context: AgentTerminalOwnerContext): void {
+	terminalOwnerContexts.set(event, context);
+}
+
+export function getAgentTerminalOwnerContext(event: object): AgentTerminalOwnerContext | undefined {
+	return terminalOwnerContexts.get(event);
+}
+export interface StandaloneRunOwnership {
+	readonly resourceRunId: string;
+	readonly domain: RunCancellationDomain;
+	claimContinuation():
+		| { ok: true; ownership: StandaloneRunOwnership }
+		| { ok: false; reason: "already_claimed" | "terminal" | "quarantined" };
+	abandon(reason: "cancelled" | "error"): void;
+}
+
+export interface RunResourceLedger {
+	/** Bind the bridge once, before any logical run may be opened. */
+	bindCancellationDomainBridge(bridge: RunCancellationDomainBridge): void;
+	/** Bind the unforgeable AgentSession claim key once, before terminal publication. */
+	bindAgentSessionClaimKey(key: object): void;
+	/** Reserve a run handle before publishing its `agent_start` event. */
+	open(resourceRunId: string): RunCancellationDomain | undefined;
+	lookupDomain(resourceRunId: string): RunCancellationDomain | undefined;
+	reserveProducer(
+		resourceRunId: string,
+		expectedDomain: RunCancellationDomain | undefined,
+		kind: RunResourceKind,
+		label: string,
+	): ReserveProducerResult;
+	claimProducer(
+		resourceRunId: string,
+		expectedDomain: RunCancellationDomain | undefined,
+		ownerKey: object,
+	): ClaimProducerResult;
+	track(resourceRunId: string, kind: RunResourceKind, label: string, settled: PromiseLike<unknown>): void;
+	pending(resourceRunId: string): RunResourceEntry[];
+	/** Seal a run after terminal event publication; only sealed empty runs settle. */
+	seal(resourceRunId: string): void;
+	waitForSettlement(resourceRunId: string, options: { graceMs: number }): Promise<RunSettlementProof>;
+	/** Terminally detach a run; its bounded tombstone remains unfenced forever. */
+	quarantine(resourceRunId: string): RunResourceEntry[];
+}
+
+/** Terminal completion requested for a logical run. */
+export interface RunTerminalRequest {
+	stopReason: "cancelled" | "error" | "exhausted";
+	messages?: AgentMessage[];
+}
+
+/**
+ * Ownership token supplied when Agent invokes a retry continuation.
+ *
+ * A continuation MUST verify `isCurrent()` immediately before starting a
+ * follow-up invocation and abandon the retry when it returns false. The token
+ * becomes invalid when its originating run is force-aborted or superseded.
+ * Coding-agent retry continuations must accept this argument and must not call
+ * `agent.continue()` after ownership has been lost.
+ */
+export interface ManagedAttemptContinuationOwnership {
+	/** Per-attempt run-loop id; use only for attempt-local ownership checks. */
+	readonly runId: number;
+	/** Stable managed logical-run id; use for all terminal completion requests. */
+	readonly logicalRunId: ManagedLogicalRunId;
+	readonly generation: number;
+	readonly domain: RunCancellationDomain;
+	readonly lease: RunResourceProducerLease;
+	/** Immutable per-attempt handle used by terminalizers and continuations. */
+	readonly handle: AttemptRunHandle;
+	isCurrent(): boolean;
+}
+
+/** Runs after a discarded attempt is idle, only while its ownership token remains current. */
+export type ManagedAttemptContinuation = (ownership: ManagedAttemptContinuationOwnership) => void | Promise<void>;
+
+/** Decision returned by managed fallback policy for one provisional attempt. */
+export type ManagedAttemptDecision =
+	| { type: "retry"; continuation: ManagedAttemptContinuation }
+	| { type: "maintenance"; continuation: ManagedAttemptContinuation }
+	| { type: "terminal"; terminal: RunTerminalRequest };
+
+/** Structured result for one managed upstream invocation. */
+export type ManagedAttemptOutcome =
+	| {
+			type: "retryable_discarded";
+			failure: {
+				message: AssistantMessage;
+				/** Exact provider transport facts, including retry headers, for fallback policy. */
+				transportFailure?: TransportFailureFacts;
+			};
+			scope?: AttemptScope;
+	  }
+	| {
+			type: "escaped_arguments_discarded";
+			/** The defective assistant turn; already removed from usable history by the loop. */
+			message: AssistantMessage;
+			scope?: AttemptScope;
+	  }
+	| { type: "context_overflow_discarded"; message: AssistantMessage; scope?: AttemptScope }
+	| { type: "run_terminal"; reason: "cancelled" | "error" | "exhausted"; scope?: AttemptScope };
+
+export type ManagedAttemptOutcomeHandler = (
+	outcome: ManagedAttemptOutcome,
+) => ManagedAttemptDecision | Promise<ManagedAttemptDecision>;
+
+/**
+ * Outcome of a cooperative mid-run context-maintenance checkpoint (see
+ * {@link AgentLoopConfig.maintainContext}). Any value other than "not-needed"
+ * means the checkpoint mutated (or attempted to mutate) durable context, so the
+ * loop ends the current run without the lossy `agent_end` finalization and the
+ * maintenance owner resumes the run on the rewritten context.
+ */
+export type MidRunMaintenanceOutcome = "not-needed" | "pruned" | "compacted" | "promoted" | "failed" | "aborted";
+
+export interface ContextMaintenanceResult {
+	outcome: MidRunMaintenanceOutcome;
+	releaseCurrentContext?: boolean;
+}
+
+/**
  * Configuration for the agent loop.
  */
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model;
+	/**
+	 * Supplies a fresh opaque token at each concrete managed transport invocation.
+	 * The callback runs at the stream boundary so controller accounting matches
+	 * upstream request count, including multi-step tool turns.
+	 */
+	nextFallbackAttempt?: (model: Model) => SimpleStreamOptions["fallbackAttempt"];
+	/** Called after a managed upstream request is accepted and committed. */
+	onManagedAttemptAccepted?: () => void | Promise<void>;
+
+	/** Receives a managed invocation outcome without publishing provisional lifecycle events. */
+	onManagedAttemptOutcome?: ManagedAttemptOutcomeHandler;
+	/** Per-attempt scope allocator for direct loop callers. */
+	attemptMinter?: AttemptMinter;
+	/** Scope allocated by the owning Agent for the first attempt in this loop. */
+	initialScope?: AttemptScope;
 
 	/**
 	 * When to interrupt tool execution for steering messages.
@@ -58,7 +272,7 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * current when `AgentLoopConfig` was first constructed). Overrides the static
 	 * `metadata` field when present.
 	 */
-	metadataResolver?: (provider: string) => Record<string, unknown> | undefined;
+	metadataResolver?: (context: AgentMetadataResolverContext) => Record<string, unknown> | undefined;
 
 	/**
 	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.
@@ -102,7 +316,7 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * }
 	 * ```
 	 */
-	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
+	transformContext?: (messages: AgentMessage[], signal?: AbortSignal, scope?: AttemptScope) => Promise<AgentMessage[]>;
 
 	/**
 	 * Resolves an API key dynamically for each LLM call.
@@ -125,6 +339,18 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	getSteeringMessages?: () => Promise<AgentMessage[]>;
 
 	/**
+	 * Returns steering messages that were dequeued for this run but cannot be
+	 * delivered by it, so the next run can pick them up.
+	 *
+	 * A user interrupt that lands while a tool is executing aborts the run's
+	 * signal without ending the loop: the loop still unwinds the tool and reaches
+	 * its steering drain. Continuing there would start a turn on an already
+	 * aborted signal, which the provider call rejects before the first token, so
+	 * the loop hands the messages back instead and ends the run.
+	 */
+	requeueSteeringMessages?: (messages: AgentMessage[]) => void;
+
+	/**
 	 * Returns follow-up messages to process after the agent would otherwise stop.
 	 *
 	 * Called when the agent has no more tool calls and no steering messages.
@@ -132,6 +358,38 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * continues with another turn.
 	 */
 	getFollowUpMessages?: () => Promise<AgentMessage[]>;
+	/**
+	 * Invoked with the follow-up messages the loop dequeues for the next turn
+	 * (right after {@link getFollowUpMessages}). The consumer may use this to
+	 * attach per-turn state (e.g., a fresh owned-completion lineage) at actual
+	 * resume admission rather than when the message was merely queued.
+	 */
+	/**
+	 * Invoked when follow-up messages are consumed. `startsOwnRun` is true only
+	 * when the batch owns a new agent run; maintenance and in-run consumption
+	 * report false so callers attach to the existing lifecycle.
+	 */
+	onFollowUpConsumed?: (messages: AgentMessage[], promotion?: { startsOwnRun: boolean }) => void;
+	/**
+	 * Invoked with the steering messages the loop dequeues mid-run for the
+	 * CURRENT turn (right after getSteeringMessages). `promotion.startsOwnRun`
+	 * is false for in-run consumption and true when the batch starts a new run.
+	 */
+	/** Invoked when steering is consumed; see `startsOwnRun` on the promotion disposition. */
+	onSteeringConsumed?: (messages: AgentMessage[], promotion?: { startsOwnRun: boolean }) => void;
+	/**
+	 * One-shot transient recovery instruction attached to the first assistant
+	 * request of this loop invocation. Sent only to the provider (never committed
+	 * to durable agent message history) so a caller-owned retry of a discarded
+	 * attempt can name the defect it is retrying around.
+	 */
+	transientRecoveryMessage?: UserMessage;
+	/**
+	 * Supplies one bounded synthetic recovery instruction before the loop would
+	 * otherwise yield. Unlike a follow-up, it is sent only to the provider and
+	 * is not committed to durable agent message history.
+	 */
+	getSyntheticRecoveryMessage?: () => Promise<UserMessage | undefined>;
 	/**
 	 * Cooperative pause checkpoint evaluated at safe loop boundaries.
 	 *
@@ -162,6 +420,36 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	syncContextBeforeModelCall?: (context: AgentContext) => void | Promise<void>;
 
 	/**
+	 * Cooperative mid-run context-maintenance checkpoint.
+	 *
+	 * Invoked at the top of every loop iteration AFTER pending tool-result /
+	 * steering messages have been materialized into durable context and BEFORE
+	 * {@link syncContextBeforeModelCall} and the model call. This is the only
+	 * boundary where the full unsent context (tool results + dequeued steering)
+	 * is already durable, so a long uninterrupted tool loop can be bounded here
+	 * before it grows past the provider window.
+	 *
+	 * The callback owns the maintenance decision (prune / compact / promote) and
+	 * receives the minimal cancellation-aware lifecycle: `signal` is the
+	 * non-optional loop signal, and `awaitEventDrain(invocationSignal)` waits for
+	 * prior event consumer bodies with loop and invocation cancellation composed.
+	 * Any outcome other than "not-needed" ends the current run with
+	 * `agent_end.stopReason === "maintenance"` (NOT the lossy pause / completed
+	 * finalization); the callback's continuation owner resumes the run on the
+	 * rewritten context.
+	 */
+	maintainContext?: (
+		context: AgentContext,
+		lifecycle: {
+			signal: AbortSignal;
+			awaitEventDrain: (invocationSignal: AbortSignal) => Promise<void>;
+		},
+	) =>
+		| Promise<ContextMaintenanceResult | MidRunMaintenanceOutcome>
+		| ContextMaintenanceResult
+		| MidRunMaintenanceOutcome;
+
+	/**
 	 * Optional transform applied to tool call arguments before execution.
 	 * Use for deobfuscating secrets or rewriting arguments.
 	 */
@@ -188,6 +476,10 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * Callers may abort synchronously to stop consuming buffered provider events.
 	 */
 	onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
+	/** Observe unmanaged provisional assistant deltas before public publication. */
+	onProvisionalAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
+	/** True when the host consumes provisional assistant events for live safety checks. */
+	hasProvisionalAssistantMessageEventConsumer?: boolean;
 
 	/** Called for non-content tool-choice incapability stream events. */
 	onToolChoiceIncapability?: (event: Extract<AssistantMessageEvent, { type: "toolChoiceIncapability" }>) => void;
@@ -252,6 +544,19 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * capture, cost estimator, agent identity).
 	 */
 	telemetry?: AgentTelemetryConfig;
+	/**
+	 * Optional prompt-run resource ownership ledger. Provider and scheduler-level tool
+	 * work is tracked until its owned lifecycle promise settles.
+	 */
+	resourceLedger?: RunResourceLedger;
+	/** Stable resource ownership identifier for this prompt run. */
+	resourceRunId?: string;
+	/** Immutable logical cancellation domain bound by the resource ledger. */
+	resourceCancellationDomain?: RunCancellationDomain;
+	/** Agent passes caller ownership; direct loop callers retain loop-owned sealing. */
+	resourceSealOwner?: "caller" | "loop";
+	/** Opaque ownership required to resume a standalone maintenance lifecycle. */
+	standaloneRunOwnership?: StandaloneRunOwnership;
 }
 
 /**
@@ -357,7 +662,7 @@ export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessag
  */
 export interface AgentState {
 	systemPrompt: string[];
-	model: Model;
+	model: Model | undefined;
 	thinkingLevel?: Effort;
 	tools: AgentTool<any>[];
 	messages: AgentMessage[]; // Can include attachments + custom message types
@@ -395,7 +700,8 @@ export interface RenderResultOptions {
  * Apps can extend via declaration merging.
  */
 export interface AgentToolContext {
-	// Empty by default - apps extend via declaration merging
+	/** Per-attempt scope used to attribute tool lifecycle and extension delivery. */
+	attemptScope?: AttemptScope;
 }
 
 export type AgentToolExecFn<TParameters extends TSchema = TSchema, TDetails = any, TTheme = unknown> = (
@@ -438,6 +744,18 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	 * - function: `_i` is NOT injected; intent is derived dynamically from (potentially partial / streaming) args.
 	 */
 	intent?: "omit" | "optional" | "require" | ((args: Partial<Static<TParameters>>) => string | undefined);
+	/**
+	 * Argument fields (dotted paths into the arguments object) that render to
+	 * the user as pure display text — question wording and option labels, never
+	 * ids, metadata, or persisted records. When every `\uXXXX`-escaped scalar in
+	 * a tool call corroborates a decoded non-ASCII character inside these
+	 * fields, the agent loop degrades to a single warning and executes the
+	 * decoded call instead of discarding the turn: a mistyped hex digit there
+	 * can only change what the user reads, never what executes or persists.
+	 * Every other field of these arguments — and every field of every other
+	 * tool — keeps the fail-closed rejection for unverified `\uXXXX` payloads.
+	 */
+	displaySafeEscapedArgFields?: readonly string[];
 
 	/** The main execution callback for this tool. */
 	execute: AgentToolExecFn<TParameters, TDetails, TTheme>;
@@ -461,30 +779,104 @@ export interface AgentContext {
 }
 
 /**
+ * Sanitized failure diagnostic carried by `agent_failed`: a stable classifier code
+ * plus a fixed human-readable message. Never the raw provider error — consumers may
+ * not depend on provider-specific detail, request bodies, or raw error objects.
+ */
+export interface AgentFailureDiagnostic {
+	code: string;
+	message: string;
+}
+
+/**
  * Events emitted by the Agent for UI updates.
  * These events provide fine-grained lifecycle information for messages, turns, and tool executions.
  */
 export type AgentEvent =
 	// Agent lifecycle
-	| { type: "agent_start" }
+	| { type: "agent_start"; scope?: AttemptScope }
+	| { type: "agent_failed"; error: AgentFailureDiagnostic; scope?: AttemptScope }
 	| {
 			type: "agent_end";
 			messages: AgentMessage[];
-			/** Indicates whether the loop ended normally or suspended at a pause checkpoint. */
-			stopReason?: "completed" | "paused";
+			/** Indicates whether the loop ended normally, suspended, cancelled, or entered maintenance. */
+			stopReason?: "completed" | "paused" | "cancelled" | "maintenance";
+			/** Present iff `stopReason === "maintenance"`; the maintenance outcome. */
+			maintenanceOutcome?: MidRunMaintenanceOutcome;
 			/** Present iff `AgentTelemetryConfig` was supplied on this run. */
 			telemetry?: AgentRunSummary;
 			coverage?: AgentRunCoverage;
+			scope?: AttemptScope;
 	  }
 	// Turn lifecycle - a turn is one assistant response + any tool calls/results
-	| { type: "turn_start" }
-	| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] }
+	| { type: "turn_start"; scope?: AttemptScope }
+	| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[]; scope?: AttemptScope }
 	// Message lifecycle - emitted for user, assistant, and toolResult messages
-	| { type: "message_start"; message: AgentMessage }
+	| { type: "message_start"; message: AgentMessage; scope?: AttemptScope }
 	// Only emitted for assistant messages during streaming
-	| { type: "message_update"; message: AgentMessage; assistantMessageEvent: AssistantMessageEvent }
-	| { type: "message_end"; message: AgentMessage }
+	| {
+			type: "message_update";
+			message: AgentMessage;
+			assistantMessageEvent: AssistantMessageEvent;
+			scope?: AttemptScope;
+	  }
+	| { type: "message_end"; message: AgentMessage; scope?: AttemptScope }
 	// Tool execution lifecycle
-	| { type: "tool_execution_start"; toolCallId: string; toolName: string; args: any; intent?: string }
-	| { type: "tool_execution_update"; toolCallId: string; toolName: string; args: any; partialResult: any }
-	| { type: "tool_execution_end"; toolCallId: string; toolName: string; result: any; isError?: boolean };
+	| {
+			type: "tool_execution_start";
+			toolCallId: string;
+			toolName: string;
+			args: any;
+			intent?: string;
+			scope?: AttemptScope;
+	  }
+	| {
+			type: "tool_execution_update";
+			toolCallId: string;
+			toolName: string;
+			args: any;
+			partialResult: any;
+			scope?: AttemptScope;
+	  }
+	| {
+			type: "tool_execution_end";
+			toolCallId: string;
+			toolName: string;
+			result: any;
+			isError?: boolean;
+			scope?: AttemptScope;
+	  };
+
+/**
+ * Why a tool call failed when the loop — not the tool — produced the result.
+ *
+ * `argument_validation` means the call never dispatched: the arguments were
+ * rejected before `execute` ran. `execution` means `execute` threw.
+ */
+export type ToolFailureKind = "argument_validation" | "execution";
+
+/**
+ * The result details the loop attaches when a tool call fails without the tool
+ * returning its own details. It carries no tool-owned field, so a consumer that
+ * dereferences a tool's own detail shape must recognise it first.
+ */
+export interface ToolFailureEnvelope {
+	failureKind: ToolFailureKind;
+}
+
+export function toolFailureEnvelope(kind: ToolFailureKind): ToolFailureEnvelope {
+	return { failureKind: kind };
+}
+
+/**
+ * True only for the loop's own envelope. Tools that report a `failureKind`
+ * alongside their own details (`todo_write`, todo persistence) keep those fields,
+ * so their renderers still own the result and are left alone.
+ */
+export function isToolFailureEnvelope(value: unknown): value is ToolFailureEnvelope {
+	if (!value || typeof value !== "object") return false;
+	const keys = Object.keys(value);
+	if (keys.length !== 1 || keys[0] !== "failureKind") return false;
+	const kind = (value as ToolFailureEnvelope).failureKind;
+	return kind === "argument_validation" || kind === "execution";
+}

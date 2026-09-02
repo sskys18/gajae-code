@@ -1,14 +1,18 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	applyGjcBundleUpdate,
 	buildAgentSubskillAdvertisement,
 	buildSubskillAdvertisement,
+	bundleIdentity,
 	type GjcPluginRegistryEntry,
-	installGjcPluginBundle,
+	installGjcBundle,
 	loadEffectiveGjcPluginRegistry,
 	type NormalizedGjcPluginSurfaces,
+	previewGjcBundleUpdate,
 	renderPluginAppendices,
 } from "../src/extensibility/gjc-plugins";
 import { buildSystemPrompt } from "../src/system-prompt";
@@ -48,7 +52,7 @@ describe("plugin prompt appendices", () => {
 	test("renders lower-authority system + agent appendix blocks from an installed bundle", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-appx-"));
 		tempDirs.push(cwd);
-		await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
+		await installGjcBundle({ cwd }, "project", sixSurface);
 		const effective = await loadEffectiveGjcPluginRegistry(cwd);
 		const rendered = await renderPluginAppendices(effective);
 		expect(rendered.system).toContain("<gjc-plugin-system-appendix");
@@ -57,17 +61,57 @@ describe("plugin prompt appendices", () => {
 		expect(rendered.byAgent.get("executor")).toContain("<gjc-plugin-agent-appendix");
 		expect(rendered.digest).toMatch(/^[0-9a-f]{64}$/);
 	});
+	test("rejects a system appendix replacement between validation and final render read", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-appx-race-system-"));
+		tempDirs.push(cwd);
+		await installGjcBundle({ cwd }, "project", sixSurface);
+		const effective = await loadEffectiveGjcPluginRegistry(cwd);
+		await expect(
+			renderPluginAppendices(effective, {
+				beforeRead: async (_entry, surface) => {
+					if (!surface.extensionId.includes("system-appendix")) return;
+					await fs.appendFile(
+						path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle", "prompts", "system-appendix.md"),
+						"\npost-validation replacement\n",
+					);
+				},
+			}),
+		).rejects.toMatchObject({ code: "runtime_mismatch" });
+	});
+
+	test("rejects an agent appendix replacement between validation and final render read", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-appx-race-agent-"));
+		tempDirs.push(cwd);
+		await installGjcBundle({ cwd }, "project", sixSurface);
+		const effective = await loadEffectiveGjcPluginRegistry(cwd);
+		await expect(
+			renderPluginAppendices(effective, {
+				beforeRead: async (_entry, surface) => {
+					if (!surface.extensionId.includes("agent-appendix")) return;
+					await fs.appendFile(
+						path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle", "prompts", "executor-appendix.md"),
+						"\npost-validation replacement\n",
+					);
+				},
+			}),
+		).rejects.toMatchObject({ code: "runtime_mismatch" });
+	});
 
 	test("digest changes when appendix content changes", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-appx2-"));
 		tempDirs.push(cwd);
-		await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
+		const source = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-appx-mod-"));
+		tempDirs.push(source);
+		await fs.cp(sixSurface, source, { recursive: true });
+		const ctx = { cwd };
+		const identity = bundleIdentity("project", "valid-six-surface-bundle");
+		await installGjcBundle(ctx, "project", source);
 		const before = (await renderPluginAppendices(await loadEffectiveGjcPluginRegistry(cwd))).digest;
-		const modified = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-appx-mod-"));
-		tempDirs.push(modified);
-		await fs.cp(sixSurface, modified, { recursive: true });
-		await fs.appendFile(path.join(modified, "prompts", "system-appendix.md"), "\nNew clause.\n");
-		await installGjcPluginBundle(modified, { scope: "project", cwd, force: true });
+		await fs.appendFile(path.join(source, "prompts", "system-appendix.md"), "\nNew clause.\n");
+		const preview = await previewGjcBundleUpdate(ctx, identity);
+		expect(preview.ok).toBe(true);
+		if (!preview.ok) throw new Error(preview.error.code);
+		await applyGjcBundleUpdate(ctx, preview.value.token);
 		const after = (await renderPluginAppendices(await loadEffectiveGjcPluginRegistry(cwd))).digest;
 		expect(after).not.toBe(before);
 	});
@@ -130,21 +174,57 @@ describe("system prompt appendix integration", () => {
 
 describe("M5 blocker fixes", () => {
 	test("renders inline-content appendices (not just file-backed)", async () => {
+		const body = "INLINE-POLICY-BODY";
 		const e = entry("inline-plugin", {
 			surfaces: surfaces({
 				systemAppendices: [
 					{
 						extensionId: "system-appendix:inline-plugin:policy",
 						name: "policy",
-						content: "INLINE-POLICY-BODY",
-						contentHash: "c".repeat(64),
-						bytes: 18,
+						content: body,
+						contentHash: createHash("sha256").update(Buffer.from(body, "utf8")).digest("hex"),
+						bytes: Buffer.byteLength(body, "utf8"),
 					},
 				],
 			}),
 		});
 		const rendered = await renderPluginAppendices([e]);
 		expect(rendered.system).toContain("INLINE-POLICY-BODY");
+	});
+
+	test("refuses an inline appendix whose declared contentHash does not match its body", async () => {
+		const e = entry("inline-drift-plugin", {
+			surfaces: surfaces({
+				systemAppendices: [
+					{
+						extensionId: "system-appendix:inline-drift-plugin:policy",
+						name: "policy",
+						content: "INLINE-DRIFTED-BODY",
+						contentHash: "c".repeat(64),
+						bytes: 19,
+					},
+				],
+			}),
+		});
+		await expect(renderPluginAppendices([e])).rejects.toMatchObject({ code: "runtime_mismatch" });
+	});
+
+	test("refuses an inline agent appendix whose declared contentHash does not match its body", async () => {
+		const e = entry("inline-agent-drift-plugin", {
+			surfaces: surfaces({
+				agentAppendices: [
+					{
+						extensionId: "agent-appendix:inline-agent-drift-plugin:policy",
+						agent: "planner",
+						name: "policy",
+						content: "INLINE-AGENT-DRIFTED-BODY",
+						contentHash: "d".repeat(64),
+						bytes: 25,
+					},
+				],
+			}),
+		});
+		await expect(renderPluginAppendices([e])).rejects.toMatchObject({ code: "runtime_mismatch" });
 	});
 
 	test("parseManifest rejects unknown agent-appendix agent with invalid_parent", async () => {

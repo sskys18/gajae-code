@@ -3,6 +3,11 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as url from "node:url";
 import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
+import {
+	createDeepInterviewIntentManifest,
+	MAX_INITIAL_CONTEXT_LENGTH,
+	reviewDeepInterviewIntent,
+} from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
 import {
 	activeSnapshotPath,
@@ -11,8 +16,8 @@ import {
 	sessionPlansDir,
 	sessionSpecsDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
-
 import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
+import { YAML } from "bun";
 import { resetSettingsForTest } from "../../src/config/settings";
 
 const tempRoots: string[] = [];
@@ -62,6 +67,7 @@ describe("native gjc deep-interview runtime", () => {
 		expect(source).toContain("slug: Flags.string");
 		expect(source).toContain("spec: Flags.string");
 		expect(source).toContain("deliberate: Flags.boolean");
+		expect(source).toContain("trace: Flags.boolean");
 		expect(source).toContain("handoff: Flags.string");
 	});
 
@@ -93,6 +99,181 @@ describe("native gjc deep-interview runtime", () => {
 		const validState = JSON.parse(await fs.readFile(validStatePath, "utf-8"));
 		expect(validState.transcript).toEqual([{ question: "q", answer: "a" }]);
 		expect(validState.spec_slug).toBe("valid-state");
+	});
+
+	it("enforces locked-intent review before creating a spec while preserving legacy handoff", async () => {
+		const lockedItems = [
+			{ id: "artifact:report", category: "artifact" as const, statement: "Produce an audit report" },
+			{ id: "surface:review", category: "surface" as const, statement: "Provide a reviewer surface" },
+		];
+		const confirmationHash = "a".repeat(64);
+		const approvalHash = "b".repeat(64);
+		const locked = createDeepInterviewIntentManifest(lockedItems, { round: 0, answer_hash: confirmationHash });
+		const fullSpec = "# Full\nartifact:report\nsurface:review";
+		const reducedSpec = "# Reduced\nartifact:report";
+		const approvedReduction = reviewDeepInterviewIntent(locked, [lockedItems[0]], {
+			status: "approved",
+			supporting_substitutions: [
+				{
+					removed_id: "surface:review",
+					replacement_ids: ["artifact:report"],
+					rationale: "Report covers the review",
+				},
+			],
+			approval_round: 2,
+			answer_hash: approvalHash,
+			user_answer_evidence: `answer_hash:${approvalHash}`,
+		});
+		const notRequired = reviewDeepInterviewIntent(locked, lockedItems, {
+			status: "not_required",
+			supporting_substitutions: [],
+		});
+
+		async function writeState(root: string, state: Record<string, unknown>): Promise<void> {
+			const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+			await fs.mkdir(path.dirname(statePath), { recursive: true });
+			await fs.writeFile(statePath, `${JSON.stringify({ state })}\n`, "utf-8");
+		}
+		async function expectBlocked(
+			name: string,
+			state: Record<string, unknown>,
+			spec: string,
+			message: string,
+		): Promise<void> {
+			const root = await tempDir();
+			await writeState(root, state);
+			const result = await runNativeDeepInterviewCommand(
+				["--write", "--stage", "final", "--slug", name, "--spec", spec, "--json"],
+				root,
+			);
+			expect(result.status, name).toBe(2);
+			expect(result.stderr, name).toContain(message);
+			await expect(
+				fs.access(path.join(sessionSpecsDir(root, TEST_SESSION_ID), `deep-interview-${name}.md`)),
+			).rejects.toThrow();
+		}
+
+		const legacyRoot = await tempDir();
+		await writeState(legacyRoot, { rounds: [] });
+		const legacy = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "legacy", "--spec", fullSpec, "--json"],
+			legacyRoot,
+		);
+		expect(legacy.status).toBe(0);
+
+		const fullRoot = await tempDir();
+		await writeState(fullRoot, { intent_contract: locked, intent_review: notRequired, rounds: [] });
+		const full = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "full", "--spec", fullSpec, "--json"],
+			fullRoot,
+		);
+		expect(full.status).toBe(0);
+		expect(
+			await fs.readFile(path.join(sessionSpecsDir(fullRoot, TEST_SESSION_ID), "deep-interview-full.md"), "utf-8"),
+		).toContain("surface:review");
+
+		const automaticRoot = await tempDir();
+		await writeState(automaticRoot, { intent_contract: locked, rounds: [] });
+		const automatic = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "automatic-review", "--spec", fullSpec, "--json"],
+			automaticRoot,
+		);
+		expect(automatic.status).toBe(0);
+		const automaticState = JSON.parse(
+			await fs.readFile(modeStatePath(automaticRoot, TEST_SESSION_ID, "deep-interview"), "utf-8"),
+		);
+		expect(automaticState.state.intent_review).toMatchObject({ status: "not_required", removed_locked_ids: [] });
+		await expectBlocked(
+			"malformed-review",
+			{ intent_contract: locked, intent_review: {}, rounds: [] },
+			fullSpec,
+			"invalid intent review",
+		);
+		await expectBlocked(
+			"pending-review",
+			{
+				intent_contract: locked,
+				intent_review: {
+					...approvedReduction,
+					status: "pending",
+					approval_round: undefined,
+					answer_hash: undefined,
+					user_answer_evidence: undefined,
+				},
+				rounds: [],
+			},
+			reducedSpec,
+			"pending or unapproved",
+		);
+		await expectBlocked(
+			"stale-review",
+			{
+				intent_contract: locked,
+				intent_review: { ...approvedReduction, observed_digest: "0".repeat(64) },
+				rounds: [],
+			},
+			reducedSpec,
+			"stale intent review",
+		);
+		await expectBlocked(
+			"omitted-locked",
+			{ intent_contract: locked, intent_review: notRequired, rounds: [] },
+			reducedSpec,
+			"stale intent review",
+		);
+		await expectBlocked(
+			"missing-substitution",
+			{
+				intent_contract: locked,
+				intent_review: { ...approvedReduction, supporting_substitutions: [] },
+				rounds: [{ round: 2, answer_hash: approvalHash }],
+			},
+			reducedSpec,
+			"every substitution",
+		);
+		await expectBlocked(
+			"absent-replacement",
+			{
+				intent_contract: locked,
+				intent_review: {
+					...approvedReduction,
+					supporting_substitutions: [
+						{ ...approvedReduction.supporting_substitutions[0], replacement_ids: ["surface:review"] },
+					],
+				},
+				rounds: [{ round: 2, answer_hash: approvalHash }],
+			},
+			reducedSpec,
+			"invalid intent substitution",
+		);
+		await expectBlocked(
+			"unrecorded-approval",
+			{
+				intent_contract: locked,
+				intent_review: approvedReduction,
+				rounds: [{ round: 2, answer_hash: confirmationHash }],
+			},
+			reducedSpec,
+			"approval evidence is invalid",
+		);
+
+		const approvedRoot = await tempDir();
+		await writeState(approvedRoot, {
+			intent_contract: locked,
+			intent_review: approvedReduction,
+			rounds: [{ round: 2, answer_hash: approvalHash }],
+		});
+		const approved = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "approved", "--spec", reducedSpec, "--json"],
+			approvedRoot,
+		);
+		expect(approved.status).toBe(0);
+		expect(
+			await fs.readFile(
+				path.join(sessionSpecsDir(approvedRoot, TEST_SESSION_ID), "deep-interview-approved.md"),
+				"utf-8",
+			),
+		).toContain("artifact:report");
 	});
 
 	it("fails closed on corrupt deep-interview state unless --force is supplied", async () => {
@@ -167,6 +348,52 @@ describe("native gjc deep-interview runtime", () => {
 		const payload = JSON.parse(result.stdout ?? "{}");
 		expect(payload.path).toBe(path.join(sessionSpecsDir(root, TEST_SESSION_ID), "deep-interview-long-inline.md"));
 		expect(await fs.readFile(payload.path, "utf-8")).toBe(`${inlineSpec}\n`);
+	});
+
+	it("accepts a 100k-code-point resolved spec and rejects +1 before persisting artifacts or handoff state", async () => {
+		const acceptedRoot = await tempDir();
+		const exactSpec = "😀".repeat(100_000);
+		const sourceSpecPath = path.join(acceptedRoot, "exact-spec.md");
+		await fs.writeFile(sourceSpecPath, exactSpec, "utf-8");
+
+		const accepted = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "exact-limit", "--spec", sourceSpecPath, "--json"],
+			acceptedRoot,
+		);
+		expect(accepted.status).toBe(0);
+		expect(
+			await fs.readFile(
+				path.join(sessionSpecsDir(acceptedRoot, TEST_SESSION_ID), "deep-interview-exact-limit.md"),
+				"utf-8",
+			),
+		).toBe(`${exactSpec}\n`);
+
+		const rejectedRoot = await tempDir();
+		const rejected = await runNativeDeepInterviewCommand(
+			[
+				"--write",
+				"--stage",
+				"final",
+				"--slug",
+				"over-limit",
+				"--spec",
+				"😀".repeat(100_001),
+				"--deliberate",
+				"--json",
+			],
+			rejectedRoot,
+		);
+		expect(rejected.status).toBe(1);
+		expect(rejected.stderr).toContain("structured deep-interview response exceeds max length 100000");
+		await expect(
+			fs.access(path.join(sessionSpecsDir(rejectedRoot, TEST_SESSION_ID), "deep-interview-over-limit.md")),
+		).rejects.toThrow();
+		await expect(
+			fs.access(path.join(sessionSpecsDir(rejectedRoot, TEST_SESSION_ID), "deep-interview-index.jsonl")),
+		).rejects.toThrow();
+		await expect(fs.access(modeStatePath(rejectedRoot, TEST_SESSION_ID, "deep-interview"))).rejects.toThrow();
+		await expect(fs.access(modeStatePath(rejectedRoot, TEST_SESSION_ID, "ralplan"))).rejects.toThrow();
+		await expect(fs.access(activeSnapshotPath(rejectedRoot, TEST_SESSION_ID))).rejects.toThrow();
 	});
 
 	it("uses --deliberate to persist the final spec and hand off to ralplan", async () => {
@@ -274,30 +501,120 @@ describe("native gjc deep-interview runtime", () => {
 		expect(state.state.established_facts).toEqual([]);
 	});
 
-	it("honors gjc.deepInterview.ambiguityThreshold in project .gjc/settings.json", async () => {
+	it("rejects an oversized initial idea before seeding workflow state", async () => {
+		const root = await tempDir();
+		const result = await runNativeDeepInterviewCommand(["--json", "한".repeat(MAX_INITIAL_CONTEXT_LENGTH + 1)], root);
+
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("initial_idea exceeds max length");
+		await expect(fs.stat(modeStatePath(root, TEST_SESSION_ID, "deep-interview"))).rejects.toThrow();
+	});
+
+	it("runs an optional bounded trace pre-step before deep-interview questions", async () => {
+		const root = await tempDir();
+		await fs.mkdir(path.join(root, "packages/coding-agent/src/gjc-runtime"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, "package.json"),
+			JSON.stringify({ name: "trace-fixture", scripts: { test: "bun test", check: "bun check" } }),
+		);
+		await fs.writeFile(
+			path.join(root, "packages/coding-agent/src/gjc-runtime/deep-interview-runtime.ts"),
+			"raw content must not be copied into the trace summary\n".repeat(200),
+		);
+
+		const result = await runNativeDeepInterviewCommand(
+			["--trace", "--json", "Add trace pre-skill option to deep-interview"],
+			root,
+		);
+
+		expect(result.status).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}");
+		expect(payload.trace).toMatchObject({ enabled: true, bounded: true });
+		expect(payload.trace.relevant_paths.length).toBeLessThanOrEqual(12);
+		expect(
+			payload.trace.relevant_paths.some((entry: { path: string }) =>
+				entry.path.includes("deep-interview-runtime.ts"),
+			),
+		).toBe(true);
+
+		const state = JSON.parse(await fs.readFile(modeStatePath(root, TEST_SESSION_ID, "deep-interview"), "utf-8"));
+		expect(state.state.rounds).toEqual([]);
+		expect(state.state.trace_summary).toEqual(payload.trace);
+		expect(state.state.codebase_context).toMatchObject({ source: "trace" });
+		expect(JSON.stringify(state.state.trace_summary)).not.toContain("raw content must not be copied");
+	});
+
+	it("keeps trace path scanning on a hard budget and skips heavy directories", async () => {
+		const root = await tempDir();
+		await fs.writeFile(path.join(root, "package.json"), JSON.stringify({ name: "trace-budget-fixture" }));
+		await fs.mkdir(path.join(root, "vendor", "deep-interview"), { recursive: true });
+		await fs.writeFile(path.join(root, "vendor", "deep-interview", "secret-token.ts"), "token should not be listed");
+		await fs.mkdir(path.join(root, "target", "deep-interview"), { recursive: true });
+		await fs.writeFile(path.join(root, "target", "deep-interview", "generated.ts"), "generated should not be listed");
+		for (let index = 0; index < 80; index += 1) {
+			await fs.mkdir(path.join(root, `src-${index}`), { recursive: true });
+			await fs.writeFile(path.join(root, `src-${index}`, `deep-interview-${index}.ts`), "bounded path hint only");
+		}
+
+		const result = await runNativeDeepInterviewCommand(["--trace", "--json", "deep interview budget"], root);
+
+		expect(result.status).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}");
+		expect(payload.trace.limits).toMatchObject({
+			max_directory_visits: 1200,
+			max_entry_visits: 5000,
+			max_pending_directories: 1200,
+		});
+		expect(payload.trace.relevant_paths.length).toBeLessThanOrEqual(12);
+		expect(payload.trace.relevant_paths.map((entry: { path: string }) => entry.path)).not.toContain(
+			"vendor/deep-interview/secret-token.ts",
+		);
+		expect(payload.trace.relevant_paths.map((entry: { path: string }) => entry.path)).not.toContain(
+			"target/deep-interview/generated.ts",
+		);
+	});
+
+	it("keeps the normal no-trace deep-interview seed path unchanged", async () => {
+		const root = await tempDir();
+		const result = await runNativeDeepInterviewCommand(["--json", "my vague idea"], root);
+		expect(result.status).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}");
+		expect(payload.trace).toBeUndefined();
+
+		const state = JSON.parse(await fs.readFile(modeStatePath(root, TEST_SESSION_ID, "deep-interview"), "utf-8"));
+		expect(state.trace).toBeUndefined();
+		expect(state.state.trace).toBeUndefined();
+		expect(state.state.trace_summary).toBeUndefined();
+		expect(state.state.codebase_context).toBeUndefined();
+	});
+
+	it("honors gjc.deepInterview.ambiguityThreshold in project .gjc/config.yml", async () => {
 		const root = await tempDir();
 		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
 		await fs.writeFile(
-			path.join(root, ".gjc", "settings.json"),
-			JSON.stringify({ gjc: { deepInterview: { ambiguityThreshold: 0.08 } } }),
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { deepInterview: { ambiguityThreshold: 0.08 } } }),
 		);
 		const result = await runNativeDeepInterviewCommand(["--standard", "--json", "idea"], root);
 		expect(result.status).toBe(0);
 		const payload = JSON.parse(result.stdout ?? "{}");
 		expect(payload.threshold).toBeCloseTo(0.08);
-		expect(payload.threshold_source).toBe(path.join(root, ".gjc", "settings.json"));
+		expect(payload.threshold_source).toBe(path.join(root, ".gjc", "config.yml"));
 	});
 
-	it("prefers modern config.yml threshold over legacy project settings.json", async () => {
+	it("prefers project config.yml over user config.yml (project beats user)", async () => {
 		const root = await tempDir();
 		const agentDir = await tempDir();
 		setAgentDir(agentDir);
 		resetSettingsForTest();
-		await fs.writeFile(path.join(agentDir, "config.yml"), "gjc:\n  deepInterview:\n    ambiguityThreshold: 0.2\n");
+		await fs.writeFile(
+			path.join(agentDir, "config.yml"),
+			YAML.stringify({ gjc: { deepInterview: { ambiguityThreshold: 0.2 } } }),
+		);
 		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
 		await fs.writeFile(
-			path.join(root, ".gjc", "settings.json"),
-			JSON.stringify({ gjc: { deepInterview: { ambiguityThreshold: 0.08 } } }),
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { deepInterview: { ambiguityThreshold: 0.08 } } }),
 		);
 
 		resetSettingsForTest();
@@ -305,16 +622,16 @@ describe("native gjc deep-interview runtime", () => {
 
 		expect(result.status).toBe(0);
 		const payload = JSON.parse(result.stdout ?? "{}");
-		expect(payload.threshold).toBeCloseTo(0.2);
-		expect(payload.threshold_source).toBe(path.join(agentDir, "config.yml"));
+		expect(payload.threshold).toBeCloseTo(0.08);
+		expect(payload.threshold_source).toBe(path.join(root, ".gjc", "config.yml"));
 	});
 
-	it("--threshold beats project settings.json", async () => {
+	it("--threshold beats project config.yml", async () => {
 		const root = await tempDir();
 		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
 		await fs.writeFile(
-			path.join(root, ".gjc", "settings.json"),
-			JSON.stringify({ gjc: { deepInterview: { ambiguityThreshold: 0.08 } } }),
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { deepInterview: { ambiguityThreshold: 0.08 } } }),
 		);
 		const result = await runNativeDeepInterviewCommand(
 			["--threshold", "0.25", "--threshold-source", "flag:explicit", "--json", "idea"],

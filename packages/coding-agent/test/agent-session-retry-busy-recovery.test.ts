@@ -1,7 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { scheduler } from "node:timers/promises";
-import { Agent, AgentBusyError } from "@gajae-code/agent-core";
+import { Agent, AgentBusyError, type AgentTool } from "@gajae-code/agent-core";
 import { type AssistantMessage, getBundledModel, type ToolCall } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -10,18 +9,9 @@ import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/s
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
+import * as z from "zod/v4";
 
 type AutoRetryEndEvent = Extract<AgentSessionEvent, { type: "auto_retry_end" }>;
-
-function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
-	// Uses a real timer (not the mocked scheduler.wait) so it survives the
-	// scheduler.wait spy that skips retry backoff.
-	let timer: NodeJS.Timeout;
-	const timeout = new Promise<never>((_, reject) => {
-		timer = setTimeout(() => reject(new Error(`TIMEOUT (session wedged busy): ${label}`)), ms);
-	});
-	return Promise.race([p, timeout]).finally(() => clearTimeout(timer)) as Promise<T>;
-}
 
 /**
  * Regression: a retryable provider error schedules an auto-retry `continue()`
@@ -53,7 +43,6 @@ describe("AgentSession auto-retry busy recovery", () => {
 		}
 		authStorage.close();
 		tempDir.removeSync();
-		vi.restoreAllMocks();
 	});
 
 	it("does not wedge the session busy when the scheduled retry continue throws", async () => {
@@ -97,27 +86,111 @@ describe("AgentSession auto-retry busy recovery", () => {
 			settings,
 			modelRegistry,
 		});
+		const handles: string[] = [];
+		const terminalEvents: AgentSessionEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "agent_start" && agent.activeResourceRunId) handles.push(agent.activeResourceRunId);
+			if (event.type === "agent_end") terminalEvents.push(event);
+		});
 
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
 			if (event.type === "auto_retry_end") retryEndEvents.push(event);
 		});
 
 		// The owning prompt must settle instead of hanging on the dead retry promise.
-		await withTimeout(session.prompt("first message"), 5_000, "prompt(first)");
-		await withTimeout(session.waitForIdle(), 5_000, "waitForIdle");
+		await session.prompt("first message");
+		await session.waitForIdle();
 
 		expect(continueFailed).toBe(true);
 		expect(session.isStreaming).toBe(false);
 		expect(session.isRetrying).toBe(false);
 		// The aborted retry is reported as a failure so the UI can clean up.
 		expect(retryEndEvents.at(-1)).toMatchObject({ success: false });
+		expect(handles).toHaveLength(1);
+		expect(terminalEvents).toHaveLength(1);
+		expect(await agent.resourceLedger.waitForSettlement(handles[0]!, { graceMs: 100 })).toEqual({
+			status: "settled",
+		});
 
 		// The actual user-visible symptom: subsequent prompts must work, not throw
 		// AgentBusyError forever.
-		await withTimeout(session.prompt("second message"), 5_000, "prompt(second)");
+		await session.prompt("second message");
 		expect(session.isStreaming).toBe(false);
+		expect(handles).toHaveLength(2);
+		expect(handles[0]).not.toBe(handles[1]);
+		expect(terminalEvents).toHaveLength(2);
+		expect(await agent.resourceLedger.waitForSettlement(handles[1]!, { graceMs: 100 })).toEqual({
+			status: "settled",
+		});
+	});
+
+	it("does not wedge when auto_retry_start extension delivery rejects", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+
+		const mock = createMockModel({
+			responses: [
+				{ throw: "503 service unavailable: overloaded_error retry-after-ms=5" },
+				{ content: ["same session accepted the next prompt"] },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		let retryStartDeliveries = 0;
+		const extensionRunner = {
+			emitBeforeAgentStart: async () => undefined,
+			hasHandlers: (eventType: string) => eventType === "auto_retry_start",
+			emit: async (event: { type: string }) => {
+				if (event.type !== "auto_retry_start") return;
+				retryStartDeliveries++;
+				throw new Error("auto_retry_start handler failed");
+			},
+		} as never;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxDelayMs": 5_000,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			extensionRunner,
+		});
+		const retryEndEvents: AutoRetryEndEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_end") retryEndEvents.push(event);
+		});
+
+		await session.prompt("provider failure before retry scheduling");
+		await session.waitForIdle();
+
+		expect(retryStartDeliveries).toBe(1);
+		expect(retryEndEvents).toContainEqual(
+			expect.objectContaining({
+				success: false,
+				finalError: "Retry start delivery failed: auto_retry_start handler failed",
+			}),
+		);
+		expect(session.isRetrying).toBe(false);
+		expect(session.isStreaming).toBe(false);
+
+		await session.prompt("same-session follow-up");
+		await session.waitForIdle();
+
+		expect(mock.calls).toHaveLength(2);
+		expect(session.isStreaming).toBe(false);
+		expect(session.agent.state.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "same session accepted the next prompt" }],
+			stopReason: "stop",
+		});
 	});
 
 	it("recovers a later retryable error normally after a prior retry was abandoned", async () => {
@@ -157,17 +230,16 @@ describe("AgentSession auto-retry busy recovery", () => {
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 
-		await withTimeout(session.prompt("first message"), 5_000, "prompt(first)");
-		await withTimeout(session.waitForIdle(), 5_000, "waitForIdle(first)");
+		await session.prompt("first message");
+		await session.waitForIdle();
 		expect(session.isStreaming).toBe(false);
 		expect(session.isRetrying).toBe(false);
 
 		// A fresh prompt whose first turn errors retryably must auto-retry and recover,
 		// proving the abandoned retry did not poison the retry machinery.
-		await withTimeout(session.prompt("second message"), 5_000, "prompt(second)");
-		await withTimeout(session.waitForIdle(), 5_000, "waitForIdle(second)");
+		await session.prompt("second message");
+		await session.waitForIdle();
 		expect(session.isStreaming).toBe(false);
 		expect(session.isRetrying).toBe(false);
 		const last = session.agent.state.messages.at(-1) as AssistantMessage | undefined;
@@ -208,14 +280,13 @@ describe("AgentSession auto-retry busy recovery", () => {
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 
 		const busyErrors: string[] = [];
 		const tryPrompt = async (text: string) => {
-			await withTimeout(session!.prompt(text), 5_000, `prompt(${text})`).catch((err: Error) => {
+			await session!.prompt(text).catch((err: Error) => {
 				if (err instanceof AgentBusyError) busyErrors.push(err.message);
 			});
-			await withTimeout(session!.waitForIdle(), 5_000, `waitForIdle(${text})`);
+			await session!.waitForIdle();
 		};
 
 		await tryPrompt("first message");
@@ -229,6 +300,121 @@ describe("AgentSession auto-retry busy recovery", () => {
 		expect(session.isStreaming).toBe(false);
 	});
 
+	it("settles A before its accepted retry successor B completes", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const heldToolStarted = Promise.withResolvers<void>();
+		const releaseHeldTool = Promise.withResolvers<void>();
+		const holdTool: AgentTool = {
+			name: "hold",
+			label: "Hold",
+			description: "Holds the accepted retry successor open",
+			parameters: z.object({}),
+			execute: async () => {
+				heldToolStarted.resolve();
+				await releaseHeldTool.promise;
+				return { content: [{ type: "text" as const, text: "released" }] };
+			},
+		};
+		const mock = createMockModel({
+			responses: [
+				{ throw: "503 service unavailable: overloaded_error retry-after-ms=5" },
+				{ content: [{ type: "toolCall", name: "hold", arguments: {} }] },
+				{ content: ["retry successor completed"] },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [holdTool], messages: [] },
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxDelayMs": 5_000,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+
+		const handles: string[] = [];
+		const domains = new Map<string, AbortSignal>();
+		session.subscribe(event => {
+			if (event.type !== "agent_start" || !agent.activeResourceRunId) return;
+			const handle = agent.activeResourceRunId;
+			handles.push(handle);
+			const domain = agent.resourceLedger.lookupDomain(handle);
+			if (domain) domains.set(handle, domain.signal);
+		});
+
+		const prompt = session.prompt("retry with held successor");
+		let firstHandle: string | undefined;
+		let successorHandle: string | undefined;
+		try {
+			await heldToolStarted.promise;
+
+			expect(handles).toHaveLength(2);
+			[firstHandle, successorHandle] = handles;
+			const firstSignal = domains.get(firstHandle!);
+			const successorSignal = domains.get(successorHandle!);
+			expect(firstSignal).toBeDefined();
+			expect(successorSignal).toBeDefined();
+			expect(firstSignal).not.toBe(successorSignal);
+			expect(firstSignal?.aborted).toBe(false);
+			expect(successorSignal?.aborted).toBe(false);
+			expect(await agent.resourceLedger.waitForSettlement(firstHandle!, { graceMs: 100 })).toEqual({
+				status: "settled",
+			});
+		} finally {
+			releaseHeldTool.resolve();
+			await prompt;
+		}
+		await session.waitForIdle();
+		expect(await agent.resourceLedger.waitForSettlement(successorHandle!, { graceMs: 100 })).toEqual({
+			status: "settled",
+		});
+	});
+	it("keeps a retry predecessor settled and terminally distinct from its successor", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const mock = createMockModel({
+			responses: [
+				{ throw: "503 service unavailable: overloaded_error retry-after-ms=5" },
+				{ content: ["retry successor succeeded"] },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxDelayMs": 5_000,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+
+		const handles: string[] = [];
+		const terminalEvents: AgentSessionEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "agent_start" && agent.activeResourceRunId) handles.push(agent.activeResourceRunId);
+			if (event.type === "agent_end") terminalEvents.push(event);
+		});
+
+		await session.prompt("retry with an owned successor");
+		await session.waitForIdle();
+
+		expect(handles).toHaveLength(2);
+		expect(handles[0]).not.toBe(handles[1]);
+		expect(await agent.resourceLedger.waitForSettlement(handles[0]!, { graceMs: 100 })).toEqual({
+			status: "settled",
+		});
+		expect(await agent.resourceLedger.waitForSettlement(handles[1]!, { graceMs: 100 })).toEqual({
+			status: "settled",
+		});
+		expect(terminalEvents).toHaveLength(1);
+	});
 	it("does not wedge when an auto-retry recovers on a turn ending with a successful yield", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
@@ -297,15 +483,14 @@ describe("AgentSession auto-retry busy recovery", () => {
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
 			if (event.type === "auto_retry_end") retryEndEvents.push(event);
 		});
 
-		await withTimeout(session.prompt("first message"), 5_000, "prompt(first)");
-		await withTimeout(session.waitForIdle(), 5_000, "waitForIdle");
+		await session.prompt("first message");
+		await session.waitForIdle();
 
 		expect(recovered).toBe(true);
 		expect(session.isStreaming).toBe(false);
@@ -313,7 +498,7 @@ describe("AgentSession auto-retry busy recovery", () => {
 		// Retry success is surfaced exactly once (resolved at message_end, idempotent at agent_end).
 		expect(retryEndEvents.filter(event => event.success === true)).toHaveLength(1);
 
-		await withTimeout(session.prompt("second message"), 5_000, "prompt(second)");
+		await session.prompt("second message");
 		expect(session.isStreaming).toBe(false);
 	});
 });

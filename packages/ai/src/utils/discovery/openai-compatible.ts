@@ -1,8 +1,56 @@
+import * as net from "node:net";
 import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
 import * as z from "zod/v4";
 import type { Api, FetchImpl, Model, Provider } from "../../types";
+import { toNumber } from "../../utils";
 
 const MODELS_PATH = "/models";
+const MAX_MODELS_RESPONSE_BYTES = 1_000_000;
+const MAX_CATALOG_MODEL_ID_LENGTH = 200;
+
+function parseIpv6Hextets(host: string): number[] | undefined {
+	if (net.isIP(host) !== 6) return undefined;
+	const doubleColon = host.indexOf("::");
+	if (doubleColon !== host.lastIndexOf("::")) return undefined;
+	const parseSide = (value: string): number[] | undefined => {
+		if (!value) return [];
+		const parts = value.split(":");
+		if (parts.some(part => !/^[0-9a-f]{1,4}$/i.test(part))) return undefined;
+		return parts.map(part => Number.parseInt(part, 16));
+	};
+	if (doubleColon < 0) {
+		const hextets = parseSide(host);
+		return hextets?.length === 8 ? hextets : undefined;
+	}
+	const left = parseSide(host.slice(0, doubleColon));
+	const right = parseSide(host.slice(doubleColon + 2));
+	if (!left || !right) return undefined;
+	const missing = 8 - left.length - right.length;
+	if (missing < 1) return undefined;
+	return [...left, ...new Array<number>(missing).fill(0), ...right];
+}
+
+function isLoopbackHost(hostname: string): boolean {
+	const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+	if (host === "localhost") return true;
+	if (net.isIP(host) === 4) return host.split(".", 1)[0] === "127";
+	const hextets = parseIpv6Hextets(host);
+	if (!hextets) return false;
+	const isIpv6Loopback = hextets.slice(0, 7).every(part => part === 0) && hextets[7] === 1;
+	const isIpv4MappedLoopback =
+		hextets.slice(0, 5).every(part => part === 0) && hextets[5] === 0xffff && hextets[6]! >> 8 === 0x7f;
+	return isIpv6Loopback || isIpv4MappedLoopback;
+}
+
+/** Catalog identities are rendered and used for routing; unsafe values are dropped, never rewritten. */
+export function isSafeCatalogModelId(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.trim().length > 0 &&
+		value.length <= MAX_CATALOG_MODEL_ID_LENGTH &&
+		!/[\u0000-\u001f\u007f-\u009f]/u.test(value)
+	);
+}
 
 /**
  * Minimal OpenAI-style model entry shape consumed by discovery.
@@ -101,6 +149,24 @@ export interface FetchOpenAICompatibleModelsOptions<TApi extends Api> {
 }
 
 /**
+ * Resolves an endpoint for an implicit local provider without allowing an
+ * environment override to turn its keyless discovery into a remote request.
+ */
+export function resolveLoopbackOpenAIBaseUrl(value: string | undefined, fallback: string): string {
+	const candidate = value?.trim();
+	if (!candidate) return fallback;
+	try {
+		const parsed = new URL(candidate);
+		if ((parsed.protocol === "http:" || parsed.protocol === "https:") && isLoopbackHost(parsed.hostname)) {
+			return candidate;
+		}
+	} catch {
+		// Fall back to the fixed loopback endpoint below.
+	}
+	return fallback;
+}
+
+/**
  * Fetches and normalizes an OpenAI-compatible `/models` catalog.
  *
  * Returns `null` on transport/protocol failures.
@@ -125,10 +191,12 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 	const fetchImpl = options.fetch ?? globalThis.fetch;
 	let response: Response;
 	try {
-		response = await fetchImpl(`${baseUrl}${MODELS_PATH}`, {
+		response = await fetchImpl(buildModelsUrl(baseUrl), {
 			method: "GET",
 			headers: requestHeaders,
-			signal: options.signal,
+			signal: options.signal
+				? AbortSignal.any([options.signal, AbortSignal.timeout(5_000)])
+				: AbortSignal.timeout(5_000),
 		});
 	} catch {
 		return null;
@@ -144,7 +212,7 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 
 	let payload: unknown;
 	try {
-		payload = await response.json();
+		payload = JSON.parse(await readModelsResponse(response));
 	} catch {
 		return null;
 	}
@@ -162,6 +230,20 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 
 	const deduped = new Map<string, Model<TApi>>();
 	for (const entry of entries) {
+		if (!isSafeCatalogModelId(entry.id)) {
+			continue;
+		}
+		const rawContextWindow = firstPositiveModelNumber(
+			UNK_CONTEXT_WINDOW,
+			entry.max_model_len,
+			entry.context_length,
+			entry.context_window,
+			entry.max_context_length,
+			entry.max_position_embeddings,
+		);
+
+		const rawMaxTokens = firstPositiveModelNumber(UNK_MAX_TOKENS, entry.max_tokens, entry.max_output_tokens);
+
 		const defaults: Model<TApi> = {
 			id: entry.id,
 			name: typeof entry.name === "string" && entry.name.length > 0 ? entry.name : entry.id,
@@ -171,12 +253,12 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 			reasoning: false,
 			input: ["text"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: UNK_CONTEXT_WINDOW,
-			maxTokens: UNK_MAX_TOKENS,
+			contextWindow: rawContextWindow,
+			maxTokens: rawMaxTokens,
 		};
 
 		const mapped = options.mapModel?.(entry, defaults, context) ?? defaults;
-		if (!mapped || typeof mapped.id !== "string" || mapped.id.length === 0) {
+		if (!mapped || !isSafeCatalogModelId(mapped.id)) {
 			continue;
 		}
 		if (options.filterModel && !options.filterModel(entry, mapped)) {
@@ -188,12 +270,61 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 	return Array.from(deduped.values()).sort((left, right) => left.id.localeCompare(right.id));
 }
 
+async function readModelsResponse(response: Response): Promise<string> {
+	const contentLength = Number(response.headers.get("content-length"));
+	if (Number.isFinite(contentLength) && contentLength > MAX_MODELS_RESPONSE_BYTES) {
+		throw new Error("OpenAI-compatible models response exceeds the size limit");
+	}
+	if (!response.body) return "";
+	const reader = response.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (!value) continue;
+			total += value.byteLength;
+			if (total > MAX_MODELS_RESPONSE_BYTES) {
+				await reader.cancel();
+				throw new Error("OpenAI-compatible models response exceeds the size limit");
+			}
+			chunks.push(value);
+		}
+	} finally {
+		reader.releaseLock();
+	}
+	const body = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		body.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return new TextDecoder().decode(body);
+}
+
 function normalizeBaseUrl(baseUrl: string): string {
 	const trimmed = baseUrl.trim();
 	if (!trimmed) {
 		return "";
 	}
-	return trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+	try {
+		const parsed = new URL(trimmed);
+		parsed.pathname = parsed.pathname.replace(/\/+$/g, "");
+		return parsed.toString();
+	} catch {
+		return trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+	}
+}
+
+function buildModelsUrl(baseUrl: string): string {
+	try {
+		const parsed = new URL(baseUrl);
+		parsed.pathname = `${parsed.pathname.replace(/\/+$/g, "")}${MODELS_PATH}`;
+		return parsed.toString();
+	} catch {
+		return `${baseUrl}${MODELS_PATH}`;
+	}
 }
 
 function extractModelEntries(payload: unknown): ParsedOpenAICompatibleModelRecord[] | null {
@@ -227,4 +358,22 @@ function extractModelEntriesFromNode(node: unknown): ParsedOpenAICompatibleModel
 	}
 
 	return null;
+}
+
+/**
+ * First positive safe integer among candidates, else the fallback.
+ *
+ * Rejects non-numbers, non-finite values (JSON `1e400` parses to `Infinity`),
+ * fractions, values outside the safe integer range, zero, and negatives so a
+ * malformed catalog field can never poison compaction thresholds or output
+ * budgets.
+ */
+function firstPositiveModelNumber(fallback: number, ...candidates: readonly unknown[]): number {
+	for (const candidate of candidates) {
+		const value = toNumber(candidate);
+		if (value !== undefined && Number.isSafeInteger(value) && value > 0) {
+			return value;
+		}
+	}
+	return fallback;
 }

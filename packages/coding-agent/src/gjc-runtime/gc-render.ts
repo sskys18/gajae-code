@@ -8,10 +8,10 @@ import { GC_STORES } from "./gc-runtime";
 
 const STORE_HEADINGS: Record<GcStore, string> = {
 	harness_leases: "Harness owner leases",
-	team_workers: "Team workers",
 	file_locks: "Config file-locks",
 	tmux_sessions: "Tmux sessions",
 	registry_entries: "Harness-root registry entries",
+	local_roots: "Session local roots",
 };
 
 function actionLabel(record: GcRecord): string {
@@ -39,7 +39,11 @@ function renderRecord(record: GcRecord): string {
 
 export function buildGcReportText(report: GcReport): string {
 	const lines: string[] = [];
-	lines.push(report.dry_run ? "gjc gc — dry run (no changes made; pass --prune to remove)" : "gjc gc — prune");
+	if (report.operation === "repair_session_index") {
+		lines.push("gjc gc — session-index repair (other stores are report-only)");
+	} else {
+		lines.push(report.dry_run ? "gjc gc — dry run (no changes made; pass --prune to remove)" : "gjc gc — prune");
+	}
 	lines.push("");
 
 	for (const store of GC_STORES) {
@@ -53,6 +57,72 @@ export function buildGcReportText(report: GcReport): string {
 		lines.push("");
 	}
 
+	if (report.session_index) {
+		const index = report.session_index;
+		lines.push(`Session index: ${index.status}; valid prefix sequence=${index.valid_prefix_seq}`);
+		if (index.quarantine_path) lines.push(`  Quarantined suffix: ${index.quarantine_path}`);
+		if (index.reason) lines.push(`  ${index.reason}`);
+		if (index.status === "corrupt")
+			lines.push("  Run `gjc gc --repair-session-index` to quarantine the corrupt suffix.");
+		if (index.status === "unsupported")
+			lines.push("  Upgrade GJC before attempting a repair; no index data was changed.");
+		if (index.status === "repaired")
+			lines.push("  Restart or re-register hosts whose only registration was in the quarantined suffix.");
+		lines.push("");
+	}
+
+	if (report.session_scope) {
+		const scope = report.session_scope;
+		const mib = (bytes: number) => (bytes / (1024 * 1024)).toFixed(1);
+		const headline =
+			scope.status === "over_limit"
+				? "Session scope is OVER the managed budget — new sessions in this directory will fail to start"
+				: "Session scope is approaching the managed budget";
+		lines.push(headline);
+		lines.push(
+			`  ${mib(scope.total_bytes)} MiB of ${mib(scope.limit_bytes)} MiB across ${scope.entries} entries` +
+				`${scope.truncated ? " (walk truncated; totals are a floor)" : ""}`,
+		);
+		lines.push(`  ${scope.path}`);
+		lines.push("  gc does not reclaim session records; move stale session directories out of the scope by hand.");
+		lines.push("");
+	}
+
+	if (report.empty_delete_receipts) {
+		const empty = report.empty_delete_receipts;
+		lines.push(`Empty .gjc-delete receipts (${empty.records.length})`);
+		if (empty.records.length === 0) {
+			lines.push("  (none)");
+		} else {
+			for (const record of empty.records) {
+				const action = record.action === "would_remove" ? "would remove" : record.action;
+				lines.push(`  [${action}] ${record.path} :: ${record.reason}`);
+				if (record.retainedPaths) {
+					const retained = [
+						["detached", record.retainedPaths.detached],
+						["successor", record.retainedPaths.successor],
+						["placeholder", record.retainedPaths.placeholder],
+						["unknown", record.retainedPaths.unknown],
+					].filter((entry): entry is [string, string] => entry[1] !== undefined);
+					if (retained.length > 0)
+						lines.push(`    retained: ${retained.map(([kind, p]) => `${kind}=${p}`).join(" ")}`);
+				}
+			}
+		}
+		for (const error of empty.errors) lines.push(`  [error] ${error}`);
+		lines.push(
+			`  Summary: roots=${empty.roots.length} would_remove=${empty.would_remove} removed=${empty.removed} ` +
+				`kept=${empty.kept} skipped=${empty.skipped} errors=${empty.errors.length}`,
+		);
+		lines.push("");
+	}
+
+	if (report.warnings.length > 0) {
+		lines.push(`Warnings (${report.warnings.length})`);
+		for (const warning of report.warnings) lines.push(`  [${warning.store}/${warning.scope}] ${warning.message}`);
+		lines.push("");
+	}
+
 	if (report.errors.length > 0) {
 		lines.push(`Errors (${report.errors.length})`);
 		for (const err of report.errors) lines.push(`  [${err.store}/${err.scope}] ${err.message}`);
@@ -63,7 +133,8 @@ export function buildGcReportText(report: GcReport): string {
 	lines.push(
 		`Summary: discovered=${c.discovered} stale=${c.stale} alive=${c.alive} eperm=${c.eperm} unknown=${c.unknown} ` +
 			`terminal_lifecycle=${c.terminal_lifecycle} unclassified=${c.unclassified} ` +
-			`${report.dry_run ? `would_remove=${c.would_remove}` : `removed=${c.removed} failed=${c.failed}`} errors=${c.errors}`,
+			`${report.dry_run ? `would_remove=${c.would_remove}` : `removed=${c.removed} failed=${c.failed}`} ` +
+			`errors=${c.errors} warnings=${report.warnings.length}`,
 	);
 	lines.push("");
 	return `${lines.join("\n")}`;

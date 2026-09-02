@@ -25,7 +25,7 @@
 import { structuredCloneJSON } from "@gajae-code/utils";
 import type { ZodType } from "zod/v4";
 import type { $ZodIssue as ZodIssue } from "zod/v4/core";
-import type { Tool, ToolCall } from "../types";
+import type { RawArgumentRejectionCode, RawArgumentRejectionDetail, Tool, ToolCall } from "../types";
 import { upgradeJsonSchemaTo202012 } from "./schema/draft";
 import {
 	isJsonSchemaValueValid,
@@ -958,6 +958,52 @@ export function validateToolCall(tools: Tool[], toolCall: ToolCall): ToolCall["a
 	return validateToolArguments(tool, toolCall);
 }
 
+const RAW_ARGUMENT_REJECTION_MESSAGES: Record<RawArgumentRejectionCode, string> = {
+	"ask-deep-interview-question-body-required":
+		"deep-interview question bodies must contain a specific question, not a placeholder",
+	"ask-intent-review-requires-positive-round":
+		"deepInterview.intent_review is post-Round-0 only and requires a positive round",
+	"ask-intent-contract-requires-non-empty-authority":
+		"deepInterview.intent_contract requires non-empty items and confirmation_options",
+	"ask-deep-interview-metadata-requires-deep-interview-gate":
+		"deepInterview metadata cannot be combined with a non-deep-interview workflowGate",
+	"ask-round-zero-metadata-requires-full-topology-fields":
+		"Round 0 review-topology deepInterview metadata requires every topology field; retry once with the named fields instead of re-sending the incomplete object",
+	"todo-write-unknown-root-key": "todo_write root accepts only an ops array of operation entries",
+	"todo-write-unknown-op-entry-key":
+		"todo_write operation entries accept only op, list, task, phase, items, and text keys",
+	"todo-write-unknown-op-value": "todo_write operation entries require a known op value",
+	"todo-write-done-drop-requires-target": "todo_write done and drop entries require a task or phase target",
+	"todo-write-unknown-init-entry-key": "todo_write init list entries accept only phase and items keys",
+};
+
+/** Bounds on model-supplied text echoed back into a rejection message. */
+const MAX_REJECTED_KEYS = 8;
+const MAX_REJECTED_KEY_LENGTH = 64;
+const MAX_REJECTION_HINT_LENGTH = 200;
+
+function clamp(value: string, limit: number): string {
+	return value.length > limit ? `${value.slice(0, limit)}…` : value;
+}
+
+/**
+ * Renders the offending keys (and an exact correction, when the rejecting
+ * contract supplied one) as a clause appended to the fixed per-code guidance.
+ * Returns undefined when there is nothing concrete to name.
+ */
+function formatRejectionDetail(detail: RawArgumentRejectionDetail): string | undefined {
+	const keys = Array.isArray(detail.rejectedKeys)
+		? detail.rejectedKeys.filter(key => typeof key === "string" && key.length > 0).slice(0, MAX_REJECTED_KEYS)
+		: [];
+	const hint = typeof detail.hint === "string" && detail.hint.length > 0 ? detail.hint : undefined;
+	if (keys.length === 0) return hint ? clamp(hint, MAX_REJECTION_HINT_LENGTH) : undefined;
+
+	const label = keys.length === 1 ? "rejected key" : "rejected keys";
+	const rendered = keys.map(key => `"${clamp(key, MAX_REJECTED_KEY_LENGTH)}"`).join(", ");
+	const suffix = hint ? ` (${clamp(hint, MAX_REJECTION_HINT_LENGTH)})` : "";
+	return `${label}: ${rendered}${suffix}`;
+}
+
 /**
  * Validates tool call arguments against the tool's schema (Zod or plain JSON
  * Schema). Applies LLM-quirk coercions (numeric strings, JSON-string
@@ -967,13 +1013,28 @@ export function validateToolCall(tools: Tool[], toolCall: ToolCall): ToolCall["a
  */
 export function validateToolArguments(tool: Tool, toolCall: ToolCall): ToolCall["arguments"] {
 	const originalArgs = toolCall.arguments;
+	const rawValidation = tool.rawArgumentValidation?.(originalArgs);
+	if (rawValidation?.outcome === "reject") {
+		const base = `Validation failed for tool "${toolCall.name}": raw arguments rejected before coercion`;
+		const code = rawValidation.code;
+		const correction =
+			typeof code === "string" && Object.hasOwn(RAW_ARGUMENT_REJECTION_MESSAGES, code)
+				? RAW_ARGUMENT_REJECTION_MESSAGES[code as RawArgumentRejectionCode]
+				: undefined;
+		if (!correction) throw new Error(base);
+		// Detail is only echoed alongside authority-controlled guidance, and only
+		// after clamping — the keys themselves come from the rejected payload.
+		const detail = rawValidation.detail ? formatRejectionDetail(rawValidation.detail) : undefined;
+		throw new Error(detail ? `${base}; ${correction}; ${detail}` : `${base}; ${correction}`);
+	}
+	const rawArgs = rawValidation?.outcome === "accept" ? rawValidation.arguments : originalArgs;
 	const ctx = getValidationContext(tool);
 	const { json } = ctx;
 
 	// Always normalize first — strip null and string "null" from optional
 	// fields and substitute defaults. Handles LLM outputting string "null"
 	// to mean "no value" even when validation would otherwise pass.
-	let normalizedArgs: unknown = originalArgs;
+	let normalizedArgs: unknown = rawArgs;
 	let changed = false;
 	const initialNormalization = normalizeOptionalNullsForSchema(json, normalizedArgs);
 	if (initialNormalization.changed) {

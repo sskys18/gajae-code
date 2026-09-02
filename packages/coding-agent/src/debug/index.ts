@@ -3,14 +3,25 @@
  *
  * Provides tools for debugging, bug report generation, and system diagnostics.
  */
+
 import * as fs from "node:fs/promises";
 import * as url from "node:url";
-import { getWorkProfile } from "@gajae-code/natives";
+import type { getWorkProfile as getWorkProfileFn } from "@gajae-code/natives";
+
+let nativeGetWorkProfile: typeof getWorkProfileFn | undefined;
+
+function getWorkProfileNative(...args: Parameters<typeof getWorkProfileFn>): ReturnType<typeof getWorkProfileFn> {
+	nativeGetWorkProfile ??= (require("@gajae-code/natives") as { getWorkProfile: typeof getWorkProfileFn })
+		.getWorkProfile;
+	return nativeGetWorkProfile(...args);
+}
+
 import { Container, Loader, type SelectItem, SelectList, Spacer, Text } from "@gajae-code/tui";
 import { getSessionsDir } from "@gajae-code/utils";
 import { DynamicBorder } from "../modes/components/dynamic-border";
 import { getSelectListTheme, getSymbolTheme, theme } from "../modes/theme/theme";
 import type { InteractiveModeContext } from "../modes/types";
+import { suspendInteractiveActivityIndicator } from "../modes/types";
 import { formatBytes } from "../tools/render-utils";
 import { openPath } from "../utils/open";
 import { DebugLogViewerComponent } from "./log-viewer";
@@ -77,10 +88,12 @@ export class DebugSelectorComponent extends Container {
 	}
 
 	handleInput(keyData: string): void {
+		if (this.ctx.isStopped?.()) return;
 		this.#selectList.handleInput(keyData);
 	}
 
 	async #handleSelection(value: string): Promise<void> {
+		if (this.ctx.isStopped?.()) return;
 		switch (value) {
 			case "open-artifacts":
 				await this.#handleOpenArtifacts();
@@ -115,12 +128,23 @@ export class DebugSelectorComponent extends Container {
 		}
 	}
 
+	#finishStatusLoader(loader: Loader, releaseActivityIndicator: () => void): void {
+		loader.stop();
+		if (!this.ctx.isStopped?.()) this.ctx.statusContainer.clear();
+		releaseActivityIndicator();
+	}
+
 	async #handlePerformanceReport(): Promise<void> {
 		// Start profiling
 		let session: ProfilerSession;
 		try {
 			session = await startCpuProfile();
+			if (this.ctx.isStopped?.()) {
+				await session.stop().catch(() => {});
+				return;
+			}
 		} catch (err) {
+			if (this.ctx.isStopped?.()) return;
 			this.ctx.showError(`Failed to start profiler: ${err instanceof Error ? err.message : String(err)}`);
 			return;
 		}
@@ -151,9 +175,17 @@ export class DebugSelectorComponent extends Container {
 			resolve();
 		};
 
-		await promise;
+		const stopped = Promise.withResolvers<void>();
+		const unsubscribeStop = this.ctx.onStop?.(() => stopped.resolve());
+		const stopWon = await Promise.race([promise.then(() => false), stopped.promise.then(() => true)]);
+		unsubscribeStop?.();
+		if (stopWon || this.ctx.isStopped?.()) {
+			await session.stop().catch(() => {});
+			return;
+		}
 
 		// Stop profiling and create report
+		const releaseActivityIndicator = suspendInteractiveActivityIndicator(this.ctx);
 		const loader = new Loader(
 			this.ctx.ui,
 			spinner => theme.fg("accent", spinner),
@@ -166,7 +198,7 @@ export class DebugSelectorComponent extends Container {
 
 		try {
 			const cpuProfile = await session.stop();
-			const workProfile = getWorkProfile(30);
+			const workProfile = getWorkProfileNative(30);
 			const result = await createReportBundle({
 				sessionFile: this.ctx.sessionManager.getSessionFile(),
 				settings: this.#getResolvedSettings(),
@@ -174,8 +206,8 @@ export class DebugSelectorComponent extends Container {
 				workProfile,
 			});
 
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.#finishStatusLoader(loader, releaseActivityIndicator);
+			if (this.ctx.isStopped?.()) return;
 
 			this.ctx.chatContainer.addChild(new Spacer(1));
 			this.ctx.chatContainer.addChild(
@@ -184,8 +216,8 @@ export class DebugSelectorComponent extends Container {
 			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", formatFileHyperlink(result.path)), 1, 0));
 			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", `Files: ${result.files.length}`), 1, 0));
 		} catch (err) {
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.#finishStatusLoader(loader, releaseActivityIndicator);
+			if (this.ctx.isStopped?.()) return;
 			this.ctx.showError(`Failed to create report: ${err instanceof Error ? err.message : String(err)}`);
 		}
 
@@ -194,7 +226,7 @@ export class DebugSelectorComponent extends Container {
 
 	async #handleWorkReport(): Promise<void> {
 		try {
-			const workProfile = getWorkProfile(30);
+			const workProfile = getWorkProfileNative(30);
 
 			if (!workProfile.svg) {
 				this.ctx.showWarning(`No work profile data (${workProfile.sampleCount} samples)`);
@@ -219,6 +251,7 @@ export class DebugSelectorComponent extends Container {
 	}
 
 	async #handleDumpReport(): Promise<void> {
+		const releaseActivityIndicator = suspendInteractiveActivityIndicator(this.ctx);
 		const loader = new Loader(
 			this.ctx.ui,
 			spinner => theme.fg("accent", spinner),
@@ -235,8 +268,8 @@ export class DebugSelectorComponent extends Container {
 				settings: this.#getResolvedSettings(),
 			});
 
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.#finishStatusLoader(loader, releaseActivityIndicator);
+			if (this.ctx.isStopped?.()) return;
 
 			this.ctx.chatContainer.addChild(new Spacer(1));
 			this.ctx.chatContainer.addChild(
@@ -245,8 +278,8 @@ export class DebugSelectorComponent extends Container {
 			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", formatFileHyperlink(result.path)), 1, 0));
 			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", `Files: ${result.files.length}`), 1, 0));
 		} catch (err) {
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.#finishStatusLoader(loader, releaseActivityIndicator);
+			if (this.ctx.isStopped?.()) return;
 			this.ctx.showError(`Failed to create report: ${err instanceof Error ? err.message : String(err)}`);
 		}
 
@@ -254,6 +287,7 @@ export class DebugSelectorComponent extends Container {
 	}
 
 	async #handleMemoryReport(): Promise<void> {
+		const releaseActivityIndicator = suspendInteractiveActivityIndicator(this.ctx);
 		const loader = new Loader(
 			this.ctx.ui,
 			spinner => theme.fg("accent", spinner),
@@ -274,8 +308,8 @@ export class DebugSelectorComponent extends Container {
 				heapSnapshot,
 			});
 
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.#finishStatusLoader(loader, releaseActivityIndicator);
+			if (this.ctx.isStopped?.()) return;
 
 			this.ctx.chatContainer.addChild(new Spacer(1));
 			this.ctx.chatContainer.addChild(
@@ -284,8 +318,8 @@ export class DebugSelectorComponent extends Container {
 			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", formatFileHyperlink(result.path)), 1, 0));
 			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", `Files: ${result.files.length}`), 1, 0));
 		} catch (err) {
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.#finishStatusLoader(loader, releaseActivityIndicator);
+			if (this.ctx.isStopped?.()) return;
 			this.ctx.showError(`Failed to create report: ${err instanceof Error ? err.message : String(err)}`);
 		}
 
@@ -293,9 +327,27 @@ export class DebugSelectorComponent extends Container {
 	}
 
 	async #handleViewLogs(): Promise<void> {
+		// The selector restores the reusable composer synchronously before this
+		// async operation starts. Capture both the exact mounted child and the
+		// container revision so a stale completion cannot mistake a newer
+		// non-Container owner (RawSSE/Input) for the composer, or reclaim the
+		// same composer after a newer overlay has already opened and closed.
+		const expectedComposerMount =
+			this.ctx.editorContainer.children.length === 1 ? this.ctx.editorContainer.children[0] : undefined;
+		const expectedMountRevision = this.ctx.editorContainer.getRenderRevision();
 		try {
 			const logSource = await createDebugLogSource();
 			const logs = await logSource.getInitialText();
+			// The awaits above leave a window where a newer overlay can take over
+			// the editor container (or the UI can stop). Mount only when the exact
+			// child and the mount revision captured before the awaits still match.
+			if (
+				expectedComposerMount === undefined ||
+				this.ctx.editorContainer.getRenderRevision() !== expectedMountRevision ||
+				this.ctx.editorContainer.children.length !== 1 ||
+				this.ctx.editorContainer.children[0] !== expectedComposerMount
+			)
+				return;
 			if (!logs && !logSource.hasOlderLogs()) {
 				this.ctx.showWarning("No log entries found for today.");
 				return;
@@ -311,6 +363,10 @@ export class DebugSelectorComponent extends Container {
 				logSource,
 			});
 
+			// The composer is reusable across overlays; detach it before clearing
+			// so clear() disposes only the transient viewer, not the editor's
+			// tab-width listener (disposal is terminal).
+			this.ctx.editorContainer.detachChild(this.ctx.editor);
 			this.ctx.editorContainer.clear();
 			this.ctx.editorContainer.addChild(viewer);
 			this.ctx.ui.setFocus(viewer);
@@ -330,6 +386,10 @@ export class DebugSelectorComponent extends Container {
 			onUpdate: () => this.ctx.ui.requestRender(),
 		});
 
+		// The composer is reusable across overlays; detach it before clearing
+		// so clear() disposes only the transient viewer, not the editor's
+		// tab-width listener (disposal is terminal).
+		this.ctx.editorContainer.detachChild(this.ctx.editor);
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(viewer);
 		this.ctx.ui.setFocus(viewer);
@@ -405,6 +465,7 @@ export class DebugSelectorComponent extends Container {
 		}
 
 		// Clear cache
+		const releaseActivityIndicator = suspendInteractiveActivityIndicator(this.ctx);
 		const loader = new Loader(
 			this.ctx.ui,
 			spinner => theme.fg("accent", spinner),
@@ -418,8 +479,8 @@ export class DebugSelectorComponent extends Container {
 		try {
 			const result = await clearArtifactCache(sessionsDir, 30);
 
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.#finishStatusLoader(loader, releaseActivityIndicator);
+			if (this.ctx.isStopped?.()) return;
 
 			this.ctx.chatContainer.addChild(new Spacer(1));
 			this.ctx.chatContainer.addChild(
@@ -430,8 +491,8 @@ export class DebugSelectorComponent extends Container {
 				),
 			);
 		} catch (err) {
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.#finishStatusLoader(loader, releaseActivityIndicator);
+			if (this.ctx.isStopped?.()) return;
 			this.ctx.showError(`Failed to clear cache: ${err instanceof Error ? err.message : String(err)}`);
 		}
 
@@ -443,7 +504,7 @@ export class DebugSelectorComponent extends Container {
 		return {
 			model: this.ctx.session.model?.id,
 			thinkingLevel: this.ctx.session.thinkingLevel,
-			planModeEnabled: this.ctx.planModeEnabled,
+			planModeEnabled: this.ctx.planModeController.enabled,
 			toolOutputExpanded: this.ctx.toolOutputExpanded,
 			hideThinkingBlock: this.ctx.hideThinkingBlock,
 		};

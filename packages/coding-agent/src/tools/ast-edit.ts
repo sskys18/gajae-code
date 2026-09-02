@@ -1,15 +1,15 @@
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import { type AstReplaceChange, type AstReplaceFileChange, astEdit } from "@gajae-code/natives";
+import type { AstReplaceChange, AstReplaceFileChange, astEdit as astEditFn } from "@gajae-code/natives";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
-import { $envpos, prompt, untilAborted } from "@gajae-code/utils";
+import { $pickenvpos, prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { computeLineHash, HL_BODY_SEP } from "../hashline/hash";
 import type { Theme } from "../modes/theme/theme";
 import astEditDescription from "../prompts/tools/ast-edit.md" with { type: "text" };
-import { assertWorkflowMutationRawPathsAllowed } from "../skill-state/deep-interview-mutation-guard";
+import { assertWorkflowMutationRawPathsAllowed } from "../skill-state/workflow-mutation-guard";
 import { Ellipsis, fileHyperlink, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
@@ -34,6 +34,12 @@ import { queueResolveHandler } from "./resolve";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
+let astEditLoad: Promise<typeof astEditFn> | undefined;
+
+async function astEditNative(): Promise<typeof astEditFn> {
+	astEditLoad ??= Promise.resolve((require("@gajae-code/natives") as { astEdit: typeof astEditFn }).astEdit);
+	return await astEditLoad;
+}
 const astEditOpSchema = z.object({
 	pat: z.string().describe("ast pattern"),
 	out: z.string().describe("replacement template"),
@@ -79,7 +85,7 @@ async function runAstEditTargets(
 	let limitReached = false;
 	let applied = !options.dryRun;
 	for (const target of targets) {
-		const targetResult = await astEdit({
+		const targetResult = await (await astEditNative())({
 			rewrites: options.rewrites,
 			path: target.basePath,
 			glob: target.glob,
@@ -120,7 +126,7 @@ async function runAstEditTargets(
 	};
 }
 
-function runAstEditOnce(
+async function runAstEditOnce(
 	targets: Array<{ basePath: string; glob?: string }> | undefined,
 	resolvedSearchPath: string,
 	globFilter: string | undefined,
@@ -129,7 +135,7 @@ function runAstEditOnce(
 	if (targets) {
 		return runAstEditTargets(targets, resolvedSearchPath, options);
 	}
-	return astEdit({
+	return (await astEditNative())({
 		rewrites: options.rewrites,
 		path: resolvedSearchPath,
 		glob: globFilter,
@@ -199,12 +205,14 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				seenPatterns.add(pat);
 			}
 			const normalizedRewrites = Object.fromEntries(ops);
-			const maxFiles = $envpos("PI_MAX_AST_FILES", 1000);
+			const maxFiles = $pickenvpos(["GJC_MAX_AST_FILES", "PI_MAX_AST_FILES"], 1000);
 
 			const scope = await resolveToolSearchScope({
 				rawPaths: params.paths,
 				cwd: this.session.cwd,
 				getArtifactsDir: this.session.getArtifactsDir,
+				mcpManager: this.session.getMcpManager?.(),
+				getAuthorizedArtifactsDirs: this.session.getAuthorizedArtifactsDirs,
 				internalUrlAction: "rewrite",
 			});
 			const { searchPath: resolvedSearchPath, scopePath, isDirectory, multiTargets, globFilter } = scope;

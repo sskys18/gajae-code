@@ -25,49 +25,44 @@ describe("GJC utility extensibility quarantine", () => {
 		expect(registry).toContain("BUILTIN_SLASH_COMMAND_LOOKUP.set(command.name, command)");
 	});
 
-	it("deletes approved non-critical slash command implementations", async () => {
+	it("keeps the explicitly contracted local customization dashboard out of utility surfaces", async () => {
 		const registry = await source("slash-commands", "builtin-registry.ts");
 		for (const removedCommand of [
-			"extensions",
 			"marketplace",
 			"plugins",
 			"reload-plugins",
 			"plan",
 			"share",
 			"todo",
-			"changelog",
 			"branch",
 			"fork",
-			"handoff",
 			"force",
+			// `quit` stays a non-standalone command: `/quit` is a TUI alias of
+			// `/exit`, verified in slash-command-builtin-registry.test.ts.
 			"quit",
 			"loop",
 		]) {
 			expect(registry).not.toContain(`name: "${removedCommand}"`);
 		}
+		const extensions = registry.match(/\{\s*name: "extensions",([\s\S]*?)\n\t\},/);
+		expect(extensions?.[1]).toContain("handleTui:");
+		expect(extensions?.[1]).not.toContain("handle:");
+		expect(extensions?.[1]).not.toContain("localHeadless:");
+		// `/changelog` was restored as a first-class built-in (see CHANGELOG
+		// Unreleased), so it is intentionally no longer in the removed set above.
+		expect(registry).toContain(`name: "changelog"`);
+		// `/handoff` was restored as a first-class built-in for issue #2736
+		// (generate a handoff document and continue in a new session), so it is
+		// intentionally no longer in the removed set above.
+		expect(registry).toContain(`name: "handoff"`);
 		expect(registry).toContain(`name: "ssh"`);
 		expect(registry).toContain(`name: "provider"`);
 		expect(await Bun.file(srcPath("slash-commands", "helpers", "marketplace-manager.ts")).exists()).toBe(false);
 		expect(await Bun.file(srcPath("slash-commands", "marketplace-install-parser.ts")).exists()).toBe(false);
 	});
 
-	it("does not parse CLI plugin, extension, hook, or skill-loading flags", async () => {
-		const args = await source("cli", "args.ts");
-		for (const removedFlag of [
-			"--plugin-dir",
-			"--extension",
-			"--hook",
-			"--no-extensions",
-			"--no-skills",
-			"--skills",
-		]) {
-			expect(args).not.toContain(`arg === "${removedFlag}"`);
-		}
-		expect(args).not.toContain("extensionFlags");
-	});
-
 	it("does not default-discover skills, extensions, custom commands, custom tools, plugins, or marketplaces", async () => {
-		const sdk = await source("sdk.ts");
+		const sdk = await source("sdk", "session.ts");
 		const main = await source("main.ts");
 		const settingsSchema = await source("config", "settings-schema.ts");
 

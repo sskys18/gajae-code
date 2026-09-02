@@ -62,6 +62,12 @@
 							"sendSessionHeaders": {
 								"type": "boolean"
 							},
+							"supportsResponsesSessionAffinity": {
+								"type": "boolean"
+							},
+							"supportsServiceTier": {
+								"type": "boolean"
+							},
 							"supportsMultipleSystemMessages": {
 								"type": "boolean"
 							},
@@ -214,6 +220,17 @@
 									"all_strict",
 									"none"
 								]
+							},
+							"supportsLongCacheRetention": {
+								"type": "boolean"
+							},
+							"promptCacheMode": {
+								"type": "string",
+								"enum": [
+									"none",
+									"explicit",
+									"automatic"
+								]
 							}
 						},
 						"additionalProperties": false
@@ -246,8 +263,30 @@
 									"ollama",
 									"llama.cpp",
 									"lm-studio",
-									"openai-models-list"
+									"omlx",
+									"vllm",
+									"sglang",
+									"openai-models-list",
+									"models-dev"
 								]
+							},
+							"apiByModelPrefix": {
+								"type": "object",
+								"propertyNames": {
+									"type": "string",
+									"minLength": 1
+								},
+								"additionalProperties": {
+									"type": "string",
+									"enum": [
+										"openai-completions",
+										"anthropic-messages"
+									]
+								}
+							},
+							"modelsDevProvider": {
+								"type": "string",
+								"minLength": 1
 							}
 						},
 						"required": [
@@ -452,7 +491,9 @@
 									"type": "number"
 								},
 								"maxTokens": {
-									"type": "number"
+									"type": "integer",
+									"exclusiveMinimum": 0,
+									"maximum": 9007199254740991
 								},
 								"headers": {
 									"type": "object",
@@ -473,6 +514,12 @@
 											"type": "boolean"
 										},
 										"sendSessionHeaders": {
+											"type": "boolean"
+										},
+										"supportsResponsesSessionAffinity": {
+											"type": "boolean"
+										},
+										"supportsServiceTier": {
 											"type": "boolean"
 										},
 										"supportsMultipleSystemMessages": {
@@ -626,6 +673,17 @@
 											"enum": [
 												"all_strict",
 												"none"
+											]
+										},
+										"supportsLongCacheRetention": {
+											"type": "boolean"
+										},
+										"promptCacheMode": {
+											"type": "string",
+											"enum": [
+												"none",
+												"explicit",
+												"automatic"
 											]
 										}
 									},
@@ -824,7 +882,9 @@
 									"type": "number"
 								},
 								"maxTokens": {
-									"type": "number"
+									"type": "integer",
+									"exclusiveMinimum": 0,
+									"maximum": 9007199254740991
 								},
 								"headers": {
 									"type": "object",
@@ -845,6 +905,12 @@
 											"type": "boolean"
 										},
 										"sendSessionHeaders": {
+											"type": "boolean"
+										},
+										"supportsResponsesSessionAffinity": {
+											"type": "boolean"
+										},
+										"supportsServiceTier": {
 											"type": "boolean"
 										},
 										"supportsMultipleSystemMessages": {
@@ -999,6 +1065,17 @@
 												"all_strict",
 												"none"
 											]
+										},
+										"supportsLongCacheRetention": {
+											"type": "boolean"
+										},
+										"promptCacheMode": {
+											"type": "string",
+											"enum": [
+												"none",
+												"explicit",
+												"automatic"
+											]
 										}
 									},
 									"additionalProperties": false
@@ -1114,8 +1191,20 @@
 						"type": "string"
 					},
 					"additionalProperties": {
-						"type": "string",
-						"minLength": 1
+						"anyOf": [
+							{
+								"type": "string",
+								"minLength": 1
+							},
+							{
+								"minItems": 1,
+								"type": "array",
+								"items": {
+									"type": "string",
+									"minLength": 1
+								}
+							}
+						]
 					}
 				},
 				"agentModelOverrides": {
@@ -1124,8 +1213,20 @@
 						"type": "string"
 					},
 					"additionalProperties": {
-						"type": "string",
-						"minLength": 1
+						"anyOf": [
+							{
+								"type": "string",
+								"minLength": 1
+							},
+							{
+								"minItems": 1,
+								"type": "array",
+								"items": {
+									"type": "string",
+									"minLength": 1
+								}
+							}
+						]
 					}
 				}
 			},
@@ -1164,7 +1265,6 @@
 				"type": "object",
 				"properties": {
 					"required_providers": {
-						"minItems": 1,
 						"type": "array",
 						"items": {
 							"type": "string",
@@ -1184,12 +1284,27 @@
 								"executor",
 								"architect",
 								"planner",
-								"critic"
+								"critic",
+								"image"
 							]
 						},
 						"additionalProperties": {
-							"type": "string",
-							"minLength": 1
+							"anyOf": [
+								{
+									"type": "string",
+									"minLength": 1,
+									"pattern": "^(?:[^,/]+\\/[^,]*[^,:]|[^/,]*[^/,:])$"
+								},
+								{
+									"minItems": 1,
+									"type": "array",
+									"items": {
+										"type": "string",
+										"minLength": 1,
+										"pattern": "^(?:[^,/]+\\/[^,]*[^,:]|[^/,]*[^/,:])$"
+									}
+								}
+							]
 						}
 					}
 				},

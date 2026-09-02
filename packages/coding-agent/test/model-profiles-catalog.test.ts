@@ -9,145 +9,359 @@ import {
 	recommendModelProfileForProvider,
 	resolveProfileBindings,
 } from "@gajae-code/coding-agent/config/model-profiles";
-import { parseModelString } from "@gajae-code/coding-agent/config/model-resolver";
+import { parseModelString, splitSelectorThinkingSuffix } from "@gajae-code/coding-agent/config/model-resolver";
 import { ProfileModelSelectorSchema } from "@gajae-code/coding-agent/config/models-config-schema";
 import modelsJson from "../../ai/src/models.json";
+import { type ModelSelectorValue, normalizeModelSelectorValue, selectorHead } from "../src/config/model-selector-value";
 
 type Role = "default" | "executor" | "planner" | "critic" | "architect";
 
 const roles: Role[] = ["default", "executor", "planner", "critic", "architect"];
 
-const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mapping: Record<Role, string> }> = [
+const expectedProfiles: Array<{
+	name: string;
+	requiredProviders: string[];
+	mapping: Record<Role, ModelSelectorValue>;
+}> = [
 	{
 		name: "codex-eco",
 		requiredProviders: ["openai-codex"],
 		mapping: {
-			default: "openai-codex/gpt-5.5:low",
-			executor: "openai-codex/gpt-5.5:minimal",
-			planner: "openai-codex/gpt-5.5:low",
-			critic: "openai-codex/gpt-5.5:medium",
-			architect: "openai-codex/gpt-5.5:high",
+			default: "openai-codex/gpt-5.6-terra:low",
+			executor: "openai-codex/gpt-5.6-luna:low",
+			planner: "openai-codex/gpt-5.6-luna:high",
+			critic: "openai-codex/gpt-5.6-terra:xhigh",
+			architect: "openai-codex/gpt-5.6-terra:high",
 		},
 	},
 	{
 		name: "codex-medium",
 		requiredProviders: ["openai-codex"],
 		mapping: {
-			default: "openai-codex/gpt-5.5:medium",
-			executor: "openai-codex/gpt-5.5:low",
-			planner: "openai-codex/gpt-5.5:medium",
-			critic: "openai-codex/gpt-5.5:high",
-			architect: "openai-codex/gpt-5.5:xhigh",
+			default: "openai-codex/gpt-5.6-sol:low",
+			executor: "openai-codex/gpt-5.6-terra:low",
+			planner: "openai-codex/gpt-5.6-terra:high",
+			critic: "openai-codex/gpt-5.6-sol:xhigh",
+			architect: "openai-codex/gpt-5.6-sol:high",
 		},
 	},
 	{
 		name: "codex-pro",
 		requiredProviders: ["openai-codex"],
 		mapping: {
-			default: "openai-codex/gpt-5.5:xhigh",
-			executor: "openai-codex/gpt-5.5:medium",
-			planner: "openai-codex/gpt-5.5:high",
-			critic: "openai-codex/gpt-5.5:xhigh",
-			architect: "openai-codex/gpt-5.5:xhigh",
+			default: "openai-codex/gpt-5.6-sol:medium",
+			executor: "openai-codex/gpt-5.6-terra:medium",
+			planner: "openai-codex/gpt-5.6-sol:high",
+			critic: "openai-codex/gpt-5.6-sol:max",
+			architect: "openai-codex/gpt-5.6-sol:xhigh",
+		},
+	},
+	{
+		name: "lunamaxxing",
+		requiredProviders: ["openai-codex"],
+		mapping: {
+			default: "openai-codex/gpt-5.6-luna:medium",
+			executor: "openai-codex/gpt-5.6-luna:xhigh",
+			planner: "openai-codex/gpt-5.6-luna:max",
+			critic: "openai-codex/gpt-5.6-luna:max",
+			architect: "openai-codex/gpt-5.6-luna:max",
+		},
+	},
+	{
+		name: "macos-omlx-fast",
+		requiredProviders: ["omlx"],
+		mapping: {
+			default: "omlx/Qwen3.6-35B-A3B-4bit:low",
+			executor: "omlx/Qwen3.6-35B-A3B-4bit:low",
+			architect: "omlx/Qwen3.6-35B-A3B-4bit:high",
+			planner: "omlx/Qwen3.6-35B-A3B-4bit:medium",
+			critic: "omlx/Qwen3.6-35B-A3B-4bit:high",
+		},
+	},
+	{
+		name: "macos-omlx-balanced",
+		requiredProviders: ["omlx"],
+		mapping: {
+			default: "omlx/Qwen3.6-35B-A3B-8bit:low",
+			executor: "omlx/Qwen3.6-35B-A3B-8bit:low",
+			architect: "omlx/Qwen3.6-35B-A3B-8bit:high",
+			planner: "omlx/Qwen3.6-35B-A3B-8bit:medium",
+			critic: "omlx/Qwen3.6-35B-A3B-8bit:high",
+		},
+	},
+	{
+		name: "macos-omlx-quality",
+		requiredProviders: ["omlx"],
+		mapping: {
+			default: "omlx/Qwen3.6-35B-A3B-8bit:low",
+			executor: "omlx/Qwen3.6-35B-A3B-8bit:low",
+			architect: "omlx/Qwen3.6-35B-A3B-8bit:high",
+			planner: "omlx/Qwen3.6-35B-A3B-8bit:medium",
+			critic: "omlx/Qwen3.8-27B-8bit:high",
+		},
+	},
+	{
+		name: "macos-omlx-abliterated-fast",
+		requiredProviders: ["omlx"],
+		mapping: {
+			default: "omlx/Qwen3.8-27B-Uncensored-MLX-4bit:low",
+			executor: "omlx/Qwen3.8-27B-Uncensored-MLX-4bit:low",
+			architect: "omlx/Qwen3.8-27B-Uncensored-MLX-4bit:high",
+			planner: "omlx/Qwen3.8-27B-Uncensored-MLX-4bit:medium",
+			critic: "omlx/Qwen3.8-27B-Uncensored-MLX-4bit:high",
+		},
+	},
+	{
+		name: "macos-omlx-abliterated-balanced",
+		requiredProviders: ["omlx"],
+		mapping: {
+			default: "omlx/Qwen3.8-27B-Uncensored-MLX-4bit:low",
+			executor: "omlx/Qwen3.8-27B-Uncensored-MLX-4bit:low",
+			architect: "omlx/Qwen3.8-27B-Uncensored-MLX-4bit:high",
+			planner: "omlx/Qwen3.8-27B-Uncensored-MLX-4bit:medium",
+			critic: "omlx/Qwen3.8-27B-Uncensored-MLX-4bit:high",
 		},
 	},
 	{
 		name: "opencodego",
 		requiredProviders: ["opencode-go"],
 		mapping: {
-			default: "opencode-go/kimi-k2.6",
+			default: "opencode-go/kimi-k3",
 			executor: "opencode-go/deepseek-v4-flash",
-			planner: "opencode-go/qwen3.7-max",
+			planner: "opencode-go/kimi-k3",
 			critic: "opencode-go/mimo-v2.5-pro",
 			architect: "opencode-go/deepseek-v4-pro",
+		},
+	},
+	{
+		name: "commandcode-goat",
+		requiredProviders: ["commandcode-goat"],
+		mapping: {
+			default: "commandcode-goat/zai-org/GLM-5.3",
+			executor: "commandcode-goat/deepseek/deepseek-v4-flash",
+			planner: "commandcode-goat/moonshotai/Kimi-K3",
+			critic: "commandcode-goat/zai-org/GLM-5.2",
+			architect: "commandcode-goat/deepseek/deepseek-v4-pro",
+		},
+	},
+	{
+		name: "open-weights-glm",
+		requiredProviders: [],
+		mapping: {
+			default: "glm-5.2:medium",
+			executor: "glm-5.2:low",
+			planner: "glm-5.2:high",
+			critic: "glm-5.2:high",
+			architect: "glm-5.2:xhigh",
+		},
+	},
+	{
+		name: "open-weights-deepseek",
+		requiredProviders: [],
+		mapping: {
+			default: "deepseek-v4-flash:high",
+			executor: "deepseek-v4-flash:medium",
+			planner: "deepseek-v4-flash:high",
+			critic: "deepseek-v4-flash:xhigh",
+			architect: "deepseek-v4-flash:xhigh",
+		},
+	},
+	{
+		name: "open-weights-kimi",
+		requiredProviders: [],
+		mapping: {
+			default: "kimi-k3:high",
+			executor: "kimi-k3:high",
+			planner: "kimi-k3:xhigh",
+			critic: "kimi-k3:high",
+			architect: "kimi-k3:xhigh",
+		},
+	},
+	{
+		name: "open-weights-luna",
+		requiredProviders: [],
+		mapping: {
+			default: "gpt-5.6-luna:high",
+			executor: "gpt-5.6-luna:high",
+			planner: "gpt-5.6-luna:xhigh",
+			critic: "gpt-5.6-luna:xhigh",
+			architect: "gpt-5.6-luna:xhigh",
+		},
+	},
+	{
+		name: "open-weights-spark",
+		requiredProviders: [],
+		mapping: {
+			default: "muse-spark-1.2:medium",
+			executor: "muse-spark-1.2:low",
+			planner: "muse-spark-1.2:high",
+			critic: "muse-spark-1.2:high",
+			architect: "muse-spark-1.2:xhigh",
+		},
+	},
+	{
+		name: "open-weights-spark-deepseek",
+		requiredProviders: [],
+		mapping: {
+			default: "muse-spark-1.2:medium",
+			executor: "deepseek-v4-flash:high",
+			planner: "muse-spark-1.2:high",
+			critic: "muse-spark-1.2:high",
+			architect: "muse-spark-1.2:xhigh",
+		},
+	},
+	{
+		name: "open-weights-spark-luna",
+		requiredProviders: [],
+		mapping: {
+			default: "muse-spark-1.2:medium",
+			executor: "gpt-5.6-luna:high",
+			planner: "muse-spark-1.2:high",
+			critic: "muse-spark-1.2:high",
+			architect: "muse-spark-1.2:xhigh",
+		},
+	},
+	{
+		name: "open-weights-glm-deepseek",
+		requiredProviders: [],
+		mapping: {
+			default: "glm-5.2:medium",
+			executor: "deepseek-v4-flash:high",
+			planner: "glm-5.2:high",
+			critic: "deepseek-v4-flash:xhigh",
+			architect: "glm-5.2:xhigh",
+		},
+	},
+	{
+		name: "open-weights-kimi-deepseek",
+		requiredProviders: [],
+		mapping: {
+			default: "kimi-k3:high",
+			executor: "deepseek-v4-flash:high",
+			planner: "kimi-k3:xhigh",
+			critic: "deepseek-v4-flash:xhigh",
+			architect: "kimi-k3:xhigh",
+		},
+	},
+	{
+		name: "open-weights-kimi-glm",
+		requiredProviders: [],
+		mapping: {
+			default: "glm-5.2:high",
+			executor: "glm-5.2:high",
+			planner: "kimi-k3:high",
+			critic: "glm-5.2:xhigh",
+			architect: "kimi-k3:xhigh",
+		},
+	},
+	{
+		name: "open-weights-kimi-glm-deepseek",
+		requiredProviders: [],
+		mapping: {
+			default: "glm-5.2:medium",
+			executor: "deepseek-v4-flash:high",
+			planner: "kimi-k3:high",
+			critic: "glm-5.2:high",
+			architect: "kimi-k3:xhigh",
+		},
+	},
+	{
+		name: "open-weights-all",
+		requiredProviders: [],
+		mapping: {
+			default: "gpt-5.6-luna:high",
+			executor: "deepseek-v4-flash:high",
+			planner: "kimi-k3:high",
+			critic: "glm-5.2:high",
+			architect: "gpt-5.6-luna:xhigh",
 		},
 	},
 	{
 		name: "claude-opus",
 		requiredProviders: ["anthropic"],
 		mapping: {
-			default: "anthropic/claude-opus-4-8:xhigh",
+			default: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"],
 			executor: "anthropic/claude-sonnet-5",
-			planner: "anthropic/claude-opus-4-8:low",
-			critic: "anthropic/claude-opus-4-8:high",
-			architect: "anthropic/claude-opus-4-8:xhigh",
+			planner: ["anthropic/claude-opus-5:low", "anthropic/claude-opus-4-6:low"],
+			critic: ["anthropic/claude-opus-5:high", "anthropic/claude-opus-4-6:high"],
+			architect: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"],
 		},
 	},
 	{
 		name: "claude-fable",
 		requiredProviders: ["anthropic"],
 		mapping: {
-			default: "anthropic/claude-fable-5:xhigh",
+			default: "anthropic/claude-fable-5-1:xhigh",
 			executor: "anthropic/claude-sonnet-5",
-			planner: "anthropic/claude-fable-5:low",
-			critic: "anthropic/claude-fable-5:high",
-			architect: "anthropic/claude-fable-5:xhigh",
+			planner: "anthropic/claude-fable-5-1:low",
+			critic: "anthropic/claude-fable-5-1:high",
+			architect: "anthropic/claude-fable-5-1:xhigh",
 		},
 	},
 	{
 		name: "glm-eco",
 		requiredProviders: ["zai"],
 		mapping: {
-			default: "zai/glm-5.2:low",
-			executor: "zai/glm-5.2:minimal",
-			planner: "zai/glm-5.2:low",
-			critic: "zai/glm-5.2:medium",
-			architect: "zai/glm-5.2:high",
+			default: "zai/glm-5.3-flash:low",
+			executor: "zai/glm-5.3-flash:low",
+			planner: "zai/glm-5.3-flash:low",
+			critic: "zai/glm-5.3:high",
+			architect: "zai/glm-5.3:high",
 		},
 	},
 	{
 		name: "glm-medium",
 		requiredProviders: ["zai"],
 		mapping: {
-			default: "zai/glm-5.2:medium",
-			executor: "zai/glm-5.2:low",
-			planner: "zai/glm-5.2:medium",
-			critic: "zai/glm-5.2:high",
-			architect: "zai/glm-5.2:xhigh",
+			default: "zai/glm-5.3:high",
+			executor: "zai/glm-5.3-flash:low",
+			planner: "zai/glm-5.3:high",
+			critic: "zai/glm-5.3:high",
+			architect: "zai/glm-5.3:max",
 		},
 	},
 	{
 		name: "glm-pro",
 		requiredProviders: ["zai"],
 		mapping: {
-			default: "zai/glm-5.2:xhigh",
-			executor: "zai/glm-5.2:medium",
-			planner: "zai/glm-5.2:high",
-			critic: "zai/glm-5.2:xhigh",
-			architect: "zai/glm-5.2:xhigh",
+			default: "zai/glm-5.3:max",
+			executor: "zai/glm-5.3-flash:high",
+			planner: "zai/glm-5.3:high",
+			critic: "zai/glm-5.3:max",
+			architect: "zai/glm-5.3:max",
 		},
 	},
 	{
 		name: "kimi-coding-plan-eco",
 		requiredProviders: ["kimi-code"],
 		mapping: {
-			default: "kimi-code/kimi-k2.7-code:low",
-			executor: "kimi-code/kimi-k2.7-code:minimal",
-			planner: "kimi-code/kimi-k2.7-code:low",
-			critic: "kimi-code/kimi-k2.7-code:medium",
-			architect: "kimi-code/kimi-k2.7-code:high",
+			default: "kimi-code/k3:low",
+			executor: "kimi-code/k3:low",
+			planner: "kimi-code/k3:low",
+			critic: "kimi-code/k3:high",
+			architect: "kimi-code/k3:high",
 		},
 	},
 	{
 		name: "kimi-coding-plan-medium",
 		requiredProviders: ["kimi-code"],
 		mapping: {
-			default: "kimi-code/kimi-k2.7-code:medium",
-			executor: "kimi-code/kimi-k2.7-code:low",
-			planner: "kimi-code/kimi-k2.7-code:medium",
-			critic: "kimi-code/kimi-k2.7-code:high",
-			architect: "kimi-code/kimi-k2.7-code:xhigh",
+			default: "kimi-code/k3:high",
+			executor: "kimi-code/k3:low",
+			planner: "kimi-code/k3:high",
+			critic: "kimi-code/k3:high",
+			architect: "kimi-code/k3:max",
 		},
 	},
 	{
 		name: "kimi-coding-plan-pro",
 		requiredProviders: ["kimi-code"],
 		mapping: {
-			default: "kimi-code/kimi-k2.7-code:xhigh",
-			executor: "kimi-code/kimi-k2.7-code:medium",
-			planner: "kimi-code/kimi-k2.7-code:high",
-			critic: "kimi-code/kimi-k2.7-code:xhigh",
-			architect: "kimi-code/kimi-k2.7-code:xhigh",
+			default: "kimi-code/k3:max",
+			executor: "kimi-code/k3:high",
+			planner: "kimi-code/k3:high",
+			critic: "kimi-code/k3:max",
+			architect: "kimi-code/k3:max",
 		},
 	},
 	{
@@ -217,6 +431,72 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		},
 	},
 	{
+		name: "grok-45-eco",
+		requiredProviders: ["xai"],
+		mapping: {
+			default: "xai/grok-4.5:low",
+			executor: "xai/grok-4.5:low",
+			planner: "xai/grok-4.5:low",
+			critic: "xai/grok-4.5:medium",
+			architect: "xai/grok-4.5:high",
+		},
+	},
+	{
+		name: "grok-45-medium",
+		requiredProviders: ["xai"],
+		mapping: {
+			default: "xai/grok-4.5:medium",
+			executor: "xai/grok-4.5:low",
+			planner: "xai/grok-4.5:medium",
+			critic: "xai/grok-4.5:high",
+			architect: "xai/grok-4.5:high",
+		},
+	},
+	{
+		name: "grok-45-pro",
+		requiredProviders: ["xai"],
+		mapping: {
+			default: "xai/grok-4.5:high",
+			executor: "xai/grok-4.5:medium",
+			planner: "xai/grok-4.5:high",
+			critic: "xai/grok-4.5:high",
+			architect: "xai/grok-4.5:high",
+		},
+	},
+	{
+		name: "grok-46-eco",
+		requiredProviders: ["xai"],
+		mapping: {
+			default: "xai/grok-4.6:low",
+			executor: "xai/grok-4.6:low",
+			planner: "xai/grok-4.6:low",
+			critic: "xai/grok-4.6:medium",
+			architect: "xai/grok-4.6:high",
+		},
+	},
+	{
+		name: "grok-46-medium",
+		requiredProviders: ["xai"],
+		mapping: {
+			default: "xai/grok-4.6:medium",
+			executor: "xai/grok-4.6:low",
+			planner: "xai/grok-4.6:medium",
+			critic: "xai/grok-4.6:high",
+			architect: "xai/grok-4.6:high",
+		},
+	},
+	{
+		name: "grok-46-pro",
+		requiredProviders: ["xai"],
+		mapping: {
+			default: "xai/grok-4.6:xhigh",
+			executor: "xai/grok-4.6:medium",
+			planner: "xai/grok-4.6:high",
+			critic: "xai/grok-4.6:xhigh",
+			architect: "xai/grok-4.6:xhigh",
+		},
+	},
+	{
 		name: "grok-build-pro",
 		requiredProviders: ["grok-build"],
 		mapping: {
@@ -231,99 +511,154 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		name: "cursor-eco",
 		requiredProviders: ["cursor"],
 		mapping: {
-			default: "cursor/composer-1.5:low",
-			executor: "cursor/composer-1.5:minimal",
-			planner: "cursor/composer-1.5:low",
-			critic: "cursor/composer-1.5:medium",
-			architect: "cursor/composer-1.5:high",
+			default: "cursor/composer-2.5",
+			executor: "cursor/composer-2.5",
+			planner: "cursor/composer-2.5",
+			critic: "cursor/composer-2.5",
+			architect: "cursor/composer-2.5",
 		},
 	},
 	{
 		name: "cursor-medium",
 		requiredProviders: ["cursor"],
 		mapping: {
-			default: "cursor/composer-1.5:medium",
-			executor: "cursor/composer-1.5:low",
-			planner: "cursor/composer-1.5:medium",
-			critic: "cursor/composer-1.5:high",
-			architect: "cursor/composer-1.5:xhigh",
+			default: "cursor/composer-2.5",
+			executor: "cursor/composer-2.5-fast",
+			planner: "cursor/composer-2.5",
+			critic: "cursor/composer-2.5-fast",
+			architect: "cursor/composer-2.5-fast",
 		},
 	},
 	{
 		name: "cursor-pro",
 		requiredProviders: ["cursor"],
 		mapping: {
-			default: "cursor/composer-1.5:xhigh",
-			executor: "cursor/composer-1.5:medium",
-			planner: "cursor/composer-1.5:high",
-			critic: "cursor/composer-1.5:xhigh",
-			architect: "cursor/composer-1.5:xhigh",
+			default: "cursor/composer-2.5-fast",
+			executor: "cursor/composer-2.5-fast",
+			planner: "cursor/composer-2.5-fast",
+			critic: "cursor/composer-2.5-fast",
+			architect: "cursor/composer-2.5-fast",
 		},
 	},
 	{
 		name: "minimax-eco",
 		requiredProviders: ["minimax-code"],
 		mapping: {
-			default: "minimax-code/minimax-m3:low",
-			executor: "minimax-code/minimax-m3:minimal",
-			planner: "minimax-code/minimax-m3:low",
-			critic: "minimax-code/minimax-m3:medium",
-			architect: "minimax-code/minimax-m3:high",
+			default: "minimax-code/MiniMax-M3:low",
+			executor: "minimax-code/MiniMax-M3:minimal",
+			planner: "minimax-code/MiniMax-M3:low",
+			critic: "minimax-code/MiniMax-M3:medium",
+			architect: "minimax-code/MiniMax-M3:high",
 		},
 	},
 	{
 		name: "minimax-medium",
 		requiredProviders: ["minimax-code"],
 		mapping: {
-			default: "minimax-code/minimax-m3:medium",
-			executor: "minimax-code/minimax-m3:low",
-			planner: "minimax-code/minimax-m3:medium",
-			critic: "minimax-code/minimax-m3:high",
-			architect: "minimax-code/minimax-m3:xhigh",
+			default: "minimax-code/MiniMax-M3:medium",
+			executor: "minimax-code/MiniMax-M3:low",
+			planner: "minimax-code/MiniMax-M3:medium",
+			critic: "minimax-code/MiniMax-M3:high",
+			architect: "minimax-code/MiniMax-M3:xhigh",
 		},
 	},
 	{
 		name: "minimax-pro",
 		requiredProviders: ["minimax-code"],
 		mapping: {
-			default: "minimax-code/minimax-m3:xhigh",
-			executor: "minimax-code/minimax-m3:medium",
-			planner: "minimax-code/minimax-m3:high",
-			critic: "minimax-code/minimax-m3:xhigh",
-			architect: "minimax-code/minimax-m3:xhigh",
+			default: "minimax-code/MiniMax-M3:xhigh",
+			executor: "minimax-code/MiniMax-M3:medium",
+			planner: "minimax-code/MiniMax-M3:high",
+			critic: "minimax-code/MiniMax-M3:xhigh",
+			architect: "minimax-code/MiniMax-M3:xhigh",
+		},
+	},
+	{
+		name: "alibaba-token-plan-balanced",
+		requiredProviders: ["alibaba-token-plan"],
+		mapping: {
+			default: "alibaba-token-plan/qwen3.8-max-preview:medium",
+			executor: "alibaba-token-plan/deepseek-v4-pro:xhigh",
+			planner: "alibaba-token-plan/glm-5.2:high",
+			critic: "alibaba-token-plan/glm-5.2:high",
+			architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+		},
+	},
+	{
+		name: "alibaba-token-plan-pro",
+		requiredProviders: ["alibaba-token-plan"],
+		mapping: {
+			default: "alibaba-token-plan/qwen3.8-max-preview:medium",
+			executor: "alibaba-token-plan/deepseek-v4-flash-0731:max",
+			planner: "alibaba-token-plan/glm-5.2:high",
+			critic: "alibaba-token-plan/glm-5.2:xhigh",
+			architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+		},
+	},
+	{
+		name: "alibaba-token-plan-qwenmaxxing",
+		requiredProviders: ["alibaba-token-plan"],
+		mapping: {
+			default: "alibaba-token-plan/qwen3.8-max-preview:medium",
+			executor: "alibaba-token-plan/qwen3.8-max-preview:low",
+			planner: "alibaba-token-plan/qwen3.8-max-preview:medium",
+			critic: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+			architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+		},
+	},
+	{
+		name: "alibaba-token-plan-qwen-deepseek",
+		requiredProviders: ["alibaba-token-plan"],
+		mapping: {
+			default: "alibaba-token-plan/qwen3.8-max:high",
+			executor: "alibaba-token-plan/deepseek-v4-flash-0731:high",
+			planner: "alibaba-token-plan/deepseek-v4-flash-0731:max",
+			critic: "alibaba-token-plan/qwen3.8-max:xhigh",
+			architect: "alibaba-token-plan/qwen3.8-max:xhigh",
+		},
+	},
+	{
+		name: "alibaba-token-plan-glm-deepseek",
+		requiredProviders: ["alibaba-token-plan"],
+		mapping: {
+			default: "alibaba-token-plan/glm-5.2:high",
+			executor: "alibaba-token-plan/deepseek-v4-flash-0731:high",
+			planner: "alibaba-token-plan/deepseek-v4-flash-0731:max",
+			critic: "alibaba-token-plan/glm-5.2:xhigh",
+			architect: "alibaba-token-plan/glm-5.2:xhigh",
 		},
 	},
 	{
 		name: "opus-codex",
 		requiredProviders: ["anthropic", "openai-codex"],
 		mapping: {
-			default: "anthropic/claude-opus-4-8:xhigh",
-			executor: "openai-codex/gpt-5.5:low",
-			planner: "openai-codex/gpt-5.5:medium",
-			critic: "openai-codex/gpt-5.5:high",
-			architect: "openai-codex/gpt-5.5:xhigh",
+			default: "anthropic/claude-opus-5:xhigh",
+			executor: "openai-codex/gpt-5.6-terra:low",
+			planner: "anthropic/claude-sonnet-5",
+			critic: "openai-codex/gpt-5.6-sol:xhigh",
+			architect: "openai-codex/gpt-5.6-sol:high",
 		},
 	},
 	{
 		name: "codex-opencodego",
 		requiredProviders: ["openai-codex", "opencode-go"],
 		mapping: {
-			default: "openai-codex/gpt-5.5:medium",
+			default: "openai-codex/gpt-5.6-sol:low",
 			executor: "opencode-go/deepseek-v4-pro",
-			planner: "opencode-go/kimi-k2.6",
+			planner: "opencode-go/kimi-k3",
 			critic: "opencode-go/mimo-v2.5-pro",
-			architect: "openai-codex/gpt-5.5:xhigh",
+			architect: "openai-codex/gpt-5.6-sol:high",
 		},
 	},
 	{
 		name: "fable-opus-codex",
 		requiredProviders: ["anthropic", "openai-codex"],
 		mapping: {
-			default: "anthropic/claude-fable-5:high",
-			executor: "openai-codex/gpt-5.5:high",
-			planner: "anthropic/claude-opus-4-8:medium",
-			critic: "anthropic/claude-opus-4-8:high",
-			architect: "openai-codex/gpt-5.5:xhigh",
+			default: "anthropic/claude-fable-5-1:high",
+			executor: "openai-codex/gpt-5.6-terra:medium",
+			planner: "anthropic/claude-opus-5:medium",
+			critic: "anthropic/claude-opus-5:high",
+			architect: "openai-codex/gpt-5.6-sol:xhigh",
 		},
 	},
 ];
@@ -343,15 +678,70 @@ const oldNames = [
 	"fable-codex",
 ];
 
+const commandCodeGoatModels = new Set([
+	"zai-org/GLM-5.2",
+	"zai-org/GLM-5.3",
+	"deepseek/deepseek-v4-flash",
+	"deepseek/deepseek-v4-pro",
+	"moonshotai/Kimi-K3",
+]);
+const macosOmlxModels = new Set([
+	"Qwen3.6-35B-A3B-4bit",
+	"Qwen3.6-35B-A3B-8bit",
+	"Qwen3.8-27B-8bit",
+	"Qwen3.8-27B-Uncensored-MLX-4bit",
+]);
+
 function selectorExists(selector: string): boolean {
+	const selectorWithoutThinking = splitSelectorThinkingSuffix(selector).selector;
+	if (!selectorWithoutThinking.includes("/")) {
+		const alias = selectorWithoutThinking.trim().toLowerCase();
+		return Object.values(modelsJson as Record<string, Record<string, unknown>>).some(models =>
+			Object.keys(models).some(modelId => modelId.split("/").at(-1)?.toLowerCase() === alias),
+		);
+	}
 	const parsed = parseModelString(selector);
 	if (!parsed) return false;
 	if (parsed.provider === "grok-build") return ["grok-composer-2.5-fast", "grok-build"].includes(parsed.id);
+	if (parsed.provider === "commandcode-goat") return commandCodeGoatModels.has(parsed.id);
+	if (parsed.provider === "omlx") return macosOmlxModels.has(parsed.id);
 	return (modelsJson as Record<string, Record<string, unknown>>)[parsed.provider]?.[parsed.id] !== undefined;
 }
 
+function builtinMapping(name: string): Record<Role, string> {
+	const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === name);
+	if (!profile) throw new Error(`Missing built-in profile: ${name}`);
+	if (roles.some(role => profile.modelMapping[role] === undefined)) {
+		throw new Error(`Built-in profile is missing a role mapping: ${name}`);
+	}
+	return profile.modelMapping as Record<Role, string>;
+}
+
+function substituteCodexFamily(selector: string, source: "sol" | "terra", target: "terra" | "luna"): string {
+	const match = /^openai-codex\/gpt-5\.6-(sol|terra|luna):(.+)$/.exec(selector);
+	if (!match) throw new Error(`Expected GPT-5.6 Codex selector, got: ${selector}`);
+	return match[1] === source ? `openai-codex/gpt-5.6-${target}:${match[2]}` : selector;
+}
+
+const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> = {
+	"opus-codex": {
+		default: "anthropic/claude-opus-5:xhigh",
+		planner: "anthropic/claude-sonnet-5",
+	},
+	"codex-opencodego": {
+		executor: "opencode-go/deepseek-v4-pro",
+		planner: "opencode-go/kimi-k3",
+		critic: "opencode-go/mimo-v2.5-pro",
+	},
+	"fable-opus-codex": {
+		default: "anthropic/claude-fable-5-1:high",
+		planner: "anthropic/claude-opus-5:medium",
+		critic: "anthropic/claude-opus-5:high",
+	},
+};
+
 describe("built-in model profile catalog", () => {
-	test("contains exact 28-profile matrix cell-for-cell", () => {
+	test("contains exact 50-profile matrix cell-for-cell", () => {
 		expect(BUILTIN_MODEL_PROFILES.map(profile => profile.name)).toEqual(
 			expectedProfiles.map(profile => profile.name),
 		);
@@ -359,6 +749,118 @@ describe("built-in model profile catalog", () => {
 			const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === expected.name);
 			expect(profile?.requiredProviders).toEqual(expected.requiredProviders);
 			expect(profile?.modelMapping).toEqual(expected.mapping);
+		}
+	});
+
+	test("open-weight profiles use only provider-agnostic aliases", () => {
+		const profiles = BUILTIN_MODEL_PROFILES.filter(profile => profile.name.startsWith("open-weights-"));
+		expect(profiles.map(profile => profile.name)).toEqual([
+			"open-weights-glm",
+			"open-weights-deepseek",
+			"open-weights-kimi",
+			"open-weights-luna",
+			"open-weights-spark",
+			"open-weights-spark-deepseek",
+			"open-weights-spark-luna",
+			"open-weights-glm-deepseek",
+			"open-weights-kimi-deepseek",
+			"open-weights-kimi-glm",
+			"open-weights-kimi-glm-deepseek",
+			"open-weights-all",
+		]);
+		for (const profile of profiles) {
+			expect(profile.requiredProviders).toEqual([]);
+			for (const selectorValue of Object.values(profile.modelMapping)) {
+				for (const selector of normalizeModelSelectorValue(selectorValue)) {
+					expect(splitSelectorThinkingSuffix(selector).selector).not.toContain("/");
+				}
+			}
+		}
+	});
+	test("Grok 4.5 profiles resolve every role at the expected effort", () => {
+		const profiles = mergeModelProfiles();
+		for (const name of ["grok-45-eco", "grok-45-medium", "grok-45-pro"] as const) {
+			const expected = expectedProfiles.find(profile => profile.name === name);
+			if (!expected) throw new Error(`Missing expected profile: ${name}`);
+			const definition = profiles.get(name);
+			if (!definition) throw new Error(`Missing resolved profile: ${name}`);
+			const resolved = resolveProfileBindings(definition);
+			expect(resolved.defaultSelector).toBe(expected.mapping.default);
+			expect(resolved.agentModelOverrides).toEqual({
+				executor: expected.mapping.executor,
+				architect: expected.mapping.architect,
+				planner: expected.mapping.planner,
+				critic: expected.mapping.critic,
+			});
+		}
+	});
+
+	test("Grok 4.5 profiles never request unsupported xhigh reasoning", () => {
+		const grok45Profiles = BUILTIN_MODEL_PROFILES.filter(profile => profile.name.startsWith("grok-45-"));
+		expect(grok45Profiles.map(profile => profile.name)).toEqual(["grok-45-eco", "grok-45-medium", "grok-45-pro"]);
+		for (const profile of grok45Profiles) {
+			for (const selectorValue of Object.values(profile.modelMapping)) {
+				for (const selector of normalizeModelSelectorValue(selectorValue)) {
+					const trimmedSelector = selector.trim();
+					const separator = trimmedSelector.lastIndexOf(":");
+					const hasEffort = separator > trimmedSelector.indexOf("/");
+					const modelReference = hasEffort ? trimmedSelector.slice(0, separator).trim() : trimmedSelector;
+					const parsed = parseModelString(modelReference);
+					if (parsed?.provider.toLowerCase() !== "xai" || parsed.id.toLowerCase() !== "grok-4.5") continue;
+					const effort = hasEffort
+						? trimmedSelector
+								.slice(separator + 1)
+								.trim()
+								.toLowerCase()
+						: undefined;
+					// grok-4.5 mappings must carry an effort suffix; narrow for tsc + assert allowlist
+					if (effort === undefined) {
+						throw new Error(`missing effort suffix on grok-4.5 selector ${trimmedSelector}`);
+					}
+					expect(["minimal", "low", "medium", "high"]).toContain(effort);
+				}
+			}
+		}
+	});
+
+	test("codex Eco is Medium with Terra lowered to Luna and Sol lowered to Terra", () => {
+		const eco = builtinMapping("codex-eco");
+		const medium = builtinMapping("codex-medium");
+		const loweredMedium = Object.fromEntries(
+			roles.map(role => [
+				role,
+				substituteCodexFamily(substituteCodexFamily(medium[role], "terra", "luna"), "sol", "terra"),
+			]),
+		) as Record<Role, string>;
+
+		expect(eco).toEqual(loweredMedium);
+		expect(Object.values(eco).some(selector => selector.includes("gpt-5.6-sol"))).toBe(false);
+	});
+
+	test("combo Codex roles project their source preset at the same role", () => {
+		const medium = builtinMapping("codex-medium");
+		const pro = builtinMapping("codex-pro");
+		const opusCodex = builtinMapping("opus-codex");
+		const codexOpencodego = builtinMapping("codex-opencodego");
+		const fableOpusCodex = builtinMapping("fable-opus-codex");
+
+		for (const role of ["executor", "critic", "architect"] as const) {
+			expect(opusCodex[role]).toBe(medium[role]);
+		}
+		for (const role of ["default", "architect"] as const) {
+			expect(codexOpencodego[role]).toBe(medium[role]);
+		}
+		for (const role of ["executor", "architect"] as const) {
+			expect(fableOpusCodex[role]).toBe(pro[role]);
+		}
+	});
+
+	test("combo non-Codex cells retain their fixed baselines", () => {
+		for (const [profileName, expectedMapping] of Object.entries(fixedNonCodexComboMappings)) {
+			const mapping = builtinMapping(profileName);
+			for (const [role, selector] of Object.entries(expectedMapping) as Array<[Role, string]>) {
+				expect(mapping[role]).toBe(selector);
+			}
 		}
 	});
 
@@ -373,16 +875,26 @@ describe("built-in model profile catalog", () => {
 		const missing: string[] = [];
 		for (const profile of BUILTIN_MODEL_PROFILES) {
 			for (const role of roles) {
-				const selector = profile.modelMapping[role];
-				expect(selector).toBeDefined();
-				expect(ProfileModelSelectorSchema.safeParse(selector).success).toBe(true);
-				expect(parseModelString(selector ?? "")).toBeDefined();
-				if (selector && !selectorExists(selector)) missing.push(`${profile.name}.${role}=${selector}`);
+				const selectorValue = profile.modelMapping[role];
+				expect(selectorValue).toBeDefined();
+				for (const selector of normalizeModelSelectorValue(selectorValue)) {
+					expect(ProfileModelSelectorSchema.safeParse(selector).success).toBe(true);
+					if (selector.includes("/")) expect(parseModelString(selector)).toBeDefined();
+					if (!selectorExists(selector)) missing.push(`${profile.name}.${role}=${selector}`);
+				}
 			}
 		}
 		expect(missing).toEqual([]);
-		expect((modelsJson as Record<string, Record<string, unknown>>)["kimi-code"]?.["kimi-k2.7-code"]).toBeDefined();
-		expect((modelsJson as Record<string, Record<string, unknown>>)["minimax-code"]?.["minimax-m3"]).toBeDefined();
+		expect((modelsJson as Record<string, Record<string, unknown>>)["kimi-code"]?.k3).toBeDefined();
+		expect((modelsJson as Record<string, Record<string, unknown>>)["minimax-code"]?.["MiniMax-M3"]).toBeDefined();
+		expect(
+			(modelsJson as Record<string, Record<string, unknown>>)["alibaba-token-plan"]?.["deepseek-v4-flash-0731"],
+		).toBeDefined();
+		expect((modelsJson as Record<string, Record<string, unknown>>)["alibaba-token-plan"]?.["glm-5.2"]).toBeDefined();
+		expect(
+			(modelsJson as Record<string, Record<string, unknown>>)["alibaba-token-plan"]?.["qwen3.8-max-preview"],
+		).toBeDefined();
+		expect((modelsJson as Record<string, Record<string, unknown>>).xai?.["grok-4.6"]).toBeDefined();
 	});
 
 	test("plain minimax provider does not appear in catalog or recommendations", () => {
@@ -397,9 +909,39 @@ describe("built-in model profile catalog", () => {
 			displayName: "Kimi Coding Plan Medium",
 			providerGroup: "KIMI CODING PLAN",
 		});
+		expect(getModelProfilePresentation("open-weights-glm-deepseek")).toEqual({
+			displayName: "GLM + DeepSeek",
+			providerGroup: "OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
+		});
+		expect(getModelProfilePresentation("commandcode-goat")).toEqual({
+			displayName: "Command Code GOAT",
+			providerGroup: "COMMAND CODE GOAT",
+		});
+		for (const [name, displayName] of Object.entries({
+			"macos-omlx-fast": "4-bit Fast (MoE measured 93.5 tok/s)",
+			"macos-omlx-balanced": "8-bit Balanced (MoE measured 71.1 tok/s)",
+			"macos-omlx-quality": "Quality mix (8-bit MoE + 8-bit dense critic)",
+			"macos-omlx-abliterated-fast": "Uncensored 4-bit Fast (measured 19.8 tok/s)",
+			"macos-omlx-abliterated-balanced": "Uncensored 4-bit Balanced (same winner as fast)",
+		})) {
+			expect(getModelProfilePresentation(name)).toEqual({ displayName, providerGroup: "macOS Local (oMLX)" });
+		}
+		for (const [name, displayName] of Object.entries({
+			"grok-45-eco": "Grok 4.5 Eco",
+			"grok-45-medium": "Grok 4.5 Medium",
+			"grok-45-pro": "Grok 4.5 Pro",
+			"grok-46-eco": "Grok 4.6 Eco",
+			"grok-46-medium": "Grok 4.6 Medium",
+			"grok-46-pro": "Grok 4.6 Pro",
+		})) {
+			expect(getModelProfilePresentation(name)).toEqual({ displayName, providerGroup: "GROK" });
+		}
 		expect([...groupModelProfilesForPresetLanding(profiles).keys()]).toEqual([
 			"CODEX",
 			"OPENCODEGO",
+			"COMMAND CODE GOAT",
+			"macOS Local (oMLX)",
+			"OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
 			"CLAUDE",
 			"GLM",
 			"KIMI CODING PLAN",
@@ -407,20 +949,75 @@ describe("built-in model profile catalog", () => {
 			"GROK",
 			"CURSOR",
 			"MINIMAX",
+			"ALIBABA TOKEN PLAN",
 			"COMBOS",
+		]);
+		expect(
+			groupModelProfilesForPresetLanding(profiles)
+				.get("macOS Local (oMLX)")
+				?.map(profile => profile.name),
+		).toEqual([
+			"macos-omlx-fast",
+			"macos-omlx-balanced",
+			"macos-omlx-quality",
+			"macos-omlx-abliterated-fast",
+			"macos-omlx-abliterated-balanced",
+		]);
+		expect(
+			groupModelProfilesForPresetLanding(profiles)
+				.get("OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)")
+				?.map(profile => profile.name),
+		).toEqual([
+			"open-weights-glm",
+			"open-weights-deepseek",
+			"open-weights-kimi",
+			"open-weights-luna",
+			"open-weights-spark",
+			"open-weights-spark-deepseek",
+			"open-weights-spark-luna",
+			"open-weights-glm-deepseek",
+			"open-weights-kimi-deepseek",
+			"open-weights-kimi-glm",
+			"open-weights-kimi-glm-deepseek",
+			"open-weights-all",
 		]);
 		expect(recommendModelProfileForProvider("openai-codex", profiles)?.name).toBe("codex-medium");
 		expect(recommendModelProfileForProvider("anthropic", profiles)?.name).toBe("claude-opus");
 		expect(recommendModelProfileForProvider("opencode-go", profiles)?.name).toBe("opencodego");
+		expect(recommendModelProfileForProvider("commandcode-goat", profiles)?.name).toBe("commandcode-goat");
 		expect(recommendModelProfileForProvider("zai", profiles)?.name).toBe("glm-medium");
 		expect(recommendModelProfileForProvider("kimi-code", profiles)?.name).toBe("kimi-coding-plan-medium");
 		expect(recommendModelProfileForProvider("xiaomi", profiles)?.name).toBe("mimo-medium");
 		expect(recommendModelProfileForProvider("xiaomi-token-plan-sgp", profiles)?.name).toBe("mimo-medium");
 		expect(recommendModelProfileForProvider("xiaomi-token-plan-ams", profiles)?.name).toBe("mimo-medium");
 		expect(recommendModelProfileForProvider("xiaomi-token-plan-cn", profiles)?.name).toBe("mimo-medium");
-		expect(recommendModelProfileForProvider("xai", profiles)?.name).toBe("grok-medium");
+		expect(recommendModelProfileForProvider("xai", profiles)?.name).toBe("grok-46-medium");
+		expect(recommendModelProfileForProvider("omlx", profiles)?.name).toBe("macos-omlx-balanced");
 		expect(recommendModelProfileForProvider("grok-build", profiles)?.name).toBe("grok-build-pro");
 		expect(recommendModelProfileForProvider("cursor", profiles)?.name).toBe("cursor-medium");
+		expect(recommendModelProfileForProvider("alibaba-token-plan", profiles)?.name).toBe(
+			"alibaba-token-plan-balanced",
+		);
+		expect(getModelProfilePresentation("alibaba-token-plan-balanced")).toEqual({
+			displayName: "Balanced",
+			providerGroup: "ALIBABA TOKEN PLAN",
+		});
+		expect(getModelProfilePresentation("alibaba-token-plan-pro")).toEqual({
+			displayName: "Pro",
+			providerGroup: "ALIBABA TOKEN PLAN",
+		});
+		expect(getModelProfilePresentation("alibaba-token-plan-qwenmaxxing")).toEqual({
+			displayName: "QwenMaxxing",
+			providerGroup: "ALIBABA TOKEN PLAN",
+		});
+		expect(getModelProfilePresentation("alibaba-token-plan-qwen-deepseek")).toEqual({
+			displayName: "Qwen + DeepSeek",
+			providerGroup: "ALIBABA TOKEN PLAN",
+		});
+		expect(getModelProfilePresentation("alibaba-token-plan-glm-deepseek")).toEqual({
+			displayName: "GLM + DeepSeek",
+			providerGroup: "ALIBABA TOKEN PLAN",
+		});
 	});
 
 	test("grok-build-pro maps Composer 2.5 Fast and Grok Build roles", () => {
@@ -436,7 +1033,23 @@ describe("built-in model profile catalog", () => {
 		});
 	});
 
-	test("built-in minimax profiles resolve to minimax-m3 and never minimax-v3 (issue #656)", () => {
+	test("Cursor tiers use distinct current model IDs without inert effort suffixes", () => {
+		const eco = builtinMapping("cursor-eco");
+		const medium = builtinMapping("cursor-medium");
+		const pro = builtinMapping("cursor-pro");
+
+		expect(new Set(Object.values(eco))).toEqual(new Set(["cursor/composer-2.5"]));
+		expect(medium).not.toEqual(eco);
+		expect(pro).not.toEqual(medium);
+		expect(medium.executor).toBe("cursor/composer-2.5-fast");
+		expect(medium.critic).toBe("cursor/composer-2.5-fast");
+		expect(new Set(Object.values(pro))).toEqual(new Set(["cursor/composer-2.5-fast"]));
+		for (const mapping of [eco, medium, pro]) {
+			for (const selector of Object.values(mapping)) expect(selector).not.toContain(":");
+		}
+	});
+
+	test("built-in minimax profiles resolve to the canonical MiniMax-M3 id (issue #3896)", () => {
 		const minimaxProfiles = BUILTIN_MODEL_PROFILES.filter(profile =>
 			profile.requiredProviders.includes("minimax-code"),
 		);
@@ -445,12 +1058,51 @@ describe("built-in model profile catalog", () => {
 			for (const role of roles) {
 				const selector = profile.modelMapping[role];
 				expect(selector).toBeDefined();
-				const parsed = parseModelString(selector ?? "");
+				const parsed = parseModelString(selectorHead(selector) ?? "");
 				expect(parsed?.provider).toBe("minimax-code");
-				expect(parsed?.id).toBe("minimax-m3");
+				expect(parsed?.id).toBe("MiniMax-M3");
 			}
 		}
 		expect(JSON.stringify(BUILTIN_MODEL_PROFILES)).not.toContain("minimax-v3");
+		expect(JSON.stringify(BUILTIN_MODEL_PROFILES)).not.toContain("minimax-m3");
+	});
+
+	test("Alibaba Token Plan profiles route their intended roles", () => {
+		expect(builtinMapping("alibaba-token-plan-balanced")).toEqual({
+			default: "alibaba-token-plan/qwen3.8-max-preview:medium",
+			executor: "alibaba-token-plan/deepseek-v4-pro:xhigh",
+			planner: "alibaba-token-plan/glm-5.2:high",
+			critic: "alibaba-token-plan/glm-5.2:high",
+			architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+		});
+		expect(builtinMapping("alibaba-token-plan-pro")).toEqual({
+			default: "alibaba-token-plan/qwen3.8-max-preview:medium",
+			executor: "alibaba-token-plan/deepseek-v4-flash-0731:max",
+			planner: "alibaba-token-plan/glm-5.2:high",
+			critic: "alibaba-token-plan/glm-5.2:xhigh",
+			architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+		});
+		expect(builtinMapping("alibaba-token-plan-qwenmaxxing")).toEqual({
+			default: "alibaba-token-plan/qwen3.8-max-preview:medium",
+			executor: "alibaba-token-plan/qwen3.8-max-preview:low",
+			planner: "alibaba-token-plan/qwen3.8-max-preview:medium",
+			critic: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+			architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+		});
+		expect(builtinMapping("alibaba-token-plan-qwen-deepseek")).toEqual({
+			default: "alibaba-token-plan/qwen3.8-max:high",
+			executor: "alibaba-token-plan/deepseek-v4-flash-0731:high",
+			planner: "alibaba-token-plan/deepseek-v4-flash-0731:max",
+			critic: "alibaba-token-plan/qwen3.8-max:xhigh",
+			architect: "alibaba-token-plan/qwen3.8-max:xhigh",
+		});
+		expect(builtinMapping("alibaba-token-plan-glm-deepseek")).toEqual({
+			default: "alibaba-token-plan/glm-5.2:high",
+			executor: "alibaba-token-plan/deepseek-v4-flash-0731:high",
+			planner: "alibaba-token-plan/deepseek-v4-flash-0731:max",
+			critic: "alibaba-token-plan/glm-5.2:xhigh",
+			architect: "alibaba-token-plan/glm-5.2:xhigh",
+		});
 	});
 
 	test("user same-name profile overrides builtin via mergeModelProfiles", () => {

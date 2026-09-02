@@ -20,8 +20,9 @@ import { formatStyledTruncationWarning, type OutputMeta, stripOutputNotice } fro
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
+export const SSH_DESCRIPTION = prompt.render(sshDescriptionBase);
 
-const sshSchema = z.object({
+export const sshSchema = z.object({
 	host: z.string().describe("ssh host"),
 	command: z.string().describe("remote command"),
 	cwd: z.string().optional().describe("remote working directory"),
@@ -105,7 +106,7 @@ async function loadHosts(session: ToolSession): Promise<{
 	hostNames: string[];
 	hostsByName: Map<string, SSHHost>;
 }> {
-	const result = await loadCapability<SSHHost>(sshCapability.id, { cwd: session.cwd });
+	const result = await loadCapability<SSHHost>(sshCapability.id, { cwd: session.cwd, settings: session.settings });
 	const hostsByName = new Map<string, SSHHost>();
 	for (const host of result.items) {
 		if (!hostsByName.has(host.name)) {
@@ -165,6 +166,7 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 		const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("ssh")) ?? {};
 
 		const result = await executeSSH(hostConfig, remoteCommand, {
+			settings: this.session.settings,
 			timeout: timeoutMs,
 			signal,
 			compatEnabled: hostInfo.compatEnabled,

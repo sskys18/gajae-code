@@ -1,13 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import type { ToolCall, ToolResultMessage } from "@gajae-code/ai";
+import type { AssistantMessage, ToolCall, ToolResultMessage } from "@gajae-code/ai";
 import { estimateEntryTokens } from "../src/compaction/compaction";
 import type { SessionEntry, SessionMessageEntry } from "../src/compaction/entries";
-import {
-	DEFAULT_PRUNE_CONFIG,
-	type PruneConfig,
-	pruneAssistantToolArguments,
-	pruneToolOutputs,
-} from "../src/compaction/pruning";
+import { DEFAULT_PRUNE_CONFIG, type PruneConfig, pruneAssistantToolArguments } from "../src/compaction/pruning";
+import { applyToolOutputPrune as pruneToolOutputs } from "./pruning-test-utils";
 
 /**
  * Staleness-aware pruning: superseded tool results (same target read/searched
@@ -91,6 +87,16 @@ function pair(
 	return result;
 }
 
+function userEntry(id: string): SessionEntry {
+	return {
+		type: "message",
+		id,
+		parentId: null,
+		timestamp: new Date(idCounter).toISOString(),
+		message: { role: "user", content: "continue", timestamp: idCounter },
+	} as SessionEntry;
+}
+
 const EAGER: PruneConfig = {
 	protectTokens: 0,
 	minimumSavings: 0,
@@ -111,6 +117,117 @@ describe("staleness supersession ordering", () => {
 		const ids = prunedIds(entries, EAGER);
 		expect(ids).toContain(oldRead.id);
 		expect(ids).not.toContain(newRead.id);
+	});
+
+	it("supersedes all-but-latest repeated idempotent bash test commands", () => {
+		const entries: SessionEntry[] = [];
+		const oldest = pair(entries, "c1", "bash", { command: "bun   test packages/agent" });
+		const middle = pair(entries, "c2", "bash", { command: "bun test packages/agent" });
+		const latest = pair(entries, "c3", "bash", { command: "bun test packages/agent" });
+		const ids = prunedIds(entries, { ...EAGER, protectTokens: 1_000_000 });
+		expect(ids).toContain(oldest.id);
+		expect(ids).toContain(middle.id);
+		expect(ids).not.toContain(latest.id);
+	});
+
+	it("does not supersede idempotent bash commands run from different directories", () => {
+		const entries: SessionEntry[] = [];
+		const first = pair(entries, "c1", "bash", { command: "bun test packages/agent", cwd: "/repo-a" });
+		const second = pair(entries, "c2", "bash", { command: "bun test packages/agent", cwd: "/repo-b" });
+		const ids = prunedIds(entries, { ...EAGER, protectTokens: 1_000_000 });
+		expect(ids).not.toContain(first.id);
+		expect(ids).not.toContain(second.id);
+	});
+
+	it("does not supersede non-allowlisted bash commands", () => {
+		const entries: SessionEntry[] = [];
+		const oldest = pair(entries, "c1", "bash", { command: "git log --oneline" });
+		const latest = pair(entries, "c2", "bash", { command: "git log --oneline" });
+		const ids = prunedIds(entries, { ...EAGER, protectTokens: 1_000_000 });
+		expect(ids).not.toContain(oldest.id);
+		expect(ids).not.toContain(latest.id);
+	});
+
+	it("a later containing read range supersedes an earlier contained range", () => {
+		const entries: SessionEntry[] = [];
+		const contained = pair(entries, "c1", "read", { path: "src/a.ts:50-100" });
+		const containing = pair(entries, "c2", "read", { path: "src/a.ts:1-200" });
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).toContain(contained.id);
+		expect(ids).not.toContain(containing.id);
+	});
+
+	it("does not let a bounded bare selector supersede an unseen distant range", () => {
+		const entries: SessionEntry[] = [];
+		const distant = pair(entries, "c1", "read", { path: "src/a.ts:10000-10050" });
+		const bounded = pair(entries, "c2", "read", { path: "src/a.ts:1" });
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).not.toContain(distant.id);
+		expect(ids).not.toContain(bounded.id);
+	});
+
+	it("does not let a raw read supersede an earlier explicit range", () => {
+		const entries: SessionEntry[] = [];
+		const ranged = pair(entries, "c1", "read", { path: "src/a.ts:10000-10050" });
+		const raw = pair(entries, "c2", "read", { path: "src/a.ts:raw" });
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).not.toContain(ranged.id);
+		expect(ids).not.toContain(raw.id);
+	});
+
+	it("does not range-supersede through a raw selector stack, but exact raw repeats still supersede", () => {
+		const mixedEntries: SessionEntry[] = [];
+		const ranged = pair(mixedEntries, "c1", "read", { path: "src/a.ts:3" });
+		pair(mixedEntries, "c2", "read", { path: "src/a.ts:2-4:raw" });
+		expect(prunedIds(mixedEntries, EAGER)).not.toContain(ranged.id);
+
+		const repeatedEntries: SessionEntry[] = [];
+		const earlierRaw = pair(repeatedEntries, "c3", "read", { path: "src/a.ts:2-4:raw" });
+		pair(repeatedEntries, "c4", "read", { path: "src/a.ts:2-4:raw" });
+		expect(prunedIds(repeatedEntries, EAGER)).toContain(earlierRaw.id);
+	});
+
+	it("does not let an open-ended read supersede an explicit high range", () => {
+		const entries: SessionEntry[] = [];
+		const highRange = pair(entries, "c1", "read", { path: "src/a.ts:10000-10050" });
+		const openEnded = pair(entries, "c2", "read", { path: "src/a.ts:1-" });
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).not.toContain(highRange.id);
+		expect(ids).not.toContain(openEnded.id);
+	});
+
+	it("never prunes stale outputs in the newest two user turns", () => {
+		const entries: SessionEntry[] = [userEntry("u-old")];
+		const oldRead = pair(entries, "c1", "read", { path: "src/a.ts" });
+		entries.push(userEntry("u-middle"));
+		pair(entries, "c2", "read", { path: "src/a.ts" });
+		entries.push(userEntry("u-current"));
+		const staleCurrent = pair(entries, "c3", "read", { path: "src/a.ts" });
+		pair(entries, "c4", "read", { path: "src/a.ts" });
+
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).toContain(oldRead.id);
+		expect(ids).not.toContain(staleCurrent.id);
+	});
+
+	it("partially overlapping read ranges do not supersede each other", () => {
+		const entries: SessionEntry[] = [];
+		const first = pair(entries, "c1", "read", { path: "src/a.ts:50-100" });
+		const overlap = pair(entries, "c2", "read", { path: "src/a.ts:75-125" });
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).not.toContain(first.id);
+		expect(ids).not.toContain(overlap.id);
+	});
+
+	it("uses relaxed minimum for over-threshold pruning without changing the default", () => {
+		const entries: SessionEntry[] = [];
+		pair(entries, "c1", "read", { path: "src/a.ts" }, 62_000);
+		pair(entries, "c2", "read", { path: "src/a.ts" }, 62_000);
+		expect(pruneToolOutputs(entries, DEFAULT_PRUNE_CONFIG).prunedCount).toBe(0);
+		const result = pruneToolOutputs(entries, DEFAULT_PRUNE_CONFIG, { relaxedMinimum: 0 });
+		expect(result.tokensSaved).toBeGreaterThanOrEqual(15_000);
+		expect(result.tokensSaved).toBeLessThan(DEFAULT_PRUNE_CONFIG.minimumSavings);
+		expect(result.prunedCount).toBe(1);
 	});
 
 	it("a later identical search supersedes the earlier one; different patterns are independent", () => {
@@ -210,12 +327,28 @@ describe("staleness supersession ordering", () => {
 		const entries: SessionEntry[] = [];
 		const rangeRead = pair(entries, "c1", "read", { path: "src/a.ts:50-100" });
 		const rawRead = pair(entries, "c2", "read", { path: "src/a.ts:2-4:raw" });
+		const openRead = pair(entries, "c-open", "read", { path: "src/a.ts:50-" });
+		const lOpenRead = pair(entries, "c-l-open", "read", { path: "src/a.ts:L50-" });
 		const otherFile = pair(entries, "c3", "read", { path: "src/b.ts:50-100" });
 		pair(entries, "c4", "edit", { path: "src/a.ts" }, 100);
 		const ids = prunedIds(entries, EAGER);
 		expect(ids).toContain(rangeRead.id);
 		expect(ids).toContain(rawRead.id);
+		expect(ids).toContain(openRead.id);
+		expect(ids).toContain(lOpenRead.id);
 		expect(ids).not.toContain(otherFile.id);
+	});
+
+	it("does not over-strip selector-looking literal path suffixes", () => {
+		const unrelatedEntries: SessionEntry[] = [];
+		const literalRead = pair(unrelatedEntries, "literal-read", "read", { path: "src/a.ts:50-:conflicts" });
+		pair(unrelatedEntries, "base-edit", "edit", { path: "src/a.ts" }, 100);
+		expect(prunedIds(unrelatedEntries, EAGER)).not.toContain(literalRead.id);
+
+		const matchingEntries: SessionEntry[] = [];
+		const matchingRead = pair(matchingEntries, "matching-read", "read", { path: "src/a.ts:50-:conflicts" });
+		pair(matchingEntries, "literal-edit", "edit", { path: "src/a.ts:50-" }, 100);
+		expect(prunedIds(matchingEntries, EAGER)).toContain(matchingRead.id);
 	});
 
 	it("search pagination pages do not supersede each other", () => {
@@ -326,6 +459,22 @@ describe("staleness supersession ordering", () => {
 		const ids = prunedIds(entries, EAGER);
 		expect(ids).toContain(readOk.id);
 		expect(ids).not.toContain(readFailed.id);
+	});
+
+	it("ambiguous per-file edit rows do not stale reads", () => {
+		const entries: SessionEntry[] = [];
+		const read = pair(entries, "ambiguous-read", "read", { path: "src/ambiguous.ts" });
+		const envelope = ["*** Begin Patch", "*** Update File: src/ambiguous.ts", "@@", "-a", "+b", "*** End Patch"].join(
+			"\n",
+		);
+		entries.push(assistantCallEntry("ambiguous-edit", "apply_patch", { input: envelope }));
+		const patchResult = toolResultEntry("ambiguous-edit", "apply_patch", 100);
+		(patchResult.message as ToolResultMessage & { details?: unknown }).details = {
+			perFileResults: [{ path: "src/ambiguous.ts" }],
+		};
+		entries.push(patchResult);
+
+		expect(prunedIds(entries, EAGER)).not.toContain(read.id);
 	});
 
 	it("a same-path edit that partly succeeds still invalidates its reads", () => {
@@ -567,7 +716,67 @@ describe("assistant edit argument pruning", () => {
 		expect(first.argumentPrunedCount).toBe(1);
 		expect(first.argumentTokensSaved).toBeGreaterThan(0);
 		expect(afterTokens).toBeLessThan(beforeTokens);
+		expect(first.argumentTokensSaved).toBe(beforeTokens - afterTokens);
 		expect(second).toEqual({ argumentPrunedCount: 0, argumentTokensSaved: 0, prunedEntries: [] });
+	});
+
+	it("accounts exactly for multiple stale tool calls in one assistant entry", () => {
+		const entries: SessionEntry[] = [];
+		const oldEdits = assistantCallEntry("multi-a", "edit", {
+			path: "src/a.ts",
+			old_string: "a",
+			new_string: "b".repeat(2000),
+		}) as SessionMessageEntry;
+		const message = oldEdits.message as AssistantMessage;
+		message.content.push({
+			type: "toolCall",
+			id: "multi-b",
+			name: "edit",
+			arguments: { path: "src/b.ts", old_string: "x", new_string: "y".repeat(2000) },
+		});
+		entries.push(oldEdits, toolResultEntry("multi-a", "edit", 100), toolResultEntry("multi-b", "edit", 100));
+		pair(entries, "later-a", "write", { path: "src/a.ts", content: "c" }, 100);
+		pair(entries, "later-b", "write", { path: "src/b.ts", content: "d" }, 100);
+		const beforeTokens = estimateEntryTokens(oldEdits);
+
+		const result = pruneAssistantToolArguments(entries, EAGER);
+		const afterTokens = estimateEntryTokens(oldEdits);
+
+		expect(result.argumentPrunedCount).toBe(2);
+		expect(result.argumentTokensSaved).toBe(beforeTokens - afterTokens);
+		expect(result.prunedEntries).toEqual([oldEdits]);
+		expect(
+			message.content
+				.filter(content => content.type === "toolCall")
+				.every(content => content.type === "toolCall" && content.arguments.pruned === true),
+		).toBe(true);
+	});
+
+	it("uses exact entry-token savings at the minimum boundary", () => {
+		const makeEntries = (): { entries: SessionEntry[]; oldEdit: SessionEntry } => {
+			const entries: SessionEntry[] = [];
+			const oldEdit = assistantCallEntry("boundary-edit", "edit", {
+				path: "src/boundary.ts",
+				old_string: "a",
+				new_string: "b".repeat(2003),
+			});
+			entries.push(oldEdit, toolResultEntry("boundary-edit", "edit", 100));
+			pair(entries, "boundary-write", "write", { path: "src/boundary.ts", content: "c" }, 100);
+			return { entries, oldEdit };
+		};
+		const probe = makeEntries();
+		const threshold = pruneAssistantToolArguments(probe.entries, EAGER).argumentTokensSaved;
+		expect(threshold).toBeGreaterThan(0);
+
+		const atThreshold = makeEntries();
+		const admitted = pruneAssistantToolArguments(atThreshold.entries, { ...EAGER, minimumSavings: threshold });
+		expect(admitted.argumentPrunedCount).toBe(1);
+		expect(admitted.argumentTokensSaved).toBe(threshold);
+
+		const aboveThreshold = makeEntries();
+		const blocked = pruneAssistantToolArguments(aboveThreshold.entries, { ...EAGER, minimumSavings: threshold + 1 });
+		expect(blocked).toEqual({ argumentPrunedCount: 0, argumentTokensSaved: 0, prunedEntries: [] });
+		expect(argumentSentinel(aboveThreshold.oldEdit).reason).not.toBe("stale_tool_arguments");
 	});
 
 	it("does not prune a multi-file apply_patch when only one touched file is later mutated", () => {
@@ -622,5 +831,55 @@ describe("assistant edit argument pruning", () => {
 
 		expect(result.argumentPrunedCount).toBe(1);
 		expect(argumentSentinel(multiFile).reason).toBe("stale_tool_arguments");
+	});
+
+	it("fences edit arguments inside the newest protected turn even when superseded later in that turn", () => {
+		const entries: SessionEntry[] = [];
+		entries.push(userEntry("u1"));
+		const oldEdit = assistantCallEntry("c1", "edit", {
+			path: "src/old.ts",
+			old_string: "a",
+			new_string: "b".repeat(2000),
+		});
+		entries.push(oldEdit, toolResultEntry("c1", "edit", 100));
+		pair(entries, "c2", "write", { path: "src/old.ts", content: "c" }, 100);
+		entries.push(userEntry("u2"));
+		entries.push(userEntry("u3"));
+		const activeEdit = assistantCallEntry("c3", "edit", {
+			path: "src/active.ts",
+			old_string: "x",
+			new_string: "y".repeat(2000),
+		});
+		entries.push(activeEdit, toolResultEntry("c3", "edit", 100));
+		pair(entries, "c4", "write", { path: "src/active.ts", content: "z" }, 100);
+
+		const result = pruneAssistantToolArguments(entries, { ...EAGER, protectRecentTurns: 2 });
+
+		// Older superseded arguments outside the turn fence still prune.
+		expect(result.prunedEntries.map(entry => entry.id)).toEqual([oldEdit.id]);
+		expect(argumentSentinel(oldEdit).reason).toBe("stale_tool_arguments");
+		// The active/newest turn is fenced: its edit arguments survive even
+		// though a later write in the same turn superseded the path.
+		expect(argumentSentinel(activeEdit).reason).not.toBe("stale_tool_arguments");
+		expect(argumentSentinel(activeEdit)).toMatchObject({ path: "src/active.ts" });
+	});
+
+	it("fences apply_patch arguments inside the newest protected turn", () => {
+		const entries: SessionEntry[] = [];
+		entries.push(userEntry("u1"));
+		pair(entries, "c1", "read", { path: "src/a.ts" }, 100);
+		entries.push(userEntry("u2"));
+		entries.push(userEntry("u3"));
+		const activePatch = assistantCallEntry("c2", "apply_patch", {
+			input: ["*** Begin Patch", "*** Update File: src/active.ts", "@@", "-old", "+new", "*** End Patch"].join("\n"),
+			payload: "x".repeat(2000),
+		});
+		entries.push(activePatch, toolResultEntry("c2", "apply_patch", 100));
+		pair(entries, "c3", "write", { path: "src/active.ts", content: "z" }, 100);
+
+		const result = pruneAssistantToolArguments(entries, { ...EAGER, protectRecentTurns: 2 });
+
+		expect(result.argumentPrunedCount).toBe(0);
+		expect(argumentSentinel(activePatch).reason).not.toBe("stale_tool_arguments");
 	});
 });

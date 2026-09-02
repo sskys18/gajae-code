@@ -1,26 +1,49 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
-import type {
-	AgentEvent,
-	AgentTool,
-	AgentToolContext,
-	AgentToolResult,
-	AgentToolUpdateCallback,
+import {
+	type AgentEvent,
+	type AgentTool,
+	type AgentToolContext,
+	type AgentToolResult,
+	type AgentToolUpdateCallback,
+	bindDispatchedToolIdentity,
 } from "@gajae-code/agent-core";
 import type {
 	CursorMcpCall,
 	CursorShellStreamCallbacks,
 	CursorExecHandlers as ICursorExecHandlers,
 	ToolResultMessage,
-} from "@gajae-code/ai";
+} from "@gajae-code/ai/core";
+import {
+	piEscapeRegexLiteral,
+	piJoinPath,
+	piLimit,
+	piLsPath,
+	piReadPath,
+	piTimeout,
+} from "@gajae-code/ai/providers/cursor/exec-modern";
 import { sanitizeText } from "@gajae-code/utils";
 import { resolveToCwd } from "./tools/path-utils";
+
+/**
+ * Emitter for events this bridge produces.
+ *
+ * `dispatchedTool` is the tool object the bridge SELECTED and is about to execute — passed
+ * alongside the event, never inside it, so the object never reaches an AgentEvent field, a
+ * serialized payload, or any wire envelope. The handler binds it as provenance (object
+ * identity only) at this producer boundary, because it is the only place that knows which
+ * object actually ran: a consumer re-resolving `toolName` later reads a mutable registry.
+ * Synthetic operations that execute no AgentTool pass nothing and stay unbound.
+ */
+type CursorExecEventEmitter = (event: AgentEvent, dispatchedTool?: AgentTool) => void;
 
 interface CursorExecBridgeOptions {
 	cwd: string;
 	tools: Map<string, AgentTool>;
+	getEditReplaceTool?: () => AgentTool | undefined;
+	createSearchTool?: (options: { context?: number; totalMatchLimit?: number }) => AgentTool | undefined;
 	getToolContext?: () => AgentToolContext | undefined;
-	emitEvent?: (event: AgentEvent) => void;
+	emitEvent?: CursorExecEventEmitter;
 	createEventEmitter?: () => ((event: AgentEvent) => void) | undefined;
 }
 
@@ -53,14 +76,17 @@ async function executeTool(
 	toolName: string,
 	toolCallId: string,
 	args: Record<string, unknown>,
+	overrideTool?: AgentTool,
 ): Promise<ToolResultMessage> {
-	const tool = options.tools.get(toolName);
+	const tool = overrideTool ?? options.tools.get(toolName);
 	if (!tool) {
 		const result = buildToolErrorResult(`Tool "${toolName}" not available`);
 		return createToolResultMessage(toolCallId, toolName, result, true);
 	}
 
-	options.emitEvent?.({ type: "tool_execution_start", toolCallId, toolName, args });
+	// `tool` is the object this call will run; pass it so the start event carries proven
+	// provenance instead of a name a consumer would have to re-resolve later.
+	options.emitEvent?.({ type: "tool_execution_start", toolCallId, toolName, args }, tool);
 
 	let result: AgentToolResult<unknown>;
 	let isError = false;
@@ -94,6 +120,7 @@ async function executeTool(
 		result = buildToolErrorResult(message);
 		isError = true;
 	}
+	isError ||= result.isError === true;
 
 	const sanitizedFinalResult: AgentToolResult<unknown> = {
 		content: result.content.map(c => (c.type === "text" ? { ...c, text: sanitizeText(c.text) } : c)),
@@ -188,12 +215,30 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		this.shellStream = this.shellStream.bind(this);
 		this.diagnostics = this.diagnostics.bind(this);
 		this.mcp = this.mcp.bind(this);
+		this.piRead = this.piRead.bind(this);
+		this.piBash = this.piBash.bind(this);
+		this.piEdit = this.piEdit.bind(this);
+		this.piWrite = this.piWrite.bind(this);
+		this.piGrep = this.piGrep.bind(this);
+		this.piFind = this.piFind.bind(this);
+		this.piLs = this.piLs.bind(this);
 	}
 
 	#optionsForCall(): CursorExecBridgeOptions {
+		const emit = this.options.createEventEmitter ? this.options.createEventEmitter() : this.options.emitEvent;
+		// Producer boundary: bind the selected object to the event BEFORE it leaves this
+		// bridge, so the run-scoped Agent emitter (and every consumer after it) receives an
+		// event whose provenance is already proven and never re-resolved from a registry
+		// that may have been replaced in the meantime.
+		const emitWithIdentity: CursorExecEventEmitter | undefined = emit
+			? (event: AgentEvent, dispatchedTool?: AgentTool) => {
+					bindDispatchedToolIdentity(event, dispatchedTool);
+					emit(event);
+				}
+			: undefined;
 		return {
 			...this.options,
-			emitEvent: this.options.createEventEmitter ? this.options.createEventEmitter() : this.options.emitEvent,
+			emitEvent: emitWithIdentity,
 		};
 	}
 
@@ -283,7 +328,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			timeout: timeoutSeconds,
 		};
 
-		options.emitEvent?.({ type: "tool_execution_start", toolCallId, toolName, args: toolArgs });
+		options.emitEvent?.({ type: "tool_execution_start", toolCallId, toolName, args: toolArgs }, tool);
 
 		let result: AgentToolResult<unknown>;
 		let isError = false;
@@ -362,6 +407,70 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			isError,
 		});
 		return createToolResultMessage(toolCallId, toolName, result, isError);
+	}
+
+	async piRead(call: Parameters<NonNullable<ICursorExecHandlers["piRead"]>>[0]) {
+		const composed = piReadPath(call.args.path, call.args.offset, call.args.limit);
+		if (composed === null) {
+			return createToolResultMessage(call.toolCallId, "read", { content: [{ type: "text", text: "" }] }, false);
+		}
+		return executeTool(this.#optionsForCall(), "read", call.toolCallId, { path: composed });
+	}
+
+	async piBash(call: Parameters<NonNullable<ICursorExecHandlers["piBash"]>>[0]) {
+		return executeTool(this.#optionsForCall(), "bash", call.toolCallId, {
+			command: call.args.command,
+			timeout: piTimeout(call.args.timeout),
+		});
+	}
+
+	async piEdit(call: Parameters<NonNullable<ICursorExecHandlers["piEdit"]>>[0]) {
+		const edits = call.args.edits.map(edit => ({
+			old_text: edit.oldText,
+			new_text: edit.newText,
+		}));
+		return executeTool(
+			this.#optionsForCall(),
+			"edit",
+			call.toolCallId,
+			{ path: call.args.path, edits },
+			this.options.getEditReplaceTool?.(),
+		);
+	}
+
+	async piWrite(call: Parameters<NonNullable<ICursorExecHandlers["piWrite"]>>[0]) {
+		return executeTool(this.#optionsForCall(), "write", call.toolCallId, {
+			path: call.args.path,
+			content: call.args.content,
+		});
+	}
+
+	async piGrep(call: Parameters<NonNullable<ICursorExecHandlers["piGrep"]>>[0]) {
+		const { pattern, path, glob, ignoreCase, literal, context, limit } = call.args;
+		const perCallSearch = this.options.createSearchTool?.({
+			context: context === undefined ? undefined : Math.max(0, Math.floor(context)),
+			totalMatchLimit: piLimit(limit),
+		});
+		const args: Record<string, unknown> = {
+			pattern: literal === true ? piEscapeRegexLiteral(pattern) : pattern,
+			paths: [glob ? piJoinPath(path, glob) : path || "."],
+		};
+		if (ignoreCase === true) args.i = true;
+		return executeTool(this.#optionsForCall(), "search", call.toolCallId, args, perCallSearch);
+	}
+
+	async piFind(call: Parameters<NonNullable<ICursorExecHandlers["piFind"]>>[0]) {
+		const { pattern, path, limit } = call.args;
+		return executeTool(this.#optionsForCall(), "find", call.toolCallId, {
+			paths: [piJoinPath(path, pattern)],
+			limit: piLimit(limit),
+		});
+	}
+
+	async piLs(call: Parameters<NonNullable<ICursorExecHandlers["piLs"]>>[0]) {
+		return executeTool(this.#optionsForCall(), "read", call.toolCallId, {
+			path: piLsPath(call.args.path),
+		});
 	}
 
 	async diagnostics(args: Parameters<NonNullable<ICursorExecHandlers["diagnostics"]>>[0]) {

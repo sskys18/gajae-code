@@ -11,9 +11,10 @@
  *
  * Activated when a {@link Model} has `transport: "pi-native"` set; the
  * dispatch hook lives in `streamSimple()` (see `../stream.ts`). Used by
- * containerized gjc deployments (e.g. robogjc slots) that route every LLM call
- * through a credential-holding sidecar so the slot itself stays credential-free.
+ * containerized GJC deployments that route every LLM call through a
+ * credential-holding sidecar so the container stays credential-free.
  */
+
 import { readSseJson } from "@gajae-code/utils";
 import type {
 	Api,
@@ -36,6 +37,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 const NON_WIRE_KEYS = new Set<keyof SimpleStreamOptions>([
 	"signal",
 	"apiKey",
+	"onStreamCreated",
 	"fetch",
 	"onPayload",
 	"onResponse",
@@ -44,7 +46,31 @@ const NON_WIRE_KEYS = new Set<keyof SimpleStreamOptions>([
 	"cursorExecHandlers",
 	"cursorOnToolResult",
 	"providerSessionState",
+	"fallbackAttempt",
 ]);
+
+/**
+ * Project the caller's {@link Context} onto the wire schema. Runtime tool
+ * objects routinely carry harness-only state (runners, session managers,
+ * fs-stat BigInts) that must never be serialized: BigInt fields make
+ * `JSON.stringify` throw outright, and the rest is dead weight the gateway
+ * re-derives from its own tool registry. Only the protocol-meaningful,
+ * JSON-safe `Tool` fields cross the wire.
+ */
+function buildWireContext(context: Context): Context {
+	if (!context.tools || context.tools.length === 0) return context;
+	return {
+		...context,
+		tools: context.tools.map(tool => ({
+			name: tool.name,
+			description: tool.description,
+			parameters: tool.parameters,
+			...(tool.strict !== undefined ? { strict: tool.strict } : {}),
+			...(tool.customFormat !== undefined ? { customFormat: tool.customFormat } : {}),
+			...(tool.customWireName !== undefined ? { customWireName: tool.customWireName } : {}),
+		})),
+	};
+}
 
 function buildWireOptions(options: SimpleStreamOptions | undefined): Record<string, unknown> {
 	if (!options) return {};
@@ -70,15 +96,27 @@ async function decodeGatewayError(response: Response): Promise<Error> {
 		if (typeof err === "object" && err !== null) {
 			const message = (err as { message?: unknown }).message;
 			const type = (err as { type?: unknown }).type;
+			const code = (err as { code?: unknown }).code;
 			const out = new Error(typeof message === "string" ? message : `auth-gateway ${status}`);
-			(out as { status?: number; type?: string }).status = status;
-			if (typeof type === "string") (out as { type?: string }).type = type;
+			const transportError = out as Error & {
+				status?: number;
+				type?: string;
+				providerCode?: string;
+				headers?: Headers;
+			};
+			transportError.status = status;
+			transportError.headers = response.headers;
+			if (typeof type === "string") transportError.type = type;
+			if (typeof code === "string") transportError.providerCode = code;
+			else if (typeof type === "string") transportError.providerCode = type;
 			return out;
 		}
 	}
 	const text = typeof body === "string" ? body : JSON.stringify(body);
 	const err = new Error(`auth-gateway ${status}: ${text || response.statusText}`);
-	(err as { status?: number }).status = status;
+	const transportError = err as Error & { status?: number; headers?: Headers };
+	transportError.status = status;
+	transportError.headers = response.headers;
 	return err;
 }
 
@@ -151,7 +189,7 @@ export function streamPiNative<TApi extends Api>(
 			const headers = buildHeaders(model as Model<Api>, options?.apiKey);
 			const body = JSON.stringify({
 				modelId: model.id,
-				context,
+				context: buildWireContext(context),
 				options: buildWireOptions(options),
 				stream: true,
 			});
@@ -171,7 +209,9 @@ export function streamPiNative<TApi extends Api>(
 				response.body as ReadableStream<Uint8Array>,
 				signal,
 			)) {
-				if (event.type === "done" || event.type === "error") sawTerminal = true;
+				if (event.type === "done" || event.type === "error") {
+					sawTerminal = true;
+				}
 				stream.push(event);
 				// `stream.push` resolves `.result()` on `done`/`error`; subsequent
 				// pushes are silently dropped by the base class. We still iterate
@@ -180,19 +220,18 @@ export function streamPiNative<TApi extends Api>(
 			}
 
 			if (!sawTerminal) {
-				// SSE closed before a terminal event reached us — synthesize one
-				// so awaiters of `.result()` resolve instead of hanging forever.
-				// Matches the gateway's own defensive fallback in
-				// `pi-native-server.encodeStream`.
 				const aborted = signal?.aborted === true;
-				const partial = makeSyntheticAssistant(model as Model<Api>);
 				if (aborted) {
+					const partial = makeSyntheticAssistant(model as Model<Api>);
 					partial.stopReason = "aborted";
 					partial.errorMessage = "stream closed without terminal event";
 					stream.push({ type: "error", reason: "aborted", error: partial });
 				} else {
-					partial.stopReason = "stop";
-					stream.push({ type: "done", reason: "stop", message: partial });
+					const error = Object.assign(new Error("pi-native SSE stream closed without terminal event"), {
+						status: 502,
+						headers: response.headers,
+					});
+					stream.fail(error);
 				}
 			}
 			stream.end();

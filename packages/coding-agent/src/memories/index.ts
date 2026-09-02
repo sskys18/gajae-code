@@ -3,7 +3,7 @@ import type * as fsNode from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
-import { completeSimple, Effort, type Model } from "@gajae-code/ai";
+import { completeSimple, Effort, type Model } from "@gajae-code/ai/core";
 import { getAgentDbPath, getMemoriesDir, logger, parseJsonlLenient, prompt } from "@gajae-code/utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { resolveModelRoleValue } from "../config/model-resolver";
@@ -238,7 +238,7 @@ async function runPhase1(options: {
 			logger.debug("Phase1 skipped: no model available");
 			return;
 		}
-		const phase1ApiKey = await modelRegistry.getApiKey(phase1Model, session.sessionId);
+		const phase1ApiKey = await modelRegistry.getApiKey(phase1Model, session.credentialSessionId);
 		if (!phase1ApiKey) {
 			logger.debug("Phase1 skipped: no API key for phase1 model", {
 				provider: phase1Model.provider,
@@ -249,6 +249,7 @@ async function runPhase1(options: {
 
 		const claims = claimStage1Jobs(db, {
 			nowSec,
+			cwd: session.sessionManager.getCwd(),
 			threadScanLimit: config.threadScanLimit,
 			maxRolloutsPerStartup: config.maxRolloutsPerStartup,
 			maxRolloutAgeDays: config.maxRolloutAgeDays,
@@ -400,7 +401,7 @@ async function runPhase2(options: {
 			});
 			return;
 		}
-		const phase2ApiKey = await modelRegistry.getApiKey(phase2Model, session.sessionId);
+		const phase2ApiKey = await modelRegistry.getApiKey(phase2Model, session.credentialSessionId);
 		if (!phase2ApiKey) {
 			markPhase2FailureWithFallback(db, {
 				claim,
@@ -975,11 +976,21 @@ function redactSecrets(input: string): string {
 		/(?:sk|pk|rk|tok|key|secret|token|password)[-_A-Za-z0-9]{12,}/g,
 		/[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/g,
 		/(?:AKIA|ASIA)[A-Z0-9]{16}/g,
+		// GitHub tokens carry no keyword the first pattern recognizes, so without
+		// this they reached MEMORY.md and memory_summary.md verbatim — and the
+		// summary is injected into every later session. Same shapes the
+		// contribution-prep scrubber already covers.
+		/\b(?:gh[opsur]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,})\b/g,
 	];
 	for (const pattern of patterns) {
 		out = out.replace(pattern, "[REDACTED]");
 	}
 	return out;
+}
+
+/** Secret scrubbing applied to every phase-2 consolidation output. Test seam. */
+export function redactMemorySecretsForTesting(input: string): string {
+	return redactSecrets(input);
 }
 
 function sanitizeSkillName(name: string): string {
@@ -1080,10 +1091,23 @@ async function resolveMemoryModel(options: {
 			settings: session.settings,
 			matchPreferences: { usageOrder: session.settings.getStorage()?.getModelUsageOrder() },
 			modelRegistry,
+			sessionId: session.sessionId,
+			credentialSessionId: session.credentialSessionId,
 		});
 		if (resolved.model) return resolved.model;
 	}
-	return session.model ?? modelRegistry.getAll()[0];
+	if (session.model) return session.model;
+	// No configured role and no active session model (e.g. background startup
+	// before lazy model resolution): prefer the most recently used model over
+	// raw registry order. `getAll()[0]` can be a retired model the provider
+	// now rejects with 404, which permanently fails consolidation jobs.
+	const allModels = modelRegistry.getAll();
+	const usageOrder = session.settings.getStorage()?.getModelUsageOrder() ?? [];
+	for (const usedKey of usageOrder) {
+		const match = allModels.find(model => `${model.provider}/${model.id}` === usedKey);
+		if (match) return match;
+	}
+	return allModels[0];
 }
 
 function loadMemoryConfig(settings: Settings): MemoryRuntimeConfig {

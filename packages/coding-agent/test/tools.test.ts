@@ -8,12 +8,29 @@ import type { AgentToolContext } from "@gajae-code/agent-core";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async";
 import { DEFAULT_BASH_INTERCEPTOR_RULES, Settings } from "@gajae-code/coding-agent/config/settings";
 import { EditTool } from "@gajae-code/coding-agent/edit";
+import { saveAgentBashOriginalArtifact } from "@gajae-code/coding-agent/session/agent-session";
+import { ArtifactManager } from "@gajae-code/coding-agent/session/artifacts";
+import type { FoldAdapter } from "@gajae-code/coding-agent/session/fold-coordinator";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import {
+	DEFAULT_ARTIFACT_MAX_BYTES,
+	OutputSink,
+	truncateHeadBytes,
+} from "@gajae-code/coding-agent/session/streaming-output";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
-import { BashTool } from "@gajae-code/coding-agent/tools/bash";
+import {
+	type BashOriginalArtifactSaveResult,
+	BashTool,
+	saveBashOriginalArtifactForTests,
+} from "@gajae-code/coding-agent/tools/bash";
 import { FindTool } from "@gajae-code/coding-agent/tools/find";
 import { JobTool } from "@gajae-code/coding-agent/tools/job";
-import { wrapToolWithMetaNotice } from "@gajae-code/coding-agent/tools/output-meta";
+import {
+	formatArtifactReference,
+	formatOutputNotice,
+	outputMeta,
+	wrapToolWithMetaNotice,
+} from "@gajae-code/coding-agent/tools/output-meta";
 import { ReadTool } from "@gajae-code/coding-agent/tools/read";
 import { DEFAULT_FILE_LIMIT, MULTI_FILE_PER_FILE_MATCHES, SearchTool } from "@gajae-code/coding-agent/tools/search";
 import { WriteTool } from "@gajae-code/coding-agent/tools/write";
@@ -28,6 +45,15 @@ function getTextOutput(result: any): string {
 			.map((c: any) => c.text)
 			.join("\n") || ""
 	);
+}
+
+function hasInteriorMiddleLine(content: string, minimum = 1_000, maximum = 5_000): boolean {
+	return content.split("\n").some(line => {
+		const match = /^middle-(\d+)$/.exec(line);
+		if (!match) return false;
+		const value = Number(match[1]);
+		return value > minimum && value < maximum;
+	});
 }
 
 function writeFileWithMtime(filePath: string, content: string, mtimeMs: number): void {
@@ -218,6 +244,23 @@ function createTestToolContext(toolNames: string[]): AgentToolContext {
 	} as AgentToolContext;
 }
 
+/**
+ * Drive a fold the way the coordinator does: hand the adapter the receipt it
+ * would have captured, which settles the foreground caller exactly once.
+ */
+function foldViaAdapter(adapter: FoldAdapter): void {
+	adapter.detachObserver({
+		jobId: adapter.jobId,
+		jobGeneration: adapter.jobGeneration,
+		kind: adapter.kind,
+		label: adapter.label,
+		outputRef: adapter.outputRef,
+		remainingIntent: undefined,
+		foldedAt: Date.now(),
+		cwdSensitive: adapter.cwdSensitive,
+	});
+}
+
 describe("Coding Agent Tools", () => {
 	let testDir: string;
 	let session: ToolSession;
@@ -395,22 +438,24 @@ describe("Coding Agent Tools", () => {
 			expect(output).toContain("Hello from file URL");
 		});
 
-		it("should truncate files exceeding line limit", async () => {
+		it("truncates files exceeding the line limit to the tail by default", async () => {
 			const testFile = path.join(testDir, "large.txt");
 			const lines = Array.from({ length: 3500 }, (_, i) => `Line ${i + 1}`);
 			fs.writeFileSync(testFile, lines.join("\n"));
-			const defaultLimit = session.settings.get("read.defaultLimit");
+			const defaultLimit = session.settings.get("read.receiptBudgetLines");
 
 			const result = await readTool.execute("test-call-3", { path: testFile });
 			const output = getTextOutput(result);
 
-			expect(output).toContain("Line 1");
-			expect(output).toContain(`Line ${defaultLimit}`);
-			expect(output).not.toContain(`Line ${defaultLimit + 1}`);
-			expect(output).toContain(`[Showing lines 1-${defaultLimit} of 3500. Use :${defaultLimit + 1} to continue]`);
+			// The default direction is `last`, so a bare read keeps the end of the file.
+			const firstKept = 3500 - defaultLimit + 1;
+			expect(output).toContain(`Line ${firstKept}`);
+			expect(output).toContain("Line 3500");
+			expect(output).not.toContain(`Line ${firstKept - 1}\n`);
+			expect(output).toContain(`[Showing last ${defaultLimit} of 3500 lines`);
 		});
 
-		it("should truncate when byte limit exceeded", async () => {
+		it("truncates to the tail when the byte limit is exceeded", async () => {
 			const testFile = path.join(testDir, "large-bytes.txt");
 			// Create file with long lines so the byte budget triggers before the line limit.
 			const lines = Array.from({ length: 1000 }, (_, i) => `Line ${i + 1}: ${"x".repeat(600)}`);
@@ -419,9 +464,10 @@ describe("Coding Agent Tools", () => {
 			const result = await readTool.execute("test-call-4", { path: testFile });
 			const output = getTextOutput(result);
 
-			expect(output).toContain("Line 1:");
-			// Should show byte limit message
-			expect(output).toMatch(/\[Showing lines 1-\d+ of 1000 \(\d+(\.\d+)?\s*KB limit\)\. Use :\d+ to continue\]/);
+			// Byte budget trips before the line budget; the tail is retained.
+			expect(output).toContain("Line 1000:");
+			expect(output).not.toContain("Line 1:");
+			expect(output).toMatch(/\[Showing last \d+ of 1000 lines/);
 		});
 
 		it("should handle offset parameter (with leading context expansion)", async () => {
@@ -532,7 +578,7 @@ describe("Coding Agent Tools", () => {
 			const testFile = path.join(testDir, "large-file.txt");
 			const lines = Array.from({ length: 3500 }, (_, i) => `Line ${i + 1}`);
 			fs.writeFileSync(testFile, lines.join("\n"));
-			const defaultLimit = session.settings.get("read.defaultLimit");
+			const defaultLimit = session.settings.get("read.receiptBudgetLines");
 
 			const result = await readTool.execute("test-call-9", { path: testFile });
 
@@ -1082,23 +1128,351 @@ function b() {
 			expect(getTextOutput(result)).toContain("hello");
 		});
 
-		it("should write truncated output to artifacts", async () => {
+		it("should keep only the tail of truncated output by default and write the full artifact", async () => {
 			const result = await bashTool.execute("test-call-8-artifact", {
-				command: "printf 'a%.0s' {1..60000}",
+				command: "printf 'HEAD\\n'; printf 'middle-%05d\\n' {1..6000}; printf 'TAIL\\n'",
 			});
+			const output = getTextOutput(result);
+			const truncation = result.details?.meta?.truncation;
 
-			const artifactId = result.details?.meta?.truncation?.artifactId;
+			expect(output).not.toContain("HEAD");
+			expect(output).toContain("TAIL");
+			expect(truncation?.direction).toBe("tail");
+			expect(truncation?.headRange).toBeUndefined();
+			expect(truncation?.outputBytes).toBe(1024);
+			const artifactId = truncation?.artifactId;
 			expect(artifactId).toBeDefined();
 			if (artifactId) {
 				const artifactPath = path.join(testDir, "session", `${artifactId}.bash.log`);
 				expect(fs.existsSync(artifactPath)).toBe(true);
+				const artifact = fs.readFileSync(artifactPath, "utf-8");
+				expect(artifact).toContain("HEAD");
+				expect(artifact).toContain("middle-03000");
+				expect(artifact).toContain("TAIL");
 			}
+		});
+
+		it("publishes truncated output through managed storage without a writable path", async () => {
+			const manager = new ArtifactManager(path.join(testDir, "managed-artifacts"));
+			const tool = wrapToolWithMetaNotice(
+				new BashTool(
+					createTestToolSession(testDir, Settings.isolated(), {
+						allocateOutputArtifact: async () => ({ id: "reserved-managed-id" }),
+						getArtifactManager: () => manager,
+					}),
+				),
+			);
+			const result = await tool.execute("test-call-managed-artifact", {
+				command: "printf 'HEAD\\n'; printf 'middle-%05d\\n' {1..400}; printf 'TAIL\\n'",
+			});
+			const truncation = result.details?.meta?.truncation;
+			const artifactId = truncation?.artifactId;
+
+			expect(getTextOutput(result)).not.toContain("HEAD");
+			expect(getTextOutput(result)).toContain("TAIL");
+			expect(artifactId).toBeDefined();
+			expect(artifactId).not.toBe("reserved-managed-id");
+			if (!artifactId) throw new Error("expected managed artifact id");
+			const artifactPath = await manager.getPath(artifactId);
+			expect(artifactPath).not.toBeNull();
+			const artifact = await Bun.file(artifactPath!).text();
+			expect(artifact).toContain("HEAD");
+			expect(artifact).toContain("middle-00200");
+			expect(artifact).toContain("TAIL");
+		});
+
+		it("reports artifact writer creation failure without publishing an artifact id", async () => {
+			const sink = new OutputSink({
+				artifactPath: path.join(testDir, "missing-artifact-parent", "output.log"),
+				artifactId: "unpublished-artifact",
+				spillThreshold: 4,
+			});
+			sink.push("abcdefgh");
+			const summary = await sink.dump();
+
+			expect(summary.artifactId).toBeUndefined();
+			expect(summary.artifactFailureDiagnostic).toMatch(/^(create|write|end):/);
+
+			const unavailable = new OutputSink({ spillThreshold: 4 });
+			unavailable.push("abcdefgh");
+			const unavailableSummary = await unavailable.dump();
+			expect(unavailableSummary.artifactFailureDiagnostic).toBeUndefined();
+		});
+
+		it("preserves typed capped and unavailable original-artifact outcomes", async () => {
+			const originalText = "界".repeat(Math.floor(DEFAULT_ARTIFACT_MAX_BYTES / 3) + 1);
+			const retainedPrefix = truncateHeadBytes(originalText, DEFAULT_ARTIFACT_MAX_BYTES);
+			const originalBytes = Buffer.byteLength(originalText, "utf-8");
+			const expectedOmittedBytes = originalBytes - retainedPrefix.bytes;
+			let savedContent: string | undefined;
+			let savedType: string | undefined;
+			let cappedResult: BashOriginalArtifactSaveResult | undefined;
+			const artifactManager = new ArtifactManager(path.join(testDir, "manager-artifacts"));
+			const managerSession = createTestToolSession(testDir, Settings.isolated(), {
+				getArtifactManager: () =>
+					({
+						save: async (content: string, type: string) => {
+							savedContent = content;
+							savedType = type;
+							return artifactManager.save(content, type);
+						},
+					}) as unknown as ArtifactManager,
+			});
+			await saveBashOriginalArtifactForTests(managerSession, originalText, result => {
+				cappedResult = result;
+			});
+			expect(cappedResult).toEqual({
+				status: "saved",
+				artifactId: "0",
+				complete: false,
+				omittedBytes: expectedOmittedBytes,
+			});
+			expect(savedContent).toBe(originalText);
+			expect(Buffer.byteLength(savedContent ?? "", "utf-8")).toBe(originalBytes);
+			expect(savedType).toBe("bash-original");
+			expect(retainedPrefix.bytes).toBeLessThanOrEqual(DEFAULT_ARTIFACT_MAX_BYTES);
+			expect(retainedPrefix.bytes).toBe(DEFAULT_ARTIFACT_MAX_BYTES - 1);
+			expect(expectedOmittedBytes).toBe(3);
+			expect(Buffer.byteLength(retainedPrefix.text, "utf-8")).toBe(retainedPrefix.bytes);
+
+			const persistedPath = path.join(testDir, "manager-artifacts", "0.bash-original.log");
+			expect(fs.existsSync(persistedPath)).toBe(true);
+			expect(fs.readFileSync(persistedPath, "utf-8")).toBe(
+				`${retainedPrefix.text}\n[artifact truncated after ${retainedPrefix.bytes} bytes; omitted at least ${expectedOmittedBytes} bytes]\n`,
+			);
+			if (cappedResult?.status === "saved" && !cappedResult.complete) {
+				const reference = formatArtifactReference(cappedResult.artifactId, cappedResult.omittedBytes);
+				expect(reference).toContain("retained output");
+				expect(reference).toContain("omitted by the artifact storage cap");
+				expect(reference).not.toContain("full output");
+			}
+
+			let unavailableResult: BashOriginalArtifactSaveResult | undefined;
+			const unavailableSession = createTestToolSession(testDir, Settings.isolated(), {
+				getArtifactManager: undefined,
+				allocateOutputArtifact: undefined,
+			});
+			await saveBashOriginalArtifactForTests(unavailableSession, "original", result => {
+				unavailableResult = result;
+			});
+			expect(unavailableResult).toEqual({ status: "unavailable" });
+		});
+
+		it("does not expose nonpersistent user-bang artifact ids", async () => {
+			let savedType: string | undefined;
+			const result = await saveAgentBashOriginalArtifact(
+				{
+					saveArtifact: async (_content, type) => {
+						savedType = type;
+						return "memory-only-id";
+					},
+					getArtifactPath: async () => null,
+				},
+				"raw user-bang output",
+			);
+
+			expect(savedType).toBe("bash-original");
+			expect(result).toEqual({ status: "unavailable" });
+			expect(JSON.stringify(result)).not.toContain("artifact://");
+		});
+
+		it("writes short original output through an allocated artifact path", async () => {
+			const originalText = "deterministic original payload\n";
+			const allocationSession = createTestToolSession(testDir, Settings.isolated(), {
+				getArtifactManager: undefined,
+				allocateOutputArtifact: async toolType => {
+					const artifactId = "allocated-bash-original";
+					const artifactPath = path.join(testDir, "session", `${artifactId}.${toolType}.log`);
+					fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
+					return { id: artifactId, path: artifactPath };
+				},
+			});
+
+			const artifactId = await saveBashOriginalArtifactForTests(allocationSession, originalText);
+			expect(artifactId).toBe("allocated-bash-original");
+			if (!artifactId) throw new Error("expected allocated original artifact id");
+			const artifactPath = path.join(testDir, "session", `${artifactId}.bash-original.log`);
+			expect(fs.readFileSync(artifactPath, "utf-8")).toBe(originalText);
+		});
+
+		it("surfaces artifact writer diagnostics on successful Bash results", async () => {
+			const failingTool = wrapToolWithMetaNotice(
+				new BashTool(
+					createTestToolSession(testDir, Settings.isolated(), {
+						allocateOutputArtifact: async () => ({
+							id: "writer-failure",
+							path: path.join(testDir, "missing-bash-artifact-parent", "output.log"),
+						}),
+					}),
+				),
+			);
+			const result = await failingTool.execute("test-writer-failure", {
+				command: "printf 'x%.0s' {1..2000}",
+			});
+			const text = getTextOutput(result);
+
+			expect(text).toContain("Artifact storage failed");
+			expect(text).toContain("create:");
+			expect(text).not.toContain("Read artifact://writer-failure");
+		});
+
+		it("surfaces artifact writer diagnostics on failed Bash results", async () => {
+			const failingTool = new BashTool(
+				createTestToolSession(testDir, Settings.isolated(), {
+					allocateOutputArtifact: async () => ({
+						id: "writer-failure-command",
+						path: path.join(testDir, "missing-bash-failure-parent", "output.log"),
+					}),
+				}),
+			);
+
+			let caught: unknown;
+			try {
+				await failingTool.execute("test-writer-failure-command", {
+					command: "printf 'x%.0s' {1..2000}; exit 7",
+				});
+			} catch (error) {
+				caught = error;
+			}
+
+			expect(caught).toBeInstanceOf(Error);
+			const message = caught instanceof Error ? caught.message : String(caught);
+			expect(message).toContain("Bash output artifact writer failed: create:");
+			expect(message).not.toContain("artifact://writer-failure-command");
+		});
+
+		it("propagates writer diagnostics through truncation notices", () => {
+			const meta = outputMeta()
+				.truncationFromSummary(
+					{
+						output: "tail",
+						truncated: true,
+						totalLines: 3,
+						totalBytes: 20,
+						outputLines: 1,
+						outputBytes: 4,
+						artifactFailureDiagnostic: "write: disk full",
+					},
+					{ direction: "tail" },
+				)
+				.get();
+
+			expect(formatOutputNotice(meta)).toContain("Artifact storage failed: write: disk full");
+		});
+
+		it("keeps a raw OutputSink artifact reachable after a short replacement body", async () => {
+			const artifactPath = path.join(testDir, "session", "minimized-output.log");
+			fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
+			const sink = new OutputSink({ artifactPath, artifactId: "raw-sink", spillThreshold: 1024 });
+			sink.push("x".repeat(2_048));
+			sink.replace("minimized");
+			sink.push("\n[raw output: artifact://raw-sink]\n");
+			const summary = await sink.dump();
+			const artifact = fs.readFileSync(artifactPath, "utf-8");
+
+			expect(summary.truncated).toBe(false);
+			expect(summary.artifactId).toBe("raw-sink");
+			expect(artifact).toBe(`${"x".repeat(2_048)}\n[raw output: artifact://raw-sink]\n`);
+			const meta = outputMeta().truncationFromSummary(summary, { direction: "tail" }).get();
+			expect(meta?.truncation?.artifactId).toBe("raw-sink");
+			expect(meta?.truncation?.noticeOwner).toBe("body");
+			expect(formatOutputNotice(meta)).toBe("");
 		});
 
 		it("should handle command errors", async () => {
 			await expect(bashTool.execute("test-call-9", { command: "exit 1" })).rejects.toThrow(
 				/(Command failed|code 1)/,
 			);
+		});
+
+		it("should keep the artifact reference when noisy output exits non-zero", async () => {
+			let caught: unknown;
+			try {
+				await bashTool.execute("test-call-9-noisy-exit", {
+					command: "printf 'HEAD\\n'; printf 'middle-%05d\\n' {1..6000}; printf 'TAIL\\n'; exit 7",
+				});
+			} catch (error) {
+				caught = error;
+			}
+
+			expect(caught).toBeInstanceOf(Error);
+			const message = caught instanceof Error ? caught.message : "";
+			expect(message).toContain("Command exited with code 7");
+			const artifactId = /artifact:\/\/([A-Za-z0-9_-]+)/.exec(message)?.[1];
+			expect(artifactId).toBeDefined();
+			if (!artifactId) throw new Error("expected noisy-exit artifact id");
+			const artifactPath = path.join(testDir, "session", `${artifactId}.bash.log`);
+			expect(fs.existsSync(artifactPath)).toBe(true);
+			const artifact = fs.readFileSync(artifactPath, "utf-8");
+			expect(artifact).toContain("HEAD");
+			expect(hasInteriorMiddleLine(artifact)).toBe(true);
+			expect(artifact).toContain("TAIL");
+		});
+
+		it("bounds configured noisy errors while retaining status and artifact evidence", async () => {
+			const configuredTool = new BashTool(
+				createTestToolSession(
+					testDir,
+					Settings.isolated({ "tools.artifactTailBytes": 8, "tools.artifactHeadBytes": 8 }),
+				),
+			);
+			let caught: unknown;
+			try {
+				await configuredTool.execute("test-call-9-configured-noisy-exit", {
+					command: "printf 'HEAD\\n'; printf 'middle-%05d\\n' {1..6000}; printf 'TAIL\\n'; exit 23",
+				});
+			} catch (error) {
+				caught = error;
+			}
+
+			expect(caught).toBeInstanceOf(Error);
+			const message = caught instanceof Error ? caught.message : "";
+			expect(Buffer.byteLength(message, "utf-8")).toBeLessThanOrEqual(4096);
+			expect(message).toContain("Command exited with code 23");
+			expect(message).toMatch(/Read artifact:\/\/[A-Za-z0-9_-]+/);
+		});
+
+		it("keeps the structured timeout cause when command output says aborted", async () => {
+			let caught: unknown;
+			try {
+				await bashTool.execute("test-call-9-timeout-status-precedence", {
+					command: "printf 'x%.0s' {1..6000}; printf '\nCommand aborted\n'; sleep 5",
+					timeout: 1,
+				});
+			} catch (error) {
+				caught = error;
+			}
+
+			expect(caught).toBeInstanceOf(Error);
+			const message = caught instanceof Error ? caught.message : "";
+			expect(Buffer.byteLength(message, "utf-8")).toBeLessThanOrEqual(4096);
+			expect(message).toContain("Command aborted");
+			expect(message.trimEnd().endsWith("Command timed out after 1 seconds")).toBe(true);
+			expect(message).toContain("artifact://");
+		});
+
+		it("should keep the artifact reference when noisy output times out", async () => {
+			let caught: unknown;
+			try {
+				await bashTool.execute("test-call-9-noisy-timeout", {
+					command: "printf 'HEAD\\n'; printf 'middle-%05d\\n' {1..6000}; sleep 5",
+					timeout: 1,
+				});
+			} catch (error) {
+				caught = error;
+			}
+
+			expect(caught).toBeInstanceOf(Error);
+			const message = caught instanceof Error ? caught.message : "";
+			expect(message).toContain("Command timed out after 1 seconds");
+			const artifactId = /artifact:\/\/([A-Za-z0-9_-]+)/.exec(message)?.[1];
+			expect(artifactId).toBeDefined();
+			if (!artifactId) throw new Error("expected noisy-timeout artifact id");
+			const artifactPath = path.join(testDir, "session", `${artifactId}.bash.log`);
+			expect(fs.existsSync(artifactPath)).toBe(true);
+			const artifact = fs.readFileSync(artifactPath, "utf-8");
+			expect(artifact).toContain("HEAD");
+			expect(hasInteriorMiddleLine(artifact)).toBe(true);
 		});
 
 		it("should keep short commands inline when auto-background is enabled", async () => {
@@ -1175,11 +1549,111 @@ function b() {
 			}
 			const runningJob = asyncJobManager.getJob(jobId);
 			expect(runningJob?.status).toBe("running");
+			expect(runningJob?.metadata?.backgrounded).toBe(true);
 			await runningJob?.promise;
 			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
 			expect(deliveries).toHaveLength(1);
 			expect(deliveries[0]?.jobId).toBe(jobId);
 			expect(deliveries[0]?.text).toContain("done");
+			await asyncJobManager.dispose();
+		});
+
+		it("marks zero-wait auto-background jobs in the manager snapshot", async () => {
+			const asyncJobManager = new AsyncJobManager({ onJobComplete: async () => {} });
+			AsyncJobManager.setInstance(asyncJobManager);
+			const tool = new BashTool(
+				createTestToolSession(
+					testDir,
+					Settings.isolated({
+						"bash.autoBackground.enabled": true,
+						"bash.autoBackground.thresholdMs": 0,
+					}),
+					{ getSessionId: () => "test-session" },
+				),
+			);
+
+			const result = await tool.execute("test-call-9-auto-zero-wait", { command: "sleep 0.05" });
+			const jobId = result.details?.async?.jobId;
+			if (!jobId) throw new Error("expected an immediate auto-background job id");
+			expect(asyncJobManager.getJob(jobId)?.metadata?.backgrounded).toBe(true);
+			expect(asyncJobManager.getJobsSnapshot().jobs.find(job => job.id === jobId)?.backgrounded).toBe(true);
+			await asyncJobManager.getJob(jobId)?.promise;
+			await asyncJobManager.dispose();
+		});
+
+		it("should bound async and monitor output while preserving full local evidence", async () => {
+			const deliveries: Array<{ jobId: string; text: string }> = [];
+			const monitorLines: string[] = [];
+			const asyncJobManager = new AsyncJobManager({
+				onJobComplete: async (jobId, text) => {
+					deliveries.push({ jobId, text });
+				},
+			});
+			AsyncJobManager.setInstance(asyncJobManager);
+			const tool = new BashTool(
+				createTestToolSession(
+					testDir,
+					Settings.isolated({ "async.enabled": true, "bash.autoBackground.enabled": false }),
+					{ getSessionId: () => "test-session" },
+				),
+			);
+			const middle = Array.from({ length: 400 }, (_, index) => `middle-${String(index).padStart(5, "0")}`).join(
+				"\\n",
+			);
+			const command = `printf 'HEAD\\n${middle}\\nTAIL\\n'`;
+
+			const asyncStarted = await tool.execute("test-call-async-tail", { command, async: true });
+			const asyncJobId = asyncStarted.details?.async?.jobId;
+			expect(asyncJobId).toBeDefined();
+			expect(asyncJobManager.getJob(asyncJobId!)?.metadata?.backgrounded).toBe(true);
+			expect(asyncJobManager.getJobsSnapshot().jobs.find(job => job.id === asyncJobId)?.backgrounded).toBe(true);
+			await asyncJobManager.getJob(asyncJobId!)?.promise;
+			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
+
+			const asyncDelivery = deliveries.find(delivery => delivery.jobId === asyncJobId)?.text ?? "";
+			const asyncReferenceOffset = asyncDelivery.indexOf("\nRead artifact://");
+			expect(asyncReferenceOffset).toBeGreaterThan(0);
+			const asyncBody = asyncDelivery.slice(0, asyncReferenceOffset);
+			expect(asyncDelivery).not.toContain("HEAD");
+			expect(asyncDelivery).toContain("TAIL");
+			expect(asyncDelivery).toContain("Read artifact://");
+			expect(Buffer.byteLength(asyncBody, "utf-8")).toBeLessThanOrEqual(1024);
+			expect(asyncBody.split("\n").some(line => line.startsWith("middle-"))).toBe(true);
+			const asyncArtifactIds = Array.from(
+				asyncDelivery.matchAll(/artifact:\/\/([A-Za-z0-9_-]+)/g),
+				match => match[1],
+			).filter((id): id is string => id !== undefined);
+			expect(asyncArtifactIds).toHaveLength(1);
+
+			const monitorStarted = await tool.startMonitorJob({ command }, { onRawLine: line => monitorLines.push(line) });
+			await asyncJobManager.getJob(monitorStarted.jobId)?.promise;
+			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
+			const monitorDelivery = deliveries.find(delivery => delivery.jobId === monitorStarted.jobId)?.text ?? "";
+			const monitorReferenceOffset = monitorDelivery.indexOf("\nRead artifact://");
+			expect(monitorReferenceOffset).toBeGreaterThan(0);
+			const monitorBody = monitorDelivery.slice(0, monitorReferenceOffset);
+			expect(monitorDelivery).not.toContain("HEAD");
+			expect(monitorDelivery).toContain("TAIL");
+			expect(monitorDelivery).toContain("Read artifact://");
+			expect(Buffer.byteLength(monitorBody, "utf-8")).toBeLessThanOrEqual(1024);
+			expect(monitorBody.split("\n").some(line => line.startsWith("middle-"))).toBe(true);
+			expect(hasInteriorMiddleLine(monitorLines.join("\n"), 50, 350)).toBe(true);
+			expect(monitorLines[0]).toBe("HEAD");
+			expect(monitorLines.at(-1)).toBe("TAIL");
+			const monitorArtifactIds = Array.from(
+				monitorDelivery.matchAll(/artifact:\/\/([A-Za-z0-9_-]+)/g),
+				match => match[1],
+			).filter((id): id is string => id !== undefined);
+			expect(monitorArtifactIds).toHaveLength(1);
+
+			for (const artifactId of [asyncArtifactIds[0]!, monitorArtifactIds[0]!]) {
+				const artifactPath = path.join(testDir, "session", `${artifactId}.bash.log`);
+				expect(fs.existsSync(artifactPath)).toBe(true);
+				const artifact = fs.readFileSync(artifactPath, "utf-8");
+				expect(artifact).toContain("HEAD");
+				expect(hasInteriorMiddleLine(artifact, 50, 350)).toBe(true);
+				expect(artifact).toContain("TAIL");
+			}
 			await asyncJobManager.dispose();
 		});
 
@@ -1192,7 +1666,7 @@ function b() {
 				},
 			});
 			AsyncJobManager.setInstance(asyncJobManager);
-			let backgroundRequestHandler: (() => void) | undefined;
+			let foldAdapter: FoldAdapter | undefined;
 			const autoBackgroundBashTool = wrapToolWithMetaNotice(
 				new BashTool(
 					createTestToolSession(
@@ -1203,10 +1677,10 @@ function b() {
 						}),
 						{
 							getSessionId: () => "test-session",
-							registerForegroundBashBackgroundRequestHandler: handler => {
-								backgroundRequestHandler = handler;
+							registerForegroundFoldParticipant: adapter => {
+								foldAdapter = adapter;
 								return () => {
-									if (backgroundRequestHandler === handler) backgroundRequestHandler = undefined;
+									if (foldAdapter === adapter) foldAdapter = undefined;
 								};
 							},
 						},
@@ -1228,18 +1702,18 @@ function b() {
 				},
 			);
 
-			for (let i = 0; i < 50 && !backgroundRequestHandler; i++) {
+			for (let i = 0; i < 50 && !foldAdapter; i++) {
 				await Bun.sleep(10);
 			}
-			expect(backgroundRequestHandler).toBeDefined();
-			backgroundRequestHandler?.();
+			expect(foldAdapter).toBeDefined();
+			if (foldAdapter) foldViaAdapter(foldAdapter);
 
 			const result = await resultPromise;
 			expect(result.details?.async?.state).toBe("running");
 			expect(result.details?.async?.type).toBe("bash");
 			expect(getTextOutput(result)).toContain("Background job");
 			expect(getTextOutput(result)).toContain("start");
-			expect(backgroundRequestHandler).toBeUndefined();
+			expect(foldAdapter).toBeUndefined();
 
 			const jobId = result.details?.async?.jobId;
 			if (!jobId) {
@@ -1247,11 +1721,73 @@ function b() {
 			}
 			const runningJob = asyncJobManager.getJob(jobId);
 			expect(runningJob?.status).toBe("running");
+			expect(runningJob?.metadata?.backgrounded).toBe(true);
+			expect(asyncJobManager.getJobsSnapshot().jobs.find(job => job.id === jobId)?.backgrounded).toBe(true);
 			await runningJob?.promise;
 			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
 			const postFoldProgress = updates.filter(update => update.text.includes("after-fold"));
 			expect(postFoldProgress.length).toBeGreaterThan(0);
 			expect(postFoldProgress.every(update => update.asyncState !== undefined)).toBe(true);
+			expect(deliveries).toHaveLength(1);
+			expect(deliveries[0]?.jobId).toBe(jobId);
+			expect(deliveries[0]?.text).toContain("done");
+			await asyncJobManager.dispose();
+		});
+
+		it("should fold a managed foreground command even when auto-background is disabled", async () => {
+			const deliveries: Array<{ jobId: string; text: string }> = [];
+			const asyncJobManager = new AsyncJobManager({
+				onJobComplete: async (jobId, text) => {
+					deliveries.push({ jobId, text });
+				},
+			});
+			AsyncJobManager.setInstance(asyncJobManager);
+			let foldAdapter: FoldAdapter | undefined;
+			const foregroundBashTool = wrapToolWithMetaNotice(
+				new BashTool(
+					createTestToolSession(
+						testDir,
+						Settings.isolated({
+							"bash.autoBackground.enabled": false,
+						}),
+						{
+							getSessionId: () => "test-session",
+							registerForegroundFoldParticipant: adapter => {
+								foldAdapter = adapter;
+								return () => {
+									if (foldAdapter === adapter) foldAdapter = undefined;
+								};
+							},
+						},
+					),
+				),
+			);
+
+			const resultPromise = foregroundBashTool.execute(
+				"test-call-9-fold-foreground-noauto",
+				{
+					command: "printf 'start\\n'; sleep 0.05; printf 'after-fold\\n'; sleep 0.2; printf 'done\\n'",
+				},
+				undefined,
+			);
+
+			for (let i = 0; i < 50 && !foldAdapter; i++) {
+				await Bun.sleep(10);
+			}
+			expect(foldAdapter).toBeDefined();
+			if (foldAdapter) foldViaAdapter(foldAdapter);
+
+			const result = await resultPromise;
+			expect(result.details?.async?.state).toBe("running");
+			expect(getTextOutput(result)).toContain("Background job");
+
+			const jobId = result.details?.async?.jobId;
+			if (!jobId) {
+				throw new Error("expected a folded background job id");
+			}
+			const runningJob = asyncJobManager.getJob(jobId);
+			await runningJob?.promise;
+			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
 			expect(deliveries).toHaveLength(1);
 			expect(deliveries[0]?.jobId).toBe(jobId);
 			expect(deliveries[0]?.text).toContain("done");
@@ -1295,6 +1831,8 @@ function b() {
 			}
 			const runningJob = asyncJobManager.getJob(jobId);
 			expect(runningJob?.status).toBe("running");
+			expect(runningJob?.metadata?.backgrounded).toBe(true);
+			expect(asyncJobManager.getJobsSnapshot().jobs.find(job => job.id === jobId)?.backgrounded).toBe(true);
 			await runningJob?.promise;
 			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
 			expect(deliveries).toHaveLength(1);
@@ -1319,22 +1857,40 @@ function b() {
 			);
 		});
 
-		it("should abort and recover for subsequent commands", async () => {
-			const controller = new AbortController();
-			const promise = bashTool.execute(
-				"test-call-10-abort",
-				{ command: "printf 'started\\n'; sleep 60", timeout: 3 },
-				controller.signal,
-				update => {
-					if (update.content?.some(content => content.type === "text" && content.text.includes("started"))) {
-						controller.abort("test abort");
-					}
-				},
-			);
-			await expect(promise).rejects.toThrow(/abort|cancel|timed out/i);
+		it("should preserve bounded terminal evidence when a managed foreground command is aborted", async () => {
+			const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+			AsyncJobManager.setInstance(manager);
+			try {
+				const controller = new AbortController();
+				const promise = bashTool.execute(
+					"test-call-10-abort",
+					{
+						command: "printf 'x%.0s' {1..2000}; printf '\nREADY\n'; sleep 60",
+						timeout: 30,
+					},
+					controller.signal,
+				);
+				const abortTimer = setTimeout(() => controller.abort("test abort"), 100);
 
-			const result = await bashTool.execute("test-call-10-after-abort", { command: "echo ok" });
-			expect(getTextOutput(result)).toContain("ok");
+				let caught: unknown;
+				try {
+					await promise;
+				} catch (error) {
+					caught = error;
+				} finally {
+					clearTimeout(abortTimer);
+				}
+				expect(caught).toBeInstanceOf(Error);
+				const message = caught instanceof Error ? caught.message : "";
+				expect(message).toContain("Command aborted");
+				expect(message).toContain("artifact://");
+				expect(Buffer.byteLength(message, "utf-8")).toBeLessThanOrEqual(4096);
+				const result = await bashTool.execute("test-call-10-after-abort", { command: "echo ok" });
+				expect(getTextOutput(result)).toContain("ok");
+			} finally {
+				await manager.dispose();
+				AsyncJobManager.setInstance(undefined);
+			}
 		}, 15_000);
 
 		it("should throw error when cwd does not exist", async () => {
@@ -1858,6 +2414,39 @@ function b() {
 			expect(outputLines).toEqual(["z/auth-actions.spec.ts", "a/auth-actions.spec.ts"]);
 		});
 
+		it("should bound progress and break equal-mtime ties by path", async () => {
+			const fixedTime = new Date(Date.now() - 30_000);
+			for (const name of ["z.txt", "a.txt", "m.txt"]) {
+				const filePath = path.join(testDir, name);
+				fs.writeFileSync(filePath, name);
+				fs.utimesSync(filePath, fixedTime, fixedTime);
+			}
+			const updates: string[][] = [];
+			const result = await findTool.execute(
+				"test-call-14f",
+				{
+					paths: [`${testDir}/**/*.txt`],
+					limit: 2,
+				},
+				undefined,
+				update => {
+					if (update.details?.files) updates.push(update.details.files);
+				},
+			);
+			const updatesAtCompletion = updates.length;
+			await Bun.sleep(25);
+
+			const outputLines = getTextOutput(result)
+				.split("\n")
+				.map(line => line.trim())
+				.filter(Boolean);
+			expect(outputLines.slice(0, 2)).toEqual(["a.txt", "m.txt"]);
+			expect(outputLines).not.toContain("z.txt");
+			expect(updates.length).toBeGreaterThan(0);
+			expect(updates.every(files => files.length <= 2)).toBe(true);
+			expect(updates).toHaveLength(updatesAtCompletion);
+		});
+
 		it("should render nested glob results relative to the session cwd", async () => {
 			const nestedDir = path.join(testDir, "apps", "daemon", "src", "telemetry");
 			fs.mkdirSync(nestedDir, { recursive: true });
@@ -1996,8 +2585,7 @@ describe("edit tool CRLF handling", () => {
 		).rejects.toThrow(/Found 2 occurrences/);
 	});
 
-	// TODO: CRLF preservation broken by LSP formatting - fix later
-	it.skip("should preserve UTF-8 BOM after edit", async () => {
+	it("should preserve UTF-8 BOM and CRLF line endings after edit", async () => {
 		const testFile = path.join(testDir, "bom-test.txt");
 		fs.writeFileSync(testFile, "\uFEFFfirst\r\nsecond\r\nthird\r\n");
 
@@ -2006,7 +2594,8 @@ describe("edit tool CRLF handling", () => {
 			edits: [{ old_text: "second\n", new_text: "REPLACED\n" }],
 		});
 
-		const content = await Bun.file(testFile).text();
+		const content = fs.readFileSync(testFile, "utf8");
 		expect(content).toBe("\uFEFFfirst\r\nREPLACED\r\nthird\r\n");
+		expect([...fs.readFileSync(testFile).slice(0, 3)]).toEqual([0xef, 0xbb, 0xbf]);
 	});
 });

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { legacyEraObservation } from "../src/runtime-mcp/protocol";
 import type { MCPReconnect } from "../src/runtime-mcp/tool-bridge";
 import { DeferredMCPTool, isRetriableConnectionError, MCPTool } from "../src/runtime-mcp/tool-bridge";
 import type { MCPServerConnection, MCPToolCallResult, MCPTransport } from "../src/runtime-mcp/types";
@@ -31,6 +32,14 @@ function makeConnection(transport: MCPTransport, name = "test-server"): MCPServe
 		transport,
 		serverInfo: { name: "test", version: "1.0" },
 		capabilities: { tools: {} },
+		protocol: legacyEraObservation({
+			preference: "auto",
+			effectiveVersion: "2025-03-26",
+			negotiation: "legacy-forced",
+			downgradeReason: "stdio-transport",
+			serverInfo: { name: "test", version: "1.0" },
+			capabilities: { tools: true },
+		}),
 	};
 }
 
@@ -91,6 +100,30 @@ describe("isRetriableConnectionError", () => {
 describe("MCPTool.execute retry on connection error", () => {
 	const noop = () => {};
 	const noCtx = {} as Parameters<MCPTool["execute"]>[3];
+
+	it("signals shared recovery without replaying a noReplay tool call after a retriable failure", async () => {
+		let callCount = 0;
+		let reconnectCount = 0;
+		const connection = makeConnection(
+			mockTransport(async () => {
+				callCount += 1;
+				throw new Error("ECONNRESET");
+			}),
+		);
+		const tool = new MCPTool(
+			connection,
+			TOOL_DEF,
+			async () => {
+				reconnectCount += 1;
+				return connection;
+			},
+			{ noReplay: true },
+		);
+		const result = await tool.execute("no-replay", {}, noop, noCtx);
+		expect(callCount).toBe(1);
+		expect(reconnectCount).toBe(1);
+		expect(result.details?.isError).toBe(true);
+	});
 
 	it("retries once on retriable error when reconnect succeeds", async () => {
 		let callCount = 0;

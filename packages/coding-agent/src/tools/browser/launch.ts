@@ -1,7 +1,10 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $which, getPuppeteerDir, logger } from "@gajae-code/utils";
+import { getPuppeteerDir } from "@gajae-code/utils/dirs";
+import { $credentialEnv } from "@gajae-code/utils/env";
+import * as logger from "@gajae-code/utils/logger";
+import { $which } from "@gajae-code/utils/which";
 import * as browsers from "@puppeteer/browsers";
 import type { Browser, CDPSession, Page, default as Puppeteer, Target } from "puppeteer-core";
 import { PUPPETEER_REVISIONS } from "puppeteer-core/internal/revisions.js";
@@ -14,11 +17,12 @@ import stealthWebglScript from "../puppeteer/05_stealth_webgl.txt" with { type: 
 import stealthScreenScript from "../puppeteer/06_stealth_screen.txt" with { type: "text" };
 import stealthFontsScript from "../puppeteer/07_stealth_fonts.txt" with { type: "text" };
 import stealthAudioScript from "../puppeteer/08_stealth_audio.txt" with { type: "text" };
-import stealthLocaleScript from "../puppeteer/09_stealth_locale.txt" with { type: "text" };
 import stealthPluginsScript from "../puppeteer/10_stealth_plugins.txt" with { type: "text" };
 import stealthHardwareScript from "../puppeteer/11_stealth_hardware.txt" with { type: "text" };
 import stealthCodecsScript from "../puppeteer/12_stealth_codecs.txt" with { type: "text" };
 import stealthWorkerScript from "../puppeteer/13_stealth_worker.txt" with { type: "text" };
+import stealthPermissionsScript from "../puppeteer/14_stealth_permissions.txt" with { type: "text" };
+import stealthWebrtcScript from "../puppeteer/15_stealth_webrtc.txt" with { type: "text" };
 import { ToolError } from "../tool-errors";
 
 export const DEFAULT_VIEWPORT = { width: 1365, height: 768, deviceScaleFactor: 1.25 };
@@ -35,7 +39,6 @@ const STEALTH_IGNORE_DEFAULT_ARGS = [
 	"--disable-default-apps",
 	"--disable-component-extensions-with-background-pages",
 ];
-const STEALTH_ACCEPT_LANGUAGE = "en-US,en";
 
 const USER_AGENT_TARGET_TIMEOUT_MS = 5_000;
 const USER_AGENT_TARGET_TYPES = new Set(["page", "webview", "background_page"]);
@@ -79,6 +82,48 @@ export async function loadPuppeteerInWorker(safeDir: string): Promise<typeof Pup
 }
 
 /**
+ * Browser launch overrides resolved from trusted environment sources only.
+ *
+ * These choose the browser binary and route/verify its traffic, so whatever can
+ * set them controls what runs and who sees the session. `$env` merges the
+ * caller's `cwd/.env` into `process.env`, so reading them directly would let
+ * repository content pick the executable, point every request at an attacker's
+ * proxy, or disable certificate validation. Resolve them the same way provider
+ * credentials are: launching shell plus GJC/user-owned `.env` files, never the
+ * project `.env`.
+ */
+function trustedBrowserEnv(name: string): string | undefined {
+	return $credentialEnv(name);
+}
+
+/** Boolean-like trusted browser env knob (`true`/`1`/`yes`/`on`). */
+function browserLaunchFlagEnabled(name: string): boolean {
+	const value = trustedBrowserEnv(name)?.toLowerCase();
+	return value === "true" || value === "1" || value === "yes" || value === "on";
+}
+
+/** Test seam: the browser launch overrides as resolved from trusted env. */
+export function resolveBrowserEnvOverridesForTest(): {
+	executablePath: string | undefined;
+	proxy: string | undefined;
+	proxyBypassLoopback: boolean;
+	ignoreCertErrors: boolean;
+	programFiles: string | undefined;
+	programFilesX86: string | undefined;
+	localAppData: string | undefined;
+} {
+	return {
+		executablePath: trustedBrowserEnv("PUPPETEER_EXECUTABLE_PATH"),
+		proxy: trustedBrowserEnv("PUPPETEER_PROXY"),
+		proxyBypassLoopback: browserLaunchFlagEnabled("PUPPETEER_PROXY_BYPASS_LOOPBACK"),
+		ignoreCertErrors: browserLaunchFlagEnabled("PUPPETEER_PROXY_IGNORE_CERT_ERRORS"),
+		programFiles: trustedBrowserEnv("ProgramFiles"),
+		programFilesX86: trustedBrowserEnv("ProgramFiles(x86)"),
+		localAppData: trustedBrowserEnv("LOCALAPPDATA"),
+	};
+}
+
+/**
  * Lazily download Chromium on first browser launch via @puppeteer/browsers.
  * Skipped when a system Chromium (NixOS) or PUPPETEER_EXECUTABLE_PATH is set.
  * The browser is cached under ~/.gjc/puppeteer (getPuppeteerDir).
@@ -87,7 +132,7 @@ let chromiumExecutablePromise: Promise<string | undefined> | undefined;
 async function ensureChromiumExecutable(): Promise<string | undefined> {
 	const sysChrome = resolveSystemChromium();
 	if (sysChrome) return sysChrome;
-	const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
+	const envPath = trustedBrowserEnv("PUPPETEER_EXECUTABLE_PATH");
 	if (envPath) return envPath;
 	if (chromiumExecutablePromise) return chromiumExecutablePromise;
 
@@ -169,7 +214,16 @@ function systemChromiumCandidates(): string[] {
 			break;
 		}
 		case "linux": {
-			const names = ["google-chrome-stable", "google-chrome", "chromium", "chromium-browser", "chrome"];
+			const names = [
+				"google-chrome-stable",
+				"google-chrome",
+				"google-chrome-beta",
+				"google-chrome-unstable",
+				"google-chrome-canary",
+				"chromium",
+				"chromium-browser",
+				"chrome",
+			];
 			for (const name of names) {
 				const found = $which(name);
 				if (found) candidates.push(found);
@@ -177,6 +231,9 @@ function systemChromiumCandidates(): string[] {
 			candidates.push(
 				"/usr/bin/google-chrome-stable",
 				"/usr/bin/google-chrome",
+				"/usr/bin/google-chrome-beta",
+				"/usr/bin/google-chrome-unstable",
+				"/usr/bin/google-chrome-canary",
 				"/usr/bin/chromium",
 				"/usr/bin/chromium-browser",
 				"/snap/bin/chromium",
@@ -193,13 +250,20 @@ function systemChromiumCandidates(): string[] {
 			break;
 		}
 		case "win32": {
-			const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
-			const programFilesX86 = process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
-			const localAppData = process.env.LOCALAPPDATA ?? path.join(home, "AppData\\Local");
+			const programFiles = trustedBrowserEnv("ProgramFiles") ?? "C:\\Program Files";
+			const programFilesX86 = trustedBrowserEnv("ProgramFiles(x86)") ?? "C:\\Program Files (x86)";
+			const localAppData = trustedBrowserEnv("LOCALAPPDATA") ?? path.join(home, "AppData\\Local");
 			candidates.push(
 				path.join(programFiles, "Google\\Chrome\\Application\\chrome.exe"),
 				path.join(programFilesX86, "Google\\Chrome\\Application\\chrome.exe"),
 				path.join(localAppData, "Google\\Chrome\\Application\\chrome.exe"),
+				path.join(programFiles, "Google\\Chrome Beta\\Application\\chrome.exe"),
+				path.join(programFilesX86, "Google\\Chrome Beta\\Application\\chrome.exe"),
+				path.join(localAppData, "Google\\Chrome Beta\\Application\\chrome.exe"),
+				path.join(programFiles, "Google\\Chrome Dev\\Application\\chrome.exe"),
+				path.join(programFilesX86, "Google\\Chrome Dev\\Application\\chrome.exe"),
+				path.join(localAppData, "Google\\Chrome Dev\\Application\\chrome.exe"),
+				path.join(localAppData, "Google\\Chrome SxS\\Application\\chrome.exe"),
 				path.join(programFiles, "Chromium\\Application\\chrome.exe"),
 				path.join(localAppData, "Chromium\\Application\\chrome.exe"),
 				path.join(programFiles, "Microsoft\\Edge\\Application\\msedge.exe"),
@@ -211,25 +275,89 @@ function systemChromiumCandidates(): string[] {
 	return candidates;
 }
 
-function resolveSystemChromium(): string | undefined {
-	if (resolvedChromium !== undefined) return resolvedChromium ?? undefined;
+function firstExecutableCandidate(candidates: string[], accept: (candidate: string) => boolean): string | undefined {
 	const seen = new Set<string>();
-	for (const candidate of systemChromiumCandidates()) {
+	for (const candidate of candidates) {
 		if (!candidate || seen.has(candidate)) continue;
 		seen.add(candidate);
-		if (isExecutableFile(candidate)) {
-			resolvedChromium = candidate;
-			logger.debug("Using system Chrome/Chromium", { path: candidate });
-			return candidate;
-		}
+		if (accept(candidate) && isExecutableFile(candidate)) return candidate;
 	}
-	resolvedChromium = null;
 	return undefined;
+}
+
+function resolveSystemChromium(): string | undefined {
+	if (resolvedChromium !== undefined) return resolvedChromium ?? undefined;
+	const found = firstExecutableCandidate(systemChromiumCandidates(), () => true);
+	resolvedChromium = found ?? null;
+	if (found) logger.debug("Using system Chrome/Chromium", { path: found });
+	return found;
+}
+
+/** Edge is Chromium-based but keeps its own profile format under its own user data root. */
+const EDGE_EXECUTABLE_PATTERN =
+	/(?:^|[/\\])(?:msedge(?:\.exe)?|microsoft-edge(?:-(?:stable|beta|dev|canary))?|com\.microsoft\.Edge|Microsoft Edge(?: Beta| Dev| Canary)?)$/i;
+
+/** True for a Microsoft Edge executable path (excluded from Chrome profile mode). */
+export function isEdgeExecutable(candidate: string): boolean {
+	return EDGE_EXECUTABLE_PATTERN.test(candidate);
+}
+
+const CHROME_PROFILE_EXECUTABLE_PATTERN =
+	/(?:^|[/\\])(?:google-chrome(?:-(?:stable|beta|unstable|canary))?|chromium(?:-browser)?|chrome(?:\.exe)?|Google Chrome(?: Beta| Dev| Canary)?|Chromium|com\.google\.Chrome|org\.chromium\.Chromium)$/i;
+
+/** True only for executable names owned by Google Chrome or Chromium. */
+export function isChromeProfileExecutable(candidate: string): boolean {
+	return CHROME_PROFILE_EXECUTABLE_PATTERN.test(candidate);
+}
+
+/**
+ * Validate the executable identity used for profile mode. Most symlinks are
+ * judged by their resolved target so a renamed cross-brand browser cannot pass
+ * by alias. Snap's canonical `/snap/bin/chromium` launcher is the exception:
+ * it resolves to the generic `/usr/bin/snap` dispatcher by design.
+ */
+export function isChromeProfileExecutableForLaunch(candidate: string, resolvedCandidate: string): boolean {
+	return (
+		(path.posix.normalize(candidate) === "/snap/bin/chromium" &&
+			path.posix.normalize(resolvedCandidate) === "/usr/bin/snap") ||
+		isChromeProfileExecutable(resolvedCandidate)
+	);
+}
+
+let resolvedProfileChrome: string | null | undefined; // undefined = unchecked; null = not found
+
+/**
+ * Installed Chrome/Chromium executable for saved-profile mode, or undefined when
+ * none is present. Edge is excluded on purpose: a discovered Chrome user data
+ * directory must never be opened by a different browser brand.
+ */
+export function resolveSystemChromeForProfile(): string | undefined {
+	if (resolvedProfileChrome !== undefined) return resolvedProfileChrome ?? undefined;
+	const found = firstExecutableCandidate(systemChromiumCandidates(), isChromeProfileExecutable);
+	resolvedProfileChrome = found ?? null;
+	if (found) logger.debug("Using system Chrome/Chromium for profile mode", { path: found });
+	return found;
 }
 
 export interface LaunchHeadlessOptions {
 	headless: boolean;
 	viewport?: { width: number; height: number; deviceScaleFactor?: number };
+	/**
+	 * Optional isolated warm-up profile directory (see profile-reuse.ts). When
+	 * set, the headless browser launches against this isolated copy of the user's
+	 * real Chrome profile so sessions inherit real cookies/storage/cache for
+	 * stronger stealth. Callers resolve this via resolveProfileReuse and MUST
+	 * pass an isolated copy, never a live profile dir.
+	 */
+	profileWarmupDir?: string;
+	/**
+	 * Optional opt-in geo alignment (see settings browser.geo.*). When set, the
+	 * browser is launched with a matching timezone (TZ env) and/or UI language
+	 * (--lang) at the source. Default unset = strict no-op: the real environment
+	 * timezone/locale are preserved (never half-spoof). Only align these to a
+	 * coherent value (e.g. one matching a configured proxy egress).
+	 */
+	geo?: { timezone?: string; locale?: string };
 }
 
 export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promise<Browser> {
@@ -244,27 +372,40 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 		"--no-sandbox",
 		"--disable-setuid-sandbox",
 		"--disable-blink-features=AutomationControlled",
+		// Suppress WebRTC leaking the real local/public IP via ICE candidates
+		// (a common bot tell). Keeps WebRTC functional over the default public
+		// interface only; 15_stealth_webrtc.txt adds a candidate-level guard.
+		"--force-webrtc-ip-handling-policy=default_public_interface_only",
 		`--window-size=${initialViewport.width},${initialViewport.height}`,
 	];
-	const proxy = process.env.PUPPETEER_PROXY;
+	if (opts.profileWarmupDir) {
+		// Isolated copy only (caller guarantees). Never point this at a live profile.
+		launchArgs.push(`--user-data-dir=${opts.profileWarmupDir}`);
+	}
+	const proxy = trustedBrowserEnv("PUPPETEER_PROXY");
 	if (proxy) {
 		launchArgs.push(`--proxy-server=${proxy}`);
 		// Chrome (since v72) bypasses proxies for localhost by default. When PUPPETEER_PROXY_BYPASS_LOOPBACK
 		// is true, add <-loopback> so traffic to localhost reaches the proxy (e.g. for mitmdump/auth capture).
-		const bypassLoopback = process.env.PUPPETEER_PROXY_BYPASS_LOOPBACK?.toLowerCase();
-		if (bypassLoopback === "true" || bypassLoopback === "1" || bypassLoopback === "yes" || bypassLoopback === "on") {
+		if (browserLaunchFlagEnabled("PUPPETEER_PROXY_BYPASS_LOOPBACK")) {
 			launchArgs.push("--proxy-bypass-list=<-loopback>");
 		}
 	}
-	const ignoreCert = process.env.PUPPETEER_PROXY_IGNORE_CERT_ERRORS?.toLowerCase();
-	if (ignoreCert === "true" || ignoreCert === "1" || ignoreCert === "yes" || ignoreCert === "on") {
+	// Opt-in geo alignment (default no-op). Locale via --lang at the source;
+	// timezone via the TZ env passed to the Chrome subprocess.
+	if (opts.geo?.locale) {
+		launchArgs.push(`--lang=${opts.geo.locale}`);
+	}
+	if (browserLaunchFlagEnabled("PUPPETEER_PROXY_IGNORE_CERT_ERRORS")) {
 		launchArgs.push("--ignore-certificate-errors");
 	}
+	const launchEnv = opts.geo?.timezone ? { ...process.env, TZ: opts.geo.timezone } : undefined;
 	return await puppeteer.launch({
 		headless: opts.headless,
 		defaultViewport: opts.headless ? initialViewport : null,
 		executablePath: await ensureChromiumExecutable(),
 		args: launchArgs,
+		...(launchEnv ? { env: launchEnv } : {}),
 		ignoreDefaultArgs: [...STEALTH_IGNORE_DEFAULT_ARGS],
 		protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 	});
@@ -306,6 +447,20 @@ export interface UserAgentOverride {
 		model: string;
 		mobile: boolean;
 	};
+}
+
+function acceptLanguageForLocale(locale: string): string {
+	const canonicalLocale = Intl.getCanonicalLocales(locale)[0]!;
+	const baseLanguage = canonicalLocale.split("-")[0]!;
+	return canonicalLocale === baseLanguage ? canonicalLocale : `${canonicalLocale},${baseLanguage}`;
+}
+
+async function resolveAcceptLanguage(page: Page, locale?: string): Promise<string> {
+	if (locale) return acceptLanguageForLocale(locale);
+	const languages = await page.evaluate(() => [...navigator.languages]);
+	const acceptLanguage = languages.filter(Boolean).join(",");
+	if (!acceptLanguage) throw new ToolError("Chromium reported no native navigator languages");
+	return acceptLanguage;
 }
 
 function resolvePageClient(page: Page): PuppeteerCdpClient | null {
@@ -362,7 +517,7 @@ function patchSourceUrl(page: Page): void {
 	};
 }
 
-async function resolveUserAgentOverride(page: Page): Promise<UserAgentOverride> {
+async function resolveUserAgentOverride(page: Page, locale?: string): Promise<UserAgentOverride> {
 	const rawUserAgent = await page.browser().userAgent();
 	let userAgent = rawUserAgent.replace("HeadlessChrome/", "Chrome/");
 	if (userAgent.includes("Linux") && !userAgent.includes("Android")) {
@@ -413,11 +568,13 @@ async function resolveUserAgentOverride(page: Page): Promise<UserAgentOverride> 
 	brands[order[0]!] = { brand: greaseyBrand, version: "99" };
 	brands[order[1]!] = { brand: "Chromium", version: String(majorVersion) };
 	brands[order[2]!] = { brand: "Google Chrome", version: String(majorVersion) };
+	const acceptLanguage = await resolveAcceptLanguage(page, locale);
 
 	return {
 		userAgent,
 		platform,
-		acceptLanguage: STEALTH_ACCEPT_LANGUAGE,
+		acceptLanguage,
+
 		userAgentMetadata: {
 			brands,
 			fullVersion: uaVersion,
@@ -436,7 +593,17 @@ function wrapSession(session: CDPSession): PuppeteerCdpClient {
 	};
 }
 
-async function sendUserAgentOverride(client: PuppeteerCdpClient, override: UserAgentOverride): Promise<void> {
+async function sendUserAgentOverride(
+	client: PuppeteerCdpClient,
+	override: UserAgentOverride,
+	strict = false,
+): Promise<void> {
+	if (strict) {
+		await client.send("Network.enable");
+		await client.send("Network.setUserAgentOverride", override as unknown as Record<string, unknown>);
+		await client.send("Emulation.setUserAgentOverride", override as unknown as Record<string, unknown>);
+		return;
+	}
 	try {
 		await client.send("Network.enable");
 	} catch {}
@@ -464,28 +631,52 @@ export interface UserAgentSession {
 /** Configure UA override on the browser + auto-attach to new targets. */
 async function configureUserAgentTargets(
 	browser: Browser,
-	state: { browserSession: CDPSession | null; override: UserAgentOverride },
+	state: { browserSession: CDPSession | null; override: UserAgentOverride; locale?: string },
+
 	targetTimeoutMs = USER_AGENT_TARGET_TIMEOUT_MS,
 ): Promise<void> {
 	if (!state.browserSession) {
 		state.browserSession = await browser.target().createCDPSession();
 		await state.browserSession.send("Target.setAutoAttach", {
 			autoAttach: true,
-			waitForDebuggerOnStart: false,
+			waitForDebuggerOnStart: true,
 			flatten: true,
 		});
 		state.browserSession.on(
 			"Target.attachedToTarget",
-			async (event: { sessionId: string; targetInfo?: { type?: string } }) => {
-				if (!targetInfoSupportsUserAgentOverride(event.targetInfo)) return;
+			async (event: { sessionId: string; targetInfo?: { targetId?: string; type?: string } }) => {
+				if (!targetInfoSupportsUserAgentOverride(event.targetInfo)) {
+					const connection = state.browserSession?.connection();
+					await connection
+						?.session(event.sessionId)
+						?.send("Runtime.runIfWaitingForDebugger")
+						.catch(() => undefined);
+					return;
+				}
 				const connection = state.browserSession?.connection();
 				const session = connection?.session(event.sessionId);
 				if (!session) return;
-				await withSoftTimeout(
-					sendUserAgentOverride(wrapSession(session), state.override),
-					targetTimeoutMs,
-					"new target user-agent override",
-				);
+				try {
+					if (state.locale) {
+						await applyClientOverrides(wrapSession(session), state.override, state.locale, true);
+					} else {
+						await withSoftTimeout(
+							sendUserAgentOverride(wrapSession(session), state.override),
+							targetTimeoutMs,
+							"new target user-agent override",
+						);
+					}
+					await session.send("Runtime.runIfWaitingForDebugger");
+				} catch (error) {
+					if (event.targetInfo?.targetId) {
+						await state.browserSession
+							?.send("Target.closeTarget", { targetId: event.targetInfo.targetId })
+							.catch(() => undefined);
+					}
+					logger.debug("Closed target after geo override failure", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
 			},
 		);
 	}
@@ -511,12 +702,31 @@ function targetInfoSupportsUserAgentOverride(targetInfo: { type?: string } | und
 }
 
 async function applyTargetUserAgentOverride(target: Target, override: UserAgentOverride): Promise<void> {
+	await applyTargetOverrides(target, override);
+}
+
+async function applyTargetOverrides(
+	target: Target,
+	override: UserAgentOverride,
+	locale?: string,
+	strict = false,
+): Promise<void> {
 	const session = await target.createCDPSession();
 	try {
-		await sendUserAgentOverride(wrapSession(session), override);
+		await applyClientOverrides(wrapSession(session), override, locale, strict);
 	} finally {
 		await session.detach().catch(() => undefined);
 	}
+}
+
+async function applyClientOverrides(
+	client: PuppeteerCdpClient,
+	override: UserAgentOverride,
+	locale?: string,
+	strict = false,
+): Promise<void> {
+	await sendUserAgentOverride(client, override, strict);
+	if (locale) await client.send("Emulation.setLocaleOverride", { locale });
 }
 
 async function withSoftTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T | undefined> {
@@ -550,11 +760,12 @@ const STEALTH_PATCH_SCRIPTS = [
 	stealthScreenScript,
 	stealthFontsScript,
 	stealthAudioScript,
-	stealthLocaleScript,
 	stealthPluginsScript,
 	stealthHardwareScript,
 	stealthCodecsScript,
 	stealthWorkerScript,
+	stealthPermissionsScript,
+	stealthWebrtcScript,
 ];
 
 function buildStealthInjectionScript(scripts: readonly string[] = STEALTH_PATCH_SCRIPTS): string {
@@ -624,17 +835,21 @@ export async function applyStealthPatches(
 	browser: Browser,
 	page: Page,
 	state: { browserSession: CDPSession | null; override: UserAgentOverride | null },
+	geo?: { readonly timezone?: string; readonly locale?: string },
 ): Promise<void> {
 	patchSourceUrl(page);
 	if (!state.override) {
-		state.override = await resolveUserAgentOverride(page);
+		state.override = await resolveUserAgentOverride(page, geo?.locale);
 	}
 	const client = resolvePageClient(page);
 	if (client) {
-		await sendUserAgentOverride(client, state.override);
+		await sendUserAgentOverride(client, state.override, Boolean(geo?.locale));
 	}
-	const targetState = { browserSession: state.browserSession, override: state.override };
+	const targetState = { browserSession: state.browserSession, override: state.override, locale: geo?.locale };
 	await configureUserAgentTargets(browser, targetState);
+	if (client && geo?.locale) {
+		await client.send("Emulation.setLocaleOverride", { locale: geo.locale });
+	}
 	state.browserSession = targetState.browserSession;
 	await injectStealthScripts(page);
 }

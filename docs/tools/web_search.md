@@ -2,7 +2,7 @@
 
 > Run one web query through the first available search provider and return LLM-formatted answer, source URLs, and optional citations.
 
-> Note: `insane-search` is **not** a `web_search` provider and does not affect search-provider selection. It is an opt-in fallback for the `read` tool's URL fetch path (`web.insaneFallback`); see `docs/tools/read.md`.
+> Note: the selectable, keyless `insane` provider uses native safe public routes for supported platforms. It is separate from the vendored `insane-search` compatibility path in `read`; that fallback is production-disabled even when `web.insaneFallback` is enabled. See `docs/tools/read.md`.
 
 ## Source
 - Entry: `packages/coding-agent/src/web/search/index.ts`
@@ -95,7 +95,7 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
 ## Modes / Variants
 - **Provider selection**
   - **Forced provider**: internal callers may pass `provider`; an unavailable forced provider falls back to the chain (which always ends in DuckDuckGo) instead of hard-failing (`packages/coding-agent/src/web/search/index.ts`). This field is not in the model-facing schema.
-  - **Preferred provider**: `setPreferredSearchProvider()` sets a module-global default consumed by `resolveProviderChain()`. `packages/coding-agent/src/sdk.ts` and `packages/coding-agent/src/modes/controllers/selector-controller.ts` wire this from settings.
+  - **Preferred provider**: `setPreferredSearchProvider()` sets a module-global default consumed by `resolveProviderChain()`. `packages/coding-agent/src/sdk/session.ts` and `packages/coding-agent/src/modes/controllers/selector-controller.ts` wire this from settings.
   - **Tavily selection**: set `providers.webSearch` to `tavily` and provide `TAVILY_API_KEY` (or a stored Tavily provider credential). In `auto`, Tavily is not scanned just because an env key exists, so keyless/default behavior remains unchanged until Tavily is selected or listed as an available fallback.
   - **Active-model-gated auto**: in `auto` mode, resolution first maps the active model's provider to its own native search via `MODEL_PROVIDER_TO_SEARCH` (`openai|openai-codex→codex`, `anthropic→anthropic`, `google|google-gemini-cli|google-antigravity|gemini→gemini`, `moonshot|kimi-code|kimi→kimi`, `zai`, `perplexity`, `synthetic`) and `inferNativeProviderFromModel()`, used when that provider's canonical creds exist. When no canonical native is selected, `activeContextNativeId()` drives native search through the active model's OWN credential + `baseUrl` (native-over-proxy), dispatched by wire `api`: `anthropic-messages`+`claude-*`→`anthropic` (reuses `ctx` key/baseUrl via `searchAnthropic`), `openai-responses`/`openai-completions`→`openai-compatible`, `google-generative-ai`+`gemini-*`→`gemini` (Generative Language `generateContent`). The native provider fails closed (and the chain falls through to DuckDuckGo) if the endpoint does not actually support web search. `SEARCH_PROVIDER_ORDER` no longer drives auto credential scanning — it is retained for explicit selection, labels, and CLI option lists.
 - **Provider adapters**
@@ -206,6 +206,7 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
 ## Limits & Caps
 - Provider registry size: 16 providers (`SEARCH_PROVIDER_ORDER` in `packages/coding-agent/src/web/search/provider.ts`), including the keyless `duckduckgo` default/fallback and selectable `insane` safe-public-route provider. `SEARCH_PROVIDER_ORDER` no longer drives auto selection — see "Active-model-gated auto" above.
 - Insane result count: default `10`, max `20` (`packages/coding-agent/src/web/search/providers/insane.ts`).
+- Insane public-route response bodies are limited to 1 MiB after transfer/content decoding; oversized declared or streamed bodies are cancelled and that route fails closed (`packages/coding-agent/src/web/search/providers/insane.ts`).
 - `formatForLLM()` truncates source snippets and citation text to 240 chars (`packages/coding-agent/src/web/search/index.ts`).
 - `formatForLLM()` emits at most 3 search queries, each truncated to 120 chars (`packages/coding-agent/src/web/search/index.ts`).
 - Brave result count: default `10`, max `20` (`DEFAULT_NUM_RESULTS`, `MAX_NUM_RESULTS` in `packages/coding-agent/src/web/search/providers/brave.ts`).

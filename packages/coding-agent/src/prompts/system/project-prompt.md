@@ -22,18 +22,24 @@ MUST read before making changes within:
 </dir-context>
 {{/if}}
 
-{{#if workspaceTree.rendered}}
-<workspace-tree>
-Working directory layout (sorted by mtime, recent first; depth ≤ 3):
-{{workspaceTree.rendered}}
-{{#if workspaceTree.truncated}}
-(some entries elided to keep the tree short — use `find`/`read` to drill in)
+{{#if alwaysApplyRules.length}}
+{{#each alwaysApplyRules}}
+{{content}}
+{{/each}}
 {{/if}}
-</workspace-tree>
+{{#if rules.length}}
+Rules are local constraints. You MUST read `rule://<name>` when working in that domain.
+<rules>
+{{#list rules join="\n"}}
+<rule name="{{name}}">
+{{description}}
+{{#if globs.length}}
+{{#list globs join="\n"}}<glob>{{this}}</glob>{{/list}}
 {{/if}}
-
-Today is {{date}}, and the current working directory is '{{cwd}}'.
-
+</rule>
+{{/list}}
+</rules>
+{{/if}}
 <critical>
 - Each response MUST advance the task. There is no stopping condition other than completion.
 - You MUST default to informed action; do not ask for confirmation when tools or repo context can answer.

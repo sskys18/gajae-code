@@ -1,7 +1,29 @@
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
-import { $credentialEnv, $env, $pickCredentialEnv, extractHttpStatusFromError } from "@gajae-code/utils";
+import {
+	$credentialEnv,
+	$env,
+	$pickCredentialEnv,
+	extractHttpStatusFromError,
+	getTrustedHomeDir,
+} from "@gajae-code/utils";
+import {
+	copyProviderSafetyStopAdapterInvocation,
+	isProviderSafetyStopModelTrusted,
+	withProviderSafetyStopAdapterInvocation,
+} from "./adapter-internals/provider-safety-stop";
+import { assertManagedAttempt, classifyFallbackTrigger, type TransportFailureFacts } from "./utils/fallback-transport";
+
+const managedAttemptValidated = Symbol("managedAttemptValidated");
+
+function hasValidatedManagedAttempt(options: object | undefined): boolean {
+	return (options as Record<symbol, unknown> | undefined)?.[managedAttemptValidated] === true;
+}
+
+function markManagedAttemptValidated<T extends object>(options: T): T {
+	return Object.assign(options, { [managedAttemptValidated]: true });
+}
+
 import { getCustomApi } from "./api-registry";
 import type { Effort } from "./model-thinking";
 import {
@@ -11,23 +33,22 @@ import {
 } from "./model-thinking";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
+import {
+	hasResolvableAwsProfileSource,
+	isValidBedrockBearerToken,
+	readAwsStaticEnvironmentCredentials,
+} from "./providers/aws-credential-config";
 import type { CursorOptions } from "./providers/cursor";
-import { isGitLabDuoModel, streamGitLabDuo } from "./providers/gitlab-duo";
 import type { GoogleOptions } from "./providers/google";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
-import { isKimiModel, streamKimi } from "./providers/kimi";
+import type { KiroCodeWhispererOptions } from "./providers/kiro-codewhisperer";
 import type { OllamaChatOptions } from "./providers/ollama";
 import type { OpenAICompletionsOptions } from "./providers/openai-completions";
-import { streamPiNative } from "./providers/pi-native-client";
 // Heavy provider stream functions are imported lazily via register-builtins,
-// which wraps each provider module in a dynamic import. This keeps the
-// AWS SDK, google-auth-library, @google/genai, @bufbuild/protobuf, and
-// other provider SDKs out of the CLI startup parse graph. The
-// gitlab-duo / kimi / synthetic providers stay eager because their modules
-// export routing predicates (isGitLabDuoModel, isKimiModel, isSyntheticModel)
-// that must be callable synchronously before streaming begins, and their
-// modules are thin wrappers with no heavy SDK dependencies.
+// which wraps each provider module in a dynamic import. Thin provider routing
+// modules are also loaded lazily below by returning an outer stream and piping
+// the dynamically imported inner stream into it.
 import {
 	streamAnthropic,
 	streamAzureOpenAIResponses,
@@ -36,16 +57,17 @@ import {
 	streamGoogle,
 	streamGoogleGeminiCli,
 	streamGoogleVertex,
+	streamKiroCodeWhisperer,
 	streamOllama,
 	streamOpenAICodexResponses,
 	streamOpenAICompletions,
 	streamOpenAIResponses,
 } from "./providers/register-builtins";
-import { isSyntheticModel, streamSynthetic } from "./providers/synthetic";
 import type {
 	Api,
 	AssistantMessage,
 	AssistantMessageEvent,
+	AuthRetryCredential,
 	Context,
 	Model,
 	OptionsForApi,
@@ -66,7 +88,7 @@ function hasVertexAdcCredentials(): boolean {
 			cachedVertexAdcCredentialsExists = fs.existsSync(gacPath);
 		} else {
 			cachedVertexAdcCredentialsExists = fs.existsSync(
-				path.join(os.homedir(), ".config", "gcloud", "application_default_credentials.json"),
+				path.join(getTrustedHomeDir(), ".config", "gcloud", "application_default_credentials.json"),
 			);
 		}
 	}
@@ -76,7 +98,7 @@ function hasVertexAdcCredentials(): boolean {
 type KeyResolver = string | (() => string | undefined);
 
 const serviceProviderMap: Record<string, KeyResolver> = {
-	"alibaba-coding-plan": "ALIBABA_CODING_PLAN_API_KEY",
+	"alibaba-token-plan": "ALIBABA_TOKEN_PLAN_API_KEY",
 	openai: () => $credentialEnv("OPENAI_API_KEY"),
 	google: "GEMINI_API_KEY",
 	groq: "GROQ_API_KEY",
@@ -90,9 +112,11 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	"vercel-ai-gateway": "AI_GATEWAY_API_KEY",
 	zai: "ZAI_API_KEY",
 	"glm-zcode": "GLM_ZCODE_API_KEY",
+	"jetbrains-junie": "JUNIE_API_KEY",
 	mistral: "MISTRAL_API_KEY",
 	minimax: "MINIMAX_API_KEY",
 	"minimax-code": "MINIMAX_CODE_API_KEY",
+	"commandcode-goat": "CMD_API_KEY",
 	"minimax-code-cn": "MINIMAX_CODE_CN_API_KEY",
 	"opencode-go": "OPENCODE_API_KEY",
 	"opencode-zen": "OPENCODE_API_KEY",
@@ -109,6 +133,13 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	tavily: "TAVILY_API_KEY",
 	parallel: "PARALLEL_API_KEY",
 	kagi: "KAGI_API_KEY",
+	// Kiro API keys use the ksk_ prefix; preserve the AWS bearer fallback for OAuth.
+	kiro: () => {
+		const apiKey = $credentialEnv("KIRO_API_KEY");
+		return apiKey?.trim().startsWith("ksk_") && !/[\x00-\x1f\x7f]/.test(apiKey)
+			? apiKey
+			: $credentialEnv("AWS_BEARER_TOKEN_KIRO");
+	},
 	// GitHub Copilot uses GitHub personal access token
 	"github-copilot": () => $pickCredentialEnv("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"),
 	// Foundry mode optionally switches Anthropic auth to enterprise gateway credentials.
@@ -129,28 +160,12 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 			return "<authenticated>";
 		}
 	},
-	// Amazon Bedrock supports multiple credential sources:
-	// 1. AWS_PROFILE - named profile from ~/.aws/credentials
-	// 2. AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY - standard IAM keys
-	// 3. AWS_BEARER_TOKEN_BEDROCK - Bedrock API keys (bearer token)
-	// 4. AWS_CONTAINER_CREDENTIALS_* - ECS/Task IAM role credentials
-	// 5. AWS_WEB_IDENTITY_TOKEN_FILE + AWS_ROLE_ARN - IRSA (EKS) web identity
+	// Advertise only credential sources implemented by the Bedrock request path.
+	// ECS and IRSA remain unavailable until matching resolvers are implemented.
 	"amazon-bedrock": () => {
-		const awsProfile = $credentialEnv("AWS_PROFILE");
-		const awsAccessKeyId = $credentialEnv("AWS_ACCESS_KEY_ID");
-		const awsSecretAccessKey = $credentialEnv("AWS_SECRET_ACCESS_KEY");
-		const awsBearerToken = $credentialEnv("AWS_BEARER_TOKEN_BEDROCK");
-		const hasEcsCredentials =
-			!!$credentialEnv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") ||
-			!!$credentialEnv("AWS_CONTAINER_CREDENTIALS_FULL_URI");
-		const hasWebIdentity = !!$credentialEnv("AWS_WEB_IDENTITY_TOKEN_FILE") && !!$credentialEnv("AWS_ROLE_ARN");
-		if (
-			awsProfile ||
-			(awsAccessKeyId && awsSecretAccessKey) ||
-			awsBearerToken ||
-			hasEcsCredentials ||
-			hasWebIdentity
-		) {
+		const bearerToken = $credentialEnv("AWS_BEARER_TOKEN_BEDROCK");
+		if (bearerToken) return isValidBedrockBearerToken(bearerToken) ? "<authenticated>" : undefined;
+		if (readAwsStaticEnvironmentCredentials() || hasResolvableAwsProfileSource()) {
 			return "<authenticated>";
 		}
 	},
@@ -162,6 +177,7 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	nvidia: "NVIDIA_API_KEY",
 	nanogpt: "NANO_GPT_API_KEY",
 	"lm-studio": "LM_STUDIO_API_KEY",
+	omlx: "OMLX_API_KEY",
 	ollama: "OLLAMA_API_KEY",
 	"ollama-cloud": "OLLAMA_CLOUD_API_KEY",
 	"llama.cpp": "LLAMA_CPP_API_KEY",
@@ -169,8 +185,12 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	"qwen-portal": () => $pickCredentialEnv("QWEN_OAUTH_TOKEN", "QWEN_PORTAL_API_KEY"),
 	together: "TOGETHER_API_KEY",
 	zenmux: "ZENMUX_API_KEY",
+	opengateway: "OPENGATEWAY_API_KEY",
+	bizrouter: "BIZROUTER_API_KEY",
+	mara: "MARA_API_KEY",
 	venice: "VENICE_API_KEY",
 	vllm: "VLLM_API_KEY",
+	sglang: "SGLANG_API_KEY",
 	xiaomi: "XIAOMI_API_KEY",
 };
 
@@ -203,6 +223,7 @@ export function listProvidersWithEnvKey(): string[] {
  * Used to give OpenCode users an accurate headless auth diagnostic (#755).
  */
 const OPENCODE_SUBSCRIPTION_PROVIDERS = new Set(["opencode-go", "opencode-zen"]);
+const API_KEY_LOGIN_PROVIDERS = new Set(["commandcode-goat"]);
 
 /**
  * Provider-specific credential guidance appended to "no credential" errors.
@@ -221,10 +242,19 @@ export function formatProviderCredentialHint(provider: string): string {
 	const resolver = serviceProviderMap[provider];
 	const envVar = typeof resolver === "string" ? resolver : undefined;
 	const isOpenCodeSubscription = OPENCODE_SUBSCRIPTION_PROVIDERS.has(provider);
+	const isApiKeyLoginProvider = API_KEY_LOGIN_PROVIDERS.has(provider);
 	const parts: string[] = [];
 	if (isOpenCodeSubscription) {
 		parts.push(
 			"OpenCode subscriptions authenticate with an API key (created at https://opencode.ai/auth), not a separate session/OAuth token.",
+		);
+	}
+	if (isApiKeyLoginProvider) {
+		parts.push("Command Code GOAT uses an API key from https://commandcode.ai/studio/#api-keys.");
+	}
+	if (provider === "jetbrains-junie") {
+		parts.push(
+			"JetBrains AI (Junie) authenticates with an access token generated at https://junie.jetbrains.com/cli; there is no OAuth login for this provider.",
 		);
 	}
 	if (envVar) {
@@ -239,6 +269,55 @@ export function formatProviderCredentialHint(provider: string): string {
 		);
 	}
 	return parts.join(" ");
+}
+function pipeAssistantStream(
+	outer: AssistantMessageEventStream,
+	inner: AssistantMessageEventStream,
+	signal?: AbortSignal,
+	onStreamCreated?: () => void,
+): void {
+	void (async () => {
+		try {
+			let admitted = false;
+			const markAdmission = (): void => {
+				if (admitted) return;
+				admitted = true;
+				onStreamCreated?.();
+			};
+			for await (const event of inner) {
+				if (event.type !== "start") markAdmission();
+				outer.push(event);
+				// The inner provider stream owns abort semantics (it receives the
+				// same signal), but stop forwarding as soon as the consumer
+				// aborted so a misbehaving inner stream cannot keep the pipe
+				// buffering events indefinitely.
+				if (signal?.aborted && !outer.done) {
+					outer.end(await inner.result());
+					return;
+				}
+			}
+			if (!outer.done) outer.end(await inner.result());
+		} catch (error) {
+			outer.fail(error);
+		}
+	})();
+}
+
+export function streamFromLazyImport(
+	createInner: () => Promise<AssistantMessageEventStream>,
+	signal?: AbortSignal,
+	onStreamCreated?: () => void,
+): AssistantMessageEventStream {
+	const outer = new AssistantMessageEventStream();
+	void (async () => {
+		try {
+			const inner = await createInner();
+			pipeAssistantStream(outer, inner, signal, onStreamCreated);
+		} catch (error) {
+			outer.fail(error);
+		}
+	})();
+	return outer;
 }
 
 /**
@@ -255,75 +334,154 @@ export function stream<TApi extends Api>(
 	model: Model<TApi>,
 	context: Context,
 	options?: OptionsForApi<TApi>,
+	onStreamCreated?: () => void,
 ): AssistantMessageEventStream {
+	if (!hasValidatedManagedAttempt(options)) assertManagedAttempt(options);
+	if (options?.fallbackManaged) {
+		options = { ...options, requestMaxRetries: 0, streamMaxRetries: 0 } as OptionsForApi<TApi>;
+	}
+	// Canonical low-level boundary: the request budget must be a positive safe
+	// integer. Provider options arrive here unvalidated (unlike `streamSimple`,
+	// whose resolver already normalizes), so an unsafe value is dropped to
+	// unspecified here once for every dispatch below — integer-only provider
+	// fields can never receive a fractional or MAX_SAFE_INTEGER+1 budget.
+	if (options?.maxTokens !== undefined && !(Number.isSafeInteger(options.maxTokens) && options.maxTokens > 0)) {
+		options = { ...options, maxTokens: undefined } as OptionsForApi<TApi>;
+	}
 	// Check custom API registry first (extension-provided APIs like "vertex-Anthropic model-api")
 	const customApiProvider = getCustomApi(model.api);
 	if (customApiProvider) {
 		return customApiProvider.stream(model, context, options as StreamOptions);
 	}
 
-	if (isGitLabDuoModel(model)) {
+	if (model.provider === "gitlab-duo") {
 		const apiKey = (options as StreamOptions | undefined)?.apiKey || getEnvApiKey(model.provider);
 		if (!apiKey) {
 			throw new Error(formatMissingApiKeyError(model.provider));
 		}
-		return streamGitLabDuo(model, context, {
-			...(options as SimpleStreamOptions | undefined),
-			apiKey,
-		});
+		const adapterOptions = isProviderSafetyStopModelTrusted(model)
+			? withProviderSafetyStopAdapterInvocation({ ...(options as SimpleStreamOptions | undefined), apiKey })
+			: { ...(options as SimpleStreamOptions | undefined), apiKey };
+		return streamFromLazyImport(
+			async () => {
+				const { streamGitLabDuo } = await import("./providers/gitlab-duo");
+				return streamGitLabDuo(model, context, adapterOptions);
+			},
+			(options as StreamOptions | undefined)?.signal,
+			onStreamCreated,
+		);
 	}
 
 	// Vertex AI uses Application Default Credentials, not API keys
 	if (model.api === "google-vertex") {
-		return streamGoogleVertex(model as Model<"google-vertex">, context, options as GoogleVertexOptions);
+		const vertexOptions = (options || {}) as GoogleVertexOptions;
+		return streamGoogleVertex(
+			model as Model<"google-vertex">,
+			context,
+			isProviderSafetyStopModelTrusted(model)
+				? withProviderSafetyStopAdapterInvocation(vertexOptions)
+				: vertexOptions,
+			onStreamCreated,
+		);
 	} else if (model.api === "bedrock-converse-stream") {
 		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
-		return streamBedrock(model as Model<"bedrock-converse-stream">, context, (options || {}) as BedrockOptions);
+		return streamBedrock(
+			model as Model<"bedrock-converse-stream">,
+			context,
+			(options || {}) as BedrockOptions,
+			onStreamCreated,
+		);
+	} else if (model.api === "kiro-codewhisperer-stream") {
+		return streamKiroCodeWhisperer(
+			model as Model<"kiro-codewhisperer-stream">,
+			context,
+			(options || {}) as KiroCodeWhispererOptions,
+			onStreamCreated,
+		);
 	}
 
-	const apiKey = options?.apiKey || getEnvApiKey(model.provider);
+	const apiKey = options?.apiKey || (model.provider === "opencodex" ? "local" : getEnvApiKey(model.provider));
 	if (!apiKey) {
 		throw new Error(formatMissingApiKeyError(model.provider));
 	}
 	const providerOptions = { ...options, apiKey };
+	const adapterProviderOptions = isProviderSafetyStopModelTrusted(model)
+		? withProviderSafetyStopAdapterInvocation(providerOptions)
+		: providerOptions;
 
 	const api: Api = model.api;
 	switch (api) {
 		case "anthropic-messages": {
-			const anthropicOptions = providerOptions as AnthropicOptions;
-			return streamAnthropic(model as Model<"anthropic-messages">, context, {
-				...anthropicOptions,
-				isOAuth: anthropicOptions.isOAuth ?? model.isOAuth,
-			});
+			const anthropicOptions = adapterProviderOptions as AnthropicOptions;
+			return streamAnthropic(
+				model as Model<"anthropic-messages">,
+				context,
+				{
+					...anthropicOptions,
+					isOAuth: anthropicOptions.isOAuth ?? model.isOAuth,
+				},
+				onStreamCreated,
+			);
 		}
 
 		case "openai-completions":
-			return streamOpenAICompletions(model as Model<"openai-completions">, context, providerOptions as any);
+			return streamOpenAICompletions(
+				model as Model<"openai-completions">,
+				context,
+				adapterProviderOptions as any,
+				onStreamCreated,
+			);
 
 		case "openai-responses":
-			return streamOpenAIResponses(model as Model<"openai-responses">, context, providerOptions as any);
+			return streamOpenAIResponses(
+				model as Model<"openai-responses">,
+				context,
+				adapterProviderOptions as any,
+				onStreamCreated,
+			);
 
 		case "azure-openai-responses":
-			return streamAzureOpenAIResponses(model as Model<"azure-openai-responses">, context, providerOptions as any);
+			return streamAzureOpenAIResponses(
+				model as Model<"azure-openai-responses">,
+				context,
+				adapterProviderOptions as any,
+				onStreamCreated,
+			);
 
 		case "openai-codex-responses":
-			return streamOpenAICodexResponses(model as Model<"openai-codex-responses">, context, providerOptions as any);
+			return streamOpenAICodexResponses(
+				model as Model<"openai-codex-responses">,
+				context,
+				adapterProviderOptions as any,
+				onStreamCreated,
+			);
 
 		case "google-generative-ai":
-			return streamGoogle(model as Model<"google-generative-ai">, context, providerOptions);
+			return streamGoogle(model as Model<"google-generative-ai">, context, adapterProviderOptions, onStreamCreated);
 
 		case "google-gemini-cli":
 			return streamGoogleGeminiCli(
 				model as Model<"google-gemini-cli">,
 				context,
-				providerOptions as GoogleGeminiCliOptions,
+				adapterProviderOptions as GoogleGeminiCliOptions,
+				onStreamCreated,
 			);
 
 		case "ollama-chat":
-			return streamOllama(model as Model<"ollama-chat">, context, providerOptions as OllamaChatOptions);
+			return streamOllama(
+				model as Model<"ollama-chat">,
+				context,
+				adapterProviderOptions as OllamaChatOptions,
+				onStreamCreated,
+			);
 
 		case "cursor-agent":
-			return streamCursor(model as Model<"cursor-agent">, context, providerOptions as CursorOptions);
+			return streamCursor(
+				model as Model<"cursor-agent">,
+				context,
+				adapterProviderOptions as CursorOptions,
+				onStreamCreated,
+			);
 
 		default:
 			throw new Error(`Unhandled API: ${api}`);
@@ -351,11 +509,59 @@ function extractStatusFromAssistantError(message: AssistantMessage): number | un
 	return extractHttpStatusFromError({ message: message.errorMessage });
 }
 
-function createAssistantAuthError(message: AssistantMessage): Error & { status?: number } {
-	const error: Error & { status?: number } = new Error(message.errorMessage ?? "Provider authentication failed");
+function createAssistantAuthError(
+	message: AssistantMessage,
+): Error & { status?: number; transportFailure?: TransportFailureFacts } {
+	const error: Error & { status?: number; transportFailure?: TransportFailureFacts } = new Error(
+		message.errorMessage ?? "Provider authentication failed",
+	);
 	const status = extractStatusFromAssistantError(message);
 	if (status !== undefined) error.status = status;
+	// Preserve the structured facts. Without this the callback receives a
+	// status-only error and every downstream `auth` consumer loses the provider
+	// code it needs to tell a credential problem from a plain `forbidden`.
+	if (message.transportFailure) error.transportFailure = message.transportFailure;
 	return error;
+}
+
+/**
+ * Unwraps a nested `error.transportFailure` carrier.
+ *
+ * `transportFailureFacts` dereferences `value`, `value.response`, `value.error`
+ * and the captured response, but NOT `value.transportFailure` — and that is the
+ * shape this repository actually throws for transport errors. Reading the
+ * carrier here keeps the shared extractor untouched (its ten production call
+ * sites and its idempotence invariant stay as they are) while still letting the
+ * auth veto below see the provider code.
+ */
+function carriedTransportFailure(candidate: unknown): unknown {
+	if (!candidate || typeof candidate !== "object") return undefined;
+	const carried = (candidate as { transportFailure?: unknown }).transportFailure;
+	return carried && typeof carried === "object" ? carried : undefined;
+}
+
+/** Auth-relevant facts for a thrown error or an assistant error, carrier first. */
+function authFailureFacts(candidate: unknown): unknown {
+	return carriedTransportFailure(candidate) ?? candidate;
+}
+
+/**
+ * Whether this failure is a credential problem worth retrying with a different
+ * credential.
+ *
+ * Consulted by BOTH capture exits below, and it is the ONLY auth predicate they
+ * use. Gating on HTTP 401 alone would contradict the classifier: a typed
+ * provider code is supposed to win over the status, so `403 + invalid_api_key`
+ * must be captured and `401 + forbidden` must not. A `forbidden` failure is an
+ * authorization or configuration defect — handing it to `onAuthError` lets the
+ * gateway and SDK consumers invalidate a perfectly healthy credential.
+ */
+function shouldCaptureAuthFailure(candidate: unknown, statusHint: number | undefined): boolean {
+	const trigger = classifyFallbackTrigger(authFailureFacts(candidate));
+	// Typed auth facts are authoritative and already encode code-over-status.
+	if (trigger.class === "auth") return trigger.authDisposition !== "forbidden";
+	// Nothing classifiable: keep the historical bare-401 admission.
+	return statusHint === 401;
 }
 
 function emitBufferedEvents(stream: AssistantMessageEventStream, events: AssistantMessageEvent[]): void {
@@ -369,20 +575,50 @@ export function streamSimple<TApi extends Api>(
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
+	assertManagedAttempt(options);
+	if (options?.fallbackManaged) {
+		options = {
+			...options,
+			requestMaxRetries: 0,
+			streamMaxRetries: 0,
+			onAuthError: undefined,
+		};
+		options = markManagedAttemptValidated(options);
+	}
 	const retryApiKey = options?.onAuthError ? (options.apiKey ?? getEnvApiKey(model.provider)) : undefined;
 	if (retryApiKey) {
-		const outer = new AssistantMessageEventStream();
+		const consumerAbortController = new AbortController();
+		const outer = new AssistantMessageEventStream(() => consumerAbortController.abort());
+		const requestSignal = options?.signal
+			? AbortSignal.any([options.signal, consumerAbortController.signal])
+			: consumerAbortController.signal;
 		const onAuthError = options!.onAuthError!;
-		const runAttempt = async (apiKey: string, captureAuthFailure: boolean): Promise<AuthRetryFailure | undefined> => {
+		const runAttempt = async (
+			apiKey: string,
+			captureAuthFailure: boolean,
+			onStreamCreated?: () => void,
+		): Promise<AuthRetryFailure | undefined> => {
 			const bufferedEvents: AssistantMessageEvent[] = [];
 			let emittedReplayUnsafeEvent = false;
+			let admitted = false;
+			const markAdmission = (): void => {
+				if (admitted) return;
+				admitted = true;
+				onStreamCreated?.();
+			};
 			const flushBuffered = (): void => {
 				emitBufferedEvents(outer, bufferedEvents);
 				bufferedEvents.length = 0;
 			};
 
 			try {
-				const inner = streamSimple(model, context, { ...options, apiKey, onAuthError: undefined });
+				const inner = streamSimple(model, context, {
+					...options,
+					apiKey,
+					onAuthError: undefined,
+					onStreamCreated: markAdmission,
+					signal: requestSignal,
+				});
 				for await (const event of inner) {
 					if (!emittedReplayUnsafeEvent && event.type === "start") {
 						bufferedEvents.push(event);
@@ -392,7 +628,9 @@ export function streamSimple<TApi extends Api>(
 						!emittedReplayUnsafeEvent &&
 						captureAuthFailure &&
 						event.type === "error" &&
-						extractStatusFromAssistantError(event.error) === 401
+						// L0 gate, event exit. Classification decides; a typed
+						// `forbidden` never becomes an auth retry.
+						shouldCaptureAuthFailure(event.error, extractStatusFromAssistantError(event.error))
 					) {
 						return { error: createAssistantAuthError(event.error), bufferedEvents, terminalEvent: event };
 					}
@@ -404,11 +642,22 @@ export function streamSimple<TApi extends Api>(
 				flushBuffered();
 				if (!outer.done) outer.end(await inner.result());
 			} catch (error) {
-				if (!emittedReplayUnsafeEvent && captureAuthFailure && extractHttpStatusFromError(error) === 401) {
+				if (
+					!emittedReplayUnsafeEvent &&
+					captureAuthFailure &&
+					// L0 gate, throw exit: same rule, carrier-aware.
+					shouldCaptureAuthFailure(error, extractHttpStatusFromError(error))
+				) {
 					return { error, bufferedEvents };
 				}
 				flushBuffered();
 				outer.fail(error);
+			} finally {
+				// A lazy import or a synchronous provider failure can happen before
+				// the admission hook is reached. Release that attempt's lease in
+				// the failure path without extending a successful request's lease
+				// through the response lifetime.
+				if (!admitted) markAdmission();
 			}
 			return undefined;
 		};
@@ -422,19 +671,22 @@ export function streamSimple<TApi extends Api>(
 		};
 
 		void (async () => {
-			const failure = await runAttempt(retryApiKey, true);
+			const failure = await runAttempt(retryApiKey, true, options?.onStreamCreated);
 			if (!failure) return;
-			let nextKey: string | undefined;
+			let nextCredential: string | AuthRetryCredential | undefined;
 			try {
-				nextKey = await onAuthError(model.provider, retryApiKey, failure.error);
+				nextCredential = await onAuthError(model.provider, retryApiKey, failure.error);
 			} catch {
-				nextKey = undefined;
+				nextCredential = undefined;
 			}
-			if (!nextKey || nextKey === retryApiKey) {
+			const retryCredential: AuthRetryCredential | undefined =
+				typeof nextCredential === "string" ? { apiKey: nextCredential } : nextCredential;
+			if (!retryCredential?.apiKey || retryCredential.apiKey === retryApiKey) {
+				if (retryCredential) retryCredential.onStreamCreated?.();
 				emitFailure(failure);
 				return;
 			}
-			await runAttempt(nextKey, false);
+			await runAttempt(retryCredential.apiKey, false, retryCredential.onStreamCreated);
 		})();
 		return outer;
 	}
@@ -445,61 +697,119 @@ export function streamSimple<TApi extends Api>(
 	// the gateway bearer instead. Comes BEFORE the custom-API check so
 	// extension-registered APIs can't accidentally override a configured
 	// pi-native transport.
+	const resolvedRequestMaxTokens = resolveDefaultRequestMaxTokens(model, options?.maxTokens);
 	if (model.transport === "pi-native") {
-		return streamPiNative(model, context, options);
+		return streamFromLazyImport(
+			async () => {
+				const { streamPiNative } = await import("./providers/pi-native-client");
+				return streamPiNative(model, context, { ...options, maxTokens: resolvedRequestMaxTokens });
+			},
+			options?.signal,
+			options?.onStreamCreated,
+		);
 	}
 
 	// Check custom API registry (extension-provided APIs)
 	const customApiProvider = getCustomApi(model.api);
 	if (customApiProvider) {
-		return customApiProvider.streamSimple(model, context, options);
+		const events = customApiProvider.streamSimple(model, context, {
+			...options,
+			maxTokens: resolvedRequestMaxTokens,
+		});
+		if (!options?.onStreamCreated) return events;
+		const forwarded = new AssistantMessageEventStream();
+		pipeAssistantStream(forwarded, events, options.signal, options.onStreamCreated);
+		return forwarded;
 	}
 
 	// Vertex AI uses Application Default Credentials, not API keys
 	if (model.api === "google-vertex") {
 		const providerOptions = mapOptionsForApi(model, options, undefined);
-		return stream(model, context, providerOptions);
+		const events = stream(model, context, providerOptions, options?.onStreamCreated);
+		return events;
 	} else if (model.api === "bedrock-converse-stream") {
 		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
 		const providerOptions = mapOptionsForApi(model, options, undefined);
-		return stream(model, context, providerOptions);
+		const events = stream(model, context, providerOptions, options?.onStreamCreated);
+		return events;
 	}
 
 	const apiKey = options?.apiKey || getEnvApiKey(model.provider);
 	if (!apiKey) {
 		throw new Error(formatMissingApiKeyError(model.provider));
 	}
+	const adapterOptions = isProviderSafetyStopModelTrusted(model)
+		? withProviderSafetyStopAdapterInvocation(options ?? {})
+		: options;
+	const resolvedSpecialProviderMaxTokens = resolvedRequestMaxTokens;
 
 	// GitLab Duo - wraps Anthropic/OpenAI behind GitLab AI Gateway direct access tokens
-	if (isGitLabDuoModel(model)) {
-		return streamGitLabDuo(model, context, {
-			...options,
-			apiKey,
-		});
+	if (model.provider === "gitlab-duo") {
+		return streamFromLazyImport(
+			async () => {
+				const { streamGitLabDuo } = await import("./providers/gitlab-duo");
+				return streamGitLabDuo(
+					model,
+					context,
+					copyProviderSafetyStopAdapterInvocation(adapterOptions, {
+						...adapterOptions,
+						apiKey,
+						maxTokens: resolvedSpecialProviderMaxTokens,
+					}),
+				);
+			},
+			options?.signal,
+			options?.onStreamCreated,
+		);
 	}
 
 	// Kimi Code - route to dedicated handler that wraps OpenAI or Anthropic API
-	if (isKimiModel(model)) {
-		// Pass raw SimpleStreamOptions - streamKimi handles mapping internally
-		return streamKimi(model as Model<"openai-completions">, context, {
-			...options,
-			apiKey,
-			format: options?.kimiApiFormat ?? "anthropic",
-		});
+	if (model.provider === "kimi-code") {
+		return streamFromLazyImport(
+			async () => {
+				const { streamKimi } = await import("./providers/kimi");
+				// Pass raw SimpleStreamOptions - streamKimi handles mapping internally
+				return streamKimi(
+					model as Model<"openai-completions">,
+					context,
+					copyProviderSafetyStopAdapterInvocation(adapterOptions, {
+						...adapterOptions,
+						apiKey,
+						maxTokens: resolvedSpecialProviderMaxTokens,
+						format: options?.kimiApiFormat ?? "anthropic",
+					}),
+				);
+			},
+			options?.signal,
+			options?.onStreamCreated,
+		);
 	}
 
 	// Synthetic - route to dedicated handler that wraps OpenAI or Anthropic API
-	if (isSyntheticModel(model)) {
-		// Pass raw SimpleStreamOptions - streamSynthetic handles mapping internally
-		return streamSynthetic(model as Model<"openai-completions">, context, {
-			...options,
-			apiKey,
-			format: options?.syntheticApiFormat ?? "openai", // Default to OpenAI format
-		});
+	if (model.provider === "synthetic") {
+		return streamFromLazyImport(
+			async () => {
+				const { streamSynthetic } = await import("./providers/synthetic");
+				// Pass raw SimpleStreamOptions - streamSynthetic handles mapping internally
+				return streamSynthetic(
+					model as Model<"openai-completions">,
+					context,
+					copyProviderSafetyStopAdapterInvocation(adapterOptions, {
+						...adapterOptions,
+						apiKey,
+						maxTokens: resolvedSpecialProviderMaxTokens,
+						format: options?.syntheticApiFormat ?? "openai", // Default to OpenAI format
+					}),
+				);
+			},
+			options?.signal,
+			options?.onStreamCreated,
+		);
 	}
 
 	const providerOptions = mapOptionsForApi(model, options, apiKey);
-	return stream(model, context, providerOptions);
+	const events = stream(model, context, providerOptions, options?.onStreamCreated);
+	return events;
 }
 
 export async function completeSimple<TApi extends Api>(
@@ -512,6 +822,7 @@ export async function completeSimple<TApi extends Api>(
 }
 
 const MIN_OUTPUT_TOKENS = 1024;
+const DEFAULT_REQUEST_MAX_TOKENS = 32000;
 export const OUTPUT_FALLBACK_BUFFER = 4000;
 const ANTHROPIC_USE_INTERLEAVED_THINKING = Bun.env.PI_NO_INTERLEAVED_THINKING !== "1";
 
@@ -609,35 +920,51 @@ function resolveOpenAiReasoningEffort<TApi extends Api>(
 
 const castApi = <TApi extends Api>(api: OptionsForApi<TApi>): OptionsForApi<Api> => api as OptionsForApi<Api>;
 
+export function resolveDefaultRequestMaxTokens<TApi extends Api>(model: Model<TApi>, requested?: number): number {
+	if (requested !== undefined && Number.isSafeInteger(requested) && requested > 0) return requested;
+	if (model.maxTokensSource === "configured" && Number.isSafeInteger(model.maxTokens) && model.maxTokens > 0) {
+		return model.maxTokens;
+	}
+	return Number.isSafeInteger(model.maxTokens) && model.maxTokens > 0
+		? Math.min(model.maxTokens, DEFAULT_REQUEST_MAX_TOKENS)
+		: DEFAULT_REQUEST_MAX_TOKENS;
+}
+
 function mapOptionsForApi<TApi extends Api>(
 	model: Model<TApi>,
 	options?: SimpleStreamOptions,
 	apiKey?: string,
 ): OptionsForApi<TApi> {
-	const base = {
+	const base = copyProviderSafetyStopAdapterInvocation(options, {
 		temperature: options?.temperature,
 		topP: options?.topP,
 		topK: options?.topK,
 		minP: options?.minP,
 		presencePenalty: options?.presencePenalty,
 		repetitionPenalty: options?.repetitionPenalty,
-		maxTokens: options?.maxTokens || Math.min(model.maxTokens, 32000),
+		maxTokens: resolveDefaultRequestMaxTokens(model, options?.maxTokens),
 		signal: options?.signal,
 		apiKey: apiKey || options?.apiKey,
+		fallbackManaged: options?.fallbackManaged,
+		fallbackAttempt: options?.fallbackAttempt,
 		cacheRetention: options?.cacheRetention ?? model.cacheRetention,
 		headers: options?.headers,
 		initiatorOverride: options?.initiatorOverride,
 		maxRetryDelayMs: options?.maxRetryDelayMs,
-		requestMaxRetries: options?.requestMaxRetries,
-		streamMaxRetries: options?.streamMaxRetries,
+		requestMaxRetries: options?.fallbackManaged ? 0 : options?.requestMaxRetries,
+		streamMaxRetries: options?.fallbackManaged ? 0 : options?.streamMaxRetries,
 		metadata: options?.metadata,
 		sessionId: options?.sessionId,
 		providerSessionState: options?.providerSessionState,
 		onPayload: options?.onPayload,
 		onResponse: options?.onResponse,
+		onStreamCreated: options?.onStreamCreated,
+		disableProviderRetries: options?.disableProviderRetries,
 		onSseEvent: options?.onSseEvent,
+		attemptScope: options?.attemptScope,
 		execHandlers: options?.execHandlers,
-	};
+		[managedAttemptValidated]: hasValidatedManagedAttempt(options),
+	});
 
 	switch (model.api) {
 		case "anthropic-messages": {
@@ -689,8 +1016,13 @@ function mapOptionsForApi<TApi extends Api>(
 				});
 			}
 
-			// Caller's maxTokens is the desired output; add thinking budget on top, capped at model limit
-			const maxTokens = Math.min((base.maxTokens || 0) + thinkingBudget, model.maxTokens);
+			// Caller's maxTokens is the desired output; add thinking budget on top,
+			// capped at the model limit. `base.maxTokens` is already resolver-sanitized,
+			// so only a finite positive model cap participates (malformed metadata
+			// cannot reintroduce NaN into the wire budget).
+			const modelCap =
+				Number.isSafeInteger(model.maxTokens) && model.maxTokens > 0 ? model.maxTokens : base.maxTokens;
+			const maxTokens = Math.min((base.maxTokens || 0) + thinkingBudget, modelCap);
 
 			// If not enough room for thinking + output, reduce thinking budget
 			if (maxTokens <= thinkingBudget) {
@@ -849,12 +1181,17 @@ function mapOptionsForApi<TApi extends Api>(
 
 			let thinkingBudget = options.thinkingBudgets?.[effort] ?? GOOGLE_THINKING[effort];
 
-			// Caller's maxTokens is the desired output; add thinking budget on top, capped at model limit
-			const maxTokens = Math.min((base.maxTokens || 0) + thinkingBudget, model.maxTokens);
+			// Caller's maxTokens is the desired output; add thinking budget on top,
+			// capped at the model limit. `base.maxTokens` is already resolver-sanitized,
+			// so only a finite positive model cap participates (malformed metadata
+			// cannot reintroduce NaN into the wire budget).
+			const modelCap =
+				Number.isSafeInteger(model.maxTokens) && model.maxTokens > 0 ? model.maxTokens : base.maxTokens;
+			const maxTokens = Math.min((base.maxTokens || 0) + thinkingBudget, modelCap);
 
 			// If not enough room for thinking + output, reduce thinking budget
 			if (maxTokens <= thinkingBudget) {
-				thinkingBudget = Math.max(0, maxTokens - MIN_OUTPUT_TOKENS) ?? 0;
+				thinkingBudget = Math.max(0, maxTokens - MIN_OUTPUT_TOKENS);
 			}
 
 			// If thinking budget is too low, disable thinking
@@ -926,6 +1263,12 @@ function mapOptionsForApi<TApi extends Api>(
 				onToolResult,
 			});
 		}
+
+		case "kiro-codewhisperer-stream":
+			return castApi<"kiro-codewhisperer-stream">({
+				...base,
+				reasoning: options?.reasoning,
+			});
 
 		default:
 			throw new Error(`Unhandled API in mapOptionsForApi: ${model.api}`);

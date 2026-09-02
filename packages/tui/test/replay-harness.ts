@@ -42,6 +42,7 @@ export interface ReplayResult {
 	finalViewport: string[];
 	scrollback: string[];
 	writeCount: number;
+	writeLog: string[];
 	turns: number;
 	/** Perceived-latency metrics (advisory wall-clock proxy, never CPU self-time). */
 	latency: ReplayLatencyMetrics;
@@ -188,7 +189,10 @@ export async function runReplay(fixture: ReplayFixture, opts: ReplayOptions = {}
 	const tReplayBegin = performance.now();
 	const cpu0 = process.cpuUsage();
 	const term = new VirtualTerminal(fixture.cols, fixture.rows);
-	const tui = new TUI(term);
+	// widthSettleMs: 0 disables the wall-clock settled width repair — in a
+	// deterministic replay it would fire at a nondeterministic logical position
+	// and break byte-parity comparisons between runs.
+	const tui = new TUI(term, undefined, { widthSettleMs: 0 });
 	tui.start();
 	const startupMs = performance.now() - tReplayBegin;
 	if (collect) renderMetrics.sampleRss(); // baseline
@@ -294,7 +298,7 @@ export async function runReplay(fixture: ReplayFixture, opts: ReplayOptions = {}
 		evidenceClass: "wall-clock-proxy",
 	};
 
-	return { metrics, finalViewport, scrollback, writeCount, turns: turnIndex, latency };
+	return { metrics, finalViewport, scrollback, writeCount, writeLog: term.getWriteLog(), turns: turnIndex, latency };
 }
 
 /**

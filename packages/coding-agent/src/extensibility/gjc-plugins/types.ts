@@ -24,6 +24,15 @@ export interface GjcPluginToolManifestEntry {
 	path: string;
 	description?: string;
 	sha256?: string;
+	/** Optional JSON Schema declaration for registry-v2 metadata. */
+	schema?: unknown;
+	/** Aliases accepted when migrating older manifests. */
+	inputSchema?: unknown;
+	input_schema?: unknown;
+	parameters?: unknown;
+	/** Optional sidecar JSON Schema file, resolved within the plugin root. */
+	schemaPath?: string;
+	schema_path?: string;
 	/**
 	 * "always-on" object entries are activated for the whole session; legacy
 	 * string shorthand stays "subskill"-scoped and is only attached to subskill
@@ -98,6 +107,18 @@ export interface LoadedSubskillBinding {
 	toolPaths: string[];
 }
 
+export interface NormalizedSubskillToolSurface {
+	extensionId: string;
+	relativePath: string;
+	implementationHash: string;
+}
+
+export interface LoadedSubskillToolReference {
+	extensionId: string;
+	relativePath: string;
+	expectedDigest: string;
+}
+
 export interface LoadedSubskillActivation {
 	activationArg: string;
 	plugin: string;
@@ -105,8 +126,13 @@ export interface LoadedSubskillActivation {
 	parent: string;
 	bindsTo: string;
 	phase: string;
+	/** Registry identity for v2-only activation. */
+	scope?: GjcPluginScope;
+	extensionId?: string;
+	expectedDigest?: string;
 	filePath: string;
 	toolPaths: string[];
+	toolRefs?: LoadedSubskillToolReference[];
 }
 
 export interface PhaseScopedToolBinding {
@@ -137,6 +163,8 @@ export type GjcPluginLoadErrorCode =
 	| "invalid_phase"
 	| "missing_file"
 	| "hash_mismatch"
+	| "invalid_schema"
+	| "missing_surface"
 	| "invalid_appendix"
 	| "invalid_hook"
 	| "invalid_mcp"
@@ -152,7 +180,8 @@ export type GjcPluginLoadErrorCode =
 	// Session-start / runtime
 	| "session_collision"
 	| "runtime_mismatch"
-	| "quarantined_surface";
+	| "quarantined_surface"
+	| "migration_required";
 
 export class GjcPluginLoadError extends Error {
 	readonly code: GjcPluginLoadErrorCode;
@@ -161,6 +190,29 @@ export class GjcPluginLoadError extends Error {
 		super(message, options);
 		this.name = "GjcPluginLoadError";
 		this.code = code;
+	}
+}
+
+/** Typed refusal raised when an implementation changed after v2 metadata was recorded. */
+export class PluginImplementationHashMismatchError extends GjcPluginLoadError {
+	readonly expected: string;
+	readonly actual: string;
+	readonly path: string;
+
+	constructor(path: string, expected: string, actual: string) {
+		super("hash_mismatch", `GJC plugin implementation hash mismatch for ${path}`);
+		this.name = "PluginImplementationHashMismatchError";
+		this.path = path;
+		this.expected = expected;
+		this.actual = actual;
+	}
+}
+
+/** Typed refusal for a registry entry that could not be migrated to v2 metadata. */
+export class PluginMigrationRequiredError extends GjcPluginLoadError {
+	constructor(plugin: string, surface: string, cause: string) {
+		super("migration_required", `GJC plugin "${plugin}" surface "${surface}" requires migration: ${cause}`);
+		this.name = "PluginMigrationRequiredError";
 	}
 }
 
@@ -183,6 +235,7 @@ export interface NormalizedSubskillSurface {
 	activationArg: string;
 	relativePath: string;
 	sha256: string;
+	toolRefs?: NormalizedSubskillToolSurface[];
 }
 
 export interface NormalizedToolSurface {
@@ -191,6 +244,41 @@ export interface NormalizedToolSurface {
 	relativePath: string;
 	sha256: string;
 	description?: string;
+	/** v2 metadata fields; optional only for in-memory legacy fixtures. */
+	schema?: JsonSchema202012;
+	schemaHash?: string;
+	implementationHash?: string;
+	presentationHash?: string;
+	metadataVersion?: 2;
+}
+
+/** JSON Schema 2020-12 documents are kept as JSON values so migration never needs an implementation import. */
+export type JsonSchema202012 = boolean | Record<string, unknown>;
+
+/**
+ * Registry-v2 tool metadata. The implementation and presentation hashes are
+ * content digests, not executable metadata. `schema` is canonicalized before
+ * `schemaHash` is computed.
+ */
+export interface NormalizedToolSurfaceV2 extends NormalizedToolSurface {
+	schema: JsonSchema202012;
+	schemaHash: string;
+	implementationHash: string;
+	presentationHash?: string;
+	metadataVersion: 2;
+}
+
+export interface GjcPluginMigrationFailure {
+	code: GjcPluginLoadErrorCode;
+	surface: string;
+	cause: string;
+}
+
+export interface GjcPluginMigrationState {
+	status: "migrated" | "failed";
+	metadataVersion: 2;
+	migratedAt?: string;
+	failure?: GjcPluginMigrationFailure;
 }
 
 export interface NormalizedHookSurface {
@@ -201,6 +289,7 @@ export interface NormalizedHookSurface {
 	phase?: "before" | "after";
 	relativePath: string;
 	sha256: string;
+	implementationHash?: string;
 }
 
 export interface NormalizedMcpSurface {
@@ -278,6 +367,8 @@ export interface GjcPluginRegistryEntry {
 	surfaces: NormalizedGjcPluginSurfaces;
 	disabledSurfaceIds: string[];
 	quarantine?: GjcPluginQuarantineEntry[];
+	/** v2 metadata status; absent is accepted for in-memory legacy test fixtures. */
+	migration?: GjcPluginMigrationState;
 }
 
 export interface GjcPluginRegistry {
@@ -291,3 +382,152 @@ export interface GjcPluginRegistry {
  * disabledSurfaceIds, and quarantine bookkeeping.
  */
 export type GjcPluginSurfaceExtensionId = string;
+
+/** Canonical GJC bundle identity: kind is fixed, target is (scope, name). */
+export const GJC_BUNDLE_KIND = "gjc-bundle";
+
+export interface GjcBundleIdentity {
+	kind: typeof GJC_BUNDLE_KIND;
+	scope: GjcPluginScope;
+	name: string;
+}
+
+/** Source descriptor exposed to CLI/Settings: never carries raw locator secrets. */
+export interface GjcBundleSafeSource {
+	kind: GjcPluginSourceKind;
+	/** Redacted display locator (host + path only; no userinfo/query/fragment). */
+	display: string;
+	/** Conservative safe git ref, omitted when the stored value is unsafe. */
+	ref?: string;
+	/** Hex-only revision identifier, omitted when the stored value is unsafe. */
+	sha?: string;
+	resolvedAt: string;
+	/** True when this source kind supports re-resolution during update. */
+	updatable: boolean;
+	/** Present only when updatable is false. */
+	unsupportedReason?: string;
+}
+
+export interface GjcBundleSurfaceSummary {
+	extensionId: string;
+	kind: "tool" | "hook" | "mcp" | "system-appendix" | "agent-appendix" | "subskill";
+	name: string;
+	/** Persisted user intent (registry disabledSurfaceIds). */
+	enabled: boolean;
+	/** Deterministic quarantine derived from persisted registry state only. */
+	quarantined: boolean;
+	quarantineCode?: GjcPluginLoadErrorCode;
+}
+
+/** Installed-bundle DTO shared by CLI and Settings. Contains no raw locators. */
+export interface GjcBundleSummary {
+	identity: GjcBundleIdentity;
+	version: string;
+	description?: string;
+	enabled: boolean;
+	source: GjcBundleSafeSource;
+	installedAt: string;
+	updatedAt: string;
+	manifestHash: string;
+	/** Deterministic fingerprint of the exact installed target. */
+	targetFingerprint: string;
+	surfaces: GjcBundleSurfaceSummary[];
+	/** True when any deterministic quarantine blocks enablement. */
+	quarantined: boolean;
+}
+
+/**
+ * Host-derived token binding an update preview to the exact candidate, the
+ * exact installed baseline, and the deterministic decision context. Apply is a
+ * compare-and-swap against all three fingerprints.
+ */
+export interface GjcReviewedUpdateToken {
+	identity: GjcBundleIdentity;
+	candidateFingerprint: string;
+	baselineFingerprint: string;
+	decisionContextFingerprint: string;
+	reviewedAt: string;
+}
+
+export type GjcLifecycleErrorCode =
+	| "already_installed_use_upgrade"
+	| "not_installed"
+	| "registry_unreadable"
+	| "identity_mismatch"
+	| "stale_candidate"
+	| "stale_baseline"
+	| "stale_decision_context"
+	| "source_unsupported"
+	| "source_unavailable"
+	| "quarantined"
+	| "surface_unknown"
+	| "invalid_target";
+
+export interface GjcLifecycleError {
+	code: GjcLifecycleErrorCode;
+	/** Sanitized operator-facing message; never contains raw locators or causes. */
+	message: string;
+	/** Safe scoped recovery hint (e.g. the exact command to run instead). */
+	recovery?: string;
+}
+
+export type GjcLifecycleResult<T> = { ok: true; value: T } | { ok: false; error: GjcLifecycleError };
+
+export interface GjcUpdatePreview {
+	identity: GjcBundleIdentity;
+	current: GjcBundleSummary;
+	candidateVersion: string;
+	candidateManifestHash: string;
+	/** Surface IDs added, removed, or retained by this candidate. */
+	addedSurfaceIds: string[];
+	removedSurfaceIds: string[];
+	retainedSurfaceIds: string[];
+	changed: boolean;
+	token: GjcReviewedUpdateToken;
+}
+
+export type GjcUpdateApplyStatus = "updated" | "unchanged";
+
+export interface GjcUpdateApplyResult {
+	status: GjcUpdateApplyStatus;
+	summary: GjcBundleSummary;
+	/** Number of filesystem remnants that could not be removed after a successful swap. */
+	remnantCount: number;
+}
+
+export interface GjcInstallResult {
+	status: "installed";
+	summary: GjcBundleSummary;
+}
+
+/** A resolved uninstall that was deliberately not performed. */
+export interface GjcUninstallPreview {
+	status: "would-uninstall";
+	identity: GjcBundleIdentity;
+	summary: GjcBundleSummary;
+}
+
+export interface GjcToggleResult {
+	summary: GjcBundleSummary;
+	/** False when the requested state already matched (no persisted mutation). */
+	mutated: boolean;
+}
+
+/**
+ * Scope-qualified runtime evidence emitted by producers. Producers never
+ * publish; the session coordinator accumulates one complete generation.
+ */
+export interface GjcRuntimeFinding {
+	identity: GjcBundleIdentity;
+	surfaceId: string;
+	code: GjcPluginLoadErrorCode;
+	message: string;
+}
+
+export interface GjcRuntimeSnapshot {
+	/** Monotonic activation generation this snapshot describes. */
+	generation: number;
+	findings: GjcRuntimeFinding[];
+}
+
+export type GjcRuntimeSnapshotState = { status: "unavailable" } | { status: "current"; snapshot: GjcRuntimeSnapshot };

@@ -1,13 +1,23 @@
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import * as logger from "@gajae-code/utils/logger";
-import { activeSnapshotPath, assertNonEmptyGjcSessionId, modeStatePath } from "../gjc-runtime/session-layout";
+import {
+	activeSnapshotPath,
+	activeStateDir,
+	assertNonEmptyGjcSessionId,
+	modeStatePath,
+} from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead, SessionResolutionError } from "../gjc-runtime/session-resolution";
 import {
 	type ActiveSessionScope,
+	type GuardedWriteResult,
 	readActiveEntries,
 	rebuildActiveSnapshot,
 	removeActiveEntry,
+	setActiveStateCacheInvalidator,
 	writeActiveEntry,
 } from "../gjc-runtime/state-writer";
+import { getSkillManifest } from "../gjc-runtime/workflow-manifest";
 import { CANONICAL_GJC_WORKFLOW_SKILLS, type CanonicalGjcWorkflowSkill } from "./canonical-skills";
 import type { WorkflowStateReceipt } from "./workflow-state-contract";
 
@@ -34,6 +44,11 @@ export interface WorkflowHudSummary {
 
 export type { WorkflowStateReceipt } from "./workflow-state-contract";
 
+export interface ActiveSubskillToolReference {
+	extensionId: string;
+	expectedDigest: string;
+}
+
 export interface ActiveSubskillEntry {
 	plugin: string;
 	subskillName: string;
@@ -41,8 +56,14 @@ export interface ActiveSubskillEntry {
 	bindsTo: string;
 	phase: string;
 	activationArg: string;
-	filePath: string;
-	toolPaths: string[];
+	/** Registry identity required for persisted v2 activation. */
+	scope?: "user" | "project";
+	extensionId?: string;
+	expectedDigest?: string;
+	toolRefs?: ActiveSubskillToolReference[];
+	/** Legacy paths are accepted only in transient in-memory values; persisted readers reject them. */
+	filePath?: string;
+	toolPaths?: string[];
 }
 
 export interface SkillActiveEntry {
@@ -105,6 +126,8 @@ export interface SyncSkillActiveStateOptions {
 	handoff_at?: string;
 	active_subskills?: ActiveSubskillEntry[];
 	sourceRevision?: number;
+	/** Internal seed path: retain the authoritative entry receipt if snapshot rebuilding fails. */
+	bestEffortSnapshot?: boolean;
 }
 
 const HUD_TEXT_LIMIT = 80;
@@ -215,12 +238,35 @@ function normalizeActiveSubskillEntry(raw: unknown): ActiveSubskillEntry | null 
 	const bindsTo = safeString(record.bindsTo).trim();
 	const phase = safeString(record.phase).trim();
 	const activationArg = safeString(record.activationArg).trim();
-	const filePath = safeString(record.filePath).trim();
-	const toolPaths = Array.isArray(record.toolPaths)
-		? record.toolPaths.map(item => safeString(item).trim()).filter(Boolean)
+	const scope = record.scope === "user" || record.scope === "project" ? record.scope : undefined;
+	const extensionId = safeString(record.extensionId).trim();
+	const expectedDigest = safeString(record.expectedDigest).trim().toLowerCase();
+	const toolRefs = Array.isArray(record.toolRefs)
+		? record.toolRefs
+				.map(item => {
+					if (!item || typeof item !== "object") return null;
+					const ref = item as Record<string, unknown>;
+					const id = safeString(ref.extensionId).trim();
+					const digest = safeString(ref.expectedDigest).trim().toLowerCase();
+					return id && digest ? { extensionId: id, expectedDigest: digest } : null;
+				})
+				.filter((item): item is ActiveSubskillToolReference => item !== null)
 		: [];
-	if (!plugin || !subskillName || !parent || !bindsTo || !phase || !activationArg || !filePath) return null;
-	return { plugin, subskillName, parent, bindsTo, phase, activationArg, filePath, toolPaths };
+	// Path-only records are intentionally invalid: runtime must resolve through
+	// the migrated registry, never trust persisted executable paths.
+	if (
+		!plugin ||
+		!subskillName ||
+		!parent ||
+		!bindsTo ||
+		!phase ||
+		!activationArg ||
+		!scope ||
+		!extensionId ||
+		!expectedDigest
+	)
+		return null;
+	return { plugin, subskillName, parent, bindsTo, phase, activationArg, scope, extensionId, expectedDigest, toolRefs };
 }
 
 function normalizeActiveSubskillEntries(raw: unknown): ActiveSubskillEntry[] | undefined {
@@ -232,7 +278,14 @@ function normalizeActiveSubskillEntries(raw: unknown): ActiveSubskillEntry[] | u
 }
 
 function activeSubskillEntryKey(entry: ActiveSubskillEntry): string {
-	return [entry.plugin, entry.parent, entry.phase, entry.activationArg].join("\0");
+	return [
+		entry.scope ?? "",
+		entry.plugin,
+		entry.extensionId ?? "",
+		entry.parent,
+		entry.phase,
+		entry.activationArg,
+	].join("\0");
 }
 
 function unionActiveSubskillEntries(...entrySets: Array<ActiveSubskillEntry[] | undefined>): ActiveSubskillEntry[] {
@@ -291,6 +344,32 @@ function normalizeEntry(raw: unknown): SkillActiveEntry | null {
 
 export function isCanonicalGjcWorkflowSkill(skill: string): skill is CanonicalGjcWorkflowSkill {
 	return (CANONICAL_GJC_WORKFLOW_SKILLS as readonly string[]).includes(skill);
+}
+
+/**
+ * Nonterminal phases that intentionally await workflow-specific integration
+ * rather than a generic synthetic compaction continuation.
+ */
+const CONTINUATION_INERT_WORKFLOW_PHASES: Readonly<Partial<Record<CanonicalGjcWorkflowSkill, ReadonlySet<string>>>> = {
+	autoresearch: new Set(["verdict"]),
+};
+
+/**
+ * Continuation inertness for compaction auto-continue, derived from each
+ * workflow's manifest contract: manifest-terminal and explicitly inert phases
+ * are inert; unknown skills or phases unknown to the skill's manifest are
+ * conservatively inert so a synthetic continuation never wakes an unrecognized
+ * workflow. Generic Ultragoal `blocked` remains continuation-active because its
+ * blocker may be autonomously resolvable; verified human pauses are represented
+ * by the inline goal's `paused` status instead.
+ */
+export function isWorkflowContinuationInert(skill: string, phase: string): boolean {
+	const normalizedPhase = phase.trim().toLowerCase();
+	if (!isCanonicalGjcWorkflowSkill(skill)) return true;
+	const manifest = getSkillManifest(skill);
+	if (manifest.terminalStates.some(terminal => terminal.toLowerCase() === normalizedPhase)) return true;
+	if (CONTINUATION_INERT_WORKFLOW_PHASES[skill]?.has(normalizedPhase)) return true;
+	return !manifest.states.some(state => state.id.toLowerCase() === normalizedPhase);
 }
 
 export function listActiveSkills(raw: unknown): SkillActiveEntry[] {
@@ -437,29 +516,18 @@ async function readModeStatePhase(
 		const record = parsed as Record<string, unknown>;
 		const phase = safeString(record.current_phase).trim();
 		if (!phase) return undefined;
-		if (record.active === false && !RALPLAN_CANONICAL_PHASE_OVERRIDES.has(phase)) return undefined;
+		if (record.active === false && !getSkillManifest("ralplan").canonicalOverrides.includes(phase)) return undefined;
 		return phase;
 	} catch {
 		return undefined;
 	}
 }
 
-const RALPLAN_CANONICAL_PHASE_OVERRIDES = new Set([
-	"final",
-	"handoff",
-	"complete",
-	"completed",
-	"failed",
-	"cancelled",
-	"canceled",
-	"inactive",
-]);
-
 function withCanonicalRalplanPhase(entry: SkillActiveEntry, canonicalPhase: string | undefined): SkillActiveEntry {
 	if (
 		entry.skill !== "ralplan" ||
 		!canonicalPhase ||
-		!RALPLAN_CANONICAL_PHASE_OVERRIDES.has(canonicalPhase) ||
+		!getSkillManifest("ralplan").canonicalOverrides.includes(canonicalPhase) ||
 		entry.phase === canonicalPhase
 	) {
 		return entry;
@@ -556,7 +624,7 @@ function dedupeVisibleBySkill(entries: SkillActiveEntry[], sessionId?: string): 
  * The planning pipeline advances one stage at a time: `deep-interview →
  * ralplan → ultragoal`. Activating a downstream stage supersedes upstream
  * stages so stale rows cannot keep owning the HUD, gate, or primary active
- * snapshot. `team` is intentionally excluded — it runs alongside ultragoal —
+ * snapshot. `autoresearch` is intentionally excluded — it runs alongside ultragoal —
  * and every non-pipeline skill is left untouched.
  */
 const PLANNING_PIPELINE_SKILLS = new Set<string>(["deep-interview", "ralplan", "ultragoal"]);
@@ -580,7 +648,7 @@ function comparePipelineEntry(a: SkillActiveEntry, b: SkillActiveEntry): number 
 	return 0;
 }
 
-function upstreamPlanningPipelineSkills(skill: string): string[] {
+export function upstreamPlanningPipelineSkills(skill: string): string[] {
 	const rank = planningPipelineRank(skill);
 	if (rank === undefined) return [];
 	return [...PLANNING_PIPELINE_RANK.entries()]
@@ -614,14 +682,110 @@ async function mergeVisibleEntries(
 	return collapsePlanningPipeline(visibleEntries).toSorted(comparePipelineEntry);
 }
 
-export async function readVisibleSkillActiveState(cwd: string, sessionId?: string): Promise<SkillActiveState | null> {
-	let resolvedSessionId: string;
+export type VisibleSkillActiveStateCacheTier = "security" | "hud";
+export interface ReadVisibleSkillActiveStateOptions {
+	tier?: VisibleSkillActiveStateCacheTier;
+	/** Bypass all signature/TTL caches for authorization decisions. */
+	bypassCache?: boolean;
+}
+
+interface ActiveStateStatSignature {
+	path: string;
+	mtimeMs: number;
+	size: number;
+}
+
+interface ActiveStateSignature {
+	sessionPath: ActiveStateStatSignature | null;
+	activeDir: ActiveStateStatSignature | null;
+	activeEntries: ActiveStateStatSignature[];
+	ralplanModeState: ActiveStateStatSignature | null;
+}
+
+interface VisibleSkillActiveStateCacheEntry {
+	signature: ActiveStateSignature;
+	value: SkillActiveState | null;
+	cachedAtMs: number;
+}
+
+const HUD_VISIBLE_STATE_TTL_MS = 500;
+const SECURITY_VISIBLE_STATE_TTL_MS = 30_000;
+const visibleSkillActiveStateCache = new Map<string, VisibleSkillActiveStateCacheEntry>();
+
+async function statSignature(filePath: string): Promise<ActiveStateStatSignature | null> {
 	try {
-		resolvedSessionId = await resolveBoundarySessionId(cwd, sessionId);
+		const stat = await fs.stat(filePath);
+		return { path: filePath, mtimeMs: stat.mtimeMs, size: stat.size };
 	} catch (error) {
-		if (error instanceof SessionResolutionError && error.code === "no_session") return null;
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
 		throw error;
 	}
+}
+
+function signaturesEqual(a: ActiveStateSignature, b: ActiveStateSignature): boolean {
+	const statEqual = (left: ActiveStateStatSignature | null, right: ActiveStateStatSignature | null): boolean =>
+		left === right ||
+		(Boolean(left) &&
+			Boolean(right) &&
+			left?.path === right?.path &&
+			left?.mtimeMs === right?.mtimeMs &&
+			left?.size === right?.size);
+	if (!statEqual(a.sessionPath, b.sessionPath)) return false;
+	if (!statEqual(a.activeDir, b.activeDir)) return false;
+	if (!statEqual(a.ralplanModeState, b.ralplanModeState)) return false;
+	if (a.activeEntries.length !== b.activeEntries.length) return false;
+	return a.activeEntries.every((entry, index) => statEqual(entry, b.activeEntries[index] ?? null));
+}
+
+export async function computeActiveStateSignature(cwd: string, sessionId: string): Promise<ActiveStateSignature> {
+	const resolvedCwd = path.resolve(cwd);
+	const { sessionPath } = getSkillActiveStatePaths(resolvedCwd, sessionId);
+	const activeDirPath = activeStateDir(resolvedCwd, sessionId);
+	const activeDir = await statSignature(activeDirPath);
+	let activeEntries: ActiveStateStatSignature[] = [];
+	try {
+		const names = await fs.readdir(activeDirPath);
+		activeEntries = (
+			await Promise.all(
+				names
+					.filter(name => name.endsWith(".json"))
+					.sort()
+					.map(name => statSignature(path.join(activeDirPath, name))),
+			)
+		).filter((entry): entry is ActiveStateStatSignature => entry !== null);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	return {
+		sessionPath: await statSignature(sessionPath),
+		activeDir,
+		activeEntries,
+		ralplanModeState: await statSignature(modeStatePath(resolvedCwd, sessionId, "ralplan")),
+	};
+}
+
+function visibleActiveStateCacheKey(cwd: string, sessionId: string): string {
+	return `${path.resolve(cwd)}\0${sessionId}`;
+}
+
+export function invalidateVisibleSkillActiveStateCache(cwd?: string, sessionId?: string): void {
+	if (!cwd && !sessionId) {
+		visibleSkillActiveStateCache.clear();
+		return;
+	}
+	const resolvedCwd = cwd ? path.resolve(cwd) : undefined;
+	const suffix = sessionId ? `\0${sessionId}` : undefined;
+	for (const key of [...visibleSkillActiveStateCache.keys()]) {
+		if (resolvedCwd && !key.startsWith(`${resolvedCwd}\0`)) continue;
+		if (suffix && !key.endsWith(suffix)) continue;
+		visibleSkillActiveStateCache.delete(key);
+	}
+}
+
+async function readVisibleSkillActiveStateUncached(
+	cwd: string,
+	resolvedSessionId: string,
+): Promise<SkillActiveState | null> {
 	const { sessionPath } = getSkillActiveStatePaths(cwd, resolvedSessionId);
 	const sessionState = await readRawActiveStateForHandoff(sessionPath, false);
 	const activeSkills = await mergeVisibleEntries(cwd, sessionState, resolvedSessionId);
@@ -639,6 +803,44 @@ export async function readVisibleSkillActiveState(cwd: string, sessionId?: strin
 	};
 }
 
+setActiveStateCacheInvalidator(invalidateVisibleSkillActiveStateCache);
+
+export async function readVisibleSkillActiveState(
+	cwd: string,
+	sessionId?: string,
+	opts?: ReadVisibleSkillActiveStateOptions,
+): Promise<SkillActiveState | null> {
+	let resolvedSessionId: string;
+	try {
+		resolvedSessionId = await resolveBoundarySessionId(cwd, sessionId);
+	} catch (error) {
+		if (error instanceof SessionResolutionError && error.code === "no_session") return null;
+		throw error;
+	}
+	const resolvedCwd = path.resolve(cwd);
+	const cacheKey = visibleActiveStateCacheKey(resolvedCwd, resolvedSessionId);
+	if (opts?.bypassCache) {
+		visibleSkillActiveStateCache.delete(cacheKey);
+		return await readVisibleSkillActiveStateUncached(resolvedCwd, resolvedSessionId);
+	}
+	const tier = opts?.tier ?? "security";
+	const now = Date.now();
+	const cached = visibleSkillActiveStateCache.get(cacheKey);
+	if (tier === "hud" && cached && now - cached.cachedAtMs < HUD_VISIBLE_STATE_TTL_MS) return cached.value;
+
+	const signature = await computeActiveStateSignature(resolvedCwd, resolvedSessionId);
+	if (
+		cached &&
+		signaturesEqual(cached.signature, signature) &&
+		(tier === "hud" || now - cached.cachedAtMs < SECURITY_VISIBLE_STATE_TTL_MS)
+	) {
+		return cached.value;
+	}
+	const value = await readVisibleSkillActiveStateUncached(resolvedCwd, resolvedSessionId);
+	visibleSkillActiveStateCache.set(cacheKey, { signature, value, cachedAtMs: now });
+	return value;
+}
+
 function activeStateWriterAudit(verb: string, sessionScope?: ActiveSessionScope | string) {
 	const sessionId = typeof sessionScope === "string" ? sessionScope : sessionScope?.sessionId;
 	return { category: "state" as const, verb, owner: "gjc-runtime" as const, ...(sessionId ? { sessionId } : {}) };
@@ -648,19 +850,19 @@ async function persistActiveEntry(
 	cwd: string,
 	sessionScope: ActiveSessionScope | undefined,
 	entry: SkillActiveEntry,
-): Promise<void> {
+): Promise<GuardedWriteResult | undefined> {
 	if (entry.active === false) {
 		await removeActiveEntry(cwd, sessionScope, entry.skill, {
 			cwd,
 			audit: activeStateWriterAudit("remove-active-entry", sessionScope),
 			sourceRevision: entry.source_state_revision,
 		});
-	} else {
-		await writeActiveEntry(cwd, sessionScope, entry.skill, entry, {
-			cwd,
-			audit: activeStateWriterAudit("write-active-entry", sessionScope),
-		});
+		return undefined;
 	}
+	return await writeActiveEntry(cwd, sessionScope, entry.skill, entry, {
+		cwd,
+		audit: activeStateWriterAudit("write-active-entry", sessionScope),
+	});
 }
 
 async function writeHandoffEntry(
@@ -709,8 +911,10 @@ async function activeSubskillsForExistingEntry(
 	return existing?.active_subskills;
 }
 
-export async function syncSkillActiveState(options: SyncSkillActiveStateOptions): Promise<void> {
-	if (!options.sessionId) return;
+export async function syncSkillActiveState(
+	options: SyncSkillActiveStateOptions,
+): Promise<GuardedWriteResult | undefined> {
+	if (!options.sessionId) return undefined;
 	const preservedActiveSubskills =
 		options.active_subskills === undefined
 			? await activeSubskillsForExistingEntry(options.cwd, options.sessionId, options.skill)
@@ -740,8 +944,13 @@ export async function syncSkillActiveState(options: SyncSkillActiveStateOptions)
 	};
 	const sessionScope = { sessionId: options.sessionId };
 	await removeSupersededPlanningPipelineEntries(options.cwd, sessionScope, entry);
-	await persistActiveEntry(options.cwd, sessionScope, entry);
-	await rebuildActiveState(options.cwd, sessionScope);
+	const entryWrite = await persistActiveEntry(options.cwd, sessionScope, entry);
+	try {
+		await rebuildActiveState(options.cwd, sessionScope);
+	} catch (error) {
+		if (!options.bestEffortSnapshot) throw error;
+	}
+	return entryWrite;
 }
 
 export interface ApplyHandoffOptions {

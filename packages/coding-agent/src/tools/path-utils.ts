@@ -2,29 +2,29 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
-import { isEnoent } from "@gajae-code/utils";
+import { isEnoent } from "@gajae-code/utils/fs-error";
 import { InternalUrlRouter } from "../internal-urls";
+import type { MCPManager } from "../runtime-mcp/manager";
 import { ToolError } from "./tool-errors";
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
 const FILE_LINE_RANGE_RE = /^(?:L?\d+(?:[-+]L?\d+|-)?(?:,L?\d+(?:[-+]L?\d+|-)?)*|raw|conflicts)$/i;
 const FILE_LINE_RANGE_ONLY_RE = /^L?\d+(?:[-+]L?\d+|-)?(?:,L?\d+(?:[-+]L?\d+|-)?)*$/i;
 const FILE_RAW_ONLY_RE = /^raw$/i;
-// Permissive selector chunk for internal URLs — accepts well-formed selectors
-// plus common malformed shapes (e.g. `:-N`) so the read tool peels the entire
-// selector chain off before dispatching to a protocol handler.
-const INTERNAL_URL_SELECTOR_PART_RE =
-	/^(?:raw|conflicts|L?\d+(?:[-+]L?\d+|-)?(?:,L?\d+(?:[-+]L?\d+|-)?)*|-\d+(?:[-+]\d+)?)$/i;
-// Schemes whose host grammar is identifier-shaped, so any trailing
-// `:<selector-chunk>` is unambiguously a read-tool selector.
-const INTERNAL_SCHEMES_WITH_SELECTORS: Record<string, true> = {
+// Schemes whose authority grammar is identifier-shaped and cannot contain a
+// literal colon. Colons in a path, query, or fragment remain part of the URL
+// and are never considered selectors.
+const INTERNAL_SCHEMES_WITH_UNAMBIGUOUS_AUTHORITIES: Record<string, true> = {
 	agent: true,
 	artifact: true,
-	issue: true,
-	local: true,
 	memory: true,
-	gjc: true,
+	issue: true,
 	pr: true,
+};
+const INTERNAL_SCHEMES_WITH_SELECTORS: Record<string, true> = {
+	...INTERNAL_SCHEMES_WITH_UNAMBIGUOUS_AUTHORITIES,
+	gjc: true,
+	local: true,
 	rule: true,
 	skill: true,
 };
@@ -36,8 +36,24 @@ function normalizeUnicodeSpaces(str: string): string {
 	return str.replace(UNICODE_SPACES, " ");
 }
 
+function rawSkillPrefixForName(authority: string, skillName: string): string | undefined {
+	for (let index = 1; index < authority.length; index++) {
+		if (authority[index] !== ":") continue;
+		try {
+			if (decodeURIComponent(authority.slice(0, index)) === skillName) return authority.slice(0, index);
+		} catch {
+			return undefined;
+		}
+	}
+	return undefined;
+}
+
 function tryMacOSScreenshotPath(filePath: string): string {
-	return filePath.replace(/ (AM|PM)\./g, `${NARROW_NO_BREAK_SPACE}$1.`);
+	// macOS writes a narrow no-break space before AM/PM, but the model normalizes it
+	// to a plain space. The original name is not always `…PM.png`: attachment paths
+	// append a timestamp (`…PM-1785075812409.png`), so match any non-alphanumeric
+	// separator or end of segment rather than a literal dot.
+	return filePath.replace(/ (AM|PM)(?=[^A-Za-z0-9/]|$)/g, `${NARROW_NO_BREAK_SPACE}$1`);
 }
 
 function tryNFDVariant(filePath: string): string {
@@ -148,39 +164,83 @@ export function splitPathAndSel(rawPath: string): { path: string; sel?: string }
 /**
  * Variant of {@link splitPathAndSel} for internal URLs (`scheme://...`).
  *
- * The filesystem-path splitter is intentionally conservative: it refuses to
- * peel a trailing `:<chunk>` unless that chunk matches the strict selector
- * grammar. That rule is right for filesystem paths (a file named `a:1-50` is
- * legal) but wrong for internal URLs, where any trailing `:<chunk>` after the
- * scheme is unambiguously a read-tool selector — even if malformed (e.g.
- * `artifact://3:raw:-100`).
- *
- * This function iteratively peels selector-shaped chunks (well-formed plus
- * common malformed shapes like `:-N`) so the rest of the read tool can pass a
- * clean URL to the protocol handler and surface selector errors via parseSel
- * instead of as misleading "host invalid" errors from the handler.
- *
- * Falls back to the input unchanged when nothing matches.
+ * Selector-capable internal authorities use identifier-shaped resource names,
+ * so an authority-only `:<tail>` is an explicit read selector even when the
+ * selector is malformed. Skill authorities are the exception: namespaced
+ * skill names already contain a colon, so the active registry gets first
+ * refusal and the fallback recognizes a later colon as the selector boundary.
  */
-export function splitInternalUrlSel(rawPath: string): { path: string; sel?: string } {
+export function splitInternalUrlSel(
+	rawPath: string,
+	options: { activeSkillNames?: readonly string[] } = {},
+): { path: string; sel?: string } {
 	const schemeMatch = rawPath.match(INTERNAL_URL_SCHEME_RE);
 	if (!schemeMatch) return { path: rawPath };
-	if (!INTERNAL_SCHEMES_WITH_SELECTORS[schemeMatch[1].toLowerCase()]) return { path: rawPath };
+	const scheme = schemeMatch[1].toLowerCase();
+	if (!INTERNAL_SCHEMES_WITH_SELECTORS[scheme]) return { path: rawPath };
 
 	const schemeEnd = schemeMatch[0].length;
-	let path = rawPath;
-	const chunks: string[] = [];
-	while (true) {
-		const colon = path.lastIndexOf(":");
-		// Stop before crossing into the scheme separator `://`.
-		if (colon < schemeEnd) break;
-		const tail = path.slice(colon + 1);
-		if (!INTERNAL_URL_SELECTOR_PART_RE.test(tail)) break;
-		chunks.unshift(tail);
-		path = path.slice(0, colon);
+	const authorityTerminator = rawPath.slice(schemeEnd).search(/[/?#]/);
+	const authorityEnd = authorityTerminator === -1 ? rawPath.length : schemeEnd + authorityTerminator;
+	const authority = rawPath.slice(schemeEnd, authorityEnd);
+	const authoritySuffix = rawPath.slice(authorityEnd);
+	const firstColon = authority.indexOf(":");
+	if (firstColon === -1) return { path: rawPath };
+	if (firstColon === 0) return { path: rawPath };
+
+	if (scheme === "skill") {
+		const activeSkillNames = options.activeSkillNames ?? [];
+		let decodedAuthority: string | undefined;
+		try {
+			decodedAuthority = decodeURIComponent(authority);
+		} catch {
+			// Let the resolver report malformed URL encoding when no selector boundary
+			// can be established from the raw authority.
+		}
+		if (decodedAuthority !== undefined && activeSkillNames.includes(decodedAuthority)) return { path: rawPath };
+		const rawSkillPrefix = activeSkillNames
+			.map(name => ({ name, prefix: rawSkillPrefixForName(authority, name) }))
+			.filter(item => item.prefix !== undefined)
+			.sort((a, b) => b.name.length - a.name.length)[0]?.prefix;
+		if (rawSkillPrefix) {
+			return {
+				path: `${rawPath.slice(0, schemeEnd)}${rawSkillPrefix}${authoritySuffix}`,
+				sel: authority.slice(rawSkillPrefix.length + 1),
+			};
+		}
+		const strict = splitPathAndSel(authority);
+		if (strict.sel !== undefined) {
+			return { path: `${rawPath.slice(0, schemeEnd)}${strict.path}${authoritySuffix}`, sel: strict.sel };
+		}
+		const firstTail = authority.slice(firstColon + 1);
+		if (FILE_LINE_RANGE_RE.test(firstTail)) {
+			return { path: `${rawPath.slice(0, schemeEnd + firstColon)}${authoritySuffix}`, sel: firstTail };
+		}
+		const selectorColon = authority.indexOf(":", firstColon + 1);
+		if (selectorColon === -1) return { path: rawPath };
+		return {
+			path: `${rawPath.slice(0, schemeEnd + selectorColon)}${authoritySuffix}`,
+			sel: authority.slice(selectorColon + 1),
+		};
 	}
-	if (chunks.length === 0) return { path: rawPath };
-	return { path, sel: chunks.join(":") };
+
+	if (!INTERNAL_SCHEMES_WITH_UNAMBIGUOUS_AUTHORITIES[scheme]) {
+		// A path/query/fragment after a path-like authority makes a colon-bearing
+		// resource identity indistinguishable from an authority selector. Preserve
+		// the complete URL; path-like selectors are accepted only on authority-only
+		// URLs, where the existing strict grammar is the sole interpretation.
+		if (authoritySuffix !== "") return { path: rawPath };
+		const strict = splitPathAndSel(authority);
+		if (strict.sel !== undefined) {
+			return { path: `${rawPath.slice(0, schemeEnd)}${strict.path}`, sel: strict.sel };
+		}
+		return { path: rawPath };
+	}
+
+	return {
+		path: `${rawPath.slice(0, schemeEnd + firstColon)}${authoritySuffix}`,
+		sel: authority.slice(firstColon + 1),
+	};
 }
 
 function assertNotInternalUrl(expanded: string, original: string): void {
@@ -625,7 +685,9 @@ export function resolveReadPath(filePath: string, cwd: string): string {
 export interface ToolScopeOptions {
 	rawPaths: string[];
 	cwd: string;
+	mcpManager?: MCPManager;
 	getArtifactsDir?: () => string | null;
+	getAuthorizedArtifactsDirs?: () => readonly string[];
 	/** Verb used in the "Cannot {action} internal URL without a backing file: …" message. */
 	internalUrlAction: string;
 	/** Collect absolute paths flagged immutable by their internal-URL handler. */
@@ -656,7 +718,7 @@ export interface ToolScopeResolution {
  *  5. stat the resolved base path so callers can branch on directory vs file scope.
  */
 export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<ToolScopeResolution> {
-	const { rawPaths: inputs, cwd, internalUrlAction, getArtifactsDir } = opts;
+	const { rawPaths: inputs, cwd, internalUrlAction, getArtifactsDir, getAuthorizedArtifactsDirs } = opts;
 	const rawPaths = inputs.map(normalizePathLikeInput);
 	if (rawPaths.some(rawPath => rawPath.length === 0)) {
 		throw new ToolError("`paths` must contain non-empty paths or globs");
@@ -672,7 +734,12 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 		if (hasGlobPathChars(rawPath)) {
 			throw new ToolError(`Glob patterns are not supported for internal URLs: ${rawPath}`);
 		}
-		const resource = await internalRouter.resolve(rawPath, { cwd, getArtifactsDir });
+		const resource = await internalRouter.resolve(rawPath, {
+			cwd,
+			getArtifactsDir,
+			getAuthorizedArtifactsDirs,
+			mcpManager: opts.mcpManager,
+		});
 		if (!resource.sourcePath) {
 			throw new ToolError(`Cannot ${internalUrlAction} internal URL without a backing file: ${rawPath}`);
 		}

@@ -2,16 +2,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
 
 import { AuthStorage, SqliteAuthCredentialStore } from "../src/auth-storage";
 import { getBundledModel } from "../src/models";
+import { glmZcodeModelManagerOptions } from "../src/provider-models/special";
 import {
 	buildAnthropicClientOptions,
 	buildAnthropicHeaders,
 	buildZCodeSourceHeaders,
+	resolveGlmZcodeAnthropicBaseUrl,
 } from "../src/providers/anthropic";
 import { isOAuthToken } from "../src/utils/anthropic-auth";
 import { getOAuthProviders, refreshOAuthToken } from "../src/utils/oauth";
+import { AnthropicOAuthFlow } from "../src/utils/oauth/anthropic";
 import {
 	GLM_ZCODE_ANTHROPIC_BASE_URL,
 	GLM_ZCODE_OAUTH_AUTHORIZE_URL,
@@ -22,6 +26,7 @@ import {
 	isGlmZcodeOAuthConfigured,
 	refreshGlmZcodeToken,
 } from "../src/utils/oauth/glm-zcode";
+
 import { withEnv } from "./helpers";
 
 const originalFetch = global.fetch;
@@ -140,6 +145,27 @@ describe("GLM ZCode OAuth login provider", () => {
 		expect(authUrl.searchParams.get("response_type")).toBe("code");
 		expect(authUrl.searchParams.get("state")).toBe("state-1");
 		expect(instructions ?? "").toMatch(/unofficial/i);
+		// A desktop-app install consumes the single-use code before the user can paste it;
+		// the instructions must warn about that or the documented flow fails silently.
+		expect(instructions ?? "").toMatch(/desktop app/i);
+		expect(instructions ?? "").toMatch(/cancel/i);
+	});
+
+	it("scopes the desktop-app warning to glm-zcode without exposing login values", async () => {
+		const glmFlow = new GlmZcodeOAuthFlow({ onAuth: () => {}, onPrompt: async () => "" });
+		const { instructions: glmInstructions } = await glmFlow.generateAuthUrl("state-1", GLM_ZCODE_OAUTH_REDIRECT_URI);
+		expect(glmInstructions ?? "").toMatch(/desktop app/i);
+		expect(glmInstructions ?? "").toMatch(/cancel/i);
+		for (const value of [ZCODE_JWT, UPSTREAM, BUSINESS, MINTED_KEY, "auth-code", "state-1"]) {
+			expect(glmInstructions ?? "").not.toContain(value);
+		}
+
+		const anthropicFlow = new AnthropicOAuthFlow({});
+		const { instructions: anthropicInstructions } = await anthropicFlow.generateAuthUrl(
+			"state-1",
+			"http://localhost:54545/callback",
+		);
+		expect(anthropicInstructions ?? "").not.toMatch(/desktop app|broker error 2007|single-use authorization code/i);
 	});
 
 	it("exchanges the code and provisions a Z.AI API key as the credential", async () => {
@@ -266,6 +292,198 @@ describe("GLM ZCode OAuth login provider", () => {
 		expect(model.api).toBe("anthropic-messages");
 	});
 
+	it("discovers the current GLM catalog through the authenticated ZCode model endpoint", async () => {
+		const requests: Array<{ url: string; headers: Headers }> = [];
+		const options = glmZcodeModelManagerOptions({ apiKey: MINTED_KEY });
+		const fetchDynamicModels = options.fetchDynamicModels;
+		if (!fetchDynamicModels) throw new Error("GLM ZCode discovery is not configured");
+		const originalFetch = global.fetch;
+		global.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			requests.push({ url: String(input), headers: new Headers(init?.headers) });
+			return new Response(
+				JSON.stringify({
+					data: [
+						{ id: "glm-5.2", name: "GLM-5.2" },
+						{ id: "glm-5.3", name: "GLM-5.3", context_length: 200000 },
+					],
+				}),
+				{ headers: { "Content-Type": "application/json" } },
+			);
+		}) as typeof fetch;
+		try {
+			const models = await fetchDynamicModels();
+			expect(models?.map(model => model.id)).toEqual(["glm-5.2", "glm-5.3"]);
+			expect(models?.find(model => model.id === "glm-5.2")).toMatchObject({
+				contextWindow: 1_000_000,
+				maxTokens: 131_072,
+			});
+			expect(requests[0]?.url).toBe(`${GLM_ZCODE_ANTHROPIC_BASE_URL}/v1/models`);
+			expect(requests[0]?.headers.get("authorization")).toBe(`Bearer ${MINTED_KEY}`);
+			expect(requests[0]?.headers.get("x-zcode-agent")).toBe("glm");
+		} finally {
+			global.fetch = originalFetch;
+		}
+	});
+	it("inherits same-family GLM metadata for IDs bundled under zai but not glm-zcode", async () => {
+		const options = glmZcodeModelManagerOptions({ apiKey: MINTED_KEY });
+		const fetchDynamicModels = options.fetchDynamicModels;
+		if (!fetchDynamicModels) throw new Error("GLM ZCode discovery is not configured");
+		const originalFetch = global.fetch;
+		global.fetch = (async () =>
+			new Response(JSON.stringify({ data: [{ id: "glm-5.1", name: "GLM-5.1" }] }), {
+				headers: { "Content-Type": "application/json" },
+			})) as unknown as typeof fetch;
+		try {
+			const models = await fetchDynamicModels();
+			const inherited = models?.find(model => model.id === "glm-5.1");
+			// glm-5.1 is bundled under zai (same family, same anthropic base);
+			// discovery must not degrade it to generic unknown metadata.
+			expect(inherited).toMatchObject({
+				provider: "glm-zcode",
+				api: "anthropic-messages",
+				baseUrl: GLM_ZCODE_ANTHROPIC_BASE_URL,
+				reasoning: true,
+				contextWindow: 200_000,
+				maxTokens: 131_072,
+			});
+			expect(inherited?.thinking).toMatchObject({ mode: "budget", minLevel: "minimal", maxLevel: "xhigh" });
+		} finally {
+			global.fetch = originalFetch;
+		}
+	});
+
+	it("strips control sequences from catalog-provided model names", async () => {
+		const options = glmZcodeModelManagerOptions({ apiKey: MINTED_KEY });
+		const fetchDynamicModels = options.fetchDynamicModels;
+		if (!fetchDynamicModels) throw new Error("GLM ZCode discovery is not configured");
+		const originalFetch = global.fetch;
+		global.fetch = (async () =>
+			new Response(
+				JSON.stringify({
+					data: [
+						{ id: "glm-5.3", name: "\u001b]0;pwned\u0007GLM-5.3\n\u000bErase-Line" },
+						{ id: "glm-5.2", name: "\u0000\u007f" },
+					],
+				}),
+				{ headers: { "Content-Type": "application/json" } },
+			)) as unknown as typeof fetch;
+		try {
+			const models = await fetchDynamicModels();
+			expect(models?.find(model => model.id === "glm-5.3")?.name).toBe("GLM-5.3 Erase-Line");
+			// A name that sanitizes to empty falls back to the bundled reference name.
+			expect(models?.find(model => model.id === "glm-5.2")?.name).toBe("GLM-5.2");
+		} finally {
+			global.fetch = originalFetch;
+		}
+	});
+
+	it("sanitizes and bounds names for unbundled catalog models", async () => {
+		const options = glmZcodeModelManagerOptions({ apiKey: MINTED_KEY });
+		const fetchDynamicModels = options.fetchDynamicModels;
+		if (!fetchDynamicModels) throw new Error("GLM ZCode discovery is not configured");
+		const originalFetch = global.fetch;
+		global.fetch = (async () =>
+			new Response(
+				JSON.stringify({
+					data: [{ id: "glm-future", name: `\u001b]0;pwned\u0007GLM Future\n${"x".repeat(300)}` }],
+				}),
+				{ headers: { "Content-Type": "application/json" } },
+			)) as unknown as typeof fetch;
+		try {
+			const discovered = (await fetchDynamicModels())?.find(model => model.id === "glm-future");
+			expect(discovered?.name).toStartWith("GLM Future ");
+			expect(discovered?.name).toHaveLength(200);
+			expect(discovered?.name).toMatch(/^[^\x00-\x1f\x7f]*$/);
+		} finally {
+			global.fetch = originalFetch;
+		}
+	});
+
+	it("uses the configured trusted GLM endpoint for discovery and requests", async () => {
+		await withEnv({ ZCODE_PLAN_ANTHROPIC_BASE_URL: "https://zai-gateway.example.test/anthropic/" }, async () => {
+			const requests: string[] = [];
+			const options = glmZcodeModelManagerOptions({ apiKey: MINTED_KEY });
+			const fetchDynamicModels = options.fetchDynamicModels;
+			if (!fetchDynamicModels) throw new Error("GLM ZCode discovery is not configured");
+			const originalFetch = global.fetch;
+			global.fetch = (async (input: string | URL | Request) => {
+				requests.push(String(input));
+				return new Response(JSON.stringify({ data: [{ id: "glm-5.2" }] }), {
+					headers: { "Content-Type": "application/json" },
+				});
+			}) as typeof fetch;
+			try {
+				const models = await fetchDynamicModels();
+				expect(models?.[0]?.baseUrl).toBe("https://zai-gateway.example.test/anthropic");
+				expect(requests).toEqual(["https://zai-gateway.example.test/anthropic/v1/models"]);
+				const model = getBundledModel("glm-zcode", "glm-5.2") as Parameters<
+					typeof buildAnthropicClientOptions
+				>[0]["model"];
+				expect(buildAnthropicClientOptions({ model, apiKey: MINTED_KEY }).baseURL).toBe(
+					"https://zai-gateway.example.test/anthropic",
+				);
+			} finally {
+				global.fetch = originalFetch;
+			}
+		});
+	});
+
+	it("falls back from hostile GLM endpoint values", async () => {
+		for (const value of [
+			"http://evil.example.test/anthropic",
+			"javascript:alert(1)",
+			"https://user:password@evil.example.test/anthropic",
+			"https://evil.example.test/anthropic?token=secret",
+			"https://evil.example.test/anthropic#fragment",
+			"https://evil.example.test/a\nX: y",
+		] as const) {
+			await withEnv({ ZCODE_PLAN_ANTHROPIC_BASE_URL: value }, async () => {
+				expect(resolveGlmZcodeAnthropicBaseUrl()).toBe(GLM_ZCODE_ANTHROPIC_BASE_URL);
+			});
+		}
+	});
+
+	it("bounds hostile unbundled IDs and metadata", async () => {
+		const options = glmZcodeModelManagerOptions({ apiKey: MINTED_KEY });
+		const fetchDynamicModels = options.fetchDynamicModels;
+		if (!fetchDynamicModels) throw new Error("GLM ZCode discovery is not configured");
+		const originalFetch = global.fetch;
+		global.fetch = (async () =>
+			new Response(
+				JSON.stringify({
+					data: [
+						{
+							id: "glm-\u001b[31mfuture",
+							name: "\u0000\u007f",
+							context_length: 1e308,
+							max_tokens: 1e308,
+						},
+						{
+							id: "glm-safe-future",
+							name: "\u0000\u007f",
+							context_length: 1e308,
+							max_tokens: 1e308,
+						},
+					],
+				}),
+				{ headers: { "Content-Type": "application/json" } },
+			)) as unknown as typeof fetch;
+		try {
+			const discovered = await fetchDynamicModels();
+			expect(discovered?.map(model => model.id)).toEqual(["glm-safe-future"]);
+			expect(discovered?.[0]?.name).toBe("glm-safe-future");
+			expect(discovered?.[0]?.name).not.toMatch(/[\x00-\x1f\x7f]/);
+			expect(discovered?.[0]?.contextWindow).toBe(UNK_CONTEXT_WINDOW);
+			expect(discovered?.[0]?.maxTokens).toBe(UNK_MAX_TOKENS);
+		} finally {
+			global.fetch = originalFetch;
+		}
+	});
+
+	it("keeps static models when no GLM ZCode credential is configured", () => {
+		expect(glmZcodeModelManagerOptions().fetchDynamicModels).toBeUndefined();
+	});
+
 	it("pins the request base to api.z.ai even if model.baseUrl was polluted", () => {
 		const model = {
 			id: "glm-5.2",
@@ -334,5 +552,74 @@ describe("GLM ZCode OAuth login provider", () => {
 		const headers = buildAnthropicHeaders({ apiKey: MINTED_KEY, baseUrl: "https://api.z.ai/api/anthropic" });
 		expect(headers["X-ZCode-Agent"]).toBeUndefined();
 		expect(headers["User-Agent"] ?? "").not.toBe("ZCode/3.1.2");
+	});
+	it("throws the documented broker failure shape when the broker rejects the exchange", async () => {
+		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+			if (url === GLM_ZCODE_OAUTH_BROKER_TOKEN_URL) {
+				return new Response("upstream says no", { status: 401 });
+			}
+			throw new Error(`Unexpected fetch: ${init?.method ?? "GET"} ${url}`);
+		});
+		const flow = new GlmZcodeOAuthFlow(
+			{ onAuth: () => {}, onPrompt: async () => "" },
+			{ fetch: fetchMock as unknown as typeof fetch },
+		);
+		let caught: unknown;
+		try {
+			await flow.exchangeToken("auth-code", "state-1", GLM_ZCODE_OAUTH_REDIRECT_URI);
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(Error);
+		const message = (caught as Error).message;
+		// Failure shape: labeled broker failure with status + redacted body, nothing else.
+		expect(message).toMatch(/^GLM ZCode broker request failed: 401 /);
+		expect(message).not.toMatch(/auth-code|state-1/);
+	});
+
+	it("redacts token-like secrets from broker error bodies", async () => {
+		const leaky = `eyJhbGciOiJIUzI1NiJ9.${Buffer.from(JSON.stringify({ sub: "x" })).toString("base64url")}.sigPART`;
+		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+			if (url === GLM_ZCODE_OAUTH_BROKER_TOKEN_URL) {
+				return new Response(`token=${leaky} trace ok`, { status: 500 });
+			}
+			throw new Error(`Unexpected fetch: ${init?.method ?? "GET"} ${url}`);
+		});
+		const flow = new GlmZcodeOAuthFlow(
+			{ onAuth: () => {}, onPrompt: async () => "" },
+			{ fetch: fetchMock as unknown as typeof fetch },
+		);
+		let caught: unknown;
+		try {
+			await flow.exchangeToken("auth-code", "state-1", GLM_ZCODE_OAUTH_REDIRECT_URI);
+		} catch (error) {
+			caught = error;
+		}
+		const message = (caught as Error).message;
+		expect(message).toContain("[redacted-jwt]");
+		expect(message).not.toContain(leaky);
+		expect(message).not.toContain("sigPART");
+	});
+
+	it("throws a labeled failure when the broker response is missing required fields", async () => {
+		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+			if (url === GLM_ZCODE_OAUTH_BROKER_TOKEN_URL) {
+				return new Response(JSON.stringify({ code: 2007, msg: "http error" }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			throw new Error(`Unexpected fetch: ${init?.method ?? "GET"} ${url}`);
+		});
+		const flow = new GlmZcodeOAuthFlow(
+			{ onAuth: () => {}, onPrompt: async () => "" },
+			{ fetch: fetchMock as unknown as typeof fetch },
+		);
+		await expect(flow.exchangeToken("auth-code", "state-1", GLM_ZCODE_OAUTH_REDIRECT_URI)).rejects.toThrow(
+			"GLM ZCode broker response missing data.token or data.zai.access_token",
+		);
 	});
 });

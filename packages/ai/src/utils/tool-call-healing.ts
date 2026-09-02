@@ -17,7 +17,12 @@
  * the end of a chunk is held back until the next chunk arrives.
  */
 
-import { parseJsonWithRepair } from "./json-parse";
+import {
+	attachUnicodeEscapeEvidence,
+	collectUnsafeUnicodeEscapeEvidence,
+	parseJsonWithRepair,
+	type UnicodeEscapeEvidence,
+} from "./json-parse";
 
 const TOK_SECTION_BEGIN = "<|tool_calls_section_begin|>";
 const TOK_SECTION_END = "<|tool_calls_section_end|>";
@@ -34,6 +39,14 @@ export interface HealedToolCall {
 	readonly id: string;
 	readonly name: string;
 	readonly arguments: string;
+	/**
+	 * Whether the raw leaked payload carried unsafe Unicode argument data.
+	 * Captured before the normalizing round-trip below, which would otherwise
+	 * erase malformed escape evidence. Valid `\uXXXX` spellings decode
+	 * canonically and leave this false.
+	 */
+	readonly escapedNonAsciiArguments: boolean;
+	readonly escapedUnicodeArgumentEvidence?: UnicodeEscapeEvidence;
 }
 
 /**
@@ -230,6 +243,13 @@ export class ToolCallHealer {
 		const name = normalizeFunctionName(rawId);
 		const id = generateHealedToolCallId();
 
+		// Sample unsafe raw payloads first: the round-trip below decodes `\uXXXX`
+		// into literal characters, so malformed escape data must be retained before
+		// normalization. Valid escapes need no evidence because their decoded value
+		// is canonical.
+		const escapedUnicodeArgumentEvidence = collectUnsafeUnicodeEscapeEvidence(rawArgs);
+		const escapedNonAsciiArguments = escapedUnicodeArgumentEvidence !== undefined;
+
 		let argsJson = rawArgs;
 		if (rawArgs.length > 0) {
 			try {
@@ -242,7 +262,14 @@ export class ToolCallHealer {
 			argsJson = "{}";
 		}
 
-		this.#completed.push({ id, name, arguments: argsJson });
+		const completed: HealedToolCall = {
+			id,
+			name,
+			arguments: argsJson,
+			escapedNonAsciiArguments,
+		};
+		if (escapedUnicodeArgumentEvidence) attachUnicodeEscapeEvidence(completed, escapedUnicodeArgumentEvidence);
+		this.#completed.push(completed);
 		this.#inCall = false;
 		this.#inArgs = false;
 		this.#pendingId = "";

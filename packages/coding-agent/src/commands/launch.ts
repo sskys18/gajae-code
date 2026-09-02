@@ -2,30 +2,44 @@
  * Root command for the coding agent CLI.
  */
 
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
-import { THINKING_EFFORTS } from "@gajae-code/ai";
-import { APP_NAME, setProjectDir } from "@gajae-code/utils";
-import { Args, Command, Flags } from "@gajae-code/utils/cli";
-import { parseArgs } from "../cli/args";
+import { APP_NAME, getAgentDir, setProjectDir } from "@gajae-code/utils";
+import { Args, Command } from "@gajae-code/utils/cli";
+import { assertLocalLaunchArgs, parseArgs } from "../cli/args";
+import { ROOT_LAUNCH_FLAGS } from "../cli/root-flags";
+import { writeCoordinatorAtomic } from "../coordinator-mcp/durability";
 import { launchDefaultTmuxIfNeeded } from "../gjc-runtime/launch-tmux";
-import { prepareLaunchWorktree } from "../gjc-runtime/launch-worktree";
+import {
+	type GjcLaunchWorktreePlan,
+	type PreparedLaunchWorktree,
+	parseLaunchWorktreeMode,
+	planLaunchWorktree,
+	prepareLaunchWorktree,
+} from "../gjc-runtime/launch-worktree";
+import { type LaunchWorktreeReservation, reserveLaunchWorktree } from "../gjc-runtime/launch-worktree-reservation";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+	GJC_TMUX_OWNER_GENERATION_ENV,
 } from "../gjc-runtime/session-state-sidecar";
 import { runRootCommand } from "../main";
+import { assertMasterLaunchArgs } from "../master-mode/context";
 import { prepareAcpTerminalAuthArgs } from "../modes/acp/terminal-auth";
+import { type IndexedSession, SessionIndex } from "../sdk/broker/session-index";
+import { worktreeOccupant } from "../sdk/broker/worktree-occupancy";
 
-async function persistCoordinatorLaunchFailure(error: unknown, cwd: string): Promise<void> {
-	const stateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
+export async function persistCoordinatorLaunchFailure(
+	error: unknown,
+	cwd: string,
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+	const stateFile = env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
 	if (!stateFile) return;
 	const message = error instanceof Error ? error.message : String(error);
 	const code = message.split(":", 1)[0] || "launch_failed";
 	const now = new Date().toISOString();
 	const payload = {
 		schema_version: 1,
-		session_id: process.env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || null,
+		session_id: env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || null,
 		state: "errored",
 		ready_for_input: false,
 		updated_at: now,
@@ -45,9 +59,59 @@ async function persistCoordinatorLaunchFailure(error: unknown, cwd: string): Pro
 			truncated: false,
 		},
 		error: { code, message, recoverable: true },
+		...(env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim()
+			? { owner_generation: env[GJC_TMUX_OWNER_GENERATION_ENV] ?? null }
+			: {}),
 	};
-	await fs.mkdir(path.dirname(stateFile), { recursive: true });
-	await Bun.write(stateFile, `${JSON.stringify(payload, null, 2)}\n`);
+	await writeCoordinatorAtomic(stateFile, `${JSON.stringify(payload, null, 2)}\n`);
+}
+
+function worktreeInUseError(worktreePath: string, occupant?: string): Error {
+	const holder = occupant ? `session ${occupant}` : "another launch";
+	return new Error(
+		`worktree_in_use:${worktreePath} is already held by ${holder}. ` +
+			"Use gjc --worktree <name> for a separate checkout, or stop that session.",
+	);
+}
+
+async function reserveLaunchWorktreeOrFail(agentDir: string, worktreePath: string): Promise<LaunchWorktreeReservation> {
+	const reservation = await reserveLaunchWorktree(agentDir, worktreePath);
+	if (!reservation) throw worktreeInUseError(worktreePath);
+	return reservation;
+}
+
+/** Test seam for the path-keyed atomic reservation. */
+export async function reserveLaunchWorktreeForTest(
+	agentDir: string,
+	worktreePath: string,
+): Promise<LaunchWorktreeReservation> {
+	return await reserveLaunchWorktreeOrFail(agentDir, worktreePath);
+}
+
+async function assertLaunchWorktreeUnoccupied(worktree: GjcLaunchWorktreePlan | { enabled: false }): Promise<void> {
+	if (!worktree.enabled) return;
+	let sessions: readonly IndexedSession[];
+	try {
+		sessions = (await new SessionIndex(getAgentDir()).open()).listSessionIdentities();
+	} catch {
+		throw new Error(`worktree_occupancy_unavailable:${worktree.worktreePath}`);
+	}
+	const occupant = worktreeOccupant(sessions, worktree.worktreePath);
+	if (occupant) throw worktreeInUseError(worktree.worktreePath, occupant);
+}
+
+async function reserveLaunchWorktreePreflight(
+	worktree: GjcLaunchWorktreePlan | { enabled: false },
+): Promise<LaunchWorktreeReservation | undefined> {
+	if (!worktree.enabled) return undefined;
+	const reservation = await reserveLaunchWorktreeOrFail(getAgentDir(), worktree.worktreePath);
+	try {
+		await assertLaunchWorktreeUnoccupied(worktree);
+		return reservation;
+	} catch (error) {
+		await reservation.release();
+		throw error;
+	}
 }
 
 export default class Index extends Command {
@@ -62,115 +126,7 @@ export default class Index extends Command {
 		}),
 	};
 
-	static flags = {
-		model: Flags.string({
-			description: 'Model to use (fuzzy match: "opus", "gpt-5.2", or "openai/gpt-5.2")',
-		}),
-		smol: Flags.string({
-			description: "Smol/fast model for lightweight tasks (or GJC_SMOL_MODEL env)",
-		}),
-		slow: Flags.string({
-			description: "Slow/reasoning model for thorough analysis (or GJC_SLOW_MODEL env)",
-		}),
-		plan: Flags.string({
-			description: "Plan model for architectural planning (or GJC_PLAN_MODEL env)",
-		}),
-		mpreset: Flags.string({
-			description: "Model profile preset to activate for this session",
-		}),
-		default: Flags.boolean({
-			description: "Persist --mpreset as the default model profile",
-		}),
-		provider: Flags.string({
-			description: "Provider to use (legacy; prefer --model)",
-		}),
-		"api-key": Flags.string({
-			description: "API key (defaults to env vars)",
-		}),
-		"system-prompt": Flags.string({
-			description: "System prompt (default: coding assistant prompt)",
-		}),
-		"append-system-prompt": Flags.string({
-			description: "Append text or file contents to the system prompt",
-		}),
-		"allow-home": Flags.boolean({
-			description: "Allow starting in ~ without auto-switching to a temp dir",
-		}),
-		mode: Flags.string({
-			description: "Output mode: text (default), json, rpc, acp, rpc-ui, or bridge",
-			options: ["text", "json", "rpc", "acp", "rpc-ui", "bridge"],
-		}),
-		print: Flags.boolean({
-			char: "p",
-			description: "Non-interactive mode: process prompt and exit",
-		}),
-		continue: Flags.boolean({
-			char: "c",
-			description: "Continue previous session",
-		}),
-		resume: Flags.string({
-			char: "r",
-			description: "Resume a session (by ID prefix, path, or picker if omitted)",
-		}),
-		"session-dir": Flags.string({
-			description: "Directory for session storage and lookup",
-		}),
-		"no-session": Flags.boolean({
-			description: "Don't save session (ephemeral)",
-		}),
-		models: Flags.string({
-			description: "Comma-separated model patterns for Alt+N cycling",
-		}),
-		"no-tools": Flags.boolean({
-			description: "Disable all built-in tools",
-		}),
-		"no-lsp": Flags.boolean({
-			description: "Disable LSP tools, formatting, and diagnostics",
-		}),
-		"no-pty": Flags.boolean({
-			description: "Disable PTY-based interactive bash execution",
-		}),
-		tmux: Flags.boolean({
-			description: "Launch interactive startup inside tmux",
-		}),
-		tools: Flags.string({
-			description: "Comma-separated list of tools to enable (default: all)",
-		}),
-		thinking: Flags.string({
-			description: `Set thinking level: ${THINKING_EFFORTS.join(", ")}`,
-			options: [...THINKING_EFFORTS],
-		}),
-		hook: Flags.string({
-			description: "Load a hook/extension file (can be used multiple times)",
-			multiple: true,
-		}),
-		extension: Flags.string({
-			char: "e",
-			description: "Load an extension file (can be used multiple times)",
-			multiple: true,
-		}),
-		"no-extensions": Flags.boolean({
-			description: "Disable extension discovery (explicit -e paths still work)",
-		}),
-		"no-skills": Flags.boolean({
-			description: "Disable skills discovery and loading",
-		}),
-		skills: Flags.string({
-			description: "Comma-separated glob patterns to filter skills (e.g., git-*,docker)",
-		}),
-		"no-rules": Flags.boolean({
-			description: "Disable rules discovery and loading",
-		}),
-		export: Flags.string({
-			description: "Export session file to HTML and exit",
-		}),
-		"list-models": Flags.string({
-			description: "List available models (with optional fuzzy search)",
-		}),
-		"no-title": Flags.boolean({
-			description: "Disable title auto-generation",
-		}),
-	};
+	static flags = ROOT_LAUNCH_FLAGS;
 
 	static examples = [
 		`# Interactive mode\n  ${APP_NAME}`,
@@ -181,43 +137,58 @@ export default class Index extends Command {
 		`# Launch in a sibling git worktree\n  ${APP_NAME} --worktree`,
 		`# Use different model (fuzzy matching)\n  ${APP_NAME} --model opus "Help me refactor this code"`,
 		`# Limit model cycling to specific models\n  ${APP_NAME} --models claude-sonnet,claude-haiku,gpt-4o`,
+		`# Pin a stored credential for this session\n  ${APP_NAME} --credential email:me@example.com`,
+		`# Prefer a stored credential, falling back on quota limits\n  ${APP_NAME} --prefer-credential id:15`,
 		`# Activate a model profile for this session\n  ${APP_NAME} --mpreset codex-medium`,
 		`# Persist a model profile as the default\n  ${APP_NAME} --mpreset opencodego --default`,
-		`# Export a session file to HTML\n  ${APP_NAME} --export ~/.gjc/agent/sessions/--path--/session.jsonl`,
+		`# Export a session file to HTML\n  ${APP_NAME} --export ~/.gjc/agent/sessions/v2-<scope>/session.jsonl`,
+		`# Use an explicit session storage directory\n  ${APP_NAME} --session-dir ./sessions`,
 	];
 
 	static strict = false;
 
 	async run(): Promise<void> {
 		const { args } = prepareAcpTerminalAuthArgs(this.argv);
-		const parsed = parseArgs([...args]);
+		const parsed = parseArgs([...args], "deferred");
+		if (parsed.mode !== "acp") assertLocalLaunchArgs(parsed);
+		assertMasterLaunchArgs(parsed);
 		if (parsed.help || parsed.version) {
 			await runRootCommand(parsed, args);
 			return;
 		}
 
-		let launch: ReturnType<typeof prepareLaunchWorktree>;
+		let launch: PreparedLaunchWorktree;
+		let reservation: LaunchWorktreeReservation | undefined;
 		try {
+			const plannedWorktree = planLaunchWorktree(process.cwd(), parseLaunchWorktreeMode(args).mode);
+			reservation = await reserveLaunchWorktreePreflight(plannedWorktree);
 			launch = prepareLaunchWorktree(process.cwd(), args);
 		} catch (error) {
+			await reservation?.release();
 			await persistCoordinatorLaunchFailure(error, process.cwd());
 			throw error;
 		}
-		if (launch.worktree.enabled) {
-			process.chdir(launch.cwd);
-			setProjectDir(launch.cwd);
+		try {
+			if (launch.worktree.enabled) {
+				process.chdir(launch.cwd);
+				setProjectDir(launch.cwd);
+			}
+			const launchParsed = parseArgs(launch.args, "deferred");
+			if (launchParsed.mode !== "acp") assertLocalLaunchArgs(launchParsed);
+			assertMasterLaunchArgs(launchParsed);
+			if (
+				launchDefaultTmuxIfNeeded({
+					parsed: launchParsed,
+					rawArgs: launch.args,
+					cwd: launch.cwd,
+					worktreeBranch: launch.worktree.enabled && !launch.worktree.detached ? launch.worktree.branchName : null,
+					project: launch.cwd,
+				})
+			)
+				return;
+			await runRootCommand(launchParsed, launch.args);
+		} finally {
+			await reservation?.release();
 		}
-		const launchParsed = parseArgs(launch.args);
-		if (
-			launchDefaultTmuxIfNeeded({
-				parsed: launchParsed,
-				rawArgs: launch.args,
-				cwd: launch.cwd,
-				worktreeBranch: launch.worktree.enabled && !launch.worktree.detached ? launch.worktree.branchName : null,
-				project: launch.cwd,
-			})
-		)
-			return;
-		await runRootCommand(launchParsed, launch.args);
 	}
 }

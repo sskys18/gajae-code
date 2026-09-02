@@ -1,16 +1,24 @@
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
-import { getProjectDir } from "@gajae-code/utils";
+import { getProjectDir, getTrustedHomeDir } from "@gajae-code/utils";
+import { findRepoRoot } from "../capability/fs";
 import { skillCapability } from "../capability/skill";
 import type { SourceMeta } from "../capability/types";
 import type { SkillsSettings } from "../config/settings";
-import { type Skill as CapabilitySkill, loadCapability } from "../discovery";
+import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
+import { type Skill as CapabilitySkill, getCapability } from "../discovery";
 import { compareSkillOrder, scanSkillsFromDir } from "../discovery/helpers";
 import type { SkillPromptDetails } from "../session/messages";
+import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
 import { expandTilde } from "../tools/path-utils";
 import type { LoadedSubskillActivation } from "./gjc-plugins";
 import { buildSubskillInjection } from "./gjc-plugins/injection";
 import { renderSkillAdvertisement } from "./gjc-plugins/runtime-adapters";
+/** Metadata-only handle returned by bounded skill discovery. */
+export interface SkillDescriptor {
+	readonly metadata: Omit<Skill, "content" | "loadContent">;
+	readonly loadContent: () => Promise<string>;
+}
+
 export interface Skill {
 	name: string;
 	description: string;
@@ -26,6 +34,8 @@ export interface Skill {
 	/** Source metadata for display */
 	_source?: SourceMeta;
 	/** Embedded SKILL.md content for bundled defaults that survive .gjc deletion. */
+	/** Lazily load the full skill body when prompt injection needs it. */
+	loadContent?: () => Promise<string>;
 	content?: string;
 }
 
@@ -67,11 +77,12 @@ export interface LoadSkillsFromDirOptions {
 }
 
 export async function loadSkillsFromDir(options: LoadSkillsFromDirOptions): Promise<LoadSkillsResult> {
+	const home = getTrustedHomeDir();
 	const [rawProviderId, rawLevel] = options.source.split(":", 2);
 	const providerId = rawProviderId || "custom";
 	const level: "user" | "project" = rawLevel === "project" ? "project" : "user";
 	const result = await scanSkillsFromDir(
-		{ cwd: getProjectDir(), home: os.homedir(), repoRoot: null },
+		{ cwd: getProjectDir(), home, repoRoot: null },
 		{
 			dir: options.dir,
 			providerId,
@@ -86,6 +97,7 @@ export async function loadSkillsFromDir(options: LoadSkillsFromDirOptions): Prom
 			description: typeof capSkill.frontmatter?.description === "string" ? capSkill.frontmatter.description : "",
 			filePath: capSkill.path,
 			baseDir: capSkill.path.replace(/[\\/]SKILL\.md$/, ""),
+			loadContent: capSkill.loadContent,
 			source: options.source,
 			hide: capSkill.frontmatter?.hide === true,
 			_source: capSkill._source,
@@ -97,7 +109,20 @@ export async function loadSkillsFromDir(options: LoadSkillsFromDirOptions): Prom
 export interface LoadSkillsOptions extends SkillsSettings {
 	/** Working directory for project-local skills. Default: getProjectDir() */
 	cwd?: string;
+	/** Explicit user home for skill discovery. Default: getTrustedHomeDir(). */
+	home?: string;
+	/** Explicit user agent directory for native user-scope skill discovery. */
+	agentDir?: string;
 }
+
+/**
+ * Skill providers loaded into sessions. Only native `.gjc` skills are live
+ * filesystem skills; Claude/Codex convention skills are explicit import
+ * sources into `.gjc` (see skill-management.ts) and are never loaded directly.
+ */
+const LOADABLE_SKILL_PROVIDERS = new Set(["native"]);
+
+const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
 
 /**
  * Load skills from all configured locations.
@@ -107,8 +132,6 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	const {
 		cwd = getProjectDir(),
 		enabled = true,
-		enablePiUser = true,
-		enablePiProject = true,
 		customDirectories = [],
 		ignoredSkills = [],
 		includeSkills = [],
@@ -119,19 +142,36 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	if (!enabled) {
 		return { skills: [], warnings: [] };
 	}
+	const home = options.home ?? getTrustedHomeDir();
 
-	// GJC only accepts native `.gjc` skills. Other providers may still exist for
-	// their own capabilities, but their skill surfaces are intentionally ignored.
+	const projectTrusted = resolveSkillScopeTrust(options, "project");
+	const userTrusted = resolveSkillScopeTrust(options, "user");
+
+	// Skill scope trust decides which canonical locations are loaded: project
+	// scope covers `.gjc/skills` (walk-up), user scope covers `~/.gjc/agent/skills`
+	// and the legacy user roots. Claude/Codex convention skills are import
+	// sources into `.gjc`, never loaded directly.
 	function isSourceEnabled(source: SourceMeta): boolean {
 		const { provider, level } = source;
-		if (provider !== "native") return false;
-		if (level === "user") return enablePiUser;
-		if (level === "project") return enablePiProject;
+		if (!LOADABLE_SKILL_PROVIDERS.has(provider)) return false;
+		if (level === "user") return userTrusted;
+		if (level === "project") return projectTrusted;
 		return false;
 	}
 
-	// Use capability API to load all skills
-	const result = await loadCapability<CapabilitySkill>(skillCapability.id, { cwd, disabledExtensions });
+	// Use capability API to load all skills. `all` (rather than `items`) keeps
+	// shadowed duplicates so this function can apply the documented precedence
+	// itself: project scope beats user scope.
+	const nativeProvider = getCapability<CapabilitySkill>(skillCapability.id)?.providers.find(
+		provider => provider.id === "native",
+	);
+	if (!nativeProvider) throw new Error("Native skill provider is unavailable");
+	const result = await nativeProvider.load({
+		cwd,
+		home,
+		userAgentDir: options.agentDir,
+		repoRoot: await findRepoRoot(cwd),
+	});
 
 	const skillMap = new Map<string, Skill>();
 	const realPathSet = new Set<string>();
@@ -152,14 +192,23 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	const disabledSkillNames = new Set(
 		(disabledExtensions ?? []).filter(id => id.startsWith("skill:")).map(id => id.slice(6)),
 	);
-	// Filter skills by source and patterns first
-	const filteredSkills = result.items.filter(capSkill => {
-		if (disabledSkillNames.has(capSkill.name)) return false;
-		if (!isSourceEnabled(capSkill._source)) return false;
-		if (matchesIgnorePatterns(capSkill.name)) return false;
-		if (!matchesIncludePatterns(capSkill.name)) return false;
-		return true;
-	});
+
+	// Apply scope trust and policy filters, then order candidates by documented
+	// precedence. `all` is already in native provider order with project dirs
+	// before user dirs; a stable sort by level lifts every project item above
+	// every user item, giving: project `.gjc/skills` > user roots.
+	const filteredSkills = result.items
+		.filter(capSkill => {
+			if (!isSourceEnabled(capSkill._source)) return false;
+			if (disabledSkillNames.has(capSkill.name)) return false;
+			if (matchesIgnorePatterns(capSkill.name)) return false;
+			if (!matchesIncludePatterns(capSkill.name)) return false;
+			return true;
+		})
+		.sort((a, b) => {
+			const levelOrder = { project: 0, user: 1 } as const;
+			return levelOrder[a.level] - levelOrder[b.level];
+		});
 
 	// Batch resolve all real paths in parallel
 	const realPaths = await Promise.all(
@@ -182,6 +231,17 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 			continue;
 		}
 
+		// A project-controlled copy of a bundled workflow skill name is a potential
+		// workflow-routing hijack: warn, and let the session merge keep the bundled
+		// definition authoritative (sdk/session.ts). User-scope copies are not
+		// warned about: installed defaults legitimately mirror bundled skills.
+		if (capSkill.level === "project" && BUILT_IN_SKILL_NAMES.has(capSkill.name)) {
+			collisionWarnings.push({
+				skillPath: capSkill.path,
+				message: `name collision: "${capSkill.name}" is a bundled GJC workflow skill; the bundled definition takes precedence in sessions and this project copy is never used`,
+			});
+		}
+
 		const existing = skillMap.get(capSkill.name);
 		if (existing) {
 			collisionWarnings.push({
@@ -194,6 +254,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 				description: typeof capSkill.frontmatter?.description === "string" ? capSkill.frontmatter.description : "",
 				filePath: capSkill.path,
 				baseDir: capSkill.path.replace(/[\\/]SKILL\.md$/, ""),
+				loadContent: capSkill.loadContent,
 				source: `${capSkill._source.provider}:${capSkill.level}`,
 				hide: capSkill.frontmatter?.hide === true,
 				_source: capSkill._source,
@@ -204,9 +265,9 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 
 	const customDirectoryResults = await Promise.all(
 		customDirectories.map(async dir => {
-			const expandedDir = expandTilde(dir);
+			const expandedDir = expandTilde(dir, home);
 			const scanResult = await scanSkillsFromDir(
-				{ cwd, home: os.homedir(), repoRoot: null },
+				{ cwd, home, repoRoot: null },
 				{
 					dir: expandedDir,
 					providerId: "custom",
@@ -231,6 +292,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 						typeof capSkill.frontmatter?.description === "string" ? capSkill.frontmatter.description : "",
 					filePath: capSkill.path,
 					baseDir: capSkill.path.replace(/[\\/]SKILL\.md$/, ""),
+					loadContent: capSkill.loadContent,
 					source: "custom:user",
 					hide: capSkill.frontmatter?.hide === true,
 					_source: { ...capSkill._source, providerName: "Custom" },
@@ -326,12 +388,28 @@ interface SkillTokenMatch {
 	skill: Skill;
 }
 
+function buildInlineSkillInvocationArgs(text: string, matches: readonly SkillTokenMatch[]): string {
+	const pieces: string[] = [];
+	let cursor = 0;
+	for (const match of matches) {
+		pieces.push(text.slice(cursor, match.index));
+		cursor = match.end;
+	}
+	pieces.push(text.slice(cursor));
+	return pieces
+		.join("")
+		.replace(/[ \t]{2,}/g, " ")
+		.replace(/[ \t]+\n/g, "\n")
+		.replace(/\n[ \t]+/g, "\n")
+		.trim();
+}
+
 export function parseSkillInvocations(
 	text: string,
 	skillsByCommandName: ReadonlyMap<string, Skill>,
 ): ParsedSkillInvocation[] {
 	const trimmedText = text.trim();
-	if (!trimmedText.startsWith("/")) return [];
+	if (!trimmedText) return [];
 	const canonicalSkillCommandPattern = /(^|\s)\/(skill:[^\s]+)/g;
 	const matches: SkillTokenMatch[] = [];
 	for (const match of trimmedText.matchAll(canonicalSkillCommandPattern)) {
@@ -348,7 +426,19 @@ export function parseSkillInvocations(
 			skill,
 		});
 	}
-	if (matches.length === 0 || matches[0]?.index !== 0) return [];
+	if (matches.length === 0) return [];
+	if (matches[0]?.index !== 0) {
+		// Preserve leading slash-command semantics: `/skill:unknown /skill:alpha`
+		// should remain plain text rather than silently skipping the unknown
+		// leading command and invoking the later known one.
+		if (trimmedText.startsWith("/")) return [];
+		const args = buildInlineSkillInvocationArgs(trimmedText, matches);
+		return matches.map(match => ({
+			commandName: match.commandName,
+			args,
+			skill: match.skill,
+		}));
+	}
 	return matches.map((match, index) => {
 		const next = matches[index + 1];
 		return {
@@ -379,12 +469,16 @@ export function resolveSkillSlashCommands(
 }
 
 export async function buildSkillPromptMessage(
-	skill: Pick<Skill, "name" | "filePath" | "content">,
+	skill: Pick<Skill, "name" | "filePath" | "content" | "loadContent">,
 	args: string,
 	context?: BuildSkillPromptMessageContext,
 ): Promise<BuiltSkillPromptMessage> {
-	const content = typeof skill.content === "string" ? skill.content : await Bun.file(skill.filePath).text();
-	const body = content.replace(/^---\n[\s\S]*?\n---\n/, "").trim();
+	const content = skill.loadContent
+		? await skill.loadContent()
+		: typeof skill.content === "string"
+			? skill.content
+			: await Bun.file(skill.filePath).text();
+	const body = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "").trim();
 	const metaLines = [`Skill: ${skill.filePath}`];
 	const trimmedArgs = args.trim();
 	if (trimmedArgs) {

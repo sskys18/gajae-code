@@ -16,13 +16,18 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
-		id: "alibaba-coding-plan",
-		name: "Alibaba Coding Plan",
+		id: "alibaba-token-plan",
+		name: "Alibaba Token Plan",
 		available: true,
 	},
 	{
 		id: "openai-codex",
 		name: "ChatGPT Plus/Pro (Codex Subscription)",
+		available: true,
+	},
+	{
+		id: "opencodex",
+		name: "OpenCodex (local proxy status)",
 		available: true,
 	},
 	{
@@ -176,6 +181,16 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
+		id: "commandcode-goat",
+		name: "Command Code GOAT",
+		available: true,
+	},
+	{
+		id: "openrouter",
+		name: "OpenRouter",
+		available: true,
+	},
+	{
 		id: "zai",
 		name: "Z.AI (GLM Coding Plan)",
 		available: true,
@@ -241,8 +256,28 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
+		id: "bizrouter",
+		name: "BizRouter",
+		available: true,
+	},
+	{
+		id: "mara",
+		name: "Mara Cloud",
+		available: true,
+	},
+	{
+		id: "opengateway",
+		name: "OpenGateway by Sionic AI",
+		available: true,
+	},
+	{
 		id: "vllm",
 		name: "vLLM (Local OpenAI-compatible)",
+		available: true,
+	},
+	{
+		id: "sglang",
+		name: "SGLang (Local OpenAI-compatible)",
 		available: true,
 	},
 	{
@@ -253,6 +288,11 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 	{
 		id: "vercel-ai-gateway",
 		name: "Vercel AI Gateway",
+		available: true,
+	},
+	{
+		id: "kiro",
+		name: "Kiro (Amazon Q Developer / CodeWhisperer)",
 		available: true,
 	},
 ];
@@ -355,11 +395,17 @@ export async function refreshOAuthToken(
 			newCredentials = await refreshGlmZcodeToken(credentials);
 			break;
 		}
+		case "kiro": {
+			const { refreshKiroToken } = await import("./kiro");
+			newCredentials = await refreshKiroToken(credentials);
+			break;
+		}
 		case "kilo":
 		case "perplexity":
 		case "huggingface":
 		case "opencode-zen":
 		case "opencode-go":
+		case "commandcode-goat":
 		case "cerebras":
 		case "deepinfra":
 		case "fireworks":
@@ -371,21 +417,27 @@ export async function refreshOAuthToken(
 		case "together":
 		case "litellm":
 		case "lm-studio":
+		case "alibaba-token-plan":
 		case "ollama":
 		case "ollama-cloud":
 		case "xiaomi":
 		case "zai":
 		case "qianfan":
 		case "venice":
+		case "openrouter":
 		case "minimax-code":
 		case "minimax-code-cn":
 		case "moonshot":
 		case "kagi":
 		case "cloudflare-ai-gateway":
+		case "mara":
 		case "vercel-ai-gateway":
 		case "qwen-portal":
 		case "zenmux":
+		case "bizrouter":
+		case "opengateway":
 		case "vllm":
+		case "sglang":
 			// API keys / static bearer tokens don't expire, return as-is
 			newCredentials = credentials;
 			break;
@@ -463,7 +515,10 @@ export async function getOAuthApiKey(
 	}
 	// For providers that need request-time credential metadata, return JSON.
 	const needsStructuredApiKey =
-		provider === "github-copilot" || provider === "google-gemini-cli" || provider === "google-antigravity";
+		provider === "github-copilot" ||
+		provider === "google-gemini-cli" ||
+		provider === "google-antigravity" ||
+		provider === "kiro";
 	const apiKey = needsStructuredApiKey
 		? JSON.stringify({
 				token: creds.access,
@@ -485,10 +540,19 @@ export function resolveOAuthStorageProvider(provider: OAuthProviderId): OAuthPro
  * Get list of OAuth providers.
  */
 export function getOAuthProviders(): OAuthProviderInfo[] {
-	const customProviders = Array.from(customOAuthProviders.values(), provider => ({
-		id: provider.id,
-		name: provider.name,
-		available: true,
-	}));
+	const builtInIds = new Set(builtInOAuthProviders.map(provider => provider.id));
+	// A custom provider colliding with a built-in id (e.g. an external
+	// integration mistakenly registering "kiro") must never produce a
+	// duplicate list entry: AuthStorage.login()'s switch statement always
+	// dispatches a matched built-in `case` before falling through to the
+	// custom-provider registry, so the built-in always wins the route and
+	// the advertised list must reflect that, not double-list the id.
+	const customProviders = Array.from(customOAuthProviders.values())
+		.filter(provider => !builtInIds.has(provider.id))
+		.map(provider => ({
+			id: provider.id,
+			name: provider.name,
+			available: true,
+		}));
 	return [...builtInOAuthProviders, ...customProviders];
 }

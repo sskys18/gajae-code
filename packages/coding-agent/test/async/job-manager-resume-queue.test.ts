@@ -206,6 +206,203 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		await manager.dispose({ timeoutMs: 500 });
 	});
 
+	test("cross-owner: an owner-A record is never admitted on an owner-B descriptor and never invokes owner-B's runner", async () => {
+		const { manager } = makeManager();
+		const foreignCalls: string[] = [];
+		const foreignRunner = (subagentId: string) => {
+			foreignCalls.push(subagentId);
+			return `${subagentId}-foreign`;
+		};
+		manager.registerSubagentRecord({
+			subagentId: "X",
+			ownerId: "owner-A",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "completed",
+			sessionFile: null,
+			resumable: true,
+		});
+		manager.registerResumeDescriptor(
+			{ subagentId: "X", ownerId: "owner-B", data: { sessionFile: "/tmp/X.jsonl" } },
+			foreignRunner,
+		);
+
+		expect(manager.resumeSubagent("X", { ownerId: "owner-A" }, "continue")).toEqual({
+			ok: false,
+			reason: "context_unavailable",
+		});
+		expect(foreignCalls).toEqual([]);
+		expect(manager.getSubagentRecord("X", { ownerId: "owner-A" })).toMatchObject({
+			status: "completed",
+			currentJobId: null,
+		});
+
+		manager.registerSubagentRecord({
+			subagentId: "Y",
+			ownerId: "owner-A",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "completed",
+			sessionFile: "/tmp/Y.jsonl",
+			resumable: true,
+		});
+		manager.registerResumeDescriptor(
+			{ subagentId: "Y", ownerId: "owner-B", data: { sessionFile: "/tmp/Y.jsonl" } },
+			foreignRunner,
+		);
+
+		expect(manager.resumeSubagent("Y", { ownerId: "owner-A" })).toEqual({ ok: false, reason: "no_runner" });
+		expect(foreignCalls).toEqual([]);
+		await manager.dispose({ timeoutMs: 500 });
+	});
+
+	test("cross-owner: a descriptor visible only to owner-B yields not_found for owner-A", async () => {
+		const { manager } = makeManager();
+		const calls: string[] = [];
+		manager.registerResumeDescriptor(
+			{ subagentId: "Z", ownerId: "owner-B", data: { sessionFile: "/tmp/Z.jsonl" } },
+			subagentId => {
+				calls.push(subagentId);
+				return `${subagentId}-resume`;
+			},
+		);
+
+		expect(manager.resumeSubagent("Z", { ownerId: "owner-A" })).toEqual({ ok: false, reason: "not_found" });
+		expect(manager.getSubagentRecord("Z", { ownerId: "owner-A" })).toBeUndefined();
+		expect(manager.getSubagentRecord("Z", { ownerId: "owner-B" })?.resumable).toBe(true);
+		expect(calls).toEqual([]);
+		await manager.dispose({ timeoutMs: 500 });
+	});
+
+	test("resume succeeds for a task-spawned record with sessionFile: null and an owner-matched descriptor", async () => {
+		const { manager, completions } = makeManager();
+		let seenDescriptor: unknown;
+		manager.registerResumeDescriptor(
+			{ subagentId: "T", ownerId: "owner-1", data: { sessionFile: "/tmp/T.jsonl" } },
+			(subagentId, message, descriptor) => {
+				seenDescriptor = descriptor?.data;
+				return manager.register(
+					"task",
+					subagentId,
+					async (): Promise<SubagentRunOutcome> => ({ kind: "completed", text: `resumed:${message}` }),
+					{
+						id: "T-resume",
+						ownerId: "owner-1",
+						metadata: { subagent: { id: subagentId, agent: "planner", agentSource: "bundled" } },
+					},
+				);
+			},
+		);
+		manager.registerSubagentRecord({
+			subagentId: "T",
+			ownerId: "owner-1",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "completed",
+			sessionFile: null,
+			resumable: true,
+		});
+
+		const result = manager.resumeSubagent("T", { ownerId: "owner-1" }, "continue");
+		expect(result).toMatchObject({ ok: true, jobId: "T-resume" });
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 500 });
+
+		expect(seenDescriptor).toEqual({ sessionFile: "/tmp/T.jsonl" });
+		expect(manager.getSubagentRecord("T", { ownerId: "owner-1" })?.status).toBe("completed");
+		expect(completions.map(completion => completion.text)).toContain("resumed:continue");
+		await manager.dispose({ timeoutMs: 500 });
+	});
+
+	test("a queued sessionFile: null resume reaches its owner-matched runner on drain", async () => {
+		const { manager, completions } = makeManager({ maxRunningJobs: 1 });
+		const blocker = spawnControllable(manager, "BLOCK", "owner-1");
+		const seenDescriptors: unknown[] = [];
+		manager.registerResumeDescriptor(
+			{ subagentId: "Q", ownerId: "owner-1", data: { sessionFile: null, marker: "managed" } },
+			(subagentId, _message, descriptor) => {
+				seenDescriptors.push(descriptor?.data);
+				return manager.register(
+					"task",
+					subagentId,
+					async (): Promise<SubagentRunOutcome> => ({ kind: "completed", text: "drained:Q" }),
+					{
+						id: "Q-resume",
+						ownerId: "owner-1",
+						metadata: { subagent: { id: subagentId, agent: "planner", agentSource: "bundled" } },
+					},
+				);
+			},
+		);
+		manager.registerSubagentRecord({
+			subagentId: "Q",
+			ownerId: "owner-1",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "completed",
+			sessionFile: null,
+			resumable: true,
+		});
+
+		expect(manager.resumeSubagent("Q", { ownerId: "owner-1" })).toEqual({
+			ok: true,
+			queued: true,
+			status: "queued",
+		});
+		expect(manager.getSubagentRecord("Q", { ownerId: "owner-1" })?.status).toBe("queued");
+
+		blocker.release();
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 500 });
+
+		expect(seenDescriptors).toEqual([{ sessionFile: null, marker: "managed" }]);
+		expect(manager.getSubagentRecord("Q", { ownerId: "owner-1" })).toMatchObject({
+			status: "completed",
+			queued: undefined,
+			currentJobId: "Q-resume",
+		});
+		expect(completions.map(completion => completion.text)).toContain("drained:Q");
+		await manager.dispose({ timeoutMs: 500 });
+	});
+
+	test("restart: a retained null-session descriptor with no record and no runner synthesizes resumable and returns no_runner", async () => {
+		const { manager } = makeManager();
+		manager.registerResumeDescriptor({
+			subagentId: "M",
+			ownerId: "owner-1",
+			data: { sessionFile: null, task: { id: "M" } },
+		});
+
+		expect(manager.getSubagentRecord("M", { ownerId: "owner-1" })).toMatchObject({
+			resumable: true,
+			sessionFile: null,
+		});
+		expect(manager.resumeSubagent("M", { ownerId: "owner-1" }, "continue")).toEqual({
+			ok: false,
+			reason: "no_runner",
+		});
+		await manager.dispose({ timeoutMs: 500 });
+	});
+
+	test("no descriptor and no sessionFile still returns context_unavailable even when resumable is true", async () => {
+		const { manager } = makeManager();
+		manager.registerSubagentRecord({
+			subagentId: "N",
+			ownerId: "owner-1",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "completed",
+			sessionFile: null,
+			resumable: true,
+		});
+
+		expect(manager.resumeSubagent("N", { ownerId: "owner-1" })).toEqual({
+			ok: false,
+			reason: "context_unavailable",
+		});
+		await manager.dispose({ timeoutMs: 500 });
+	});
+
 	test("resume queues when at the concurrency limit and drains FIFO (AC6)", async () => {
 		const { manager, completions } = makeManager({ maxRunningJobs: 1 });
 		installResumeRunner(manager);
@@ -228,6 +425,33 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		expect(manager.getSubagentRecord("A")?.status).toBe("completed");
 		expect(manager.getSubagentRecord("B")?.status).toBe("completed");
 		expect(completions.map(c => c.text).sort()).toEqual(["B done", "resumed:A"]);
+		await manager.dispose({ timeoutMs: 500 });
+	});
+
+	test("a fenced queued owner remains queued while a later foreign owner resumes", async () => {
+		const { manager, completions } = makeManager({ maxRunningJobs: 1 });
+		installResumeRunner(manager);
+		const a = spawnControllable(manager, "A", "owner-a");
+		expect(manager.pauseSubagent("A").ok).toBe(true);
+		a.release();
+		await manager.waitForAll();
+		const c = spawnControllable(manager, "C", "owner-c");
+		expect(manager.pauseSubagent("C").ok).toBe(true);
+		c.release();
+		await manager.waitForAll();
+		const b = spawnControllable(manager, "B", "owner-b");
+		expect(manager.resumeSubagent("A").queued).toBe(true);
+		expect(manager.resumeSubagent("C").queued).toBe(true);
+		const lease = manager.beginOwnerSubagentShutdown("owner-a")!;
+		expect(manager.resumeSubagent("A")).toMatchObject({ ok: false, reason: "owner_shutdown_in_progress" });
+		b.release();
+		await manager.waitForAll();
+		expect(manager.getSubagentRecord("A")?.status).toBe("queued");
+		expect(manager.getSubagentRecord("C")?.status).toBe("completed");
+		expect(completions.map(completion => completion.text)).toContain("resumed:C");
+		const proof = await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 50 });
+		expect(proof).toMatchObject({ confirmed: true, terminalIds: ["A"], unresolvedIds: [] });
+		manager.finishOwnerSubagentShutdown(lease, "release");
 		await manager.dispose({ timeoutMs: 500 });
 	});
 
@@ -258,6 +482,41 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		const res = manager.resumeSubagent("E");
 		expect(res.ok).toBe(false);
 		expect(res.reason).toBe("context_unavailable");
+		await manager.dispose({ timeoutMs: 500 });
+	});
+
+	test("resume whose runner job throws marks the subagent failed and delivers the error", async () => {
+		// Backs the task resume-runner fix: a resumed subprocess that aborted or
+		// exited non-zero throws, so the resumed job must end `failed` (not
+		// `completed`), and the error text must be delivered to the leader.
+		const { manager, completions } = makeManager();
+		manager.registerResumeDescriptor({
+			subagentId: "R",
+			ownerId: "owner-1",
+			data: { sessionFile: "/tmp/R.jsonl" },
+		});
+		manager.setResumeRunner(subagentId =>
+			manager.register(
+				"task",
+				subagentId,
+				async (): Promise<SubagentRunOutcome> => {
+					throw new Error("resumed subagent failed");
+				},
+				{
+					id: "R-resume",
+					ownerId: "owner-1",
+					metadata: { subagent: { id: subagentId, agent: "planner", agentSource: "bundled" } },
+				},
+			),
+		);
+
+		const res = manager.resumeSubagent("R", { ownerId: "owner-1" }, "revision");
+		expect(res.ok).toBe(true);
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 500 });
+
+		expect(manager.getSubagentRecord("R", { ownerId: "owner-1" })?.status).toBe("failed");
+		expect(completions.some(completion => completion.text.includes("resumed subagent failed"))).toBe(true);
 		await manager.dispose({ timeoutMs: 500 });
 	});
 

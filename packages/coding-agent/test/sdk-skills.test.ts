@@ -7,6 +7,7 @@ import { DEFAULT_GJC_DEFINITION_NAMES } from "@gajae-code/coding-agent/defaults/
 import type { Skill } from "@gajae-code/coding-agent/sdk";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { safeRmSync } from "../../../scripts/safe-cleanup";
 import { cleanupTempHome } from "./helpers/temp-home-cleanup";
 
 function createIsolatedSkillsSettings(): Settings {
@@ -71,7 +72,7 @@ Loaded via symbolic link.
 	afterEach(cleanupTempHome(() => ({ tempDir, tempHomeDir, originalHome })));
 
 	it("loads embedded default GJC workflow skills even when .gjc is absent and arbitrary skill discovery is disabled", async () => {
-		fs.rmSync(path.join(tempDir, ".gjc"), { recursive: true, force: true });
+		safeRmSync(path.join(tempDir, ".gjc"), { recursive: true, force: true });
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
@@ -110,7 +111,7 @@ Loaded via symbolic link.
 
 	it("should still discover project skills when user skills directory is missing", async () => {
 		const userAgentDir = path.join(tempHomeDir, ".gjc", "agent");
-		fs.rmSync(path.join(userAgentDir, "skills"), { recursive: true, force: true });
+		safeRmSync(path.join(userAgentDir, "skills"), { recursive: true, force: true });
 		fs.writeFileSync(path.join(userAgentDir, "placeholder.txt"), "placeholder");
 
 		const { session } = await createAgentSession({
@@ -122,6 +123,38 @@ Loaded via symbolic link.
 
 		expect(session.skills.some((s: Skill) => s.name === "test-skill")).toBe(true);
 	});
+	it("loads user skills from the session agent-directory profile", async () => {
+		const profileDir = path.join(tempDir, "profile-agent");
+		const profileSkillDir = path.join(profileDir, "skills", "profile-skill");
+		fs.mkdirSync(profileSkillDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(profileSkillDir, "SKILL.md"),
+			`---
+name: profile-skill
+description: Skill installed into an explicit agent-directory profile.
+---
+
+# Profile Skill
+`,
+		);
+
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: profileDir,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({
+				"skills.enabled": true,
+				"skills.trustUserSkills": true,
+			}),
+		});
+
+		try {
+			expect(session.skills.some(skill => skill.name === "profile-skill")).toBe(true);
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	it("keeps bundled GJC workflow skills even when options.skills is empty", async () => {
 		const { session } = await createAgentSession({
 			cwd: tempDir,
@@ -133,6 +166,34 @@ Loaded via symbolic link.
 
 		expect(session.skills.map(skill => skill.name).sort()).toEqual([...DEFAULT_GJC_DEFINITION_NAMES].sort());
 		expect(session.skillWarnings).toEqual([]);
+	});
+
+	it("keeps bundled workflow skills authoritative when a disk skill shares their name", async () => {
+		const impostorDir = path.join(tempDir, ".gjc", "skills", "ralplan");
+		fs.mkdirSync(impostorDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(impostorDir, "SKILL.md"),
+			`---
+name: ralplan
+description: On-disk impostor that must never replace the bundled workflow.
+---
+
+# Impostor
+
+This body must never reach a session.
+`,
+		);
+
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.inMemory(),
+			settings: createIsolatedSkillsSettings(),
+		});
+
+		const ralplan = session.skills.find(skill => skill.name === "ralplan");
+		expect(ralplan).toBeDefined();
+		expect(ralplan?.filePath.startsWith("embedded:gjc/skills/ralplan")).toBe(true);
 	});
 
 	it("should use provided skills plus bundled GJC workflow skills when options.skills is explicitly set", async () => {

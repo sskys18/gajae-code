@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, test, vi } from "bun:test";
 import { Effort, type Model } from "@gajae-code/ai";
-import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
+import { BUILTIN_MODEL_PROFILES, type ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import {
 	ModelSelectorComponent,
@@ -28,10 +28,29 @@ const model = (provider: string, id: string, minLevel = Effort.Low): Model =>
 	}) as Model;
 
 const codexModel = model("openai-codex", "gpt-5.5", Effort.Low);
-const anthropicModel = model("anthropic", "claude-opus-4-8");
+const anthropicModel = model("anthropic", "claude-opus-5");
 const minimaxModel = model("minimax-code", "minimax-v3");
 const noSuffixModel = model("provider-a", "default");
 
+const builtinCodexModels = [
+	model("openai-codex", "gpt-5.6-terra", Effort.Low),
+	model("openai-codex", "gpt-5.6-luna", Effort.Low),
+	model("openai-codex", "gpt-5.6-sol", Effort.Low),
+];
+const builtinComboModels = [
+	model("anthropic", "claude-opus-5", Effort.Low),
+	model("anthropic", "claude-fable-5", Effort.Low),
+	model("anthropic", "claude-sonnet-5"),
+	model("opencode-go", "deepseek-v4-pro"),
+	model("opencode-go", "kimi-k3"),
+	model("opencode-go", "mimo-v2.5-pro"),
+];
+
+function builtinProfile(name: string): ModelProfileDefinition {
+	const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === name);
+	if (!profile) throw new Error(`Missing built-in profile: ${name}`);
+	return profile;
+}
 const codexEco: ModelProfileDefinition = {
 	name: "codex-eco",
 	requiredProviders: ["openai-codex"],
@@ -45,19 +64,19 @@ const codexEco: ModelProfileDefinition = {
 const combo: ModelProfileDefinition = {
 	name: "opus-codex",
 	requiredProviders: ["anthropic", "openai-codex"],
-	modelMapping: { default: "anthropic/claude-opus-4-8:xhigh", executor: "openai-codex/gpt-5.5:low" },
+	modelMapping: { default: "anthropic/claude-opus-5:xhigh", executor: "openai-codex/gpt-5.5:low" },
 	source: "builtin",
 };
 const comboOpencode: ModelProfileDefinition = {
 	name: "codex-opencodego",
 	requiredProviders: ["openai-codex", "opencode-go"],
-	modelMapping: { default: "opencode-go/kimi-k2.6", executor: "openai-codex/gpt-5.5:low" },
+	modelMapping: { default: "opencode-go/kimi-k3", executor: "openai-codex/gpt-5.5:low" },
 	source: "builtin",
 };
 const minimax: ModelProfileDefinition = {
 	name: "minimax-medium",
 	requiredProviders: ["minimax-code"],
-	modelMapping: { default: "minimax-code/minimax-v3:medium" },
+	modelMapping: { default: "minimax-code/MiniMax-M3:medium" },
 	source: "builtin",
 };
 const noSuffixProfile: ModelProfileDefinition = {
@@ -93,10 +112,28 @@ function createRegistry(
 	return {
 		refresh: vi.fn(async () => {}),
 		getError: () => undefined,
-		getAvailable: () => [codexModel, anthropicModel, minimaxModel, noSuffixModel],
-		getAll: () => [codexModel, anthropicModel, minimaxModel, noSuffixModel],
+		getAvailable: () => [
+			codexModel,
+			anthropicModel,
+			minimaxModel,
+			noSuffixModel,
+			{ ...noSuffixModel, provider: "provider-b" },
+			...builtinCodexModels,
+			...builtinComboModels,
+		],
+		getAll: () => [
+			codexModel,
+			anthropicModel,
+			minimaxModel,
+			noSuffixModel,
+			{ ...noSuffixModel, provider: "provider-b" },
+			...builtinCodexModels,
+			...builtinComboModels,
+		],
+		hasConfiguredProviderAuth: (provider: string) => authenticatedProviders.includes(provider),
 		getDiscoverableProviders: () => [],
 		getCanonicalModels: () => [],
+		getCanonicalModelSelections: () => [],
 		resolveCanonicalModel: () => undefined,
 		getModelProfiles: () => new Map(profileMap),
 		getModelProfile: (name: string) => profileMap.get(name),
@@ -270,6 +307,64 @@ describe("preset landing adversarial QA", () => {
 		expect(text).not.toContain("✗ COMBOS");
 	});
 
+	test("alternative provider groups allow a preset through with one authenticated member", async () => {
+		const alternativeProfile: ModelProfileDefinition = {
+			name: "alternative-profile",
+			displayName: "Alternative Profile",
+			requiredProviders: ["provider-a", "provider-b"],
+			alternativeProviderGroups: [["provider-a", "provider-b"]],
+			modelMapping: { default: "provider-a/default" },
+			source: "builtin",
+		};
+		const selector = createSelector({ authenticatedProviders: ["provider-b"], profiles: [alternativeProfile] });
+		await rendered(selector);
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+
+		const text = normalizeRenderedText(selector.render(260).join("\n"));
+		expect(text).toContain("Preset preview: Alternative Profile");
+		expect(text).not.toContain("Run /login");
+	});
+
+	test("a valid bare-alias fallback tail keeps the preset usable", async () => {
+		const fallbackProfile: ModelProfileDefinition = {
+			name: "alias-fallback-profile",
+			displayName: "Alias Fallback Profile",
+			requiredProviders: [],
+			modelMapping: { default: ["missing-alias", "gpt-5.5"] },
+			source: "builtin",
+		};
+		const selector = createSelector({ authenticatedProviders: ["openai-codex"], profiles: [fallbackProfile] });
+		await rendered(selector);
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+
+		const text = normalizeRenderedText(selector.render(260).join("\n"));
+		expect(text).toContain("Preset preview: Alias Fallback Profile");
+		expect(text).not.toContain("No available model matches this preset");
+	});
+	test("provider-qualified selectors require an available catalog model", async () => {
+		const unavailablePinnedProfile: ModelProfileDefinition = {
+			name: "unavailable-pinned-profile",
+			displayName: "Unavailable Pinned Profile",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/missing" },
+			source: "builtin",
+		};
+		const selector = createSelector({
+			authenticatedProviders: ["provider-a"],
+			profiles: [unavailablePinnedProfile],
+		});
+		await rendered(selector);
+		selector.handleInput("\n");
+
+		const text = normalizeRenderedText(selector.render(260).join("\n"));
+		expect(text).toContain("No available model matches this preset");
+		expect(text).not.toContain("Preset preview: Unavailable Pinned Profile");
+	});
+
 	test("preview clamps codex eco executor to low and omits suffix for suffixless selector", async () => {
 		const selector = createSelector();
 		await rendered(selector);
@@ -288,6 +383,36 @@ describe("preset landing adversarial QA", () => {
 		text = normalizeRenderedText(suffixless.render(260).join("\n"));
 		expect(text).toContain("DEFAULT: provider-a/default");
 		expect(text).not.toContain("DEFAULT: provider-a/default:");
+	});
+
+	test("built-in Codex Eco preview preserves the Terra and Luna role models", async () => {
+		const selector = createSelector({ profiles: [builtinProfile("codex-eco")] });
+		await rendered(selector);
+		selector.refreshPresetProfiles("codex-eco");
+
+		const text = await rendered(selector);
+		expect(text).toContain("DEFAULT: openai-codex/gpt-5.6-terra");
+		expect(text).toContain("EXECUTOR: openai-codex/gpt-5.6-luna");
+		expect(text).toContain("PLANNER: openai-codex/gpt-5.6-luna");
+		expect(text).toContain("CRITIC: openai-codex/gpt-5.6-terra");
+		expect(text).toContain("ARCHITECT: openai-codex/gpt-5.6-terra");
+		expect(text).not.toContain("gpt-5.6-sol");
+	});
+
+	test("built-in Codex + OpenCodeGo preview preserves provider role models", async () => {
+		const selector = createSelector({
+			authenticatedProviders: ["openai-codex", "opencode-go"],
+			profiles: [builtinProfile("codex-opencodego")],
+		});
+		await rendered(selector);
+		selector.refreshPresetProfiles("codex-opencodego");
+
+		const text = await rendered(selector);
+		expect(text).toContain("DEFAULT: openai-codex/gpt-5.6-sol");
+		expect(text).toContain("EXECUTOR: opencode-go/deepseek-v4-pro");
+		expect(text).toContain("PLANNER: opencode-go/kimi-k3");
+		expect(text).toContain("CRITIC: opencode-go/mimo-v2.5-pro");
+		expect(text).toContain("ARCHITECT: openai-codex/gpt-5.6-sol");
 	});
 
 	test("#688 Down crossing a group boundary lands on the destination group header", async () => {

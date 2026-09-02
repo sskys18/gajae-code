@@ -4,6 +4,7 @@ import * as z from "zod/v4";
 import { AsyncJobManager, isBackgroundJobSupportEnabled } from "../async";
 import monitorDescription from "../prompts/tools/monitor.md" with { type: "text" };
 import { truncateTail } from "../session/streaming-output";
+import { lookupOwnedRegistration } from "../session/terminal-abort";
 import { BashTool } from "./bash";
 import type { ToolSession } from "./index";
 import { ToolError } from "./tool-errors";
@@ -51,6 +52,7 @@ const MONITOR_LABEL_MAX = 120;
 const MAX_PENDING_MONITOR_NOTIFICATIONS = 3;
 const MONITOR_NOTIFICATION_LINE_MAX_BYTES = 16 * 1024;
 const MONITOR_NOTIFICATION_LINE_MAX_LINES = 20;
+const PERSISTENT_MONITOR_DEBOUNCE_MS = 250;
 
 function buildMonitorLabel(params: MonitorParams): string {
 	const base = `[monitor:${params.kind}] ${params.description}`;
@@ -105,13 +107,20 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 	}
 
 	async execute(
-		_toolCallId: string,
+		toolCallId: string,
 		params: MonitorParams,
 		_signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<MonitorToolDetails>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<MonitorToolDetails>> {
-		const manager = AsyncJobManager.instance();
+		// The session's ENDPOINT-owned manager first: the monitor job is created
+		// in it, its generation is read from it, and non-persistent cancel must
+		// stop that exact job — the process-global instance may belong to a
+		// different concurrent top-level session (review thread P1).
+		const manager =
+			this.session.getAsyncJobManager?.() ??
+			AsyncJobManager.forEndpoint(this.session.getSessionId?.() ?? undefined) ??
+			AsyncJobManager.instance();
 		if (!manager) {
 			throw new ToolError("Async execution is disabled; the monitor tool is unavailable in this session.");
 		}
@@ -124,6 +133,7 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 		const controller = { closed: false };
 		let currentJobId = "";
 		let sequence = 0;
+		let flushTimer: NodeJS.Timeout | undefined;
 		let latestLine: string | undefined;
 		let coalescedCount = 0;
 		let flushScheduled = false;
@@ -136,6 +146,10 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			(message.details as { taskId?: string } | undefined)?.taskId === currentJobId;
 		const flushLatest = () => {
 			if (!persistent || latestLine === undefined) return;
+			if (flushTimer) {
+				clearTimeout(flushTimer);
+				flushTimer = undefined;
+			}
 			const line = latestLine;
 			const count = coalescedCount;
 			latestLine = undefined;
@@ -163,8 +177,38 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			const suffix = count > 0 ? `\n(+${count} earlier lines)` : "";
 			const notificationLine = formatMonitorNotificationLine(line);
 			const content = `<task-notification>\nMonitor task ${jobId} (${params.kind}: ${params.description}) emitted latest state:\n${notificationLine.content}${suffix}\n</task-notification>`;
+			// Route the notification through the SAME owned-completion envelope
+			// and fresh-admission path as async results: a scope:"turn" abort
+			// that left this monitor running must resume the agent with a FRESH
+			// lineage (never the aborted attempt's), and scope:"owned" must drop
+			// it. The envelope is built from the tool-call lineage binding and
+			// the exact registered tuple; monitors without a registration stay
+			// ordinary. The standalone generation is NOT persisted — it lives in
+			// the envelope, which INTERNAL_DETAILS_FIELDS strips (review threads
+			// P1/P2).
+			const generation = manager.getJob(jobId)?.generation;
+			// Build the envelope from the RETAINED registration (which carries the
+			// complete lineage tuple), not the tool-call binding: the binding map
+			// is separately bounded and can evict a long-lived monitor's entry,
+			// but the registration keeps the lineage for owned classification
+			// (review thread P2).
+			// The lookup is ENDPOINT-scoped to THIS monitor's session: concurrent
+			// sessions have monitors with the same manager-local job id, and an
+			// endpoint-less fallback scan could attach a foreign session's
+			// registration (review thread P2).
+			const registration = generation
+				? lookupOwnedRegistration(jobId, generation, this.session.getSessionId?.() ?? "local")
+				: undefined;
+			const ownedCompletion = registration
+				? {
+						lineageIdHash: registration.lineageIdHash,
+						promptAttemptEpoch: registration.promptAttemptEpoch,
+						registration,
+					}
+				: undefined;
 			const details = {
 				taskId: jobId,
+				...(ownedCompletion ? { ownedCompletions: [ownedCompletion] } : {}),
 				kind: params.kind,
 				description: params.description,
 				monitor: true,
@@ -205,7 +249,7 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			coalescedCount += flushScheduled ? 1 : 0;
 			if (flushScheduled) return;
 			flushScheduled = true;
-			queueMicrotask(flushLatest);
+			flushTimer = setTimeout(flushLatest, PERSISTENT_MONITOR_DEBOUNCE_MS);
 		};
 		const monitorJob = await bash.startMonitorJob(
 			{ command: params.command, timeout: params.timeout },
@@ -213,6 +257,7 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 				ownerId,
 				label,
 				ctx: context,
+				toolCallId,
 				shouldAcceptRawLine: () => !controller.closed,
 				lifecycle: {
 					onCancel: () => closeMonitor("purge"),

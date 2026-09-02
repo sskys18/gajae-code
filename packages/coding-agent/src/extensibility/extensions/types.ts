@@ -7,7 +7,16 @@
  * - Register commands, keyboard shortcuts, and CLI flags
  * - Interact with the user via UI primitives
  */
-import type { AgentMessage, AgentToolResult, AgentToolUpdateCallback, ThinkingLevel } from "@gajae-code/agent-core";
+
+import type {
+	AgentFailureDiagnostic,
+	AgentMessage,
+	AgentToolResult,
+	AgentToolUpdateCallback,
+	RunSettlementProof,
+	ThinkingLevel,
+} from "@gajae-code/agent-core";
+import type { AttemptScope } from "@gajae-code/agent-core/attempt-scope";
 import type { CompactionResult } from "@gajae-code/agent-core/compaction";
 import type {
 	Api,
@@ -20,20 +29,31 @@ import type {
 	SimpleStreamOptions,
 	Static,
 	TextContent,
+	Tool,
 	TSchema,
-} from "@gajae-code/ai";
+	UsageReport,
+} from "@gajae-code/ai/core";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@gajae-code/ai/utils/oauth/types";
 import type * as piCodingAgent from "@gajae-code/coding-agent";
 import type { AutocompleteItem, Component, EditorTheme, KeyId, TUI } from "@gajae-code/tui";
 import type { KeybindingsManager } from "../../config/keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
+import type { ModelSelectorValue } from "../../config/model-selector-value";
+import type { Settings } from "../../config/settings";
+import type { SettingPath, SettingValue } from "../../config/settings-schema";
 import type { EditToolDetails } from "../../edit";
 import type { PythonResult } from "../../eval/py/executor";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type { CustomEditor } from "../../modes/components/custom-editor";
-import type { WorkflowGateEmitter } from "../../modes/shared/agent-wire/unattended-session";
+import type { WorkflowGateEmitter } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import type { Theme } from "../../modes/theme/theme";
+import type {
+	ClientBridge,
+	ClientBridgePermissionOption,
+	ClientBridgePermissionOutcome,
+	ClientBridgePermissionToolCall,
+} from "../../session/client-bridge";
 import type { CustomMessage } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
 import type {
@@ -50,7 +70,6 @@ import type {
 import type { EventBus } from "../../utils/event-bus";
 import type {
 	AgentEndEvent,
-	AgentStartEvent,
 	AutoCompactionEndEvent,
 	AutoCompactionStartEvent,
 	AutoRetryEndEvent,
@@ -74,6 +93,7 @@ import type {
 	SessionStartEvent,
 	SessionSwitchEvent,
 	SessionTreeEvent,
+	AgentStartEvent as SharedAgentStartEvent,
 	TodoReminderEvent,
 	ToolCallEventResult,
 	ToolResultEventResult,
@@ -114,7 +134,7 @@ export interface ExtensionUIDialogOptions {
 	/**
 	 * For interactive TUI select dialogs, render the focused option across
 	 * multiple rows instead of truncating it. This is a select-only rendering
-	 * hint; non-TUI bridges (RPC, ACP) drop it and do not serialize it.
+	 * hint; non-TUI clients (SDK, ACP) drop it and do not serialize it.
 	 */
 	wrapFocused?: boolean;
 	/**
@@ -128,13 +148,15 @@ export interface ExtensionUIDialogOptions {
 	 * inline: selecting it keeps the title and option list on screen and opens
 	 * a free-text input below the list. Submitting calls `onSubmit` with the
 	 * typed text and resolves the select with `optionLabel`; Escape returns to
-	 * option selection. Non-TUI bridges (RPC, ACP) drop it; callers must keep
+	 * option selection. Non-TUI clients (SDK, ACP) drop it; callers must keep
 	 * a fallback path for selects that resolve `optionLabel` without invoking
 	 * `onSubmit`.
 	 */
 	customInput?: {
 		optionLabel: string;
 		onSubmit: (text: string) => void;
+		/** Empty/whitespace-only submissions may be rejected by the selector. */
+		allowEmpty?: boolean;
 	};
 	/**
 	 * Inline free-text input for a non-answer clarification action. It is
@@ -164,7 +186,7 @@ export type ExtensionWidgetContent = string[] | ExtensionUiComponentFactory | un
 
 /**
  * UI context for extensions to request interactive UI.
- * Each mode (interactive, RPC, print) provides its own implementation.
+ * Interactive, SDK, and headless callers provide their own implementation.
  */
 // fallow-ignore-next-line code-duplication
 // Parallel to HookUIContext: extensions expose a strictly larger UI surface
@@ -264,7 +286,11 @@ export interface ExtensionUIContext {
 	/** Get current tool output expansion state. */
 	getToolsExpanded(): boolean;
 
-	/** Set tool output expansion state. */
+	/**
+	 * Set tool output expansion state. This is an explicit fold choice, pinning
+	 * existing tool and read components for their renderer instance lifetime,
+	 * the same as the user shortcut.
+	 */
 	setToolsExpanded(expanded: boolean): void;
 }
 
@@ -272,17 +298,143 @@ export interface ExtensionUIContext {
 // Extension Context
 // ============================================================================
 
+export interface ExtensionTranscriptEntry {
+	id: string;
+	role: string;
+	textSummary: string;
+	ts: string;
+	body?: string;
+	/**
+	 * Durable, image-free message blocks used by rich transcript consumers such
+	 * as ACP replay. Binary image payloads intentionally remain unavailable.
+	 */
+	content?: Array<
+		| { type: "text"; text: string }
+		| { type: "thinking"; thinking: string }
+		| { type: "toolCall"; id: string; name: string; arguments: unknown }
+	>;
+	toolCallId?: string;
+	toolName?: string;
+	isError?: boolean;
+}
+
 export interface ContextUsage {
-	/** Estimated context tokens, or null if unknown (e.g. right after compaction, before next LLM response). */
+	/** Context tokens, or null if unknown (e.g. right after compaction, before next LLM response). */
 	tokens: number | null;
 	contextWindow: number;
 	/** Context usage as percentage of context window, or null if tokens is unknown. */
 	percent: number | null;
+	/** Provenance: "provider_anchor" = anchored on provider-reported usage (+ heuristic trailing delta); "heuristic" = no provider anchor available, full estimate; "unknown" = post-compaction, no post-compaction provider response yet. */
+	source: "provider_anchor" | "heuristic" | "unknown";
 }
 
 export interface CompactOptions {
 	onComplete?: (result: CompactionResult) => void;
 	onError?: (error: Error) => void;
+}
+
+export interface ExtensionSessionMetadata {
+	kind: "main" | "sub";
+	taskDepth: number;
+	parentTaskPrefix?: string;
+	currentAgentType?: string;
+}
+
+/** Non-sensitive session policy exposed to third-party extensions. */
+export interface ExtensionSettings {
+	/** Read an allowlisted non-sensitive setting; blocked secret paths return undefined. */
+	get<P extends SettingPath>(path: P): SettingValue<P> | undefined;
+	getModelRole(role: string): ModelSelectorValue | undefined;
+}
+
+const EXTENSION_BLOCKED_SETTING_PREFIXES = [
+	"auth.",
+	"notifications.",
+	"hindsight.apiToken",
+	"searxng.basic",
+	"searxng.token",
+	"crashReport.",
+] as const;
+
+function isExtensionSettingReadable(path: string): boolean {
+	return !EXTENSION_BLOCKED_SETTING_PREFIXES.some(prefix => path.startsWith(prefix));
+}
+
+function deepFreeze<T>(value: T): T {
+	if (value === null || typeof value !== "object" || Object.isFrozen(value)) return value;
+	for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
+	return Object.freeze(value);
+}
+
+function cloneAndFreeze<T>(value: T): T {
+	if (value === null || typeof value !== "object") return value;
+	return deepFreeze(structuredClone(value));
+}
+
+/** Create an extension-safe settings facade without exposing credentials or mutation APIs. */
+export function createExtensionSettings(
+	settings: Pick<Settings, "getModelRole"> & Pick<Settings, "get">,
+): ExtensionSettings {
+	return Object.freeze({
+		get: <P extends SettingPath>(path: P): SettingValue<P> | undefined => {
+			if (!isExtensionSettingReadable(path)) return undefined;
+			return cloneAndFreeze(settings.get(path));
+		},
+		getModelRole: (role: string): ModelSelectorValue | undefined => cloneAndFreeze(settings.getModelRole(role)),
+	});
+}
+
+const CUSTOM_TOOL_ALLOWED_SETTINGS_METHODS = new Set<PropertyKey>([
+	"getAgentDir",
+	"getBashInterceptorRules",
+	"getCwd",
+	"getEditVariantForModel",
+	"getModelRoles",
+	"getPlansDirectory",
+	"getShellConfig",
+]);
+
+const CUSTOM_TOOL_SETTINGS_BLOCKED_MESSAGE = "Custom tool settings are read-only and secret paths are unavailable";
+
+/**
+ * Preserve the historical Settings-shaped custom-tool contract without exposing
+ * mutation APIs or unrestricted settings reads at runtime.
+ */
+
+export function createCustomToolSettings(settings: Settings | ExtensionSettings): Settings {
+	const blockedMethod = (): never => {
+		throw new Error(CUSTOM_TOOL_SETTINGS_BLOCKED_MESSAGE);
+	};
+	if (!("getCwd" in settings)) {
+		return new Proxy(Object.create(null) as Settings, {
+			get(_target, property) {
+				if (property === "get") return settings.get;
+				if (property === "getModelRole") return settings.getModelRole;
+				return blockedMethod;
+			},
+			set: () => blockedMethod(),
+			deleteProperty: () => blockedMethod(),
+			defineProperty: () => blockedMethod(),
+			setPrototypeOf: () => blockedMethod(),
+		});
+	}
+	const extensionSettings = createExtensionSettings(settings);
+
+	return new Proxy(settings, {
+		get(target, property, receiver) {
+			if (property === "get") return extensionSettings.get;
+			if (property === "getModelRole") return extensionSettings.getModelRole;
+			const value = Reflect.get(target, property, receiver);
+			if (typeof value !== "function") return value;
+			if (!CUSTOM_TOOL_ALLOWED_SETTINGS_METHODS.has(property)) return blockedMethod;
+			const bound = value.bind(target);
+			return (...args: unknown[]) => cloneAndFreeze(bound(...args));
+		},
+		set: () => blockedMethod(),
+		deleteProperty: () => blockedMethod(),
+		defineProperty: () => blockedMethod(),
+		setPrototypeOf: () => blockedMethod(),
+	});
 }
 
 /**
@@ -300,33 +452,123 @@ export interface ExtensionContext {
 	getContextUsage(): ContextUsage | undefined;
 	/** Compact the session context (interactive mode shows UI). */
 	compact(instructionsOrOptions?: string | CompactOptions): Promise<void>;
-	/** Whether UI is available (false in print/RPC mode) */
+	/** Whether an interactive UI is available */
 	hasUI: boolean;
 	/** Current working directory */
 	cwd: string;
+	/** Aborted when the runner stops waiting for this handler, including handler timeout. */
+	signal?: AbortSignal;
 	/** Session manager (read-only) */
 	sessionManager: ReadonlySessionManager;
+	/** Session classification supplied by the SDK for extension policy decisions. */
+	sessionMetadata?: ExtensionSessionMetadata;
 	/** Model registry for API key resolution */
 	modelRegistry: ModelRegistry;
+	/** Non-sensitive session settings for role resolution. */
+	settings?: ExtensionSettings;
+	/** Credential-selection identity, distinct from logical/provider cache identity. */
+	credentialSessionId?: string;
 	/** Current model (may be undefined) */
 	model: Model | undefined;
 	/** Whether the agent is idle (not streaming) */
 	isIdle(): boolean;
+	/** Stable resource ownership identifier for the active prompt run. */
+	getActivePromptHandle(): string | undefined;
 	/** Abort the current agent operation */
-	abort(): void;
+	abort(): void | Promise<void>;
+	/** Abort and prove whether resources for a specific prompt settled. */
+	abortPromptAndWait?(handle: string, options: { graceMs: number }): Promise<RunSettlementProof>;
 	/** Whether there are queued messages waiting */
 	hasPendingMessages(): boolean;
+	/** Typed pending-message counts per queue (steering, follow-up, next-turn). */
+	getPendingMessageCounts(): { steering: number; followUp: number; nextTurn: number };
+	/** Read-only session data exposed to extensions and the SDK host. */
+	getTranscript(): ExtensionTranscriptEntry[];
+	getTranscriptBody(entryId: string): string | undefined;
+	getGoalState(): unknown;
+	getTodoState(): unknown;
+	getQueuedMessages(): unknown[];
+	getActiveTools(): string[];
+	getAllTools(): string[];
+	/** Resolve display-safe metadata for a configured tool without exposing its implementation. */
+	resolveTool(name: string): Pick<Tool, "safeSummary" | "safeSummaryFields"> | undefined;
+	/** Session control seams used by the SDK host. */
+	cycleModel(): Promise<{ model: Model; thinkingLevel: ThinkingLevel | undefined } | undefined>;
+	setModelProfile?(name: string): Promise<boolean>;
+	/** Persist a model profile as the global default (SDK host seam). */
+	setDefaultModelProfile?(
+		name: string,
+		options?: {
+			persistDefault?: boolean;
+			thinkingLevelOverride?: ThinkingLevel;
+			/** Internal SDK host hooks invoked inside the profile activation admission. */
+			onBeforeActivation?: () => void;
+			onAfterActivation?: () => void;
+		},
+	): Promise<DefaultModelProfileActivationResult>;
+	/** The in-session active-profile marker; sole source of logical current state. */
+	getActiveModelProfile?(): string | undefined;
+	/** Run a control-surface mutation inside the session admission boundary. */
+	withSdkControlMutation?<T>(body: () => Promise<T>): Promise<T>;
+	cycleThinkingLevel(): ThinkingLevel | undefined;
+	setQueueMode(kind: "steering" | "follow_up" | "interrupt", mode: unknown): boolean;
+	getSkillState(): unknown;
+	getConfigItems(): unknown;
+	getBranchCandidates(): unknown;
+	getExtensions(): unknown;
+	getArtifact(id: string): Uint8Array | string | undefined | Promise<Uint8Array | string | undefined>;
+	getArtifactRange?(
+		id: string,
+		offset: number,
+		length: number,
+	):
+		| { bytes: Uint8Array; totalBytes: number }
+		| undefined
+		| Promise<{ bytes: Uint8Array; totalBytes: number } | undefined>;
+
+	getJobs(): unknown;
+	/** Typed skill and mode controls exposed to the SDK host. */
+	invokeSkill?(
+		name: string,
+		args?: string,
+		options?: {
+			onPreflightAccepted?: () => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+			onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
+			preflightSignal?: AbortSignal;
+			sdkRunCapability?: unknown;
+		},
+	): Promise<unknown>;
+	setPlanMode?(on: boolean): unknown;
+	operateGoal?(op: "create" | "get" | "resume" | "pause" | "complete" | "drop", objective?: string): Promise<unknown>;
+
+	/** Typed nonvisual session controls exposed to the SDK host. */
+	sdkControl?(operation: string, input: Record<string, unknown>): unknown | Promise<unknown>;
+	/** Install a permission callback backed by a live SDK reverse provider lease. */
+	setSdkPermissionProvider?(
+		provider:
+			| ((
+					toolCall: ClientBridgePermissionToolCall,
+					options: ClientBridgePermissionOption[],
+					signal?: AbortSignal,
+			  ) => Promise<ClientBridgePermissionOutcome>)
+			| undefined,
+	): void;
+	/** Install a client bridge backed by a live SDK reverse provider lease. */
+	setSdkClientBridge?(bridge: ClientBridge | undefined): void;
+	/** Names of session SDK seams actually installed by the active runtime. */
+	sdkBindings?(): readonly string[];
+
 	/** Gracefully shutdown and exit. */
 	shutdown(): void;
 	/** Get the current effective system prompt. */
 	getSystemPrompt(): string[];
 	/** @deprecated Use hasPendingMessages() instead */
 	hasQueuedMessages(): boolean;
-	/**
-	 * Unattended workflow-gate bridge. Present only when the session runs in
-	 * unattended/RPC mode; `undefined` in interactive/TUI mode (notify-only).
-	 */
+	/** SDK workflow-gate bridge, when a session has a remote gate responder. */
 	workflowGate?: WorkflowGateEmitter;
+	/** Clear the active conversation while preserving the saved session identity. */
+	clearContext(): Promise<boolean>;
 }
 
 /**
@@ -500,7 +742,25 @@ export interface BeforeAgentStartEvent {
 	systemPrompt: string[];
 }
 
-export type { AgentEndEvent, AgentStartEvent, TurnEndEvent, TurnStartEvent } from "../shared-events";
+export type { AgentEndEvent, TurnEndEvent, TurnStartEvent } from "../shared-events";
+
+/** Fired when an agent loop starts. `sdkRunToken` is an internal SDK queue-owner binding. */
+export interface AgentStartEvent extends SharedAgentStartEvent {
+	sdkRunToken?: string;
+}
+
+/** Fired when an agent run fails before emitting agent_end. The error is the
+ * sanitized `{ code, message }` diagnostic from the agent runtime — never the raw
+ * provider error. */
+export interface AgentFailedEvent {
+	type: "agent_failed";
+	error: AgentFailureDiagnostic;
+	/** Internal SDK queue-owner binding for exact lifecycle attribution. */
+	sdkRunToken?: string;
+	/** Attempt correlation for the failing run, when scoped (matches the
+	 * agent_start/agent_end scope contract). */
+	scope?: AttemptScope;
+}
 
 /** Fired when a message starts (user, assistant, or toolResult) */
 export interface MessageStartEvent {
@@ -513,6 +773,26 @@ export interface MessageUpdateEvent {
 	type: "message_update";
 	message: AgentMessage;
 	assistantMessageEvent: AssistantMessageEvent;
+}
+
+export interface ReasoningSummaryStartEvent {
+	type: "reasoning_summary_start";
+	message: AgentMessage;
+	contentIndex: number;
+}
+
+export interface ReasoningSummaryDeltaEvent {
+	type: "reasoning_summary_delta";
+	message: AgentMessage;
+	contentIndex: number;
+	delta: string;
+}
+
+export interface ReasoningSummaryEndEvent {
+	type: "reasoning_summary_end";
+	message: AgentMessage;
+	contentIndex: number;
+	content: string;
 }
 
 /** Fired when a message ends */
@@ -600,12 +880,12 @@ export interface UserPythonEvent {
 // Input Events
 // ============================================================================
 
-/** Fired when the user submits input (interactive mode only). */
+/** Fired when input enters through an interactive, SDK, or extension source. */
 export interface InputEvent {
 	type: "input";
 	text: string;
 	images?: ImageContent[];
-	source: "interactive" | "rpc" | "extension";
+	source: "interactive" | "sdk" | "extension";
 }
 
 // ============================================================================
@@ -758,12 +1038,16 @@ export type ExtensionEvent =
 	| AfterProviderResponseEvent
 	| BeforeAgentStartEvent
 	| AgentStartEvent
+	| AgentFailedEvent
 	| AgentEndEvent
 	| TurnStartEvent
 	| TurnEndEvent
 	| MessageStartEvent
 	| MessageUpdateEvent
 	| MessageEndEvent
+	| ReasoningSummaryStartEvent
+	| ReasoningSummaryDeltaEvent
+	| ReasoningSummaryEndEvent
 	| ToolExecutionStartEvent
 	| ToolExecutionUpdateEvent
 	| ToolExecutionEndEvent
@@ -920,11 +1204,15 @@ export interface ExtensionAPI {
 	on(event: "after_provider_response", handler: ExtensionHandler<AfterProviderResponseEvent>): void;
 	on(event: "before_agent_start", handler: ExtensionHandler<BeforeAgentStartEvent, BeforeAgentStartEventResult>): void;
 	on(event: "agent_start", handler: ExtensionHandler<AgentStartEvent>): void;
+	on(event: "agent_failed", handler: ExtensionHandler<AgentFailedEvent>): void;
 	on(event: "agent_end", handler: ExtensionHandler<AgentEndEvent>): void;
 	on(event: "turn_start", handler: ExtensionHandler<TurnStartEvent>): void;
 	on(event: "turn_end", handler: ExtensionHandler<TurnEndEvent>): void;
 	on(event: "message_start", handler: ExtensionHandler<MessageStartEvent>): void;
 	on(event: "message_update", handler: ExtensionHandler<MessageUpdateEvent>): void;
+	on(event: "reasoning_summary_start", handler: ExtensionHandler<ReasoningSummaryStartEvent>): void;
+	on(event: "reasoning_summary_delta", handler: ExtensionHandler<ReasoningSummaryDeltaEvent>): void;
+	on(event: "reasoning_summary_end", handler: ExtensionHandler<ReasoningSummaryEndEvent>): void;
 	on(event: "message_end", handler: ExtensionHandler<MessageEndEvent>): void;
 	on(event: "tool_execution_start", handler: ExtensionHandler<ToolExecutionStartEvent>): void;
 	on(event: "tool_execution_update", handler: ExtensionHandler<ToolExecutionUpdateEvent>): void;
@@ -1009,14 +1297,27 @@ export interface ExtensionAPI {
 	 */
 	sendMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
-		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+		options?: {
+			triggerTurn?: boolean;
+			deliverAs?: "steer" | "followUp" | "nextTurn";
+		},
 	): void;
 
 	/** Send a user message to the agent, or queue it when deliverAs is set. */
 	sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp" },
-	): void;
+		options?: {
+			deliverAs?: "steer" | "followUp";
+			/** Internal SDK signal preserving a busy dispatch across async admission fences. */
+			queuedAtDispatch?: boolean;
+			onPreflightAccepted?: () => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+			onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+			onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
+			preflightSignal?: AbortSignal;
+			/** Internal SDK correlation owner for an exact queued follow-up. */
+		},
+	): Promise<void>;
 
 	/** Append a custom entry to the session for state persistence (not sent to LLM). */
 	appendEntry<T = unknown>(customType: string, data?: T): void;
@@ -1029,6 +1330,8 @@ export interface ExtensionAPI {
 
 	/** Get all configured tools (built-in + extension tools). */
 	getAllTools(): string[];
+	/** Resolve display-safe metadata for a configured tool without exposing its implementation. */
+	resolveTool(name: string): Pick<Tool, "safeSummary" | "safeSummaryFields"> | undefined;
 
 	/** Set the active tools by name. */
 	setActiveTools(toolNames: string[]): Promise<void>;
@@ -1043,7 +1346,35 @@ export interface ExtensionAPI {
 	getThinkingLevel(): ThinkingLevel | undefined;
 
 	/** Set thinking level for the current session. */
-	setThinkingLevel(level: ThinkingLevel): void;
+	setThinkingLevel(level: ThinkingLevel, persist?: boolean): void;
+
+	/** Get whether thinking output is visible in the current session. */
+	getThinkingVisibility(): "visible" | "hidden";
+
+	/** Set whether thinking output is visible for the current session. */
+	setThinkingVisibility(visibility: "visible" | "hidden", persist?: boolean): void;
+
+	/** Cycle the current model's available thinking levels. */
+	cycleThinkingLevel(): ThinkingLevel | undefined;
+
+	/** Set thinking level from a session or durable global control surface. */
+	setThinkingLevelForControl(level: ThinkingLevel, persist: boolean): Promise<void>;
+
+	/** Set thinking visibility from a session or durable global control surface. */
+	setThinkingVisibilityForControl(visibility: "visible" | "hidden", persist: boolean): Promise<void>;
+
+	/** Set the model for this session only. Returns false when it is unavailable. */
+	setModelTemporaryForControl(
+		model: Model,
+		expectedSessionId?: string,
+		thinkingLevel?: ThinkingLevel,
+	): Promise<boolean>;
+
+	/** Fetch provider usage through the session's canonical provider resolution. */
+	fetchUsageReportsForControl(): Promise<UsageReport[] | null>;
+
+	/** Report whether the current effort follows global config or a session override. */
+	getThinkingScopeForControl(): "session" | "global config";
 
 	/** Get the current session name. */
 	getSessionName(): string | undefined;
@@ -1193,19 +1524,36 @@ export type SendMessageHandler = <T = unknown>(
 	 * When paired with `triggerTurn: true` during prompt teardown, the session schedules
 	 * an internal continuation without surfacing the message in the editable pending queue.
 	 */
-	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+	options?: {
+		triggerTurn?: boolean;
+		deliverAs?: "steer" | "followUp" | "nextTurn";
+	},
 ) => void;
 
 export type SendUserMessageHandler = (
 	content: string | (TextContent | ImageContent)[],
-	options?: { deliverAs?: "steer" | "followUp" },
-) => void;
+	options?: {
+		deliverAs?: "steer" | "followUp";
+		onPreflightAccepted?: () => void;
+		onPreflightAcceptCommit?: () => void | Promise<void>;
+		/**
+		 * Fired when a queued submission is consumed. `startsOwnRun: true` means
+		 * the batch starts a new run; false means it joins an active run or
+		 * maintenance continuation. Consumers must not assume every promotion
+		 * grants root abort ownership.
+		 */
+		onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+		preflightSignal?: AbortSignal;
+		/** Internal SDK correlation owner for an exact queued follow-up. */
+	},
+) => void | Promise<void>;
 
 export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;
 
 export type GetActiveToolsHandler = () => string[];
 
 export type GetAllToolsHandler = () => string[];
+export type ResolveToolHandler = (name: string) => Pick<Tool, "safeSummary" | "safeSummaryFields"> | undefined;
 
 export type GetCommandsHandler = () => SlashCommandInfo[];
 
@@ -1213,9 +1561,38 @@ export type SetActiveToolsHandler = (toolNames: string[]) => Promise<void>;
 
 export type SetModelHandler = (model: Model) => Promise<boolean>;
 
+export type CycleThinkingLevelHandler = () => ThinkingLevel | undefined;
+
+export type SetThinkingLevelForControlHandler = (level: ThinkingLevel, persist: boolean) => Promise<void>;
+
+export type SetThinkingVisibilityForControlHandler = (
+	visibility: "visible" | "hidden",
+	persist: boolean,
+) => Promise<void>;
+
+export type SetModelTemporaryForControlHandler = (
+	model: Model,
+	expectedSessionId?: string,
+	thinkingLevel?: ThinkingLevel,
+) => Promise<boolean>;
+
+/** Result of activating a model profile as the global default from a control surface. */
+export interface DefaultModelProfileActivationResult {
+	changed: boolean;
+	/** The canonical (alias-resolved) profile id. */
+	id: string;
+}
+
+export type FetchUsageReportsForControlHandler = () => Promise<UsageReport[] | null>;
+export type GetThinkingScopeForControlHandler = () => "session" | "global config";
+
 export type GetThinkingLevelHandler = () => ThinkingLevel | undefined;
 
 export type SetThinkingLevelHandler = (level: ThinkingLevel, persist?: boolean) => void;
+
+export type GetThinkingVisibilityHandler = () => "visible" | "hidden";
+
+export type SetThinkingVisibilityHandler = (visibility: "visible" | "hidden", persist?: boolean) => void;
 
 /** Shared state created by loader, used during registration and runtime. */
 export interface ExtensionRuntimeState {
@@ -1232,11 +1609,20 @@ export interface ExtensionActions {
 	setLabel: (targetId: string, label: string | undefined) => void;
 	getActiveTools: GetActiveToolsHandler;
 	getAllTools: GetAllToolsHandler;
+	resolveTool: ResolveToolHandler;
 	setActiveTools: SetActiveToolsHandler;
 	getCommands: GetCommandsHandler;
 	setModel: SetModelHandler;
 	getThinkingLevel: GetThinkingLevelHandler;
 	setThinkingLevel: SetThinkingLevelHandler;
+	getThinkingVisibility: GetThinkingVisibilityHandler;
+	setThinkingVisibility: SetThinkingVisibilityHandler;
+	cycleThinkingLevel: CycleThinkingLevelHandler;
+	setThinkingLevelForControl: SetThinkingLevelForControlHandler;
+	setThinkingVisibilityForControl: SetThinkingVisibilityForControlHandler;
+	setModelTemporaryForControl: SetModelTemporaryForControlHandler;
+	fetchUsageReportsForControl: FetchUsageReportsForControlHandler;
+	getThinkingScopeForControl: GetThinkingScopeForControlHandler;
 	getSessionName: () => string | undefined;
 	setSessionName: (name: string) => Promise<void>;
 }
@@ -1244,15 +1630,90 @@ export interface ExtensionActions {
 /** Actions for ExtensionContext (ctx.* in event handlers). */
 export interface ExtensionContextActions {
 	getModel: () => Model | undefined;
+	getCredentialSessionId?: () => string;
 	isIdle: () => boolean;
-	abort: () => void;
+	/** Stable resource ownership identifier for the active prompt run. */
+	getActivePromptHandle?: () => string | undefined;
+	abort: () => void | Promise<void>;
+	abortPromptAndWait?: (handle: string, options: { graceMs: number }) => Promise<RunSettlementProof>;
+
 	hasPendingMessages: () => boolean;
+	/** Typed pending-message counts per queue; optional for embedders without a counted queue. */
+	getPendingMessageCounts?: () => { steering: number; followUp: number; nextTurn: number };
+	getTranscript?: () => ExtensionTranscriptEntry[];
+	getTranscriptBody?: (entryId: string) => string | undefined;
+	getGoalState?: () => unknown;
+	getTodoState?: () => unknown;
+	getQueuedMessages?: () => unknown[];
+	getActiveTools?: () => string[];
+	getAllTools?: () => string[];
+	resolveTool?: (name: string) => Pick<Tool, "safeSummary" | "safeSummaryFields"> | undefined;
 	shutdown: () => void;
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
 	getSystemPrompt: () => string[];
-	/** Unattended workflow-gate bridge (present only in unattended/RPC mode). */
+	/** SDK workflow-gate bridge, when a session has a remote gate responder. */
 	getWorkflowGate?: () => WorkflowGateEmitter | undefined;
+	/** Clear the active conversation while preserving the saved session identity. */
+	clearContext?: () => Promise<boolean>;
+	/** Session control and query seams exposed to the per-session SDK host. */
+	cycleModel?: () => Promise<{ model: Model; thinkingLevel: ThinkingLevel | undefined } | undefined>;
+	setModelProfile?: (name: string) => Promise<boolean>;
+	setDefaultModelProfile?: (
+		name: string,
+		options?: {
+			persistDefault?: boolean;
+			thinkingLevelOverride?: ThinkingLevel;
+			/** Internal SDK host hooks invoked inside the profile activation admission. */
+			onBeforeActivation?: () => void;
+			onAfterActivation?: () => void;
+		},
+	) => Promise<DefaultModelProfileActivationResult>;
+	getActiveModelProfile?: () => string | undefined;
+	withSdkControlMutation?: <T>(body: () => Promise<T>) => Promise<T>;
+	cycleThinkingLevel?: () => ThinkingLevel | undefined;
+	setQueueMode?: (kind: "steering" | "follow_up" | "interrupt", mode: unknown) => boolean;
+	getSkillState?: () => unknown;
+	getConfigItems?: () => unknown;
+	getBranchCandidates?: () => unknown;
+	getExtensions?: () => unknown;
+	getArtifact?: (id: string) => Uint8Array | string | undefined | Promise<Uint8Array | string | undefined>;
+	getArtifactRange?: (
+		id: string,
+		offset: number,
+		length: number,
+	) =>
+		| { bytes: Uint8Array; totalBytes: number }
+		| undefined
+		| Promise<{ bytes: Uint8Array; totalBytes: number } | undefined>;
+	getJobs?: () => unknown;
+	setSdkPermissionProvider?: (
+		provider:
+			| ((
+					toolCall: ClientBridgePermissionToolCall,
+					options: ClientBridgePermissionOption[],
+					signal?: AbortSignal,
+			  ) => Promise<ClientBridgePermissionOutcome>)
+			| undefined,
+	) => void;
+	setSdkClientBridge?: (bridge: ClientBridge | undefined) => void;
+	sdkControl?: (operation: string, input: Record<string, unknown>) => unknown | Promise<unknown>;
+	invokeSkill?: (
+		name: string,
+		args?: string,
+		options?: {
+			onPreflightAccepted?: () => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+			onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
+			preflightSignal?: AbortSignal;
+			sdkRunCapability?: unknown;
+		},
+	) => Promise<unknown>;
+	setPlanMode?: (on: boolean) => unknown;
+	operateGoal?: (
+		op: "create" | "get" | "resume" | "pause" | "complete" | "drop",
+		objective?: string,
+	) => Promise<unknown>;
 }
 
 /** Actions for ExtensionCommandContext (ctx.* in command handlers). */

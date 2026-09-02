@@ -1,15 +1,30 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { installGjcPluginBundle, loadConstrainedPluginHooks } from "../src/extensibility/gjc-plugins";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import {
+	ConstrainedPluginHookDescriptor,
+	installGjcBundle,
+	loadConstrainedPluginHooks,
+	registryPathForScope,
+} from "../src/extensibility/gjc-plugins";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
 const sixSurface = path.join(fixturesRoot, "valid-six-surface-bundle");
 const tempDirs: string[] = [];
+const originalAgentDir = getAgentDir();
+let agentDir: string;
+
+beforeEach(async () => {
+	agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hooks-agent-"));
+	setAgentDir(agentDir);
+});
 
 afterEach(async () => {
+	setAgentDir(originalAgentDir);
 	for (const d of tempDirs.splice(0)) await fs.rm(d, { recursive: true, force: true });
+	await fs.rm(agentDir, { recursive: true, force: true });
 });
 
 async function mkCwd(): Promise<string> {
@@ -38,7 +53,7 @@ async function bundleWithHook(hookBody: string): Promise<string> {
 describe("constrained plugin hooks", () => {
 	test("loads a declared hook that registers its event via the constrained api", async () => {
 		const cwd = await mkCwd();
-		await installGjcPluginBundle(sixSurface, { scope: "project", cwd });
+		await installGjcBundle({ cwd }, "project", sixSurface);
 		const res = await loadConstrainedPluginHooks({ cwd });
 		expect(res.hooks.map(h => h.event)).toContain("tool_call");
 		expect(res.quarantine).toHaveLength(0);
@@ -55,7 +70,7 @@ describe("constrained plugin hooks", () => {
 		const src = await bundleWithHook(
 			"export default function(api){ api.registerCommand('evil', { handler(){} }); api.on('tool_call', ()=>({})); }\n",
 		);
-		await installGjcPluginBundle(src, { scope: "project", cwd });
+		await installGjcBundle({ cwd }, "project", src);
 		const res = await loadConstrainedPluginHooks({ cwd });
 		expect(res.hooks).toHaveLength(0);
 		expect(res.quarantine.some(q => q.code === "security_policy")).toBe(true);
@@ -66,7 +81,7 @@ describe("constrained plugin hooks", () => {
 		const src = await bundleWithHook(
 			"export default function(api){ api.sendMessage({}); api.on('tool_call', ()=>({})); }\n",
 		);
-		await installGjcPluginBundle(src, { scope: "project", cwd });
+		await installGjcBundle({ cwd }, "project", src);
 		const res = await loadConstrainedPluginHooks({ cwd });
 		expect(res.quarantine.some(q => q.code === "security_policy")).toBe(true);
 	});
@@ -74,9 +89,53 @@ describe("constrained plugin hooks", () => {
 	test("quarantines runtime_mismatch when the hook registers a different event", async () => {
 		const cwd = await mkCwd();
 		const src = await bundleWithHook("export default function(api){ api.on('turn_start', ()=>({})); }\n");
-		await installGjcPluginBundle(src, { scope: "project", cwd });
+		await installGjcBundle({ cwd }, "project", src);
 		const res = await loadConstrainedPluginHooks({ cwd });
 		expect(res.hooks).toHaveLength(0);
 		expect(res.quarantine.some(q => q.code === "runtime_mismatch")).toBe(true);
+	});
+
+	test("rejects malformed declared metadata before hashing or importing plugin code", async () => {
+		const root = await mkCwd();
+		const hookPath = path.join(root, "malformed.ts");
+		const markerPath = path.join(root, "imported");
+		await fs.writeFile(
+			hookPath,
+			`await Bun.write(${JSON.stringify(markerPath)}, "imported"); export default () => undefined;\n`,
+		);
+		const descriptor = new ConstrainedPluginHookDescriptor({
+			plugin: "malformed",
+			scope: "project",
+			event: "tool_call",
+			target: "read",
+			phase: "during" as never,
+			relativePath: hookPath,
+			implementationHash: "not-a-real-hash",
+		});
+
+		await expect(descriptor.load()).rejects.toThrow("invalid_plugin_phase");
+		expect(await Bun.file(markerPath).exists()).toBe(false);
+	});
+
+	test("quarantines malformed registry metadata before evaluating an installed hook", async () => {
+		const cwd = await mkCwd();
+		const markerPath = path.join(cwd, "imported");
+		const src = await bundleWithHook(
+			`await Bun.write(${JSON.stringify(markerPath)}, "imported"); export default function(api){ api.on('tool_call', ()=>({})); }\n`,
+		);
+		await installGjcBundle({ cwd }, "project", src);
+		const registryPath = registryPathForScope("project", cwd);
+		const registry = JSON.parse(await fs.readFile(registryPath, "utf8")) as {
+			plugins: Array<{ surfaces: { hooks: Array<{ phase?: string }> } }>;
+		};
+		const hook = registry.plugins[0]?.surfaces.hooks[0];
+		if (!hook) throw new Error("expected installed hook metadata");
+		hook.phase = "during";
+		await fs.writeFile(registryPath, JSON.stringify(registry));
+
+		const res = await loadConstrainedPluginHooks({ cwd });
+		expect(res.hooks).toHaveLength(0);
+		expect(res.quarantine.some(q => q.code === "invalid_hook")).toBe(true);
+		expect(await Bun.file(markerPath).exists()).toBe(false);
 	});
 });

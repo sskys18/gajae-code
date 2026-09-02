@@ -6,6 +6,7 @@
  * and get back a unified array of MCP servers.
  */
 
+import type { Settings } from "../config/settings";
 /**
  * Context passed to every provider loader.
  */
@@ -14,8 +15,24 @@ export interface LoadContext {
 	cwd: string;
 	/** User home directory */
 	home: string;
+	/**
+	 * GJC's user-scope config directory: the resolved agent directory
+	 * (`getAgentDir()`), which `--agent-dir`, `GJC_CODING_AGENT_DIR` and
+	 * `setAgentDir()` redirect away from `<home>/.gjc/agent`. `loadCapability`
+	 * always sets it; ad-hoc contexts built for path scanning may omit it, and
+	 * native providers then fall back to the home-relative default
+	 * `<home>/<configDirName>/agent` (see `resolveUserAgentDir` in
+	 * `discovery/builtin.ts`).
+	 *
+	 * A native surface whose write path targets the agent directory resolves its
+	 * user scope from here, or discovery reads a different file than the writer
+	 * produced. This includes MCP registrations and user-installed skills.
+	 */
+	userAgentDir?: string;
 	/** Git repository root (directory containing .git), or null if not in a repo */
 	repoRoot: string | null;
+	/** Owning session settings for provider policy decisions. */
+	settings?: Settings;
 }
 
 /**
@@ -66,12 +83,26 @@ export interface LoadOptions {
 	excludeProviders?: string[];
 	/** Custom cwd. Default: getProjectDir() */
 	cwd?: string;
+	/**
+	 * Agent directory backing `LoadContext.userAgentDir`. Default: getAgentDir().
+	 * Set it when loading for a session whose agent directory differs from the
+	 * process-wide one (`createAgentSession({ agentDir })`).
+	 */
+	agentDir?: string;
 	/** Include items even if they fail validation. Default: false */
 	includeInvalid?: boolean;
 	/** Include items disabled via settings. Default: false */
 	includeDisabled?: boolean;
+	/**
+	 * Include providers disabled via settings (for diagnostics). Default: false.
+	 * Items loaded from a disabled provider are not marked by the registry; callers
+	 * compare `_source.provider` against the disabled-provider set themselves.
+	 */
+	includeDisabledProviders?: boolean;
 	/** Explicit disabled extension IDs to apply instead of settings. */
 	disabledExtensions?: string[];
+	/** Session settings whose provider policy applies to this load. */
+	settings?: Settings;
 }
 
 /**

@@ -1,14 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import * as compactionModule from "@gajae-code/agent-core/compaction";
 import type { AssistantMessage, ToolCall } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { createAppendOnlyContextManager } from "@gajae-code/coding-agent/append-only-mode";
+import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ExtensionRunner, loadExtensions } from "@gajae-code/coding-agent/extensibility/extensions";
+import * as internalUrls from "@gajae-code/coding-agent/internal-urls";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
+import { ArtifactManager } from "@gajae-code/coding-agent/session/artifacts";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
@@ -20,6 +25,23 @@ describe("AgentSession handoff", () => {
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
 	let events: AgentSessionEvent[];
+	let asyncManager: AsyncJobManager | undefined;
+
+	async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			if (predicate()) return;
+			await Bun.sleep(10);
+		}
+		throw new Error("Timed out waiting for handoff maintenance observation");
+	}
+
+	async function waitForAbort(signal: AbortSignal): Promise<void> {
+		if (signal.aborted) return;
+		const aborted = Promise.withResolvers<void>();
+		signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+		await aborted.promise;
+	}
 
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@pi-handoff-");
@@ -41,6 +63,7 @@ describe("AgentSession handoff", () => {
 				tools: [],
 				messages: [],
 			},
+			appendOnlyContext: createAppendOnlyContextManager(model.provider),
 		});
 
 		session = new AgentSession({
@@ -51,6 +74,7 @@ describe("AgentSession handoff", () => {
 				"compaction.autoContinue": false,
 			}),
 			modelRegistry,
+			agentId: "owner",
 		});
 
 		session.subscribe(event => {
@@ -85,6 +109,8 @@ describe("AgentSession handoff", () => {
 		if (session) {
 			await session.dispose();
 		}
+		if (asyncManager) await asyncManager.dispose({ timeoutMs: 100 });
+		AsyncJobManager.setInstance(undefined);
 		authStorage.close();
 		try {
 			await tempDir.remove();
@@ -101,7 +127,7 @@ describe("AgentSession handoff", () => {
 		expect(session.sessionFile).toBe(beforeSessionFile);
 		expect(session.sessionId).toBe(beforeSessionId);
 		expect(
-			sessionManager.getEntries().filter(entry => entry.type === "custom" && entry.customType === "handoff"),
+			sessionManager.getEntries().filter(entry => entry.type === "custom_message" && entry.customType === "handoff"),
 		).toHaveLength(0);
 	});
 
@@ -109,6 +135,18 @@ describe("AgentSession handoff", () => {
 		const created = await session.newSession();
 		expect(created).toBe(true);
 		expect(sessionManager.buildSessionContext().models.default).toBe("anthropic/claude-sonnet-4-5");
+	});
+
+	it("releases append-only provider-normalized history at the handoff rewrite boundary", async () => {
+		const appendOnly = session.agent.appendOnlyContext;
+		expect(appendOnly).not.toBeUndefined();
+		appendOnly?.syncMessages([{ role: "user", content: "handoff-provider-marker" }]);
+		expect(appendOnly?.log.length).toBe(1);
+		vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue("## Goal\nContinue from here");
+
+		const result = await session.handoff();
+		expect(result?.document).toContain("Continue from here");
+		expect(appendOnly?.log.length).toBe(0);
 	});
 
 	it("does not run auto-compaction after handoff turn completes", async () => {
@@ -123,6 +161,67 @@ describe("AgentSession handoff", () => {
 		expect(events.filter(event => event.type === "auto_compaction_start")).toHaveLength(0);
 		expect(events.filter(event => event.type === "auto_compaction_end")).toHaveLength(0);
 		expect(sessionManager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(0);
+	});
+
+	it("settles detached owner jobs before handoff artifact retirement", async () => {
+		vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue("## Goal\nContinue safely");
+		asyncManager = new AsyncJobManager({ onJobComplete: async () => {} });
+		AsyncJobManager.setInstance(asyncManager);
+		const fallbackRoot = await fs.mkdtemp(path.join(tempDir.path(), "handoff-fallback-"));
+		const fallbackManager = new ArtifactManager(fallbackRoot);
+		sessionManager.adoptArtifactManager(fallbackManager);
+		session.registerToolSessionTransitionCleanup(async () => {
+			sessionManager.releaseArtifactManager(fallbackManager);
+			await fs.rm(fallbackRoot, { recursive: true, force: true });
+		});
+		const order: string[] = [];
+		const ownerJobId = asyncManager.register(
+			"task",
+			"handoff predecessor task",
+			async ({ signal }) => {
+				await waitForAbort(signal);
+				await Bun.write(path.join(fallbackRoot, "late-task.md"), "settled before handoff cleanup");
+				order.push("late-write");
+				return "cancelled";
+			},
+			{
+				ownerId: "owner",
+				metadata: { subagent: { id: "handoff-child", agent: "executor", agentSource: "bundled" } },
+			},
+		);
+		asyncManager.registerSubagentRecord({
+			subagentId: "handoff-child",
+			ownerId: "owner",
+			currentJobId: ownerJobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: null,
+			resumable: true,
+		});
+		const foreignGate = Promise.withResolvers<string>();
+		const foreignJobId = asyncManager.register("task", "foreign handoff task", async () => foreignGate.promise, {
+			ownerId: "foreign",
+		});
+		const originalSettle = asyncManager.cancelAndSettleOwnerJobs.bind(asyncManager);
+		vi.spyOn(asyncManager, "cancelAndSettleOwnerJobs").mockImplementation(async ownerId => {
+			const settled = await originalSettle(ownerId);
+			order.push("settle");
+			return settled;
+		});
+		const originalCommit = sessionManager.commitPreparedNewSession.bind(sessionManager);
+		vi.spyOn(sessionManager, "commitPreparedNewSession").mockImplementation(prepared => {
+			order.push("commit");
+			originalCommit(prepared);
+		});
+
+		await expect(session.handoff()).resolves.toBeDefined();
+		expect(order).toEqual(["late-write", "settle", "commit"]);
+		expect(await Bun.file(path.join(fallbackRoot, "late-task.md")).exists()).toBe(false);
+		await Bun.sleep(20);
+		expect(await Bun.file(fallbackRoot).exists()).toBe(false);
+		expect(asyncManager.getJob(foreignJobId)?.status).toBe("running");
+		foreignGate.resolve("foreign complete");
+		await asyncManager.getJob(foreignJobId)?.promise;
 	});
 
 	it("does not run auto maintenance after final yield", async () => {
@@ -487,7 +586,9 @@ describe("AgentSession handoff", () => {
 
 		session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
-		await Bun.sleep(20);
+		await waitFor(
+			() => handoffSpy.mock.calls.length === 1 && events.some(event => event.type === "auto_compaction_end"),
+		);
 
 		expect(handoffSpy).toHaveBeenCalledTimes(1);
 		const endEvents = events.filter(event => event.type === "auto_compaction_end");
@@ -581,17 +682,19 @@ describe("AgentSession handoff", () => {
 		expect(handoffCall[3].systemPrompt).toEqual(["Test"]);
 	});
 
-	it("saves auto-handoff document to disk when enabled", async () => {
+	it("saves auto-handoff document as an artifact when enabled", async () => {
 		session.settings.set("compaction.handoffSaveToDisk", true);
 
 		const handoffText = "## Goal\nContinue from here";
 		vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue(handoffText);
 
 		const result = await session.handoff(undefined, { autoTriggered: true });
-		expect(result?.savedPath).toBeDefined();
-		if (!result?.savedPath) throw new Error("Expected handoff document path");
-		expect(result.savedPath.endsWith(".md")).toBe(true);
-		const savedText = await Bun.file(result.savedPath).text();
+		expect(result?.savedPath).toMatch(/^artifact:\/\/\d+$/);
+		if (!result?.savedPath) throw new Error("Expected handoff artifact URI");
+		const artifactPath = await session.sessionManager.getArtifactPath(result.savedPath.slice("artifact://".length));
+		expect(artifactPath).toBeDefined();
+		if (!artifactPath) throw new Error("Expected handoff artifact path");
+		const savedText = await Bun.file(artifactPath).text();
 		expect(savedText).toContain(handoffText);
 	});
 
@@ -642,5 +745,401 @@ describe("AgentSession handoff", () => {
 		await expect(handoffPromise).rejects.toThrow("Handoff cancelled");
 		expect(generateHandoffSpy).toHaveBeenCalledTimes(1);
 		expect(generateHandoffSpy.mock.calls[0]?.[4]?.aborted).toBe(true);
+	});
+
+	it("refuses a manual handoff while a response is streaming and does not mutate the session", async () => {
+		const generateHandoffSpy = vi.spyOn(compactionModule, "generateHandoff");
+		const beforeId = session.sessionId;
+		const beforeFile = session.sessionFile;
+		session.agent.state.isStreaming = true;
+		try {
+			await expect(session.handoff()).rejects.toThrow(/stream/i);
+		} finally {
+			session.agent.state.isStreaming = false;
+		}
+		expect(generateHandoffSpy).not.toHaveBeenCalled();
+		expect(session.sessionId).toBe(beforeId);
+		expect(session.sessionFile).toBe(beforeFile);
+	});
+
+	it("still allows an auto-triggered handoff even if the streaming flag is set", async () => {
+		vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue("## Goal\nauto");
+		session.agent.state.isStreaming = true;
+		try {
+			const result = await session.handoff(undefined, { autoTriggered: true });
+			expect(result?.document).toBe("## Goal\nauto");
+		} finally {
+			session.agent.state.isStreaming = false;
+		}
+	});
+
+	it("keeps the predecessor active when successor local readiness fails, then retries", async () => {
+		const handoffText = "## Goal\nContinue from here";
+		vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue(handoffText);
+		const beforeId = session.sessionId;
+		const beforeFile = session.sessionFile;
+		vi.spyOn(internalUrls, "initializeLocalRoot").mockRejectedValueOnce(new Error("local readiness boom"));
+
+		await expect(session.handoff()).rejects.toThrow("local readiness boom");
+		expect(session.sessionId).toBe(beforeId);
+		expect(session.sessionFile).toBe(beforeFile);
+		expect(sessionManager.getBranch().filter(entry => entry.type === "custom_message")).toHaveLength(0);
+
+		const result = await session.handoff();
+		expect(result?.document).toBe(handoffText);
+		expect(session.sessionId).not.toBe(beforeId);
+	});
+
+	it("is non-destructive when the post-generation switch fails: session stays active and document is retained", async () => {
+		const handoffText = "## Goal\nContinue from here";
+		vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue(handoffText);
+		const beforeId = session.sessionId;
+		const beforeFile = session.sessionFile;
+		const beforeMessageCount = session.agent.state.messages.length;
+
+		// Force a failure in staged injection before successor adoption.
+		const appendSpy = vi.spyOn(sessionManager, "appendPreparedCustomMessageEntry").mockImplementationOnce(() => {
+			throw new Error("inject boom");
+		});
+
+		let caught: unknown;
+		try {
+			await session.handoff();
+		} catch (error) {
+			caught = error;
+		}
+
+		expect(caught).toBeInstanceOf(Error);
+		expect((caught as Error).message).toContain("inject boom");
+		// Generated document is preserved for copy/retry.
+		expect((caught as { handoffDocument?: string }).handoffDocument).toBe(handoffText);
+		// The active session is fully restored (non-destructive failure).
+		expect(session.sessionId).toBe(beforeId);
+		expect(session.sessionFile).toBe(beforeFile);
+		expect(session.agent.state.messages.length).toBe(beforeMessageCount);
+		// No handoff custom entry leaked into the restored session.
+		expect(
+			sessionManager.getBranch().filter(entry => entry.type === "custom_message" && entry.customType === "handoff"),
+		).toHaveLength(0);
+
+		appendSpy.mockRestore();
+
+		// A subsequent handoff succeeds normally after the recovered failure.
+		const result = await session.handoff();
+		expect(result?.document).toBe(handoffText);
+		expect(session.sessionId).not.toBe(beforeId);
+	});
+
+	it.each([
+		[
+			"prepareNewSession throws before mutating (partial-switch guard)",
+			() => vi.spyOn(sessionManager, "prepareNewSession").mockRejectedValueOnce(new Error("newSession boom")),
+			"newSession boom",
+		],
+		[
+			"staged persistence throws before successor adoption",
+			() =>
+				vi.spyOn(sessionManager, "ensurePreparedNewSessionOnDisk").mockRejectedValueOnce(new Error("ensure boom")),
+			"ensure boom",
+		],
+		[
+			"staged display rebuild throws before successor adoption",
+			() =>
+				vi.spyOn(session, "buildPreparedDisplaySessionContext").mockImplementationOnce(() => {
+					throw new Error("display boom");
+				}),
+			"display boom",
+		],
+	])("is non-destructive when %s", async (_label, installFault, expectedMessage) => {
+		const handoffText = "## Goal\nContinue from here";
+		vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue(handoffText);
+		const beforeId = session.sessionId;
+		const beforeFile = session.sessionFile;
+		const beforeMessageCount = session.agent.state.messages.length;
+
+		const faultSpy = installFault();
+
+		let caught: unknown;
+		try {
+			await session.handoff();
+		} catch (error) {
+			caught = error;
+		}
+
+		expect(caught).toBeInstanceOf(Error);
+		expect((caught as Error).message).toContain(expectedMessage);
+		expect((caught as { handoffDocument?: string }).handoffDocument).toBe(handoffText);
+		// Active session fully restored.
+		expect(session.sessionId).toBe(beforeId);
+		expect(session.sessionFile).toBe(beforeFile);
+		expect(session.agent.state.messages.length).toBe(beforeMessageCount);
+		expect(
+			sessionManager.getBranch().filter(entry => entry.type === "custom_message" && entry.customType === "handoff"),
+		).toHaveLength(0);
+
+		faultSpy.mockRestore();
+
+		// Recovery: a subsequent handoff succeeds.
+		const result = await session.handoff();
+		expect(result?.document).toBe(handoffText);
+		expect(session.sessionId).not.toBe(beforeId);
+	});
+	it("retains the committed successor when a post-commit step fails (no rollback)", async () => {
+		const handoffText = "## Goal\nContinue from here";
+		vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue(handoffText);
+		const beforeId = session.sessionId;
+		// clearKind("async-result") runs at the commit boundary, after `committed`
+		// is set. A failure there must NOT roll back the already-committed switch.
+		vi.spyOn(session.yieldQueue, "clearKind").mockImplementationOnce(() => {
+			throw new Error("post-commit boom");
+		});
+
+		let caught: unknown;
+		try {
+			await session.handoff();
+		} catch (error) {
+			caught = error;
+		}
+
+		// Post-commit failure is surfaced explicitly while retaining the successor.
+		expect(caught).toBeInstanceOf(Error);
+		expect((caught as { code?: string }).code).toBe("handoff_committed_degraded");
+		expect((caught as { handoffDocument?: string }).handoffDocument).toBe(handoffText);
+		expect((caught as Error).cause).toBeInstanceOf(Error);
+		expect(((caught as Error).cause as Error).message).toContain("post-commit boom");
+		expect(session.sessionId).not.toBe(beforeId);
+		expect(
+			sessionManager.getBranch().filter(entry => entry.type === "custom_message" && entry.customType === "handoff"),
+		).toHaveLength(1);
+	});
+
+	it("fences background async idle delivery during a handoff transition", async () => {
+		const unregister = session.yieldQueue.register("handoff-fence-test", {
+			build: survivors => ({
+				role: "user" as const,
+				content: [{ type: "text" as const, text: `entries:${survivors.length}` }],
+				timestamp: Date.now(),
+			}),
+		});
+		const promptSpy = vi.spyOn(session.agent, "prompt");
+		const gate = Promise.withResolvers<void>();
+		vi.spyOn(compactionModule, "generateHandoff").mockImplementation(async () => {
+			await gate.promise;
+			return "## Goal\nContinue";
+		});
+
+		const handoffPromise = session.handoff();
+		await Bun.sleep(5); // let handoff engage the delivery fence and enter generation
+
+		// A background completion lands mid-handoff. The session is not streaming, so
+		// without the fence this would schedule an idle flush that calls agent.prompt.
+		session.yieldQueue.enqueue("handoff-fence-test", { done: true });
+		await Bun.sleep(30);
+		expect(promptSpy).not.toHaveBeenCalled();
+
+		gate.resolve();
+		await handoffPromise;
+		// The fenced predecessor delivery was dropped at commit, never delivered.
+		expect(promptSpy).not.toHaveBeenCalled();
+		unregister();
+	});
+	it("rejects a concurrent handoff while one is in progress (single-flight)", async () => {
+		const gate = Promise.withResolvers<void>();
+		vi.spyOn(compactionModule, "generateHandoff").mockImplementation(async () => {
+			await gate.promise;
+			return "## Goal\nContinue";
+		});
+		const first = session.handoff();
+		await Bun.sleep(5); // let the first handoff engage the transition
+
+		await expect(session.handoff()).rejects.toThrow(/already in progress/i);
+
+		gate.resolve();
+		await first;
+	});
+
+	it("rejects an external prompt turn while a handoff is in progress", async () => {
+		const gate = Promise.withResolvers<void>();
+		vi.spyOn(compactionModule, "generateHandoff").mockImplementation(async () => {
+			await gate.promise;
+			return "## Goal\nContinue";
+		});
+		const handoffPromise = session.handoff();
+		await Bun.sleep(5);
+
+		// The admission barrier fences external turns for the whole transition.
+		await expect(session.prompt("hello during handoff")).rejects.toThrow(/handoff is in progress/i);
+
+		gate.resolve();
+		await handoffPromise;
+	});
+
+	it("rejects steer/follow-up turn starters while a handoff is in progress", async () => {
+		const gate = Promise.withResolvers<void>();
+		vi.spyOn(compactionModule, "generateHandoff").mockImplementation(async () => {
+			await gate.promise;
+			return "## Goal\nContinue";
+		});
+		const handoffPromise = session.handoff();
+		await Bun.sleep(5);
+
+		// The bypass turn-start paths (steer/follow-up/sendUserMessage) are fenced too.
+		await expect(session.steer("steer during handoff")).rejects.toThrow(/handoff is in progress/i);
+		await expect(session.followUp("follow-up during handoff")).rejects.toThrow(/handoff is in progress/i);
+		await expect(session.sendUserMessage("msg", { deliverAs: "followUp" })).rejects.toThrow(
+			/handoff is in progress/i,
+		);
+
+		gate.resolve();
+		await handoffPromise;
+	});
+
+	it("retains the generated document when a turn starts during generation (late busy)", async () => {
+		const handoffText = "## Goal\nGenerated before the late race";
+		vi.spyOn(compactionModule, "generateHandoff").mockImplementation(async () => {
+			// A turn begins after generation started but before the switch.
+			session.agent.state.isStreaming = true;
+			return handoffText;
+		});
+
+		let caught: unknown;
+		try {
+			await session.handoff();
+		} catch (error) {
+			caught = error;
+		} finally {
+			session.agent.state.isStreaming = false;
+		}
+
+		expect(caught).toBeInstanceOf(Error);
+		expect((caught as { code?: string }).code).toBe("busy");
+		// The generated document is retained on the late-busy rejection for copy/retry.
+		expect((caught as { handoffDocument?: string }).handoffDocument).toBe(handoffText);
+		// Non-destructive: the current session is unchanged.
+		expect(
+			sessionManager.getBranch().filter(entry => entry.type === "custom_message" && entry.customType === "handoff"),
+		).toHaveLength(0);
+	});
+
+	it("releases the turn fence on the committed successor (no over-fencing after handoff)", async () => {
+		vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue("## Goal\nContinue");
+		const result = await session.handoff();
+		expect(result?.document).toBeDefined();
+
+		// The transition fence is released at commit (before session_switch), so a
+		// turn starter on the committed successor is NOT rejected as "handoff in
+		// progress". (#queueFollowUp resolves after enqueue; the continuation runs
+		// detached.)
+		let rejection: unknown;
+		try {
+			await session.followUp("after handoff");
+		} catch (error) {
+			rejection = error;
+		}
+		expect(String((rejection as Error | undefined)?.message ?? "")).not.toMatch(/handoff is in progress/i);
+	});
+
+	it("owns the shared transition lease and rejects every other identity transition (handoff → others)", async () => {
+		const gate = Promise.withResolvers<void>();
+		vi.spyOn(compactionModule, "generateHandoff").mockImplementation(async () => {
+			await gate.promise;
+			return "## Goal\nContinue";
+		});
+		const handoffPromise = session.handoff();
+		await Bun.sleep(5); // let handoff acquire the shared session-transition lease
+
+		// Every session-identity transition acquires the same lease at its entry, so
+		// each is rejected as "busy" while the handoff owns it. This proves the lease
+		// is shared (not a handoff-only guard) and covers the newly-wrapped fork /
+		// clearContext / navigateTree paths alongside compact / new / switch / branch.
+		const attempts: Array<[string, () => Promise<unknown>]> = [
+			["compact", () => session.compact()],
+			["newSession", () => session.newSession()],
+			["switchSession", () => session.switchSession(path.join(tempDir.path(), "other.session"))],
+			["branch", () => session.branch("missing-entry")],
+			["clearContext", () => session.clearContext()],
+			["fork", () => session.fork()],
+			["navigateTree", () => session.navigateTree("missing-target")],
+		];
+		for (const [name, run] of attempts) {
+			let caught: unknown;
+			try {
+				await run();
+			} catch (error) {
+				caught = error;
+			}
+			expect(caught, `${name} should reject while a handoff owns the lease`).toBeInstanceOf(Error);
+			expect((caught as { code?: string }).code).toBe("busy");
+			expect(String((caught as Error).message)).toMatch(/while a handoff transition is in progress/i);
+		}
+
+		// No competing transition mutated the session: still no successor/handoff entry.
+		expect(
+			sessionManager.getBranch().filter(entry => entry.type === "custom_message" && entry.customType === "handoff"),
+		).toHaveLength(0);
+
+		gate.resolve();
+		await handoffPromise;
+	});
+
+	it("rejects a handoff before mutation while a non-handoff transition owns the lease (compact → handoff)", async () => {
+		session.settings.set("compaction.keepRecentTokens", 1);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		const assistant: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "large response" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			stopReason: "stop",
+			usage: {
+				input: 4000,
+				output: 100,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 4100,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		sessionManager.appendMessage({ role: "user", content: "u".repeat(8000), timestamp: Date.now() });
+		sessionManager.appendMessage(assistant);
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+		const branch = sessionManager.getBranch();
+		const firstKeptEntryId = branch[branch.length - 1]!.id;
+		const gate = Promise.withResolvers<void>();
+		// Deferred compaction call: compact() has already acquired the shared lease and
+		// awaits here, so the lease is held deterministically without any timing race.
+		vi.spyOn(compactionModule, "compact").mockImplementation(async () => {
+			await gate.promise;
+			return {
+				summary: "compacted",
+				shortSummary: "short",
+				firstKeptEntryId,
+				tokensBefore: 4100,
+				details: {},
+			};
+		});
+
+		const compactPromise = session.compact();
+		await Bun.sleep(5); // compact acquires the lease, then suspends on the deferred call
+
+		let caught: unknown;
+		try {
+			await session.handoff();
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(Error);
+		expect((caught as { code?: string }).code).toBe("busy");
+		expect(String((caught as Error).message)).toMatch(/while a compact transition is in progress/i);
+		// Reverse-direction symmetry: handoff is rejected at its own lease acquisition,
+		// before any session mutation — no compaction entry was appended yet.
+		expect(sessionManager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(0);
+
+		gate.resolve();
+		await compactPromise.catch(() => {});
 	});
 });

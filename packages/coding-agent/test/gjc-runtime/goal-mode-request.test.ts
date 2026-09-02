@@ -14,7 +14,9 @@ import { sessionStateDir, sessionUltragoalDir } from "@gajae-code/coding-agent/g
 import {
 	buildSessionContext,
 	loadEntriesFromFile,
+	SessionContextTooLargeError,
 	type SessionEntry,
+	SessionManagerTestHooks,
 } from "@gajae-code/coding-agent/session/session-manager";
 
 const TEST_SESSION_ID = "test-session";
@@ -24,11 +26,16 @@ let priorSessionId: string | undefined;
 beforeAll(() => {
 	priorSessionId = process.env.GJC_SESSION_ID;
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+	// Pin the session-context budget to 64 MiB in-process via the test hook so the
+	// 40 MiB overflow fixture is deterministic under any production default. This
+	// does not leak into spawned subprocesses (unlike process.env).
+	SessionManagerTestHooks.sessionContextBudgetBytesOverride = 64 * 1024 * 1024;
 });
 
 afterAll(() => {
 	if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
 	else delete process.env.GJC_SESSION_ID;
+	delete SessionManagerTestHooks.sessionContextBudgetBytesOverride;
 });
 
 async function tempDir(): Promise<string> {
@@ -72,6 +79,7 @@ describe("GJC ultragoal goal mode request", () => {
 		expect(request?.objective).toBe("Complete ultragoal");
 		expect(request?.source).toBe("ultragoal");
 		expect(consumedAgain).toBeNull();
+		expect(request?.provenance).toEqual({ source: "ultragoal", runId: TEST_SESSION_ID, goalId: "aggregate" });
 	});
 
 	it("does not let a concurrent session consume another session's pending request", async () => {
@@ -117,6 +125,12 @@ describe("GJC ultragoal goal mode request", () => {
 		expect(request?.sessionId).toBe("session-X");
 	});
 
+	it("compares pending request ownership with the resolved session id", async () => {
+		const root = await tempDir();
+		await writePendingGoalModeRequest({ cwd: root, objective: "Complete ultragoal", sessionId: TEST_SESSION_ID });
+		expect((await consumePendingGoalModeRequest(root))?.sessionId).toBe(TEST_SESSION_ID);
+	});
+
 	it("writes goal mode state into the current session file", async () => {
 		const root = await tempDir();
 		const sessionFile = path.join(root, "session.jsonl");
@@ -152,6 +166,7 @@ describe("GJC ultragoal goal mode request", () => {
 			status: "active",
 			tokensUsed: 0,
 		});
+		expect(context.modeData?.goal).not.toHaveProperty("provenance");
 	});
 
 	it("does not overwrite an existing active session goal", async () => {
@@ -285,6 +300,29 @@ describe("GJC ultragoal goal mode request", () => {
 		);
 		const context = buildSessionContext(entries);
 		expect(context.modeData?.goal).toMatchObject(existingGoal);
+	}, 15_000);
+
+	it("surfaces the exported typed overflow from the session context build", async () => {
+		const root = await tempDir();
+		const sessionFile = path.join(root, "session.jsonl");
+		const timestamp = new Date().toISOString();
+		await Bun.write(
+			sessionFile,
+			[
+				JSON.stringify({ type: "session", version: 5, id: "overflow", timestamp, cwd: root }),
+				JSON.stringify({
+					type: "message",
+					id: "big",
+					parentId: null,
+					timestamp,
+					message: { role: "user", content: "x".repeat(40_000_000), timestamp: 1 },
+				}),
+			].join("\n"),
+		);
+
+		await expect(
+			writeCurrentSessionGoalModeState({ sessionFile, objective: "Complete generated plan" }),
+		).rejects.toThrow(SessionContextTooLargeError);
 	});
 
 	it("surfaces corrupt pending request json", async () => {

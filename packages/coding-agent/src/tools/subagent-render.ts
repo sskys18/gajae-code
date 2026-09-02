@@ -11,7 +11,7 @@ import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
-import { renderSubagentLiveProgress } from "../task/render";
+import { providerRetryPhaseLabel } from "../task/provider-retry-status";
 import { Ellipsis, Hasher, renderStatusLine } from "../tui";
 import {
 	formatDuration,
@@ -21,7 +21,14 @@ import {
 	type ToolUIStatus,
 	truncateToWidth,
 } from "./render-utils";
-import { type SubagentSnapshot, type SubagentToolDetails, subagentAwaitRenderedStateSignature } from "./subagent";
+import {
+	type SubagentLiveProgress,
+	type SubagentSnapshot,
+	type SubagentToolDetails,
+	subagentAwaitRenderedStateSignature,
+} from "./subagent";
+
+export { subagentAwaitRenderedStateSignature } from "./subagent";
 
 const PREVIEW_LINES_COLLAPSED = 1;
 const PREVIEW_LINES_EXPANDED = 4;
@@ -40,7 +47,8 @@ const PREVIEW_LINE_WIDTH = 80;
  * wall-clock displays are deliberately kept OUT of the cached body — the animated
  * spinner and the fresh duration live in the cheap per-subagent status line, and
  * `renderSubagentLiveProgress` is invoked with `staticTime` so current-tool elapsed
- * and retry countdowns are never baked into cached lines.
+ * and retry countdowns are never baked into cached lines. Snapshots with an active
+ * retry anywhere in their nested task tree bypass this cache and render dynamically.
  */
 const SUBAGENT_BODY_CACHE_MAX = 128;
 const subagentBodyCache = new Map<bigint, string[]>();
@@ -75,6 +83,39 @@ export const subagentBodyCacheTestHooks = {
 	},
 };
 
+function snapshotHasActiveRetry(snapshot: SubagentSnapshot): boolean {
+	if (snapshot.liveProgressAvailable === false || !snapshot.progress) return false;
+	return hasActiveProviderRetryInProgress(snapshot.progress);
+}
+
+function hasActiveProviderRetryInProgress(progress: SubagentLiveProgress): boolean {
+	return progress.status === "running" && progress.retryState !== undefined;
+}
+
+function providerProgressAgeLabel(progress: SubagentLiveProgress["retryState"], nowMs: number): string {
+	if (progress?.lastProviderProgressAtMs === undefined) return "no provider events yet";
+	const ageSeconds = Math.max(0, Math.floor((nowMs - progress.lastProviderProgressAtMs) / 1000));
+	return `last provider progress ${ageSeconds}s ago`;
+}
+
+function collectProviderDegradationGroups(
+	progress: readonly SubagentLiveProgress[],
+): Array<{ provider: string; count: number }> {
+	const counts = new Map<string, number>();
+	for (const item of progress) {
+		if (item.status !== "running" || !item.retryState) continue;
+		const provider = item.retryState.provider ?? "provider";
+		counts.set(provider, (counts.get(provider) ?? 0) + 1);
+	}
+	return Array.from(counts, ([provider, count]) => ({ provider, count }))
+		.filter(group => group.count > 1)
+		.sort((a, b) => b.count - a.count || a.provider.localeCompare(b.provider));
+}
+
+function boundSubagentBodyLines(lines: string[], width: number): string[] {
+	return lines.map(line => (line.length > 0 ? truncateToWidth(replaceTabs(line), width, Ellipsis.Omit) : ""));
+}
+
 function renderCachedSubagentBody(
 	snapshot: SubagentSnapshot,
 	signature: string,
@@ -90,9 +131,7 @@ function renderCachedSubagentBody(
 		subagentBodyCache.set(key, hit);
 		return hit;
 	}
-	const lines = renderSubagentSnapshotBody(snapshot, expanded, theme).map(line =>
-		line.length > 0 ? truncateToWidth(line, width, Ellipsis.Omit) : "",
-	);
+	const lines = boundSubagentBodyLines(renderSubagentSnapshotBody(snapshot, expanded, theme), width);
 	subagentBodyRenderCount += 1;
 	subagentBodyCache.set(key, lines);
 	if (subagentBodyCache.size > SUBAGENT_BODY_CACHE_MAX) {
@@ -100,6 +139,16 @@ function renderCachedSubagentBody(
 		if (oldest !== undefined) subagentBodyCache.delete(oldest);
 	}
 	return lines;
+}
+
+function renderDynamicSubagentBody(
+	snapshot: SubagentSnapshot,
+	expanded: boolean,
+	width: number,
+	theme: Theme,
+): string[] {
+	subagentBodyRenderCount += 1;
+	return boundSubagentBodyLines(renderSubagentSnapshotBody(snapshot, expanded, theme, false), width);
 }
 
 function statusIconKind(status: SubagentSnapshot["status"]): ToolUIStatus {
@@ -128,16 +177,92 @@ function renderSubagentStatusLine(snapshot: SubagentSnapshot, theme: Theme, spin
 		theme,
 		snapshot.status === "running" ? spinnerFrame : undefined,
 	);
-	const id = theme.fg("muted", snapshot.id);
-	const status = theme.fg("dim", snapshot.status);
+	const id = theme.fg("muted", truncateToWidth(replaceTabs(snapshot.id), PREVIEW_LINE_WIDTH, Ellipsis.Unicode));
+	const retryState = snapshot.liveProgressAvailable !== false ? snapshot.progress?.retryState : undefined;
+	const status = retryState
+		? theme.fg(
+				"warning",
+				`provider degraded · ${providerRetryPhaseLabel(retryState.kind)} · ${providerProgressAgeLabel(retryState, Date.now())}`,
+			)
+		: theme.fg("dim", snapshot.status);
 	const duration = theme.fg("dim", formatDuration(snapshot.durationMs));
 	return `${icon} ${id} ${status} ${duration}`;
 }
 
-// Heavy, cacheable per-subagent body: a pure function of (snapshot content, expanded,
-// theme). No spinner frame and no wall-clock displays leak in (live progress uses
-// `staticTime`), so the module body cache can never serve stale or frozen-ticking lines.
-function renderSubagentSnapshotBody(snapshot: SubagentSnapshot, expanded: boolean, theme: Theme): string[] {
+function renderSubagentLiveProgress(
+	progress: SubagentLiveProgress,
+	expanded: boolean,
+	theme: Theme,
+	spinnerFrame?: number,
+	staticTime = false,
+): string[] {
+	const lines: string[] = [];
+	const prefix = theme.fg("dim", theme.tree.last);
+	const iconColor = progress.status === "failed" || progress.status === "aborted" ? "error" : "accent";
+	const icon = formatStatusIcon(
+		progress.status === "completed" ? "success" : progress.status === "failed" ? "error" : "info",
+		theme,
+		progress.status === "running" ? spinnerFrame : undefined,
+	);
+	let statusLine = `${prefix} ${theme.fg(iconColor, icon)} ${theme.fg("accent", progress.id)}`;
+	if (progress.fastMode && theme.icon.fast) statusLine += ` ${theme.icon.fast}`;
+	if (progress.retryState && progress.status === "running") {
+		statusLine += ` ${theme.fg("warning", "provider degraded")}`;
+	}
+	lines.push(statusLine);
+
+	const continuePrefix = "   ";
+	if (progress.status === "running") {
+		const tool = progress.currentTool ?? progress.recentTool;
+		if (tool) lines.push(`${continuePrefix}${theme.tree.hook} ${theme.fg("muted", tool)}`);
+	}
+	if (progress.recentOutputSummary) {
+		const count = progress.recentOutputSummary.lineCount;
+		lines.push(
+			`${continuePrefix}${theme.tree.hook} ${theme.fg("dim", `recent output available (${count} ${count === 1 ? "line" : "lines"})`)}`,
+		);
+	}
+	if (progress.retryState && progress.status === "running") {
+		const retry = progress.retryState;
+		const attemptLabel = retry.unbounded
+			? `attempt ${retry.attempt}, unbounded`
+			: `attempt ${retry.attempt} of ${retry.maxAttempts}, bounded`;
+		const progressAge = staticTime ? "" : ` · ${providerProgressAgeLabel(retry, Date.now())}`;
+		let waitLabel = "";
+		if (!staticTime) {
+			const remainingMs = Math.max(0, retry.startedAtMs + retry.delayMs - Date.now());
+			waitLabel = remainingMs > 0 ? ` in ${formatDuration(remainingMs)}` : " now";
+		}
+		lines.push(
+			`${continuePrefix}${theme.tree.hook} ${theme.fg("warning", `${providerRetryPhaseLabel(retry.kind)} · retrying ${attemptLabel}${waitLabel}${progressAge}`)}`,
+		);
+	}
+	if (progress.retryFailure && progress.status !== "running") {
+		const attempts = progress.retryFailure.attempt;
+		lines.push(
+			`${continuePrefix}${theme.tree.hook} ${theme.fg("error", `auto-retry gave up after ${attempts} attempt${attempts === 1 ? "" : "s"}`)}`,
+		);
+	}
+	if (
+		expanded &&
+		progress.status === "running" &&
+		!progress.currentTool &&
+		!progress.recentTool &&
+		!progress.recentOutputSummary
+	) {
+		lines.push(`${continuePrefix}${theme.fg("dim", "running, no approved activity summary yet")}`);
+	}
+	return lines;
+}
+
+// Heavy per-subagent body. The cache path uses staticTime=true; the bounded dynamic
+// path opts into wall-clock displays when an active retry exists in the nested tree.
+function renderSubagentSnapshotBody(
+	snapshot: SubagentSnapshot,
+	expanded: boolean,
+	theme: Theme,
+	staticTime = true,
+): string[] {
 	const lines: string[] = [];
 
 	// Static receipt fields (parity with the markdown content for non-await actions).
@@ -146,16 +271,36 @@ function renderSubagentSnapshotBody(snapshot: SubagentSnapshot, expanded: boolea
 		lines.push(`  ${theme.fg("dim", `Agent: ${snapshot.agent} (${snapshot.agentSource})`)}`);
 	}
 	if (snapshot.effectiveModel) {
+		// Fast mode is a property of the tier this model runs under, so the ⚡ glyph
+		// belongs on the model line rather than the id.
+		const fastSuffix = snapshot.fastMode && theme.icon.fast ? ` ${theme.icon.fast}` : "";
 		if (snapshot.modelFellBack && snapshot.requestedModel) {
 			lines.push(
-				`  ${theme.fg("warning", `Model: ${snapshot.effectiveModel} (requested ${snapshot.requestedModel}, fell back — no credentials)`)}`,
+				`  ${theme.fg("warning", `Model: ${snapshot.effectiveModel} (requested ${snapshot.requestedModel}, fell back — no credentials)`)}${fastSuffix}`,
 			);
 		} else {
-			lines.push(`  ${theme.fg("dim", `Model: ${snapshot.effectiveModel}`)}`);
+			lines.push(`  ${theme.fg("dim", `Model: ${snapshot.effectiveModel}`)}${fastSuffix}`);
 		}
 	}
 	if (snapshot.description) lines.push(`  ${theme.fg("dim", `Description: ${snapshot.description}`)}`);
 	if (snapshot.outputRef) lines.push(`  ${theme.fg("dim", `Output: ${snapshot.outputRef}`)}`);
+	if (snapshot.setupFailureSummary) {
+		lines.push(`  ${theme.fg("error", `Setup failure: ${snapshot.setupFailureSummary}`)}`);
+	}
+	if (snapshot.localErrorSummary) {
+		const local = snapshot.localErrorSummary;
+		lines.push(`  ${theme.fg("error", `Local failure (${local.kind}): ${local.summary}`)}`);
+		// Kind-conditional guidance: an overflow is a staging limit that
+		// reproduces on re-issue; a snapshot failure is a serialization
+		// defect. Rendering the wrong one mislabels the failure mode.
+		const guidance =
+			local.kind === "local_buffer_overflow"
+				? "Local gjc staging-buffer limit, not a provider or context-window failure; re-issuing reproduces it."
+				: local.kind === "local_snapshot_failure"
+					? "Local gjc event-serialization defect, not a provider failure; safe to retry."
+					: undefined;
+		if (guidance) lines.push(`  ${theme.fg("dim", guidance)}`);
+	}
 	if (snapshot.assignment) {
 		lines.push(`  ${theme.fg("dim", "Assignment:")}`);
 		for (const al of snapshot.assignment.split("\n")) lines.push(`    ${theme.fg("toolOutput", replaceTabs(al))}`);
@@ -172,13 +317,13 @@ function renderSubagentSnapshotBody(snapshot: SubagentSnapshot, expanded: boolea
 	// exists (subagent.ts #liveProgressFields), but the renderer also honors an
 	// explicit `liveProgressAvailable: false` so stale retained progress can never
 	// resurrect a live panel (AC5). `staticTime` keeps wall-clock displays out of
-	// these cached lines.
+	// cached lines when the body is served by the cache.
 	if (snapshot.progress && snapshot.liveProgressAvailable !== false) {
-		for (const pl of renderSubagentLiveProgress(snapshot.progress, expanded, theme, undefined, true)) {
+		for (const pl of renderSubagentLiveProgress(snapshot.progress, expanded, theme, undefined, staticTime)) {
 			lines.push(`  ${pl}`);
 		}
 	} else if (snapshot.liveProgressAvailable && (snapshot.status === "running" || snapshot.status === "queued")) {
-		lines.push(`  ${theme.fg("dim", "running, no activity yet")}`);
+		lines.push(`  ${theme.fg("dim", "running, no approved activity summary yet")}`);
 	}
 
 	const preview = snapshot.errorText?.trim() || snapshot.resultText?.trim();
@@ -195,7 +340,12 @@ function renderSubagentSnapshotBody(snapshot: SubagentSnapshot, expanded: boolea
 		}
 	}
 
-	if (snapshot.guidance) lines.push(`  ${theme.fg("dim", snapshot.guidance)}`);
+	if (snapshot.guidance) {
+		for (const line of getPreviewLines(snapshot.guidance, 1, PREVIEW_LINE_WIDTH, Ellipsis.Unicode)) {
+			lines.push(`  ${theme.fg("dim", replaceTabs(line))}`);
+		}
+	}
+
 	return lines;
 }
 
@@ -218,6 +368,8 @@ export const subagentToolRenderer = {
 		}
 
 		const runningCount = subagents.filter(s => s.status === "running").length;
+		const failedCount = subagents.filter(s => s.status === "failed" || s.status === "not_found").length;
+		const interrupted = result.details?.interrupted === true;
 
 		// Each snapshot's rendered-state signature is constant for this component
 		// instance, so compute them at most once; the heavy per-subagent bodies are
@@ -232,34 +384,64 @@ export const subagentToolRenderer = {
 				// it is never gated by the heavy body cache.
 				const header = renderStatusLine(
 					{
-						icon: runningCount > 0 ? "info" : "success",
-						spinnerFrame: runningCount > 0 ? options.spinnerFrame : undefined,
-						title: "Subagent",
-						description:
-							runningCount > 0
+						icon: interrupted ? "warning" : runningCount > 0 ? "info" : failedCount > 0 ? "error" : "success",
+						spinnerFrame: !interrupted && runningCount > 0 ? options.spinnerFrame : undefined,
+						title: interrupted ? "Subagent await interrupted" : failedCount > 0 ? "Subagent failed" : "Subagent",
+						description: interrupted
+							? "child subagents continue"
+							: runningCount > 0
 								? `awaiting ${runningCount} of ${subagents.length}`
-								: `${subagents.length} ${subagents.length === 1 ? "subagent" : "subagents"}`,
+								: failedCount > 0
+									? `${failedCount} ${failedCount === 1 ? "subagent" : "subagents"} failed`
+									: `${subagents.length} ${subagents.length === 1 ? "subagent" : "subagents"}`,
 					},
 					theme,
 				);
-				const out: string[] = [truncateToWidth(header, width, Ellipsis.Omit)];
+				const out: string[] = [truncateToWidth(replaceTabs(header), width, Ellipsis.Omit)];
 				// Discoverability: the inline panel is a bounded preview; the session
 				// observer (ctrl+s) streams the full per-subagent message history.
 				if (runningCount > 0) {
-					out.push(truncateToWidth(`  ${theme.fg("dim", "(ctrl+s to observe sessions)")}`, width, Ellipsis.Omit));
-				}
-
-				snapshotSignatures ??= subagents.map(snapshot => subagentAwaitRenderedStateSignature([snapshot]));
-				subagents.forEach((snapshot, index) => {
-					// Fresh per-subagent status line (cheap), then the cached heavy body.
 					out.push(
 						truncateToWidth(
-							renderSubagentStatusLine(snapshot, theme, options.spinnerFrame),
+							replaceTabs(`  ${theme.fg("dim", "(ctrl+s to observe sessions)")}`),
 							width,
 							Ellipsis.Omit,
 						),
 					);
-					out.push(...renderCachedSubagentBody(snapshot, snapshotSignatures![index]!, expanded, width, theme));
+				}
+				const liveProgress = subagents.flatMap(snapshot =>
+					snapshot.progress && snapshot.liveProgressAvailable !== false ? [snapshot.progress] : [],
+				);
+				for (const group of collectProviderDegradationGroups(liveProgress)) {
+					out.push(
+						truncateToWidth(
+							replaceTabs(
+								`  ${theme.fg("warning", `provider degraded: ${group.count} subagents retrying on ${group.provider}`)}`,
+							),
+							width,
+							Ellipsis.Omit,
+						),
+					);
+				}
+
+				snapshotSignatures ??= subagents.map(
+					snapshot =>
+						`${subagentAwaitRenderedStateSignature([snapshot], result.details)}:${snapshot.setupFailureSummary ?? ""}:${snapshot.localErrorSummary?.summary ?? ""}`,
+				);
+				subagents.forEach((snapshot, index) => {
+					// Fresh per-subagent status line (cheap), then a cached or dynamic body.
+					out.push(
+						truncateToWidth(
+							replaceTabs(renderSubagentStatusLine(snapshot, theme, options.spinnerFrame)),
+							width,
+							Ellipsis.Omit,
+						),
+					);
+					out.push(
+						...(snapshotHasActiveRetry(snapshot)
+							? renderDynamicSubagentBody(snapshot, expanded, width, theme)
+							: renderCachedSubagentBody(snapshot, snapshotSignatures![index]!, expanded, width, theme)),
+					);
 				});
 				return out;
 			},

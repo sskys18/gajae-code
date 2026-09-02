@@ -217,6 +217,17 @@ impl Shell {
 	pub async fn abort(&self) {
 		self.abort_state.abort().await;
 	}
+
+	/// Abort in-flight work and drop the retained session.
+	///
+	/// `abort` only cancels running commands; a successfully completed command
+	/// keeps its session alive for reuse (see `session_keepalive`). Callers that
+	/// are done with a shell must be able to release the underlying process and
+	/// its resources, otherwise the host keeps them for its whole lifetime.
+	pub async fn close(&self) {
+		self.abort_state.abort().await;
+		*self.session.lock().await = None;
+	}
 }
 
 pub async fn execute_shell(
@@ -365,7 +376,7 @@ async fn run_shell_oneshot(
 	ct: CancelToken,
 ) -> Result<ShellExecuteResult> {
 	let tokio_cancel = CancellationToken::new();
-	let baseline_descendants = process::current_descendant_pids();
+	let baseline_descendants = process::DescendantBaseline::capture();
 
 	let mut task = tokio::spawn({
 		let tokio_cancel = tokio_cancel.clone();
@@ -424,7 +435,7 @@ async fn run_shell_oneshot_streams(
 	ct: CancelToken,
 ) -> Result<ShellExecuteResult> {
 	let tokio_cancel = CancellationToken::new();
-	let baseline_descendants = process::current_descendant_pids();
+	let baseline_descendants = process::DescendantBaseline::capture();
 
 	let mut task = tokio::spawn({
 		let tokio_cancel = tokio_cancel.clone();
@@ -693,7 +704,7 @@ async fn run_shell_command(
 	params.set_fd(OpenFiles::STDERR_FD, stderr_file);
 	params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
 	params.set_cancel_token(cancel_token.clone());
-	let baseline_descendants = process::current_descendant_pids();
+	let baseline_descendants = process::DescendantBaseline::capture();
 	let command_pgid = Arc::new(AtomicI32::new(0));
 	let reader_cancel = CancellationToken::new();
 	let (activity_tx, mut activity_rx) = mpsc::channel::<()>(1);
@@ -893,7 +904,7 @@ async fn run_shell_command_streams(
 	params.set_fd(OpenFiles::STDERR_FD, stderr_file);
 	params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
 	params.set_cancel_token(cancel_token.clone());
-	let baseline_descendants = process::current_descendant_pids();
+	let baseline_descendants = process::DescendantBaseline::capture();
 	let command_pgid = Arc::new(AtomicI32::new(0));
 	let reader_cancel = CancellationToken::new();
 	let (activity_tx, mut activity_rx) = mpsc::channel::<()>(1);
@@ -1101,13 +1112,18 @@ async fn read_output_bytes(
 // Rescan-and-signal loop for cancellation. Each pass picks up descendants
 // spawned during the previous wave's grace period, then exits as soon as no
 // targets remain so unrelated later commands are not swept into old cancels.
-async fn capture_new_process_group<S: std::hash::BuildHasher + Sync>(
-	baseline: HashSet<i32, S>,
+async fn capture_new_process_group(
+	baseline: process::DescendantBaseline,
 	command_pgid: Arc<AtomicI32>,
 ) {
+	if !baseline.observed() {
+		// Without a proven baseline every pre-existing helper looks new, so any
+		// pgid this probe published could belong to an unrelated process.
+		return;
+	}
 	for _ in 0..100 {
 		let mut targets = process::TerminationTargets::new();
-		process::add_new_descendants(&mut targets, &baseline);
+		let _ = process::add_new_descendants(&mut targets, baseline.pids());
 		if let Some(pgid) = targets.first_pgid() {
 			command_pgid.store(pgid, Ordering::SeqCst);
 			return;
@@ -1116,15 +1132,35 @@ async fn capture_new_process_group<S: std::hash::BuildHasher + Sync>(
 	}
 }
 
-async fn terminate_new_descendants<S: std::hash::BuildHasher + Sync>(
-	baseline: &HashSet<i32, S>,
-	command_pgid: i32,
-) {
+async fn terminate_new_descendants(baseline: &process::DescendantBaseline, command_pgid: i32) {
 	const WAVES: u32 = 3;
+	// An unproven baseline cannot be differenced safely: pre-existing processes
+	// would look newly spawned, so a pid diff could signal unrelated work. Fall
+	// back to the one target we know is exclusively ours.
+	//
+	// KNOWN PLATFORM LIMITATION (pre-existing, Windows only): `kill_process_group`
+	// is a no-op on Windows and no pgid is assigned there, so an unproven baseline
+	// leaves a cancelled/timed-out Windows tree unterminated. Differencing against
+	// an empty baseline is *not* a safe substitute — on Windows it would sweep up
+	// concurrent commands' processes. A correct Windows fix needs per-command
+	// ownership (a job object or retained child handles), which is a separate
+	// design change and is tracked as follow-up rather than patched here.
+	if !baseline.observed() {
+		if command_pgid > 0 {
+			let _ = process::kill_process_group(command_pgid, process::TERM_SIGNAL);
+			time::sleep(Duration::from_millis(75)).await;
+			let _ = process::kill_process_group(command_pgid, process::KILL_SIGNAL);
+		}
+		return;
+	}
 	for wave in 0..WAVES {
 		let mut targets = process::TerminationTargets::new();
-		process::add_new_descendants(&mut targets, baseline);
-		if targets.is_empty() && command_pgid <= 0 {
+		let observed = process::add_new_descendants(&mut targets, baseline.pids());
+		// Only an *observed* empty target set proves there is nothing left to kill.
+		// When the process tree could not be read, fall through and keep signalling
+		// the command's process group across every wave instead of reporting a
+		// clean cleanup we cannot substantiate.
+		if observed && targets.is_empty() && command_pgid <= 0 {
 			return;
 		}
 		let signal = if wave == 0 {
@@ -1227,6 +1263,8 @@ fn should_skip_env_var(key: &str) -> bool {
 		"BASH_ENV"
 			| "ENV"
 			| "HISTFILE"
+			| "GJC_SESSION_FILE"
+			| "GJC_MANAGED_OWNER_TRANSCRIPT_PATH"
 			| "HISTTIMEFORMAT"
 			| "HISTCMD"
 			| "PS0"
@@ -1778,7 +1816,7 @@ impl builtins::Command for TimeoutCommand {
 			}
 
 			let cancel_token = context.cancel_token();
-			let baseline_descendants = process::current_descendant_pids();
+			let baseline_descendants = process::DescendantBaseline::capture();
 			let command_pgid = Arc::new(AtomicI32::new(0));
 			let pgid_probe = tokio::spawn(capture_new_process_group(
 				baseline_descendants.clone(),
@@ -1870,6 +1908,17 @@ mod tests {
 
 	#[cfg(unix)]
 	static PROCESS_TEST_LOCK: TokioMutex<()> = TokioMutex::const_new(());
+	#[cfg(unix)]
+	async fn wait_until_descendant_visible(pid: i32) {
+		for _ in 0..100 {
+			if process::current_descendant_pids().contains(&pid) {
+				return;
+			}
+			time::sleep(Duration::from_millis(10)).await;
+		}
+
+		panic!("descendant {pid} did not become visible to process discovery");
+	}
 
 	/// Truth-table coverage for `brush_core::commands::child_session_action`.
 	///
@@ -2050,6 +2099,221 @@ mod tests {
 			child_sid, child_pid,
 			"child PID {child_pid} should be its own session leader after setsid",
 		);
+	}
+
+	/// Standard base64 (RFC 4648, with padding) for the Windows e2e probe below:
+	/// `-EncodedCommand` delivers the PowerShell script without exposing it to
+	/// any shell quoting/expansion layer. Kept local because pi-shell has no
+	/// base64 dependency and the vendored crate cannot be touched for tests.
+	#[cfg(windows)]
+	fn test_base64(input: &[u8]) -> String {
+		const ALPHABET: &[u8; 64] =
+			b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+		let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+		for chunk in input.chunks(3) {
+			let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+			let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+			out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+			out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+			out.push(if chunk.len() > 1 {
+				ALPHABET[(n >> 6) as usize & 63] as char
+			} else {
+				'='
+			});
+			out.push(if chunk.len() > 2 {
+				ALPHABET[n as usize & 63] as char
+			} else {
+				'='
+			});
+		}
+		out
+	}
+
+	/// Windows hidden-console creation-flag contract (#4883). The brush-core
+	/// crate is excluded from the workspace and cannot be tested standalone
+	/// (same reason `child_session_action` truth-table tests live here), so the
+	/// composition surface is re-tested through the public brush API.
+	#[cfg(windows)]
+	mod windows_hidden_console_flags {
+		use std::process::Command;
+
+		use brush_core::commands::CommandWindowControlExt as _;
+
+		#[test]
+		fn consoleless_host_probe_matches_kernel() {
+			// On an ordinary console-attached test runner this is false; what is
+			// pinned is that the trait probe is exactly the GetConsoleWindow
+			// sentinel, not a cached or guessed value.
+			assert_eq!(
+				Command::host_is_consoleless(),
+				unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() }.is_null(),
+			);
+		}
+
+		/// Truth table for the real brush-core composition. std's
+		/// `creation_flags` replaces the whole value, so every Windows flags
+		/// write must flow through this function; these cases pin both halves
+		/// of the contract.
+		#[test]
+		fn spawn_creation_flags_truth_table() {
+			use brush_core::sys::commands::spawn_creation_flags;
+			use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+
+			// Base spawn from a console-less host: hidden console (#4883).
+			assert_eq!(spawn_creation_flags(0, true), CREATE_NO_WINDOW);
+			// Base spawn from a console-attached host: std default (inherit).
+			assert_eq!(spawn_creation_flags(0, false), 0);
+			// Process-group spawns compose, never overwrite, the no-window bit.
+			assert_eq!(
+				spawn_creation_flags(CREATE_NEW_PROCESS_GROUP, true),
+				CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+			);
+			assert_eq!(
+				spawn_creation_flags(CREATE_NEW_PROCESS_GROUP, false),
+				CREATE_NEW_PROCESS_GROUP,
+			);
+			// CREATE_NO_WINDOW is 0x08000000; a wrong constant silently changes
+			// which console behavior every external child gets.
+			assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
+			assert_eq!(CREATE_NEW_PROCESS_GROUP, 0x0200);
+		}
+
+		/// The issue explicitly forbids `DETACHED_PROCESS` (0x00000008): a
+		/// detached child has no console, so its own children would allocate
+		/// fresh *visible* consoles. The composed flags must never carry it.
+		#[test]
+		fn no_window_flag_never_implies_detached_process() {
+			use brush_core::sys::commands::spawn_creation_flags;
+			const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+			assert_eq!(spawn_creation_flags(0, true) & DETACHED_PROCESS, 0);
+		}
+	}
+
+	/// Windows counterpart of
+	/// `embedded_external_command_runs_in_its_own_session`: verifies the #4883
+	/// hidden-console wiring end-to-end through a real embedded brush session.
+	///
+	/// The host-console probe itself is pinned by
+	/// `windows_hidden_console_flags::consoleless_host_probe_matches_kernel`;
+	/// this test covers the *wiring* — that a real brush session spawned
+	/// exactly the way `create_session` builds it passes `CREATE_NO_WINDOW`
+	/// to its external children when the host is console-less, and plain
+	/// default flags (inherit parent console) when the host has a console.
+	///
+	/// The child reports its own console state via `GetConsoleWindow`/
+	/// `IsWindowVisible` P/Invoked from PowerShell, so the assertion reads the
+	/// kernel's view of the spawned child, not a mock:
+	///   - console-less host  → child HAS a console whose window is NOT visible
+	///     (CREATE_NO_WINDOW; `DETACHED_PROCESS` would print `has-console=0` and
+	///     fail the first assert);
+	///   - console-attached host → child inherits this console, and
+	///     `CREATE_NO_WINDOW` must NOT be set (a hidden, different console would
+	///     decouple the child from the interactive terminal).
+	#[cfg(windows)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn embedded_external_command_console_window_visibility_follows_host_console_state() {
+		use std::process::Command;
+
+		use brush_core::sys::commands::CommandWindowControlExt as _;
+
+		let host_consoleless = Command::host_is_consoleless();
+
+		// Three-way console-state probe: handle (GetConsoleWindow — non-null
+		// means a console WINDOW exists), has-console (GetConsoleCP — non-zero
+		// means a console is attached at all; CREATE_NO_WINDOW keeps a headless
+		// one, DETACHED_PROCESS would not), visible (window shown).
+		let script = concat!(
+			"$w = Add-Type -Namespace GjcProbe -Name Win -PassThru -MemberDefinition @'",
+			"\n",
+			"[DllImport(\"kernel32\")] public static extern IntPtr GetConsoleWindow();\n",
+			"[DllImport(\"kernel32\")] public static extern uint GetConsoleCP();\n",
+			"[DllImport(\"user32\")] public static extern bool IsWindowVisible(IntPtr h);\n",
+			"'@\n",
+			"$h = $w::GetConsoleWindow()\n",
+			"Write-Output (\"handle={0} has-console={1} visible={2}\" -f $h, ",
+			"[int]($w::GetConsoleCP() -ne 0), [int]($h -ne [IntPtr]::Zero -and \
+			 $w::IsWindowVisible($h)))"
+		);
+
+		// Build the same kind of session pi-natives uses in production.
+		let config = ShellConfig { session_env: None, snapshot_path: None, minimizer: None };
+		let mut session = create_session(&config).await.expect("create_session");
+
+		let (mut reader, writer) = pipe_to_files("win-console").expect("pipe");
+		let stdout_file = OpenFile::from(writer.try_clone().expect("clone"));
+		let stderr_file = OpenFile::from(writer);
+
+		let mut params = session.shell.default_exec_params();
+		params.set_fd(OpenFiles::STDIN_FD, null_file().expect("null stdin"));
+		params.set_fd(OpenFiles::STDOUT_FD, stdout_file);
+		params.set_fd(OpenFiles::STDERR_FD, stderr_file);
+
+		let source_info = SourceInfo::from("pi-natives:test");
+		// The probe script is delivered base64-encoded (`-EncodedCommand`): no
+		// quoting, variable expansion, or backslash semantics of the brush shell
+		// can mangle it, and powershell.exe itself decodes the payload.
+		// `-EncodedCommand` decodes UTF-16LE, so encode the script's UTF-16
+		// code units rather than its UTF-8 bytes.
+		let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+		let encoded = test_base64(&utf16);
+		let quoted = format!("powershell -NoProfile -NonInteractive -EncodedCommand {encoded}");
+		let exec = session
+			.shell
+			.run_string(&quoted, &source_info, &params)
+			.await
+			.expect("run_string");
+		drop(params);
+
+		assert!(
+			matches!(exec.exit_code, ExecutionExitCode::Success),
+			"powershell console probe failed: {}",
+			exit_code(&exec),
+		);
+
+		// Drain the probe's stdout.
+		let mut output = String::new();
+		use std::io::Read as _;
+		reader
+			.read_to_string(&mut output)
+			.expect("read probe output");
+
+		let has_window = !output.contains("handle=0");
+		let has_console = output.contains("has-console=1");
+		let visible = output.contains("visible=1");
+		assert!(
+			output.contains("handle=")
+				&& output.contains("has-console=")
+				&& output.contains("visible="),
+			"probe produced no parseable result: {output:?}",
+		);
+
+		if host_consoleless {
+			// CREATE_NO_WINDOW contract, three-way discriminated:
+			//   no console window allocated (a flags-0 child of a console-less
+			//   host would allocate a visible one), but a headless console is
+			//   still attached (DETACHED_PROCESS would report none).
+			assert!(
+				!has_window,
+				"console-less host child allocated a console window (#4883 regression); output: \
+				 {output:?}"
+			);
+			assert!(
+				has_console,
+				"console-less host child got no console (DETACHED-like); output: {output:?}"
+			);
+			assert!(
+				!visible,
+				"console-less host child console window is visible (#4883 regression); output: \
+				 {output:?}"
+			);
+		} else {
+			// Console-attached host: child inherits this console untouched.
+			assert!(
+				has_window && has_console,
+				"console-attached host child lost the inherited console; output: {output:?}"
+			);
+		}
 	}
 
 	#[tokio::test]
@@ -2343,12 +2607,12 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn timeout_builtin_reaps_reparented_same_group_grandchild_and_preserves_sibling() {
 		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
-		let sibling = std::process::Command::new("/bin/sh")
-			.arg("-c")
-			.arg("sleep 30")
+		let sibling = std::process::Command::new("sleep")
+			.arg("30")
 			.spawn()
 			.expect("spawn unrelated sibling");
 		let sibling_pid = i32::try_from(sibling.id()).expect("sibling pid should fit i32");
+		wait_until_descendant_visible(sibling_pid).await;
 		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 		let command = "timeout 0.2 perl -e 'if (($pid = fork()) == 0) { $SIG{TERM} = \"IGNORE\"; \
 		               print qq(grandchild=$$ ppid=) . getppid() . qq( pgid=) . getpgrp() . \
@@ -2404,12 +2668,12 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn cancelled_command_reaps_reparented_same_group_grandchild() {
 		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
-		let sibling = std::process::Command::new("/bin/sh")
-			.arg("-c")
-			.arg("sleep 30")
+		let sibling = std::process::Command::new("sleep")
+			.arg("30")
 			.spawn()
 			.expect("spawn unrelated sibling");
 		let sibling_pid = i32::try_from(sibling.id()).expect("sibling pid should fit i32");
+		wait_until_descendant_visible(sibling_pid).await;
 		let cancel = CancelToken::default();
 		let abort = cancel.clone().emplace_abort_token();
 		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
@@ -2460,7 +2724,7 @@ mod tests {
 		);
 
 		abort.abort(AbortReason::Signal);
-		terminate_new_descendants(&process::current_descendant_pids(), command_pgid).await;
+		terminate_new_descendants(&process::DescendantBaseline::capture(), command_pgid).await;
 		time::sleep(Duration::from_millis(500)).await;
 		run.abort();
 		let _ = run.await;
@@ -2688,5 +2952,51 @@ mod tests {
 			stdout.extend_from_slice(&chunk);
 		}
 		assert_eq!(stdout, b"prod:8080");
+	}
+	/// `add_new_descendants` must report whether the process tree was actually
+	/// observed. A successful observation that finds nothing returns `true` with
+	/// an empty target set; only that combination lets
+	/// `terminate_new_descendants` conclude there is nothing left to kill. If
+	/// this ever returns `false` on a healthy host, cancellation cleanup would
+	/// spin its full wave budget; if it returned `true` on an observation
+	/// failure, cleanup would silently leak descendants.
+	#[test]
+	fn descendant_observation_reports_success_on_a_healthy_process_table() {
+		let baseline = process::current_descendant_pids();
+		let mut targets = process::TerminationTargets::new();
+		let observed = process::add_new_descendants(&mut targets, &baseline);
+		assert!(observed, "process tree must be observable on a healthy host");
+	}
+
+	/// A live child must be observed as a descendant and classified as a *new*
+	/// target relative to a baseline captured before it spawned. This pins the
+	/// evidence that the fail-closed signal is derived from a real walk rather
+	/// than a constant.
+	#[cfg(unix)]
+	#[test]
+	fn descendant_observation_sees_a_new_live_child() {
+		let baseline = process::current_descendant_pids();
+		let mut child = std::process::Command::new("sleep")
+			.arg("30")
+			.spawn()
+			.expect("sleep should spawn");
+		let child_pid = i32::try_from(child.id()).expect("child pid should fit i32");
+		assert!(!baseline.contains(&child_pid), "baseline predates the child");
+
+		// Observe without signalling: `add_new_descendants` builds a process-wide
+		// target set, so signalling it here would kill concurrently running tests'
+		// processes. Assert on the observed pid set instead.
+		let observed_pids = process::current_descendant_pids();
+		let mut targets = process::TerminationTargets::new();
+		let observed = process::add_new_descendants(&mut targets, &baseline);
+
+		let _ = child.kill();
+		let _ = child.wait();
+
+		assert!(observed, "process tree must be observable");
+		assert!(
+			observed_pids.contains(&child_pid),
+			"a live child must appear in the observed descendant set",
+		);
 	}
 }

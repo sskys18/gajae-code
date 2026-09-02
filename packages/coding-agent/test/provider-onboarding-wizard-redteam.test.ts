@@ -106,12 +106,36 @@ describe("provider onboarding wizard red-team", () => {
 		controller.showCustomProviderWizard();
 		const wizard = ctx.ui.focused as CustomProviderWizardComponent;
 		driveWizard(wizard, { providerId: "insecure-wizard", baseUrl: "http://api.example.com/v1" });
+		const errorRendered = Promise.withResolvers<void>();
+		ctx.ui.requestRender = () => errorRendered.resolve();
 		wizard.handleInput("\n");
-		await Bun.sleep(20);
+		await errorRendered.promise;
 
 		const rendered = visibleText(wizard);
 		expect(rendered).toContain("Provider setup failed");
 		expect(rendered).toContain("Base URL must use https unless it targets localhost or a loopback address");
+	});
+
+	it("does not report success when config notification rejects and renders the wizard error", async () => {
+		await withRegistry(async registry => {
+			let notificationAttempts = 0;
+			const ctx = createControllerContext(registry, async () => {
+				notificationAttempts++;
+				throw new Error("notification unavailable");
+			});
+			const controller = new SelectorController(ctx);
+			controller.showCustomProviderWizard();
+			const wizard = ctx.ui.focused as CustomProviderWizardComponent;
+			driveWizard(wizard, { providerId: "notify-failure", models: "notify-model" });
+			const errorRendered = Promise.withResolvers<void>();
+			ctx.ui.requestRender = () => errorRendered.resolve();
+			wizard.handleInput("\n");
+			await errorRendered.promise;
+
+			expect(notificationAttempts).toBe(1);
+			expect(ctx.statuses).toEqual([]);
+			expect(visibleText(wizard)).toContain("Provider setup failed: notification unavailable");
+		});
 	});
 
 	it("rejects empty provider id and empty model lists", async () => {
@@ -133,7 +157,7 @@ describe("provider onboarding wizard red-team", () => {
 				apiKeyEnv: "EMPTY_MODELS_KEY",
 				models: ["", "  ", ","],
 			}),
-		).rejects.toThrow("At least one model id is required");
+		).rejects.toThrow("At least one model id or model discovery is required.");
 	});
 
 	it("requires force for an existing provider and overwrites when force is confirmed", async () => {
@@ -187,32 +211,59 @@ describe("provider onboarding wizard red-team", () => {
 	it("refreshes offline, notifies config change, shows formatted result, and exposes new provider in a subsequent model selector read", async () => {
 		await withRegistry(async registry => {
 			const refreshModes: (string | undefined)[] = [];
+			const events: string[] = [];
 			const originalRefresh = registry.refresh.bind(registry);
 			registry.refresh = async mode => {
 				refreshModes.push(mode);
 				await originalRefresh(mode);
+				events.push(`refresh:${mode}`);
 			};
 			let configChanged = 0;
 			const ctx = createControllerContext(registry, () => {
 				configChanged++;
+				events.push("notify");
 			});
+			const successStatus = [
+				"Provider 'visible-provider' configured as openai-compatible.",
+				"Models: visible-model",
+				"Base URL: https://api.example.com/v1",
+				"API key: CUST…_KEY (environment variable)",
+				`Config: ${path.join(tempAgentDir!, "models.yml")}`,
+			].join("\n");
+			const { promise: completion, resolve: resolveCompletion } = Promise.withResolvers<void>();
+			ctx.showStatus = message => {
+				ctx.statuses.push(message);
+				if (message === successStatus) {
+					events.push("success-status");
+					resolveCompletion();
+				}
+			};
 			const controller = new SelectorController(ctx);
 
 			controller.showCustomProviderWizard();
 			const wizard = ctx.ui.focused as CustomProviderWizardComponent;
 			driveWizard(wizard, { providerId: "visible-provider", models: "visible-model" });
 			wizard.handleInput("\n");
-			await Bun.sleep(50);
+			await completion;
 
-			expect(refreshModes).toContain("offline");
+			expect(events).toEqual(["refresh:offline", "notify", "success-status"]);
+			expect(refreshModes).toEqual(["offline"]);
 			expect(configChanged).toBe(1);
-			const status = ctx.statuses.join("\n");
-			expect(status).toContain("Provider 'visible-provider' configured as openai-compatible.");
-			expect(status).toContain("Models: visible-model");
-			expect(status).toContain("API key: CUST…_KEY (environment variable)");
-
-			await registry.refresh("offline");
+			expect(ctx.statuses).toEqual([successStatus]);
 			expect(registry.find("visible-provider", "visible-model")).toBeDefined();
+
+			const selectorLoaded = Promise.withResolvers<void>();
+			let selectorRenderRequests = 0;
+			ctx.ui.requestRender = () => {
+				selectorRenderRequests++;
+				if (selectorRenderRequests === 2) selectorLoaded.resolve();
+			};
+			controller.showModelSelector({ temporaryOnly: true });
+			await selectorLoaded.promise;
+			const selector = ctx.ui.focused as { handleInput(input: string): void; render(width: number): string[] };
+			for (const char of "visible-model") selector.handleInput(char);
+			const selectorText = visibleText(selector);
+			expect(selectorText).toContain("visible-model");
 		});
 	});
 
@@ -270,11 +321,18 @@ function createControllerContext(
 			clear: () => {
 				children.length = 0;
 			},
+			detachChild: () => {},
 			addChild: (child: unknown) => {
 				children.push(child);
 			},
 		},
-		session: { modelRegistry, scopedModels: [] },
+		session: {
+			modelRegistry,
+			scopedModels: [],
+			isFastForProvider: () => false,
+			isFastForSubagentProvider: () => false,
+			isFastModeActive: () => false,
+		},
 		sessionManager: { getCwd: () => process.cwd() },
 		settings: createSettingsStub(),
 		showStatus: (message: string) => statuses.push(message),

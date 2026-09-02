@@ -8,8 +8,15 @@ import { Settings } from "../../src/config/settings";
 import type { BashInterceptorRule } from "../../src/config/settings-schema";
 import { disposeAllShellSessions, getShellSessionCount } from "../../src/exec/bash-executor";
 import type { ToolSession } from "../../src/tools";
-import { BashTool, type BashToolInput } from "../../src/tools/bash";
+import {
+	BashTool,
+	type BashToolInput,
+	isStrictDirectSdkSpawnCommand,
+	masterCommandEnvOverrides,
+	parseDirectSdkSpawnArgs,
+} from "../../src/tools/bash";
 import * as shellSnapshot from "../../src/utils/shell-snapshot";
+import { stubBashExecutorSettings } from "../helpers/tool-session-settings";
 
 afterEach(async () => {
 	vi.restoreAllMocks();
@@ -19,6 +26,9 @@ afterEach(async () => {
 function createBashTool(rules: BashInterceptorRule[]): BashTool {
 	const session = {
 		settings: {
+			has(key: string) {
+				return this.get(key) !== undefined;
+			},
 			get(key: string) {
 				if (key === "bashInterceptor.enabled") return true;
 				if (key === "async.enabled") return false;
@@ -29,11 +39,47 @@ function createBashTool(rules: BashInterceptorRule[]): BashTool {
 			getBashInterceptorRules() {
 				return rules;
 			},
+			...stubBashExecutorSettings,
 		},
 	} as unknown as ToolSession;
 
 	return new BashTool(session);
 }
+
+describe("Bash master capability command boundary", () => {
+	it("allows only a direct shell-syntax-free sdk spawn", () => {
+		expect(isStrictDirectSdkSpawnCommand("gjc sdk spawn --cwd /tmp --prompt task")).toBe(true);
+		expect(isStrictDirectSdkSpawnCommand("gjc sdk spawn --prompt 'task with spaces'")).toBe(true);
+		expect(isStrictDirectSdkSpawnCommand("gjc sdk spawn --prompt 'Investigate issue #4420 $HOME [urgent]'")).toBe(
+			true,
+		);
+		expect(isStrictDirectSdkSpawnCommand("gjc sdk spawn --prompt task; env")).toBe(false);
+		expect(isStrictDirectSdkSpawnCommand("gjc sdk spawn --prompt $(cat secret)")).toBe(false);
+		expect(isStrictDirectSdkSpawnCommand("printf x | gjc sdk spawn --cwd /tmp --prompt task")).toBe(false);
+		expect(
+			isStrictDirectSdkSpawnCommand("env GJC_MASTER_CAPABILITY=forged gjc sdk spawn --cwd /tmp --prompt task"),
+		).toBe(false);
+		expect(
+			masterCommandEnvOverrides(
+				{ PATH: "/tmp/fake", LD_PRELOAD: "/tmp/steal.so", FOO: "bar", GJC_MASTER_CAPABILITY: "forged" },
+				true,
+			),
+		).toEqual({});
+	});
+});
+
+describe("Direct master spawn argument parsing", () => {
+	it("accepts --idempotency-key so uncertain spawns can be replayed", () => {
+		const args = parseDirectSdkSpawnArgs("gjc sdk spawn --cwd /repo --prompt task --idempotency-key retry-key-1");
+		expect(args).toEqual({ cwd: "/repo", prompt: "task", idempotencyKey: "retry-key-1" });
+	});
+
+	it("still rejects agent directory overrides", () => {
+		expect(() => parseDirectSdkSpawnArgs("gjc sdk spawn --cwd /repo --prompt task --agent-dir /tmp/x")).toThrow(
+			"Master spawn cannot override the session agent directory.",
+		);
+	});
+});
 
 describe("BashTool interception", () => {
 	it("checks the original command before leading cd normalization", async () => {
@@ -92,6 +138,9 @@ describe("BashTool head/tail stripping", () => {
 			getSessionFile: () => null,
 			getSessionId: () => undefined,
 			settings: {
+				has(key: string) {
+					return this.get(key) !== undefined;
+				},
 				get(key: string) {
 					if (key === "bashInterceptor.enabled") return false;
 					if (key === "async.enabled") return false;
@@ -103,6 +152,7 @@ describe("BashTool head/tail stripping", () => {
 				getBashInterceptorRules() {
 					return [];
 				},
+				...stubBashExecutorSettings,
 			},
 		} as unknown as ToolSession;
 		return new BashTool(session);
@@ -144,6 +194,9 @@ describe("BashTool restricted role-agent allowlist", () => {
 			bashAllowedPrefixes,
 			bashRestrictionProfile,
 			settings: {
+				has(key: string) {
+					return this.get(key) !== undefined;
+				},
 				get(key: string) {
 					if (key === "bashInterceptor.enabled") return false;
 					if (key === "async.enabled") return false;
@@ -155,6 +208,7 @@ describe("BashTool restricted role-agent allowlist", () => {
 				getBashInterceptorRules() {
 					return [];
 				},
+				...stubBashExecutorSettings,
 			},
 		} as unknown as ToolSession;
 		return new BashTool(session);

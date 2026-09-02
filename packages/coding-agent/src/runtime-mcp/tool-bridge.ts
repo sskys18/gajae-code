@@ -4,7 +4,7 @@
  * Converts MCP tool definitions to CustomTool format for the agent.
  */
 import type { AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import type { TSchema } from "@gajae-code/ai";
+import type { TSchema } from "@gajae-code/ai/core";
 import { normalizeSchemaForMCP } from "@gajae-code/ai/utils/schema";
 import { untilAborted } from "@gajae-code/utils";
 import type { SourceMeta } from "../capability/types";
@@ -17,11 +17,37 @@ import type {
 import type { Theme } from "../modes/theme/theme";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { callTool } from "./client";
+import type { MCPPoolLease } from "./pool";
 import { renderMCPCall, renderMCPResult } from "./render";
-import type { MCPContent, MCPServerConnection, MCPToolCallParams, MCPToolCallResult, MCPToolDefinition } from "./types";
+import type {
+	MCPContent,
+	MCPInputRequestHandler,
+	MCPRequestOptions,
+	MCPServerConnection,
+	MCPToolCallParams,
+	MCPToolCallResult,
+	MCPToolDefinition,
+} from "./types";
 
 /** Reconnect callback: tears down stale connection, returns new one or null. */
 export type MCPReconnect = () => Promise<MCPServerConnection | null>;
+
+type MCPToolTarget = MCPServerConnection | MCPPoolLease;
+
+/** Options shared by MCPTool and DeferredMCPTool. */
+export interface MCPToolOptions {
+	/** Shared lease policy: never retry the original request after transport/auth failure. */
+	noReplay?: boolean;
+	/**
+	 * Lazy resolver for the modern MRTR `input_required` handler, registered by the
+	 * owning manager/runtime. Resolved per call so late registration still applies.
+	 */
+	inputHandler?: () => MCPInputRequestHandler | undefined;
+}
+
+function connectionForTool(target: MCPToolTarget): MCPServerConnection {
+	return "connectionForLease" in target ? target.connectionForLease() : target;
+}
 
 /**
  * Network-level and stale-session errors that warrant a reconnect + single retry.
@@ -218,22 +244,40 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 	/** Server name */
 	readonly mcpServerName: string;
 
-	/** Create MCPTool instances for all tools from an MCP server connection */
-	static fromTools(connection: MCPServerConnection, tools: MCPToolDefinition[], reconnect?: MCPReconnect): MCPTool[] {
-		return tools.map(tool => new MCPTool(connection, tool, reconnect));
+	private connection: MCPServerConnection;
+	#noReplay = false;
+	#inputHandlerResolver: (() => MCPInputRequestHandler | undefined) | undefined;
+
+	#callOptions(signal?: AbortSignal): MCPRequestOptions {
+		const inputHandler = this.#inputHandlerResolver?.();
+		return { signal, noReplay: this.#noReplay, ...(inputHandler ? { inputHandler } : {}) };
+	}
+	/** Create MCPTool instances for all tools from an MCP server lease/connection. */
+	static fromTools(
+		target: MCPToolTarget,
+		tools: MCPToolDefinition[],
+		reconnect?: MCPReconnect,
+		options?: MCPToolOptions,
+	): MCPTool[] {
+		return tools.map(tool => new MCPTool(target, tool, reconnect, options));
 	}
 
 	constructor(
-		private connection: MCPServerConnection,
+		target: MCPToolTarget,
 		private readonly tool: MCPToolDefinition,
 		private readonly reconnect?: MCPReconnect,
+		options?: MCPToolOptions,
 	) {
-		this.name = createMCPToolName(connection.name, tool.name);
-		this.label = `${connection.name}/${tool.name}`;
-		this.description = tool.description ?? `MCP tool from ${connection.name}`;
+		const resolvedConnection = connectionForTool(target);
+		this.connection = resolvedConnection;
+		this.#noReplay = options?.noReplay === true;
+		this.#inputHandlerResolver = options?.inputHandler;
+		this.name = createMCPToolName(resolvedConnection.name, tool.name);
+		this.label = `${resolvedConnection.name}/${tool.name}`;
+		this.description = tool.description ?? `MCP tool from ${resolvedConnection.name}`;
 		this.parameters = normalizeSchemaForMCP(tool.inputSchema) as TSchema;
 		this.mcpToolName = tool.name;
-		this.mcpServerName = connection.name;
+		this.mcpServerName = resolvedConnection.name;
 	}
 
 	renderCall(args: unknown, _options: RenderResultOptions, theme: Theme) {
@@ -257,19 +301,21 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		const providerName = this.connection._source?.providerName;
 
 		try {
-			const result = await callTool(this.connection, this.tool.name, args, { signal });
+			const result = await callTool(this.connection, this.tool.name, args, this.#callOptions(signal));
 			return buildResult(result, this.connection.name, this.tool.name, provider, providerName);
 		} catch (error) {
 			rethrowIfAborted(error, signal);
 			if (this.reconnect && isRetriableConnectionError(error)) {
 				const newConn = await reconnectWithAbort(this.reconnect, signal);
 				if (newConn) {
+					if (this.#noReplay)
+						return buildErrorResult(error, this.connection.name, this.tool.name, provider, providerName);
 					// Rebind so subsequent calls on this instance use the fresh connection
 					this.connection = newConn;
 					const retryProvider = newConn._source?.provider ?? provider;
 					const retryProviderName = newConn._source?.providerName ?? providerName;
 					try {
-						const result = await callTool(newConn, this.tool.name, args, { signal });
+						const result = await callTool(newConn, this.tool.name, args, this.#callOptions(signal));
 						return buildResult(result, newConn.name, this.tool.name, retryProvider, retryProviderName);
 					} catch (retryError) {
 						rethrowIfAborted(retryError, signal);
@@ -302,6 +348,13 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 	readonly mcpServerName: string;
 	readonly #fallbackProvider: string | undefined;
 	readonly #fallbackProviderName: string | undefined;
+	#noReplay = false;
+	#inputHandlerResolver: (() => MCPInputRequestHandler | undefined) | undefined;
+
+	#callOptions(signal?: AbortSignal): MCPRequestOptions {
+		const inputHandler = this.#inputHandlerResolver?.();
+		return { signal, noReplay: this.#noReplay, ...(inputHandler ? { inputHandler } : {}) };
+	}
 
 	/** Create DeferredMCPTool instances for all tools from an MCP server */
 	static fromTools(
@@ -310,8 +363,9 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		getConnection: () => Promise<MCPServerConnection>,
 		source?: SourceMeta,
 		reconnect?: MCPReconnect,
+		options?: MCPToolOptions,
 	): DeferredMCPTool[] {
-		return tools.map(tool => new DeferredMCPTool(serverName, tool, getConnection, source, reconnect));
+		return tools.map(tool => new DeferredMCPTool(serverName, tool, getConnection, source, reconnect, options));
 	}
 
 	constructor(
@@ -320,6 +374,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		private readonly getConnection: () => Promise<MCPServerConnection>,
 		source?: SourceMeta,
 		private readonly reconnect?: MCPReconnect,
+		options?: MCPToolOptions,
 	) {
 		this.name = createMCPToolName(serverName, tool.name);
 		this.label = `${serverName}/${tool.name}`;
@@ -329,6 +384,8 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		this.mcpServerName = serverName;
 		this.#fallbackProvider = source?.provider;
 		this.#fallbackProviderName = source?.providerName;
+		this.#noReplay = options?.noReplay === true;
+		this.#inputHandlerResolver = options?.inputHandler;
 	}
 
 	renderCall(args: unknown, _options: RenderResultOptions, theme: Theme) {
@@ -355,7 +412,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 			const connection = await untilAborted(signal, () => this.getConnection());
 			throwIfAborted(signal);
 			try {
-				const result = await callTool(connection, this.tool.name, args, { signal });
+				const result = await callTool(connection, this.tool.name, args, this.#callOptions(signal));
 				return buildResult(
 					result,
 					this.serverName,
@@ -368,10 +425,12 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 				if (this.reconnect && isRetriableConnectionError(callError)) {
 					const newConn = await reconnectWithAbort(this.reconnect, signal);
 					if (newConn) {
+						if (this.#noReplay)
+							return buildErrorResult(callError, this.serverName, this.tool.name, provider, providerName);
 						const retryProvider = newConn._source?.provider ?? provider;
 						const retryProviderName = newConn._source?.providerName ?? providerName;
 						try {
-							const result = await callTool(newConn, this.tool.name, args, { signal });
+							const result = await callTool(newConn, this.tool.name, args, this.#callOptions(signal));
 							return buildResult(result, this.serverName, this.tool.name, retryProvider, retryProviderName);
 						} catch (retryError) {
 							rethrowIfAborted(retryError, signal);
@@ -394,9 +453,9 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 			rethrowIfAborted(connError, signal);
 			if (this.reconnect) {
 				const newConn = await reconnectWithAbort(this.reconnect, signal);
-				if (newConn) {
+				if (newConn && !this.#noReplay) {
 					try {
-						const result = await callTool(newConn, this.tool.name, args, { signal });
+						const result = await callTool(newConn, this.tool.name, args, this.#callOptions(signal));
 						return buildResult(
 							result,
 							this.serverName,

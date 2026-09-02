@@ -1,25 +1,35 @@
 import { existsSync } from "node:fs";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
-import type { SkillDiscoverySettings } from "../config/skill-settings-defaults";
+import { resolveSkillScopeTrust, type SkillDiscoverySettings } from "../config/skill-settings-defaults";
 import { detectDeepInterviewPlaintextAskLeak } from "../deep-interview/plaintext-gate-guard";
+import { captureRepositoryBinding, publicRepositoryBinding } from "../gjc-runtime/repository-binding";
 import { activeSnapshotPath, modeStatePath as sessionModeStatePath } from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
 import { ModeStateSchema, SkillActiveStateSchema } from "../gjc-runtime/state-schema";
 import {
-	readExistingStateForMutation,
+	deleteIfOwned,
+	type GuardedStateWriteReceipt,
+	guardedStateWriteReceipt,
+	matchesGuardedStateWriteReceipt,
+	readActiveEntries,
+	rebuildActiveSnapshot,
+	writeActiveEntry,
 	writeGuardedJsonAtomic,
 	writeGuardedWorkflowEnvelopeAtomic,
 } from "../gjc-runtime/state-writer";
 import { isUltragoalBypassPrompt, verifyUltragoalDurableCompletionState } from "../gjc-runtime/ultragoal-guard";
+import { getSkillManifest } from "../gjc-runtime/workflow-manifest";
 import { buildSessionContext, loadEntriesFromFile, type SessionEntry } from "../session/session-manager";
 import {
 	readVisibleSkillActiveState as readCanonicalVisibleSkillActiveState,
 	type SkillActiveEntry,
 	type SkillActiveState,
 	syncSkillActiveState,
+	upstreamPlanningPipelineSkills,
 } from "../skill-state/active-state";
 import { initialPhaseForSkill } from "../skill-state/initial-phase";
+import { readWorkflowGuardContext } from "../skill-state/workflow-mutation-guard";
 
 // Re-export for existing callers and tests that imported it from this module.
 export { initialPhaseForSkill };
@@ -62,7 +72,7 @@ function formatBoolean(name: string, value: boolean | undefined): string {
 export function buildSanitizedEffectiveSkillConfigContext(input: EffectiveSkillConfigInput | undefined): string {
 	if (!input || input.unavailableReason) {
 		const reason = input?.unavailableReason ? sanitizeConfigValue(input.unavailableReason) : "not available";
-		return `Sanitized effective skill config unavailable (${reason}); bundled GJC workflow activation remains available for deep-interview, ralplan, ultragoal, team.`;
+		return `Sanitized effective skill config unavailable (${reason}); bundled GJC workflow activation remains available for deep-interview, ralplan, ultragoal, autoresearch.`;
 	}
 
 	const settings = input.skillsSettings ?? {};
@@ -72,18 +82,22 @@ export function buildSanitizedEffectiveSkillConfigContext(input: EffectiveSkillC
 		(input.disabledExtensions ?? []).filter(extension => extension.startsWith("skill:")),
 	);
 	const customDirectoryCount = countNonEmptyStrings(settings.customDirectories);
+	const projectTrusted = resolveSkillScopeTrust(settings, "project");
+	const userTrusted = resolveSkillScopeTrust(settings, "user");
 
 	return [
-		"Sanitized effective skill config for filesystem/custom skill discovery; bundled GJC workflow activation remains available for exactly deep-interview, ralplan, ultragoal, team.",
+		"Sanitized effective skill config for filesystem/custom skill discovery; bundled GJC workflow activation remains available for exactly deep-interview, ralplan, ultragoal, autoresearch.",
 		`Skill discovery booleans: ${[
 			formatBoolean("enabled", settings.enabled),
 			formatBoolean("enableSkillCommands", settings.enableSkillCommands),
-			formatBoolean("enablePiUser", settings.enablePiUser),
+			formatBoolean("trustProjectSkills", settings.trustProjectSkills),
+			formatBoolean("trustUserSkills", settings.trustUserSkills),
 			formatBoolean("enablePiProject", settings.enablePiProject),
+			formatBoolean("enablePiUser", settings.enablePiUser),
 			formatBoolean("enableCodexUser", settings.enableCodexUser),
 			formatBoolean("enableClaudeUser", settings.enableClaudeUser),
 			formatBoolean("enableClaudeProject", settings.enableClaudeProject),
-		].join(", ")}.`,
+		].join(", ")}. Effective scope trust: project=${projectTrusted}; user=${userTrusted}.`,
 		`Skill discovery filters: includeSkills.count=${includeSkillCount}; ignoredSkills.count=${ignoredSkillCount}; disabledSkillExtensions.count=${disabledSkillExtensionCount}.`,
 		`Custom skill directories: count=${customDirectoryCount}.`,
 	].join(" ");
@@ -358,6 +372,16 @@ interface SeedSkillActivationStateInput {
 	turnId?: string;
 	nowIso?: string;
 	stateDir?: string;
+	activeSubskills?: SkillActiveEntry["active_subskills"];
+}
+
+interface SeedSkillActivationWrite {
+	state: SkillActiveState;
+	modeWrite: GuardedStateWriteReceipt;
+	activeEntryWrite: GuardedStateWriteReceipt;
+	activeStateWrite?: GuardedStateWriteReceipt;
+	/** Active upstream pipeline entries superseded by this seed; rollback restores them. */
+	supersededEntries: SkillActiveEntry[];
 }
 
 async function seedSkillActivationState(
@@ -365,7 +389,7 @@ async function seedSkillActivationState(
 	keyword: string,
 	source: string,
 	input: SeedSkillActivationStateInput,
-): Promise<SkillActiveState> {
+): Promise<SeedSkillActivationWrite> {
 	const resolvedSessionId = await resolveBoundarySessionId(input.cwd, input.sessionId);
 	const nowIso = input.nowIso ?? new Date().toISOString();
 	const phase = initialPhaseForSkill(skill);
@@ -379,6 +403,7 @@ async function seedSkillActivationState(
 		session_id: resolvedSessionId,
 		...(input.threadId ? { thread_id: input.threadId } : {}),
 		...(input.turnId ? { turn_id: input.turnId } : {}),
+		...(input.activeSubskills ? { active_subskills: input.activeSubskills } : {}),
 	};
 	const state: SkillActiveState = {
 		version: 1,
@@ -395,7 +420,12 @@ async function seedSkillActivationState(
 		initialized_mode: skill,
 		initialized_state_path: initializedStatePath,
 		active_skills: [entry],
+		...(input.activeSubskills ? { active_subskills: input.activeSubskills } : {}),
 	};
+	const repositoryBinding =
+		skill === "ralplan"
+			? publicRepositoryBinding(await captureRepositoryBinding(input.cwd, { displayPath: input.cwd }))
+			: undefined;
 	const modeState: ModeState = {
 		active: true,
 		version: WORKFLOW_STATE_VERSION,
@@ -406,36 +436,33 @@ async function seedSkillActivationState(
 		session_id: resolvedSessionId,
 		...(input.threadId ? { thread_id: input.threadId } : {}),
 		...(input.turnId ? { turn_id: input.turnId } : {}),
+		...(repositoryBinding ? { repository_binding: repositoryBinding } : {}),
 	};
 	if (skill === "deep-interview") {
 		modeState.threshold = DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD;
 		modeState.threshold_source = "default";
 	}
 
-	await readExistingStateForMutation(initializedStatePath);
-	const expectedRevision = 0;
-	await writeGuardedWorkflowEnvelopeAtomic(initializedStatePath, modeState, {
-		cwd: input.cwd,
-		policy: "source",
-		expectedRevision,
-		receipt: {
+	const modeWrite = guardedStateWriteReceipt(
+		await writeGuardedWorkflowEnvelopeAtomic(initializedStatePath, modeState, {
 			cwd: input.cwd,
-			skill,
-			owner: "gjc-hook",
-			command: source,
-			sessionId: resolvedSessionId,
-		},
-		audit: { category: "state", verb: "write", owner: "gjc-hook", skill, sessionId: resolvedSessionId },
-	});
-	const persistedModeState =
-		(await readValidatedJsonFile<ModeState>(initializedStatePath, "mode-state", ModeStateSchema)) ?? modeState;
-	const sourceRevision =
-		typeof persistedModeState.state_revision === "number" && Number.isFinite(persistedModeState.state_revision)
-			? persistedModeState.state_revision
-			: undefined;
-
+			policy: "source",
+			expectedRevision: 0,
+			receipt: {
+				cwd: input.cwd,
+				skill,
+				owner: "gjc-hook",
+				command: source,
+				sessionId: resolvedSessionId,
+			},
+			audit: { category: "state", verb: "write", owner: "gjc-hook", skill, sessionId: resolvedSessionId },
+		}),
+	);
+	if (!modeWrite) throw new Error(`Workflow activation mode write was not persisted: ${initializedStatePath}`);
+	let supersededEntries: SkillActiveEntry[] = [];
 	try {
-		await syncSkillActiveState({
+		supersededEntries = await captureSupersededPlanningEntries(input.cwd, resolvedSessionId, skill);
+		const activeEntryResult = await syncSkillActiveState({
 			cwd: input.cwd,
 			skill,
 			active: true,
@@ -443,26 +470,79 @@ async function seedSkillActivationState(
 			sessionId: resolvedSessionId,
 			threadId: input.threadId,
 			turnId: input.turnId,
+			active_subskills: input.activeSubskills,
 			source,
 			receipt: undefined,
-			sourceRevision,
+			sourceRevision: modeWrite.revision,
 			nowIso,
+			bestEffortSnapshot: true,
 		});
-	} catch {
-		// Derived active-state/HUD writes are best-effort during activation; source mode-state already persisted.
-	}
-	try {
-		await writeGuardedJsonAtomic(skillStatePath(input.cwd, resolvedSessionId), state, {
+		const activeEntryWrite = activeEntryResult ? guardedStateWriteReceipt(activeEntryResult) : undefined;
+		if (!activeEntryWrite) throw new Error(`Workflow activation entry write was not persisted: ${skill}`);
+		let activeStateWrite: GuardedStateWriteReceipt | undefined;
+		try {
+			activeStateWrite = guardedStateWriteReceipt(
+				await writeGuardedJsonAtomic(skillStatePath(input.cwd, resolvedSessionId), state, {
+					cwd: input.cwd,
+					policy: "cache",
+					sourceRevision: modeWrite.revision + 1,
+					receipt: undefined,
+					audit: { category: "state", verb: "write", owner: "gjc-hook", sessionId: resolvedSessionId },
+				}),
+			);
+		} catch {
+			// Corrupt derived active-state is reported by recovery diagnostics; activation remains fail-open.
+		}
+		return { state, modeWrite, activeEntryWrite, activeStateWrite, supersededEntries };
+	} catch (error) {
+		// The invocation is being rejected: remove the owned mode receipt so a retry
+		// does not wedge on a revision-1 mode file with no visible active entry.
+		await deleteIfOwned(modeWrite.path, {
 			cwd: input.cwd,
-			policy: "cache",
-			sourceRevision: (sourceRevision ?? 0) + 1,
-			receipt: undefined,
-			audit: { category: "state", verb: "write", owner: "gjc-hook", sessionId: resolvedSessionId },
+			predicate: current => matchesGuardedStateWriteReceipt(current, modeWrite),
 		});
-	} catch {
-		// Corrupt derived active-state is reported by recovery diagnostics; activation remains fail-open.
+		// syncSkillActiveState removes the upstream pipeline entries it supersedes
+		// before persisting; if a later write throws, restore them so a rejected
+		// invocation does not silently clear the prior workflow.
+		await restoreSupersededPlanningEntries(input.cwd, resolvedSessionId, supersededEntries);
+		throw error;
 	}
-	return state;
+}
+/**
+ * Snapshot the active upstream planning-pipeline entries that seeding `skill`
+ * will supersede (e.g. an active deep-interview when ralplan is seeded). The
+ * seed's rollback re-writes these entries so a prompt that was never accepted
+ * does not silently clear the existing workflow.
+ */
+async function captureSupersededPlanningEntries(
+	cwd: string,
+	sessionId: string,
+	skill: string,
+): Promise<SkillActiveEntry[]> {
+	const upstream = upstreamPlanningPipelineSkills(skill);
+	if (upstream.length === 0) return [];
+	const visible = await readCanonicalVisibleSkillActiveState(cwd, sessionId);
+	if (!visible) return [];
+	return listActiveSkills(visible).filter(entry => upstream.includes(entry.skill));
+}
+
+/**
+ * Re-write superseded upstream pipeline entries that a seed removed, skipping
+ * skills that were re-seeded in the meantime. Shared by the seed error path and
+ * the returned rollback so a never-accepted prompt never clears a prior workflow.
+ */
+async function restoreSupersededPlanningEntries(
+	cwd: string,
+	sessionId: string,
+	superseded: readonly SkillActiveEntry[],
+): Promise<void> {
+	if (superseded.length === 0) return;
+	const existingEntries = await readActiveEntries(cwd, { sessionId });
+	const existingSkills = new Set(existingEntries.map(entry => entry.skill));
+	for (const entry of superseded) {
+		if (existingSkills.has(entry.skill)) continue;
+		await writeActiveEntry(cwd, { sessionId }, entry.skill, entry);
+	}
 }
 
 // Fallback for native-hook prompts when SkillPromptDetails.subskillActivation is absent;
@@ -470,7 +550,7 @@ async function seedSkillActivationState(
 export async function recordSkillActivation(input: RecordSkillActivationInput): Promise<SkillActiveState | null> {
 	const match = detectPrimarySkillKeyword(input.text);
 	if (!match) return null;
-	return await seedSkillActivationState(match.skill, match.keyword, "gjc-skill-state-hook", input);
+	return (await seedSkillActivationState(match.skill, match.keyword, "gjc-skill-state-hook", input)).state;
 }
 
 export interface EnsureWorkflowSkillActivationInput {
@@ -481,6 +561,13 @@ export interface EnsureWorkflowSkillActivationInput {
 	turnId?: string;
 	nowIso?: string;
 	stateDir?: string;
+	activeSubskills?: SkillActiveEntry["active_subskills"];
+}
+
+export interface WorkflowSkillActivationSeed {
+	state: SkillActiveState | null;
+	seeded: boolean;
+	rollback(): Promise<boolean>;
 }
 
 /**
@@ -494,11 +581,12 @@ export interface EnsureWorkflowSkillActivationInput {
  * `handoff_from`/`handoff_at` lineage), nothing is written so lineage is
  * preserved. Non-workflow skills are ignored.
  */
-export async function ensureWorkflowSkillActivationState(
+export async function ensureWorkflowSkillActivationSeed(
 	input: EnsureWorkflowSkillActivationInput,
-): Promise<SkillActiveState | null> {
+): Promise<WorkflowSkillActivationSeed> {
 	const skill = input.skill.trim();
-	if (!isGjcWorkflowSkill(skill)) return null;
+	const noRollback = async () => false;
+	if (!isGjcWorkflowSkill(skill)) return { state: null, seeded: false, rollback: noRollback };
 	const resolvedSessionId = await resolveBoundarySessionId(input.cwd, input.sessionId);
 	const existing = await readVisibleSkillActiveState(input.cwd, resolvedSessionId, input.stateDir);
 	const alreadyActive = listActiveSkills(existing).some(
@@ -506,15 +594,54 @@ export async function ensureWorkflowSkillActivationState(
 			entry.skill === skill &&
 			(existing ? entryMatchesContext(entry, existing, resolvedSessionId, input.threadId) : true),
 	);
-	if (alreadyActive) return existing;
-	return await seedSkillActivationState(skill, `/skill:${skill}`, "gjc-skill-invocation", {
+	if (alreadyActive) return { state: existing, seeded: false, rollback: noRollback };
+	const seed = await seedSkillActivationState(skill, `/skill:${skill}`, "gjc-skill-invocation", {
 		cwd: input.cwd,
 		sessionId: resolvedSessionId,
 		threadId: input.threadId,
 		turnId: input.turnId,
 		nowIso: input.nowIso,
 		stateDir: input.stateDir,
+		activeSubskills: input.activeSubskills,
 	});
+	const state = seed.state;
+	return {
+		state,
+		seeded: true,
+		rollback: async () => {
+			const modeRemoved = await deleteIfOwned(seed.modeWrite.path, {
+				cwd: input.cwd,
+				predicate: current => matchesGuardedStateWriteReceipt(current, seed.modeWrite),
+			});
+			if (!modeRemoved.deleted) {
+				await rebuildActiveSnapshot(input.cwd, { sessionId: resolvedSessionId }, { cwd: input.cwd });
+				return false;
+			}
+			const entryRemoved = await deleteIfOwned(seed.activeEntryWrite.path, {
+				cwd: input.cwd,
+				predicate: current => matchesGuardedStateWriteReceipt(current, seed.activeEntryWrite),
+			});
+			if (seed.activeStateWrite) {
+				const activeStateWrite = seed.activeStateWrite;
+				await deleteIfOwned(activeStateWrite.path, {
+					cwd: input.cwd,
+					predicate: current => matchesGuardedStateWriteReceipt(current, activeStateWrite),
+				});
+			}
+			// Restore the upstream pipeline entries this seed superseded so a
+			// prompt that was never accepted does not silently clear the prior
+			// workflow; skills that were re-seeded in the meantime are skipped.
+			await restoreSupersededPlanningEntries(input.cwd, resolvedSessionId, seed.supersededEntries);
+			await rebuildActiveSnapshot(input.cwd, { sessionId: resolvedSessionId }, { cwd: input.cwd });
+			return entryRemoved.deleted;
+		},
+	};
+}
+
+export async function ensureWorkflowSkillActivationState(
+	input: EnsureWorkflowSkillActivationInput,
+): Promise<SkillActiveState | null> {
+	return (await ensureWorkflowSkillActivationSeed(input)).state;
 }
 
 function isTerminalModeState(state: ModeState | null): boolean {
@@ -531,7 +658,6 @@ function isTerminalModeState(state: ModeState | null): boolean {
  * declared it is ready to chain but has not yet been demoted/cleared, so it
  * must keep blocking until the chain (or an explicit clear) removes it.
  */
-const STOP_RELEASING_PHASES = ["complete", "completed", "failed", "cancelled", "canceled", "inactive"] as const;
 
 /**
  * Handoff workflows must never stop silently — they always have to offer the
@@ -553,13 +679,13 @@ function isHandoffRequiredSkill(skill: GjcWorkflowSkill): boolean {
  * mode-state preserves the historical fail-open behavior so a broken state file
  * cannot lock a session.
  */
-function modeStateReleasesStop(state: ModeState | null, handoffRequired: boolean): boolean {
+function modeStateReleasesStop(state: ModeState | null, handoffRequired: boolean, skill: GjcWorkflowSkill): boolean {
 	if (!state) return !handoffRequired;
 	if (state.active !== true) return true;
 	const phase = String(state.current_phase ?? "")
 		.trim()
 		.toLowerCase();
-	if ((STOP_RELEASING_PHASES as readonly string[]).includes(phase)) return true;
+	if (getSkillManifest(skill).stopReleasingPhases.includes(phase)) return true;
 	if (!handoffRequired && phase === "handoff") return true;
 	return false;
 }
@@ -743,12 +869,21 @@ function buildHandoffModeStateRecoveryMessage(skill: GjcWorkflowSkill, phase: st
 }
 
 function buildHandoffForceAskMessage(skill: GjcWorkflowSkill, phase: string, statePath: string): string {
+	if (skill === "deep-interview" && phase.trim().toLowerCase() === "interviewing") {
+		return `GJC deep-interview is still interviewing and must not stop (${statePath}). Continue the active round immediately: score and persist an answered round, then report progress. Use the ask tool for the next question. Only stop after crystallizing, recording a handoff, or explicitly cancelling the workflow. ${buildHandoffStopReleaseGuidance(skill)}`;
+	}
 	return `GJC handoff skill "${skill}" must not stop without offering a next step (phase: ${phase}; state: ${statePath}). ${buildHandoffStopReleaseGuidance(skill)}`;
 }
 
 export async function buildSkillStopOutput(input: StopHookInput): Promise<Record<string, unknown> | null> {
-	const resolvedSessionId = await resolveBoundarySessionId(input.cwd, input.sessionId);
-	const skillState = await readVisibleSkillActiveState(input.cwd, resolvedSessionId, input.stateDir);
+	const guardContext = await readWorkflowGuardContext(input.cwd, {
+		sessionId: input.sessionId,
+		threadId: input.threadId,
+	});
+	const resolvedSessionId = guardContext.sessionId;
+	if (!resolvedSessionId) return null;
+	const skillState = guardContext.activeState;
+
 	const activeEntries = listActiveSkills(skillState)
 		.filter(isWorkflowActiveEntry)
 		.filter(entry =>
@@ -757,11 +892,7 @@ export async function buildSkillStopOutput(input: StopHookInput): Promise<Record
 	if (!skillState || activeEntries.length === 0) return null;
 
 	for (const entry of activeEntries) {
-		const modeState = await readValidatedJsonFile<ModeState>(
-			modeStatePath(input.cwd, entry.skill, resolvedSessionId),
-			"mode-state",
-			ModeStateSchema,
-		);
+		const modeState = guardContext.modeStates.get(entry.skill) ?? null;
 		const handoffRequired = isHandoffRequiredSkill(entry.skill);
 		if (!modeState && handoffRequired) {
 			const phase = String(entry.phase ?? skillState.phase ?? "active");
@@ -784,7 +915,7 @@ export async function buildSkillStopOutput(input: StopHookInput): Promise<Record
 				systemMessage: rescueMessage,
 			};
 		}
-		if (modeStateReleasesStop(modeState, handoffRequired)) {
+		if (modeStateReleasesStop(modeState, handoffRequired, entry.skill)) {
 			// A mode-state that claims it releases the Stop block must agree with
 			// authoritative durable state. If a stale/incoherent mode-state would
 			// release while the plan/ledger still shows pending work, block instead

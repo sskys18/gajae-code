@@ -85,6 +85,8 @@ function createStubInputControllerContext(opts: {
 	skillCommands: Map<string, Skill>;
 	isStreaming: boolean;
 	busyPromptMode?: "steer" | "queue";
+	isBashRunning?: boolean;
+	isEvalRunning?: boolean;
 }) {
 	let editorText = "";
 	const editor: StubEditor = {
@@ -116,8 +118,8 @@ function createStubInputControllerContext(opts: {
 			sessionId: "stub-session",
 			isStreaming: opts.isStreaming,
 			isCompacting: false,
-			isBashRunning: false,
-			isEvalRunning: false,
+			isBashRunning: opts.isBashRunning ?? false,
+			isEvalRunning: opts.isEvalRunning ?? false,
 			extensionRunner: undefined,
 			enqueueCustomMessageDisplay,
 			sendCustomMessage,
@@ -140,6 +142,7 @@ function createStubInputControllerContext(opts: {
 		compactionQueuedMessages: [],
 		locallySubmittedUserSignatures: new Set<string>(),
 		withLocalSubmission: async (_text: string, fn: () => unknown) => fn(),
+		hasActiveBtw: () => false,
 	} as unknown as InteractiveModeContext;
 
 	return { ctx, editor, enqueueCustomMessageDisplay, promptCustomMessage, sendCustomMessage, prompt };
@@ -265,7 +268,7 @@ describe("InputController #invokeSkillCommand (E1-E3)", () => {
 		const messageArg = firstCall[0];
 		expect(messageArg.content).toContain("Do the thing.");
 		expect(messageArg.content).toContain("User: from compaction");
-		expect(firstCall[1]).toEqual({ streamingBehavior: "followUp" });
+		expect(firstCall[1]).toEqual({ streamingBehavior: "followUp", followUpQueuePolicy: "sequential" });
 		expect(ctx.compactionQueuedMessages).toEqual([]);
 	});
 
@@ -288,6 +291,22 @@ describe("InputController #invokeSkillCommand (E1-E3)", () => {
 		}
 		const messageArg = firstCall[0];
 		expect(messageArg.details.__pendingDisplayTag).toBeUndefined();
+	});
+
+	it("dispatches inline canonical skill commands with surrounding prompt text as args", async () => {
+		const { ctx, editor, promptCustomMessage } = createStubInputControllerContext({
+			skillCommands,
+			isStreaming: false,
+		});
+
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+		editor.setText("please use /skill:test-skill for this plan");
+		await editor.onSubmit?.("please use /skill:test-skill for this plan");
+
+		expect(promptCustomMessage).toHaveBeenCalledTimes(1);
+		expect(promptCustomMessage.mock.calls[0]?.[0].content).toContain("Do the thing.");
+		expect(promptCustomMessage.mock.calls[0]?.[0].content).toContain("User: please use for this plan");
 	});
 
 	it("dispatches chained canonical skill commands in order while idle", async () => {
@@ -550,7 +569,7 @@ describe("AgentSession custom-role tag dequeue (E4-E7)", () => {
 // enqueueCustomMessageDisplay.
 // ============================================================================
 
-function createStubInteractiveModeContextForUiHelpers(session: AgentSession) {
+function createStubInteractiveModeContextForUiHelpers(session: AgentSession, dequeueDisplay = "Alt+Up") {
 	let editorText = "";
 	const editor: StubEditor = {
 		setText(text) {
@@ -569,13 +588,16 @@ function createStubInteractiveModeContextForUiHelpers(session: AgentSession) {
 		editor,
 		ui: { requestRender },
 		pendingMessagesContainer,
+		pendingBashComponents: [],
+		pendingPythonComponents: [],
 		session,
 		compactionQueuedMessages: [],
 		keybindings: {
-			getDisplayString: (_action: string) => "Alt+Up",
+			getDisplayString: (_action: string) => dequeueDisplay,
 		},
 		updatePendingMessagesDisplay,
 		locallySubmittedUserSignatures: new Set<string>(),
+		hasActiveBtw: () => false,
 	} as unknown as InteractiveModeContext;
 
 	return { ctx, editor, pendingMessagesContainer };
@@ -622,6 +644,27 @@ describe("UiHelpers / InputController against the queued-display layer (E8-E9)",
 		// chip appears verbatim. Matches the user-facing "Steer: /skill:..." format.
 		const rendered = pendingMessagesContainer.render(120).join("\n");
 		expect(rendered).toMatch(/Steer: \/skill:test-skill arg1 arg2/);
+	});
+	it("E8a: dequeue guidance uses effective display text and omits unbound controls", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		await session.followUp("queue this message");
+
+		const darwin = createStubInteractiveModeContextForUiHelpers(session, "⌥↑/⌥↓");
+		new UiHelpers(darwin.ctx).updatePendingMessagesDisplay();
+		expect(darwin.pendingMessagesContainer.render(120).join("\n")).toContain("⌥↑/⌥↓ to select/edit/reorder");
+
+		const textual = createStubInteractiveModeContextForUiHelpers(session, "Alt+Up/Alt+Down");
+		new UiHelpers(textual.ctx).updatePendingMessagesDisplay();
+		expect(textual.pendingMessagesContainer.render(120).join("\n")).toContain(
+			"Alt+Up/Alt+Down to select/edit/reorder",
+		);
+
+		const unbound = createStubInteractiveModeContextForUiHelpers(session, "");
+		new UiHelpers(unbound.ctx).updatePendingMessagesDisplay();
+		const unboundRendered = unbound.pendingMessagesContainer.render(120).join("\n");
+		expect(unboundRendered).not.toContain("to select/edit/reorder");
+		expect(unboundRendered).not.toContain("Alt+Up/Alt+Down");
 	});
 
 	it("E8b: updatePendingMessagesDisplay labels normal follow-up prompts as queued", async () => {
@@ -689,6 +732,7 @@ function createEventControllerFixtureForE10() {
 		addMessageToChat,
 		updatePendingMessagesDisplay,
 		session: {},
+		hasActiveBtw: () => false,
 	} as unknown as InteractiveModeContext;
 
 	const controller = new EventController(ctx);

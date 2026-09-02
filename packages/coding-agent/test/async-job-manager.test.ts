@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
+import { lookupOwnedRegistration, registerOwnedRegistration } from "../src/session/terminal-abort";
 
 describe("AsyncJobManager", () => {
 	test("forwards progress updates and delivers completion", async () => {
@@ -358,11 +359,21 @@ describe("AsyncJobManager", () => {
 			},
 			{ ownerId: "3-AuthLoader" },
 		);
+		manager.registerSubagentRecord({
+			subagentId: "3-AuthLoader",
+			ownerId: "3-AuthLoader",
+			currentJobId: subagentJobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: null,
+			resumable: false,
+		});
 
 		manager.cancelAll({ ownerId: "3-AuthLoader" });
 
 		expect(manager.getJob(parentJobId)?.status).toBe("running");
 		expect(manager.getJob(subagentJobId)?.status).toBe("cancelled");
+		expect(manager.getSubagentRecord("3-AuthLoader")?.status).toBe("cancelled");
 
 		// Filtered query mirrors filtered cancel.
 		expect(manager.getRunningJobs({ ownerId: "0-Main" }).map(j => j.id)).toEqual([parentJobId]);
@@ -373,6 +384,44 @@ describe("AsyncJobManager", () => {
 		manager.cancelAll();
 		await manager.waitForAll();
 		expect(manager.getJob(parentJobId)?.status).toBe("cancelled");
+	});
+	test("updateSubagentModel preserves fields omitted from a partial patch", () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const jobId = manager.register("task", "fast subagent", async () => "done", { ownerId: "0-Main" });
+		manager.registerSubagentRecord({
+			subagentId: "0-Fast",
+			ownerId: "0-Main",
+			currentJobId: jobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: null,
+			resumable: false,
+		});
+
+		manager.updateSubagentModel("0-Fast", {
+			requestedModel: "anthropic/claude-opus-4-5",
+			effectiveModel: "anthropic/claude-sonnet-4-5",
+			modelFellBack: true,
+			fastMode: true,
+		});
+		expect(manager.getSubagentRecord("0-Fast")).toMatchObject({
+			requestedModel: "anthropic/claude-opus-4-5",
+			effectiveModel: "anthropic/claude-sonnet-4-5",
+			modelFellBack: true,
+			fastMode: true,
+		});
+
+		// A narrow fast-mode patch must not erase the model identity recorded above;
+		// unconditional assignment used to blank all three of the omitted fields.
+		manager.updateSubagentModel("0-Fast", { fastMode: false });
+		expect(manager.getSubagentRecord("0-Fast")).toMatchObject({
+			requestedModel: "anthropic/claude-opus-4-5",
+			effectiveModel: "anthropic/claude-sonnet-4-5",
+			modelFellBack: true,
+			fastMode: false,
+		});
+
+		manager.cancelAll();
 	});
 	test("retention-zero eviction runs onEvict and records a monitor tombstone", async () => {
 		let evictCount = 0;
@@ -393,6 +442,30 @@ describe("AsyncJobManager", () => {
 		expect(evictCount).toBe(1);
 		expect(manager.getMonitorTombstone(jobId, { ownerId: "0-Test" })?.jobId).toBe(jobId);
 		expect(manager.getMonitorTombstone(jobId, { ownerId: "other" })).toBeUndefined();
+	});
+
+	test("eviction sweeps expired monitor tombstones", async () => {
+		const clock = spyOn(Date, "now").mockReturnValue(0);
+		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
+		try {
+			const expiredJobId = manager.register("bash", "expired monitor", async () => "done", {
+				metadata: { monitor: true },
+			});
+			await manager.waitForAll();
+			expect(manager.getMonitorTombstone(expiredJobId)?.expiresAt).toBe(5 * 60_000);
+
+			clock.mockReturnValue(5 * 60_000 + 1);
+			manager.register("bash", "new monitor", async () => "done", {
+				id: "new-monitor",
+				metadata: { monitor: true },
+			});
+			await manager.waitForAll();
+
+			expect(manager.getMonitorTombstone(expiredJobId)).toBeUndefined();
+		} finally {
+			clock.mockRestore();
+			await manager.dispose();
+		}
 	});
 
 	test("purgeMonitorTombstone after eviction returns found and runs purge once", async () => {
@@ -470,5 +543,274 @@ describe("AsyncJobManager", () => {
 		expect(phases.filter(p => p === "cancel")).toHaveLength(1);
 		expect(phases.filter(p => p === "terminal")).toHaveLength(1);
 		expect(phases.filter(p => p === "evict")).toHaveLength(2);
+	});
+
+	test("cancelling a job retires its owned registration", async () => {
+		// Review thread P2: a task registered under the turn fence that is later
+		// explicitly cancelled settles no delivery (the cancelled-job completion
+		// path deliberately enqueues none), so the ownership tuple must be
+		// retired at cancellation — otherwise it persists until eviction, makes
+		// an owned abort of the same turn report owned_unsettled with no work
+		// remaining, and repeated cancellations exhaust the bounded registries.
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const endpointId = AsyncJobManager.endpointIdOf(manager);
+		const jobId = manager.register(
+			"task",
+			"subagent",
+			async ({ signal }) => {
+				await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+				return "cancelled";
+			},
+			{},
+		);
+		const job = manager.getJob(jobId);
+		const generation = job?.generation ?? jobId;
+		registerOwnedRegistration({
+			endpointId,
+			lineageIdHash: "lineage-hash",
+			promptAttemptEpoch: 1,
+			endpointGeneration: 1,
+			jobId,
+			jobGeneration: generation,
+		});
+		expect(lookupOwnedRegistration(jobId, generation, endpointId)).toBeDefined();
+		expect(manager.cancel(jobId)).toBe(true);
+		// The run is still unwinding (it awaits the abort signal): the tuple is
+		// RETAINED so a concurrent scope:"owned" abort still captures this exact
+		// job and waits for it instead of reporting stopped while it keeps
+		// executing (review thread P1).
+		expect(lookupOwnedRegistration(jobId, generation, endpointId)).toBeDefined();
+		await manager.waitForAll();
+		// The run actually unwound: the tuple is retired at the settlement
+		// boundary, so cancelled tasks leave no permanent registration.
+		expect(lookupOwnedRegistration(jobId, generation, endpointId)).toBeUndefined();
+	});
+
+	test("terminal waits support all/any predicates and idempotent acknowledgement", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const first = manager.register("task", "first", async () => "one", { id: "wait-first" });
+		const secondGate = Promise.withResolvers<string>();
+		const second = manager.register("task", "second", async () => secondGate.promise, { id: "wait-second" });
+		await manager.getJob(first)?.promise;
+
+		const targets = [manager.resolveSubagentWaitTarget(first)!, manager.resolveSubagentWaitTarget(second)!];
+		const all = manager.subscribeTerminalWait(targets, "all_terminal");
+		const any = manager.subscribeTerminalWait(targets, "any_terminal");
+		expect(await any.result).toMatchObject({
+			outcome: "completed",
+			condition: "any_terminal",
+			terminalJobIds: [first],
+		});
+		expect(any.acknowledge()).toEqual({ acknowledged: true, jobIds: [first] });
+		expect(any.acknowledge()).toEqual({ acknowledged: false, jobIds: [] });
+
+		secondGate.resolve("two");
+		await manager.getJob(second)?.promise;
+		expect(await all.result).toMatchObject({
+			outcome: "completed",
+			condition: "all_terminal",
+			terminalJobIds: [first, second],
+			pendingJobIds: [],
+		});
+		expect(all.acknowledge()).toEqual({ acknowledged: true, jobIds: [first, second] });
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	test("closing a terminal wait interrupts observation without mutating child status", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const gate = Promise.withResolvers<string>();
+		const jobId = manager.register("task", "held", async () => gate.promise, { id: "wait-held" });
+		const handle = manager.subscribeTerminalWait([manager.resolveSubagentWaitTarget(jobId)!]);
+		handle.close();
+		expect(await handle.result).toMatchObject({ outcome: "interrupted", pendingJobIds: [jobId] });
+		expect(manager.getJob(jobId)?.status).toBe("running");
+		gate.resolve("finished");
+		await manager.getJob(jobId)?.promise;
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	test("cancelling a paused subagent retires its owned registration", async () => {
+		// Review thread P2: cancelSubagent() takes its DIRECT paused branch
+		// (never reaching cancel()), so the owned tuple must be retired there —
+		// the cancellation emits no completion delivery, and without this the
+		// tuple survives job eviction and a later scope:"owned" abort of the
+		// attempt reports owned_unsettled with no work remaining.
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const jobId = manager.register("task", "paused-owned", async () => ({ kind: "paused", note: "safe boundary" }), {
+			id: "paused-owned-job",
+		});
+		manager.registerSubagentRecord({
+			subagentId: "paused-owned-subagent",
+			ownerId: "0-Test",
+			currentJobId: jobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: "/tmp/paused-owned.jsonl",
+			resumable: true,
+		});
+		await manager.getJob(jobId)?.promise;
+		const job = manager.getJob(jobId);
+		const generation = job?.generation ?? jobId;
+		const endpointId = AsyncJobManager.endpointIdOf(manager);
+		registerOwnedRegistration({
+			endpointId,
+			lineageIdHash: "lineage-paused-owned",
+			promptAttemptEpoch: 1,
+			endpointGeneration: 1,
+			jobId,
+			jobGeneration: generation,
+		});
+		expect(lookupOwnedRegistration(jobId, generation, endpointId)).toBeDefined();
+		expect(manager.cancelSubagent("paused-owned-subagent", { ownerId: "0-Test" })).toBe(true);
+		expect(lookupOwnedRegistration(jobId, generation, endpointId)).toBeUndefined();
+	});
+
+	test("paused and queued cancellation publish terminal wait evidence", async () => {
+		const pausedManager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const pausedJobId = pausedManager.register(
+			"task",
+			"pause",
+			async () => ({ kind: "paused", note: "safe boundary" }),
+			{ id: "paused-job" },
+		);
+		pausedManager.registerSubagentRecord({
+			subagentId: "paused-subagent",
+			ownerId: "0-Main",
+			currentJobId: pausedJobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: "/tmp/paused.jsonl",
+			resumable: true,
+		});
+		await pausedManager.getJob(pausedJobId)?.promise;
+		const pausedWait = pausedManager.subscribeTerminalWait([
+			pausedManager.resolveSubagentWaitTarget("paused-subagent")!,
+		]);
+		expect(pausedManager.cancelSubagent("paused-subagent", { ownerId: "0-Main" })).toBe(true);
+		expect(await pausedWait.result).toMatchObject({ outcome: "completed", terminalJobIds: ["paused-subagent"] });
+		await pausedManager.dispose({ timeoutMs: 100 });
+
+		const queuedManager = new AsyncJobManager({ maxRunningJobs: 1, onJobComplete: async () => {} });
+		const blockerGate = Promise.withResolvers<void>();
+		const blocker = queuedManager.register(
+			"task",
+			"blocker",
+			async () => {
+				await blockerGate.promise;
+				return "released";
+			},
+			{ id: "queue-blocker", ownerId: "0-Main" },
+		);
+		queuedManager.registerSubagentRecord({
+			subagentId: "queued-subagent",
+			ownerId: "0-Main",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "completed",
+			sessionFile: "/tmp/queued.jsonl",
+			resumable: true,
+		});
+		queuedManager.setResumeRunner(() =>
+			queuedManager.register("task", "queued resume", async () => "resumed", { ownerId: "0-Main" }),
+		);
+		expect(queuedManager.resumeSubagent("queued-subagent", { ownerId: "0-Main" }).queued).toBe(true);
+		const queuedWait = queuedManager.subscribeTerminalWait([
+			queuedManager.resolveSubagentWaitTarget("queued-subagent")!,
+		]);
+		expect(queuedManager.cancelSubagent("queued-subagent", { ownerId: "0-Main" })).toBe(true);
+		expect(await queuedWait.result).toMatchObject({ outcome: "completed", terminalJobIds: ["queued-subagent"] });
+		blockerGate.resolve();
+		await queuedManager.getJob(blocker)?.promise;
+		await queuedManager.dispose({ timeoutMs: 100 });
+	});
+
+	test("rekeyForEndpoint moves the registration across committed session-identity transitions", () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const foreign = new AsyncJobManager({ onJobComplete: async () => {} });
+		try {
+			AsyncJobManager.registerForEndpoint("session-a", manager);
+			expect(AsyncJobManager.endpointIdOf(manager)).toBe("session-a");
+
+			// newSession/switchSession/fork/handoff/branch commit a successor
+			// endpoint identity: the manager registration must follow so
+			// post-transition lineage bindings resolve (review thread P1).
+			expect(
+				AsyncJobManager.rekeyForEndpoint("session-a", "session-b", AsyncJobManager.forEndpoint("session-a")),
+			).toBe(true);
+			expect(AsyncJobManager.endpointIdOf(manager)).toBe("session-b");
+			expect(AsyncJobManager.forEndpoint("session-a")).toBeUndefined();
+			expect(AsyncJobManager.forEndpoint("session-b")).toBe(manager);
+
+			// A foreign registration under the successor is never clobbered; the
+			// rekey reports FAILURE (review thread P1) so the transitioning
+			// session aborts/rolls back before retiring predecessor state —
+			// leaving this manager under the predecessor while tools resolve
+			// the successor to the foreign manager would send jobs to the
+			// wrong session and strip owned aborts of their causal set.
+			AsyncJobManager.registerForEndpoint("session-c", foreign);
+			expect(AsyncJobManager.rekeyForEndpoint("session-b", "session-c", manager)).toBe(false);
+			expect(AsyncJobManager.endpointIdOf(manager)).toBe("session-b");
+			expect(AsyncJobManager.forEndpoint("session-b")).toBe(manager);
+			expect(AsyncJobManager.forEndpoint("session-c")).toBe(foreign);
+
+			// Same-id and unknown-predecessor rekeys are successful no-ops.
+			expect(AsyncJobManager.rekeyForEndpoint("session-b", "session-b", manager)).toBe(true);
+			expect(AsyncJobManager.endpointIdOf(manager)).toBe("session-b");
+			expect(AsyncJobManager.rekeyForEndpoint("unknown", "session-b", manager)).toBe(true);
+			expect(AsyncJobManager.endpointIdOf(manager)).toBe("session-b");
+
+			// Disposal: unregisterManager drops every key owned by the manager,
+			// including rekeyed successor keys that no longer match the session id.
+			AsyncJobManager.unregisterManager(manager);
+			expect(AsyncJobManager.forEndpoint("session-b")).toBeUndefined();
+			expect(AsyncJobManager.forEndpoint("session-c")).toBe(foreign);
+		} finally {
+			AsyncJobManager.unregisterManager(manager);
+			AsyncJobManager.unregisterManager(foreign);
+		}
+	});
+
+	test("registerForEndpoint rejects a foreign holder instead of silently replacing it", () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const foreign = new AsyncJobManager({ onJobComplete: async () => {} });
+		try {
+			expect(AsyncJobManager.registerForEndpoint("session-a", manager)).toBe(true);
+			expect(AsyncJobManager.forEndpoint("session-a")).toBe(manager);
+
+			// A second top-level session constructed or resumed under an
+			// endpoint id already held by a FOREIGN live manager must not
+			// clobber it: the first session's tools would resolve the second
+			// manager, letting same-id jobs be queried, registered, or
+			// cancelled across sessions and stripping an owned abort of its
+			// causal work set (review thread P1).
+			expect(AsyncJobManager.registerForEndpoint("session-a", foreign)).toBe(false);
+			expect(AsyncJobManager.forEndpoint("session-a")).toBe(manager);
+			expect(AsyncJobManager.endpointIdOf(foreign)).toBeUndefined();
+
+			// Same-manager re-registration is a successful no-op.
+			expect(AsyncJobManager.registerForEndpoint("session-a", manager)).toBe(true);
+			expect(AsyncJobManager.forEndpoint("session-a")).toBe(manager);
+
+			// After the holder is disposed, the endpoint id is free again.
+			AsyncJobManager.unregisterManager(manager);
+			expect(AsyncJobManager.forEndpoint("session-a")).toBeUndefined();
+			expect(AsyncJobManager.registerForEndpoint("session-a", foreign)).toBe(true);
+			expect(AsyncJobManager.forEndpoint("session-a")).toBe(foreign);
+		} finally {
+			AsyncJobManager.unregisterManager(manager);
+			AsyncJobManager.unregisterManager(foreign);
+		}
+	});
+
+	test("resetForTests clears endpoint registrations with the global instance", () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		AsyncJobManager.setInstance(manager);
+		expect(AsyncJobManager.registerForEndpoint("test-session", manager)).toBe(true);
+		expect(AsyncJobManager.forEndpoint("test-session")).toBe(manager);
+
+		AsyncJobManager.resetForTests();
+
+		expect(AsyncJobManager.instance()).toBeUndefined();
+		expect(AsyncJobManager.forEndpoint("test-session")).toBeUndefined();
 	});
 });

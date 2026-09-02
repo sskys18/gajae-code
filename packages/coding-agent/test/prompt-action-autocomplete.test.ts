@@ -1,24 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import type { SlashCommand } from "@gajae-code/tui";
-import { KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "@gajae-code/tui";
+import { Editor } from "@gajae-code/tui/components/editor";
+import { defaultEditorTheme } from "../../tui/test/test-themes";
 import { KeybindingsManager as AppKeybindingsManager } from "../src/config/keybindings";
 import { createPromptActionAutocompleteProvider } from "../src/modes/prompt-action-autocomplete";
 
 describe("prompt action autocomplete", () => {
-	beforeEach(() => {
-		setKeybindings(
-			new KeybindingsManager({
-				"tui.editor.cursorLineStart": { defaultKeys: ["home", "f6"], description: "Move cursor to line start" },
-				"tui.editor.cursorLineEnd": { defaultKeys: "f7", description: "Move cursor to line end" },
-				"tui.editor.undo": { defaultKeys: "f8", description: "Undo" },
-			}),
-		);
-	});
-
-	afterEach(() => {
-		setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS));
-	});
-
 	function createNoopProvider(commands: SlashCommand[] = []) {
 		return createPromptActionAutocompleteProvider({
 			commands,
@@ -27,6 +14,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
@@ -39,18 +27,23 @@ describe("prompt action autocomplete", () => {
 	}
 
 	it("shows prompt actions with configured shortcut hints", async () => {
+		const keybindings = AppKeybindingsManager.inMemory({
+			"app.clipboard.copyLine": "ctrl+shift+l",
+			"app.clipboard.copyPrompt": ["alt+shift+c", "ctrl+shift+c"],
+			"app.clipboard.pasteImage": "ctrl+i",
+			"app.session.new": "ctrl+n",
+			"tui.editor.cursorLineStart": ["home", "f6"],
+			"tui.editor.cursorLineEnd": "f7",
+			"tui.editor.undo": "f8",
+		});
 		const provider = createPromptActionAutocompleteProvider({
 			commands: [],
 			basePath: "/tmp",
-			keybindings: AppKeybindingsManager.inMemory({
-				"app.clipboard.copyLine": "ctrl+shift+l",
-				"app.clipboard.copyPrompt": ["alt+shift+c", "ctrl+shift+c"],
-				"app.clipboard.pasteImage": "ctrl+i",
-				"app.session.new": "ctrl+n",
-			}),
+			keybindings,
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
@@ -70,6 +63,7 @@ describe("prompt action autocomplete", () => {
 			"Copy current line",
 			"Copy whole prompt",
 			"Paste image from clipboard",
+			"Paste text from configured clipboard",
 			"Scroll to previous user input",
 			"Undo",
 			"Move cursor to end of message",
@@ -77,25 +71,102 @@ describe("prompt action autocomplete", () => {
 			"Move cursor to beginning of line",
 			"Move cursor to end of line",
 		]);
-		expect(suggestions?.items.find(item => item.label === "Copy current line")?.description).toBe("Ctrl+Shift+L");
+		expect(suggestions?.items.find(item => item.label === "Copy current line")?.description).toBe(
+			keybindings.getDisplayString("app.clipboard.copyLine"),
+		);
 		expect(suggestions?.items.find(item => item.label === "Copy whole prompt")?.description).toBe(
-			"Alt+Shift+C/Ctrl+Shift+C",
+			keybindings.getDisplayString("app.clipboard.copyPrompt"),
 		);
-		expect(suggestions?.items.find(item => item.label === "Paste image from clipboard")?.description).toBe("Ctrl+I");
+		expect(suggestions?.items.find(item => item.label === "Paste image from clipboard")?.description).toBe(
+			keybindings.getDisplayString("app.clipboard.pasteImage"),
+		);
+		expect(suggestions?.items.find(item => item.label === "Paste text from configured clipboard")?.description).toBe(
+			"requires --clipboard-transport ssh",
+		);
 		expect(suggestions?.items.find(item => item.label === "Move cursor to beginning of line")?.description).toBe(
-			"Home/F6",
+			keybindings.getDisplayString("tui.editor.cursorLineStart"),
 		);
-		expect(suggestions?.items.find(item => item.label === "Move cursor to end of line")?.description).toBe("F7");
-		expect(suggestions?.items.find(item => item.label === "Undo")?.description).toBe("F8");
-		expect(suggestions?.items.find(item => item.label === "Start new session")?.description).toBe("Ctrl+N");
+		expect(suggestions?.items.find(item => item.label === "Move cursor to end of line")?.description).toBe(
+			keybindings.getDisplayString("tui.editor.cursorLineEnd"),
+		);
+		expect(suggestions?.items.find(item => item.label === "Undo")?.description).toBe(
+			keybindings.getDisplayString("tui.editor.undo"),
+		);
+		expect(suggestions?.items.find(item => item.label === "Start new session")?.description).toBe(
+			keybindings.getDisplayString("app.session.new"),
+		);
 		expect(suggestions?.items.find(item => item.label === "Open command help")?.description).toBe("/help");
+	});
+	it("uses the injected non-host display context for editor shortcut hints", async () => {
+		const injectedPlatform: NodeJS.Platform = process.platform === "darwin" ? "linux" : "darwin";
+		const keybindings = AppKeybindingsManager.inMemory({
+			"tui.editor.cursorLineStart": "ctrl+a",
+			"tui.editor.cursorLineEnd": "ctrl+e",
+			"tui.editor.undo": "ctrl+-",
+		});
+		keybindings.setDisplayContext({ platform: injectedPlatform });
+		const provider = createPromptActionAutocompleteProvider({
+			commands: [],
+			basePath: "/tmp",
+			keybindings,
+			copyCurrentLine: () => {},
+			copyPrompt: () => {},
+			pasteImage: () => {},
+			pasteText: () => {},
+			newSession: () => {},
+			showHelp: () => {},
+			scrollTmuxToPreviousUserInput: () => {},
+			undo: () => {},
+			moveCursorToMessageEnd: () => {},
+			moveCursorToMessageStart: () => {},
+			moveCursorToLineStart: () => {},
+			moveCursorToLineEnd: () => {},
+		});
+
+		const suggestions = await provider.getSuggestions(["#"], 0, 1);
+		const expectedPrefix = injectedPlatform === "darwin" ? "⌃" : "Ctrl+";
+
+		expect(suggestions?.items.find(item => item.label === "Move cursor to beginning of line")?.description).toBe(
+			`${expectedPrefix}A`,
+		);
+		expect(suggestions?.items.find(item => item.label === "Move cursor to end of line")?.description).toBe(
+			`${expectedPrefix}E`,
+		);
+		expect(suggestions?.items.find(item => item.label === "Undo")?.description).toBe(`${expectedPrefix}-`);
+	});
+	it("leaves unbound app shortcut descriptions empty", async () => {
+		const provider = createPromptActionAutocompleteProvider({
+			commands: [],
+			basePath: "/tmp",
+			keybindings: AppKeybindingsManager.inMemory({ "app.session.new": [] }),
+			copyCurrentLine: () => {},
+			copyPrompt: () => {},
+			pasteImage: () => {},
+			pasteText: () => {},
+			newSession: () => {},
+			showHelp: () => {},
+			scrollTmuxToPreviousUserInput: () => {},
+			undo: () => {},
+			moveCursorToMessageEnd: () => {},
+			moveCursorToMessageStart: () => {},
+			moveCursorToLineStart: () => {},
+			moveCursorToLineEnd: () => {},
+		});
+
+		const suggestions = await provider.getSuggestions(["#"], 0, 1);
+
+		expect(suggestions?.items.find(item => item.label === "Start new session")?.description).toBe("");
 	});
 
 	it("orders top-level slash commands by beginner-first priorities and keeps provider internals low", async () => {
 		const provider = createNoopProvider([
 			{ name: "grok-build-usage", description: "Advanced provider diagnostics" },
 			{ name: "settings", description: "Open settings and preferences", priority: 40 },
-			{ name: "session", description: "Show current session info or delete current session", priority: 88 },
+			{
+				name: "session",
+				description: "Show session info or delete the current session transcript/artifacts",
+				priority: 88,
+			},
 			{ name: "resume", description: "Resume a previous session", priority: 92 },
 			{ name: "new", description: "Start a new session", priority: 96 },
 			{ name: "help", description: "Learn commands and beginner workflows", priority: 100 },
@@ -112,8 +183,29 @@ describe("prompt action autocomplete", () => {
 			"grok-build-usage",
 		]);
 		expect(suggestions?.items.find(item => item.value === "session")?.description).toBe(
-			"Show current session info or delete current session",
+			"Show session info or delete the current session transcript/artifacts",
 		);
+	});
+
+	it.each([
+		"please /he",
+		"please/hel",
+	])("does not offer slash-command suggestions after prompt text: %s", async line => {
+		const provider = createNoopProvider([{ name: "help", description: "Learn commands and beginner workflows" }]);
+
+		expect(await provider.getSuggestions([line], 0, line.length)).toBeNull();
+	});
+
+	it("keeps the composer autocomplete closed for an inline slash", async () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setAutocompleteProvider(
+			createNoopProvider([{ name: "help", description: "Learn commands and beginner workflows" }]),
+		);
+
+		editor.handleInput("please/");
+		await Bun.sleep(0);
+
+		expect(editor.isShowingAutocomplete()).toBe(false);
 	});
 
 	it("passes the typed trigger to undo and leaves text removal to the editor", async () => {
@@ -126,6 +218,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
@@ -168,6 +261,7 @@ describe("prompt action autocomplete", () => {
 			pasteImage: () => {
 				pasteCalls += 1;
 			},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
@@ -202,6 +296,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {
 				newSessionCalls += 1;
 			},
@@ -236,6 +331,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {
@@ -271,6 +367,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
@@ -293,6 +390,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
@@ -308,6 +406,25 @@ describe("prompt action autocomplete", () => {
 		expect(result!.items.map(i => i.value)).toContain("model");
 	});
 
+	it("preserves Hangul chosung ordering through the product wrapper", () => {
+		const provider = createNoopProvider([
+			{ name: "한모글", description: "Gapped Korean command" },
+			{ name: "한글", description: "Adjacent Korean command" },
+		]);
+
+		const result = provider.trySyncSlashCompletion("/ㅎㄱ");
+		expect(result?.items.map(item => item.value)).toEqual(["한글", "한모글"]);
+	});
+
+	it("rejects separator-only slash queries and normalizes skill Hangul queries", () => {
+		expect(
+			createNoopProvider([{ name: "model", description: "Switch model" }]).trySyncSlashCompletion("/-"),
+		).toBeNull();
+
+		const provider = createNoopProvider([{ name: "skill:한글", description: "Korean skill" }]);
+		expect(provider.trySyncSlashCompletion("/ㅎ-ㄱ")?.items.map(item => item.value)).toEqual(["skill:한글"]);
+	});
+
 	it("returns null from trySyncSlashCompletion for non-slash text", () => {
 		const provider = createPromptActionAutocompleteProvider({
 			commands: [{ name: "model", description: "Switch AI model" }],
@@ -316,6 +433,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},

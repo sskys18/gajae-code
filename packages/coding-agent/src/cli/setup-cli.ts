@@ -6,7 +6,7 @@
 
 import * as path from "node:path";
 import { createInterface } from "node:readline/promises";
-import { AuthStorage, SqliteAuthCredentialStore } from "@gajae-code/ai";
+import { AuthStorage, SqliteAuthCredentialStore } from "@gajae-code/ai/core";
 import { $which, APP_NAME, getAgentDbPath, getPythonEnvDir } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
@@ -18,7 +18,11 @@ import {
 } from "../hooks/codex-native-hooks-config";
 import { theme } from "../modes/theme/theme";
 import { formatCredentialAutoImportResult, runExternalCredentialAutoImport } from "../setup/credential-auto-import";
-import { filterAutoImportOAuthCredentials, formatDiscoverySummary } from "../setup/credential-import";
+import {
+	formatDiscoverySummary,
+	getAutoImportOAuthCredentialSkips,
+	isAutoImportOAuthCredential,
+} from "../setup/credential-import";
 import {
 	formatHermesSetupResult,
 	type HermesSetupFlags,
@@ -26,6 +30,14 @@ import {
 	runHermesSetup,
 } from "../setup/hermes-setup";
 import { buildHostPluginSetup, formatHostPluginSetup, type HostPluginKind } from "../setup/host-plugin-setup";
+import {
+	type PaseoSetupFlags,
+	type PaseoSetupOutcome,
+	PaseoSetupUsageError,
+	runPaseoSetup,
+} from "../setup/paseo/paseo-setup";
+import { checkExitCode } from "../setup/paseo/result-types";
+import { createDefaultPaseoSetupDependencies } from "../setup/paseo/setup-deps";
 import {
 	addApiCompatibleProvider,
 	formatProviderPresetList,
@@ -40,6 +52,7 @@ export type SetupComponent =
 	| "defaults"
 	| "hermes"
 	| "hooks"
+	| "paseo"
 	| "provider"
 	| "python"
 	| "stt";
@@ -63,15 +76,21 @@ export interface SetupCommandArgs {
 		repo?: string;
 		profile?: string;
 		sessionCommand?: string;
+		remove?: boolean;
+		mpreset?: string;
 		noWorktree?: boolean;
 		worktreeName?: string;
+		requireWorktree?: boolean;
 		stateRoot?: string;
+		codingAgentDir?: string;
 		mutation?: string[];
 		artifactByteCap?: string;
 		serverKey?: string;
 		gjcCommand?: string;
 		target?: string;
 		profileDir?: string;
+		timeout?: string;
+		connectTimeout?: string;
 		yes?: boolean;
 		dryRun?: boolean;
 		keychain?: boolean;
@@ -85,10 +104,59 @@ const VALID_COMPONENTS: SetupComponent[] = [
 	"defaults",
 	"hermes",
 	"hooks",
+	"paseo",
 	"provider",
 	"python",
 	"stt",
 ];
+
+/**
+ * Flags introduced by the `paseo` component.
+ *
+ * Deliberately narrow: `--check`, `--json`, and `--force` are pre-existing
+ * shared setup flags and are NOT relabeled here, so no other component's
+ * behavior changes.
+ */
+const PASEO_ONLY_FLAGS: readonly (keyof SetupCommandArgs["flags"])[] = ["remove", "mpreset"];
+const HERMES_ONLY_FLAGS: readonly (keyof SetupCommandArgs["flags"])[] = [
+	"smoke",
+	"install",
+	"sessionCommand",
+	"noWorktree",
+	"worktreeName",
+	"requireWorktree",
+	"stateRoot",
+	"codingAgentDir",
+	"mutation",
+	"artifactByteCap",
+	"serverKey",
+	"gjcCommand",
+	"target",
+	"profile",
+	"profileDir",
+	"timeout",
+	"connectTimeout",
+];
+
+function rejectHermesFlagsOutsideHermes(component: SetupComponent, flags: SetupCommandArgs["flags"]): void {
+	if (component === "hermes") return;
+	const offending = HERMES_ONLY_FLAGS.filter(flag => flags[flag] !== undefined);
+	if (offending.length === 0) return;
+	const flagList = offending.map(flag => `--${flag.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)}`);
+	process.stderr.write(`${chalk.red(`${flagList.join(", ")} require the explicit \`hermes\` component.`)}\n`);
+	process.stderr.write(`${chalk.dim(`Run: ${APP_NAME} setup hermes ${flagList.join(" ")}`)}\n`);
+	process.exit(1);
+}
+
+function rejectPaseoFlagsOutsidePaseo(component: SetupComponent, flags: SetupCommandArgs["flags"]): void {
+	if (component === "paseo") return;
+	const offending = PASEO_ONLY_FLAGS.filter(flag => flags[flag] !== undefined);
+	if (offending.length === 0) return;
+	const flagList = offending.map(flag => `--${flag}`);
+	process.stderr.write(`${chalk.red(`${flagList.join(", ")} require the explicit \`paseo\` component.`)}\n`);
+	process.stderr.write(`${chalk.dim(`Run: ${APP_NAME} setup paseo ${flagList.join(" ")}`)}\n`);
+	process.exit(1);
+}
 
 function hasProviderSetupFlags(flags: SetupCommandArgs["flags"]): boolean {
 	return (
@@ -109,7 +177,7 @@ function rejectProviderFlagsOutsideProvider(component: SetupComponent, flags: Se
 	console.error(chalk.red("Provider setup flags require the explicit `provider` component."));
 	console.error(
 		chalk.dim(
-			`Run: ${APP_NAME} setup provider --preset <minimax|glm> or ${APP_NAME} setup provider --compat <openai|anthropic> --provider <id> --base-url <url> --api-key-env <ENV> --model <id>`,
+			`Run: ${APP_NAME} setup provider --preset <id> (see --help for presets) or ${APP_NAME} setup provider --compat <openai|anthropic> --provider <id> --base-url <url> --api-key-env <ENV> --model <id>`,
 		),
 	);
 	process.exit(1);
@@ -159,8 +227,12 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 			flags.noWorktree = true;
 		} else if (arg === "--worktree-name") {
 			flags.worktreeName = args[++i];
+		} else if (arg === "--require-worktree") {
+			flags.requireWorktree = true;
 		} else if (arg === "--state-root") {
 			flags.stateRoot = args[++i];
+		} else if (arg === "--coding-agent-dir") {
+			flags.codingAgentDir = args[++i];
 		} else if (arg === "--mutation") {
 			flags.mutation = [...(flags.mutation ?? []), args[++i] ?? ""];
 		} else if (arg === "--artifact-byte-cap") {
@@ -169,6 +241,10 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 			flags.serverKey = args[++i];
 		} else if (arg === "--gjc-command") {
 			flags.gjcCommand = args[++i];
+		} else if (arg === "--timeout") {
+			flags.timeout = args[++i] ?? "";
+		} else if (arg === "--connect-timeout") {
+			flags.connectTimeout = args[++i] ?? "";
 		} else if (arg === "--target") {
 			flags.target = args[++i];
 		} else if (arg === "--profile-dir") {
@@ -190,6 +266,10 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 			flags.model = [...(flags.model ?? []), args[++i] ?? ""];
 		} else if (arg === "--models-path") {
 			flags.modelsPath = args[++i];
+		} else if (arg === "--remove") {
+			flags.remove = true;
+		} else if (arg === "--mpreset") {
+			flags.mpreset = args[++i];
 		} else if (!componentSeen && VALID_COMPONENTS.includes(arg as SetupComponent)) {
 			component = arg as SetupComponent;
 			componentSeen = true;
@@ -201,6 +281,8 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 	}
 
 	rejectProviderFlagsOutsideProvider(component, flags);
+	rejectPaseoFlagsOutsidePaseo(component, flags);
+	rejectHermesFlagsOutsideHermes(component, flags);
 
 	return {
 		component,
@@ -258,6 +340,8 @@ async function checkPythonSetup(): Promise<PythonCheckResult> {
  */
 export async function runSetupCommand(cmd: SetupCommandArgs): Promise<void> {
 	rejectProviderFlagsOutsideProvider(cmd.component, cmd.flags);
+	rejectPaseoFlagsOutsidePaseo(cmd.component, cmd.flags);
+	rejectHermesFlagsOutsideHermes(cmd.component, cmd.flags);
 	switch (cmd.component) {
 		case "claude":
 			handleHostPluginSetup("claude", cmd.flags);
@@ -273,6 +357,9 @@ export async function runSetupCommand(cmd: SetupCommandArgs): Promise<void> {
 			break;
 		case "hooks":
 			await handleHooksSetup(cmd.flags);
+			break;
+		case "paseo":
+			await handlePaseoSetup(cmd.flags);
 			break;
 		case "provider":
 			await handleProviderSetup(cmd.flags);
@@ -294,10 +381,13 @@ async function handleHermesSetup(flags: HermesSetupFlags): Promise<void> {
 		const result = await runHermesSetup(flags);
 		if (flags.json) {
 			process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-			return;
+		} else {
+			process.stdout.write(
+				`${result.ok ? chalk.green(`${theme.status.success} Hermes MCP setup ready`) : chalk.red(`${theme.status.error} Hermes MCP setup check failed`)}\n`,
+			);
+			process.stdout.write(`${chalk.dim(formatHermesSetupResult(result))}\n`);
 		}
-		process.stdout.write(`${chalk.green(`${theme.status.success} Hermes MCP setup ready`)}\n`);
-		process.stdout.write(`${chalk.dim(formatHermesSetupResult(result))}\n`);
+		if (!result.ok) process.exit(4);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		if (flags.json) {
@@ -378,6 +468,105 @@ async function handleProviderSetup(flags: {
 	}
 }
 
+/**
+ * Register GJC with Paseo, diagnose that registration, or roll it back.
+ *
+ * Every write target belongs to another application, so failures are reported
+ * rather than worked around: a refusal here means the user's files were left
+ * exactly as they were.
+ */
+async function handlePaseoSetup(flags: SetupCommandArgs["flags"]): Promise<void> {
+	const paseoFlags: PaseoSetupFlags = {
+		check: flags.check,
+		json: flags.json,
+		force: flags.force,
+		remove: flags.remove,
+		mpreset: flags.mpreset,
+	};
+	try {
+		const outcome = await runPaseoSetup(paseoFlags, createDefaultPaseoSetupDependencies());
+		if (flags.json) {
+			process.stdout.write(`${JSON.stringify(outcome.result, null, 2)}\n`);
+			process.exitCode = paseoExitCode(outcome);
+			return;
+		}
+		writePaseoHumanOutput(outcome);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		if (flags.json) {
+			process.stdout.write(`${JSON.stringify({ ok: false, error: message }, null, 2)}\n`);
+		} else {
+			process.stderr.write(`${chalk.red(`${theme.status.error} Paseo setup failed`)}\n`);
+			process.stderr.write(`${chalk.dim(message)}\n`);
+		}
+		process.exit(error instanceof PaseoSetupUsageError ? 2 : 1);
+	}
+}
+
+function paseoExitCode(outcome: PaseoSetupOutcome): number {
+	if (outcome.kind === "check") return checkExitCode(outcome.result);
+	if (outcome.kind === "install") return outcome.result.outcome === "installed" ? 0 : 1;
+	return outcome.result.outcome === "partial-removal" ? 1 : 0;
+}
+
+function writePaseoHumanOutput(outcome: PaseoSetupOutcome): void {
+	if (outcome.kind === "check") {
+		const result = outcome.result;
+		switch (result.status) {
+			case "drift":
+				process.stderr.write(`${chalk.red(`${theme.status.error} Paseo setup has drifted`)}\n`);
+				for (const reason of result.reasons) {
+					process.stderr.write(`${chalk.dim(`  ${reason.code}: ${reason.subject} -- ${reason.detail}`)}\n`);
+				}
+				process.exitCode = 1;
+				return;
+			case "stale":
+				process.stdout.write(`${chalk.yellow(`${theme.status.warning} Paseo has not picked up the change yet`)}\n`);
+				if (result.guidance) process.stdout.write(`${chalk.dim(result.guidance)}\n`);
+				return;
+			case "skipped":
+				process.stdout.write(`${chalk.green(`${theme.status.success} Paseo setup files are correct`)}\n`);
+				process.stdout.write(
+					`${chalk.dim("The Paseo daemon did not respond, so its live provider list was not verified.")}\n`,
+				);
+				return;
+			case "pass":
+				process.stdout.write(`${chalk.green(`${theme.status.success} GJC is registered with Paseo`)}\n`);
+				return;
+		}
+	}
+
+	if (outcome.kind === "install") {
+		if (outcome.result.outcome === "installed") {
+			process.stdout.write(`${chalk.green(`${theme.status.success} GJC registered with Paseo`)}\n`);
+			for (const entry of outcome.result.changed) process.stdout.write(`${chalk.dim(`  updated ${entry}`)}\n`);
+			process.stdout.write(
+				`${chalk.dim("Restart the Paseo daemon when convenient so it picks up the new provider.")}\n`,
+			);
+			return;
+		}
+		process.stderr.write(`${chalk.red(`${theme.status.error} Paseo setup did not complete`)}\n`);
+		process.stderr.write(`${chalk.dim(outcome.result.evidence.detail)}\n`);
+		process.exitCode = 1;
+		return;
+	}
+
+	switch (outcome.result.outcome) {
+		case "removed":
+			process.stdout.write(`${chalk.green(`${theme.status.success} GJC unregistered from Paseo`)}\n`);
+			for (const entry of outcome.result.removed) process.stdout.write(`${chalk.dim(`  reverted ${entry}`)}\n`);
+			return;
+		case "nothing-to-remove":
+			process.stdout.write(`${chalk.dim("GJC has nothing recorded to remove from Paseo.")}\n`);
+			return;
+		case "partial-removal":
+			process.stderr.write(`${chalk.red(`${theme.status.error} Paseo removal did not complete`)}\n`);
+			process.stderr.write(`${chalk.dim(outcome.result.evidence.detail)}\n`);
+			process.exitCode = 1;
+			return;
+	}
+}
+
 async function handleHooksSetup(flags: { json?: boolean; check?: boolean }): Promise<void> {
 	const hooksPath = getDefaultCodexHooksPath();
 	const existingContent = await Bun.file(hooksPath)
@@ -453,6 +642,14 @@ async function handleDefaultsSetup(flags: { json?: boolean; check?: boolean; for
 	console.log(chalk.dim(`Target: ${result.targetRoot}`));
 	console.log(chalk.dim(`Written: ${result.written}; skipped: ${result.skipped}`));
 	console.log(chalk.dim(inspectGuidance));
+	const quarantined = result.retired.filter(entry => entry.status === "quarantined");
+	for (const entry of quarantined) {
+		console.log(
+			chalk.dim(
+				`Retired: \`${entry.name}\` is no longer a bundled workflow skill; moved to ${entry.quarantinedTo} so it is no longer discoverable.`,
+			),
+		);
+	}
 	if (result.skipped > 0 && !flags.force) {
 		console.log(
 			chalk.dim(
@@ -492,7 +689,7 @@ async function handlePythonSetup(flags: { json?: boolean; check?: boolean }): Pr
 }
 
 async function handleSttSetup(flags: { json?: boolean; check?: boolean }): Promise<void> {
-	const { checkDependencies, formatDependencyStatus } = await import("../stt/setup");
+	const { checkDependencies, formatDependencyStatus, formatSTTUsage } = await import("../stt/setup");
 	const status = await checkDependencies();
 
 	if (flags.json) {
@@ -505,6 +702,7 @@ async function handleSttSetup(flags: { json?: boolean; check?: boolean }): Promi
 
 	if (status.recorder.available && status.python.available && status.whisper.available) {
 		console.log(chalk.green(`\n${theme.status.success} Speech-to-text is ready`));
+		console.log(`\n${formatSTTUsage()}`);
 		return;
 	}
 
@@ -538,6 +736,7 @@ async function handleSttSetup(flags: { json?: boolean; check?: boolean }): Promi
 	const recheck = await checkDependencies();
 	if (recheck.recorder.available && recheck.python.available && recheck.whisper.available) {
 		console.log(chalk.green(`\n${theme.status.success} Speech-to-text is ready`));
+		console.log(`\n${formatSTTUsage()}`);
 	} else {
 		console.error(chalk.red(`\n${theme.status.error} Setup incomplete`));
 		console.log(formatDependencyStatus(recheck));
@@ -564,7 +763,7 @@ async function confirmImport(count: number): Promise<boolean> {
  */
 export interface CredentialsSetupDependencies {
 	openStore?: typeof SqliteAuthCredentialStore.open;
-	createAuthStorage?: (store: Awaited<ReturnType<typeof SqliteAuthCredentialStore.open>>) => AuthStorage;
+	createAuthStorage?: (store: SqliteAuthCredentialStore) => AuthStorage;
 	discover?: Parameters<typeof runExternalCredentialAutoImport>[0]["discover"];
 }
 
@@ -596,8 +795,10 @@ export async function handleCredentialsSetup(
 			trigger: "setup-cli",
 		});
 		const result = preview.discovery ?? { importable: [], skipped: [], environment: [] };
-		const candidates = filterAutoImportOAuthCredentials(result.importable);
-		const filteredResult = { ...result, importable: candidates };
+		const now = Date.now();
+		const candidates = result.importable.filter(credential => isAutoImportOAuthCredential(credential, now));
+		const autoImportSkips = getAutoImportOAuthCredentialSkips(result.importable, now);
+		const filteredResult = { ...result, importable: candidates, skipped: [...result.skipped, ...autoImportSkips] };
 		const redactedPlan = {
 			importable: candidates.map(c => ({
 				provider: c.provider,
@@ -607,7 +808,7 @@ export async function handleCredentialsSetup(
 				expiresAt: c.expiresAt,
 				redactedToken: c.redactedToken,
 			})),
-			skipped: result.skipped,
+			skipped: filteredResult.skipped,
 			environment: result.environment,
 			keychainChecked: flags.keychain === true,
 		};
@@ -716,6 +917,7 @@ ${chalk.bold("Components:")}
   defaults  Install bundled GJC default workflow skills (default)
   hermes   Optional: render/install a Hermes MCP bridge setup package
   hooks     Optional: install GJC native Codex UserPromptSubmit/Stop skill-state hooks
+  paseo     Optional: register GJC as a Paseo ACP provider and bridge Paseo's skills
   provider  Optional: add a preset, OpenAI-compatible, or Anthropic-compatible API provider
   python    Optional: verify a Python 3 interpreter is reachable for code execution
   stt       Optional: install speech-to-text dependencies (openai-whisper, recording tools)
@@ -725,22 +927,30 @@ ${chalk.bold("Components:")}
 ${chalk.bold("Provider example:")}
   ${APP_NAME} setup provider --preset minimax
   ${APP_NAME} setup provider --preset glm
+  ${APP_NAME} setup provider --preset cline-pass
+  ${APP_NAME} setup provider --preset commandcode-goat
+  ${APP_NAME} setup provider --preset litellm --base-url https://litellm.example.com/v1
+  ${APP_NAME} setup provider --preset openai-compatible-proxy --base-url https://gateway.example.com/v1
   MY_PROVIDER_KEY=sk-... ${APP_NAME} setup provider --compat openai --provider my-oai --base-url https://api.example.com/v1 --api-key-env MY_PROVIDER_KEY --model gpt-example
 
 ${chalk.bold("Hermes example:")}
   ${APP_NAME} setup hermes --root /path/to/repo
   ${APP_NAME} setup hermes --root /path/to/repo --profile my-bot --repo gajae-code --profile-dir /path/to/hermes/profile --install
   ${APP_NAME} setup hermes --root /path/to/repo --worktree-name hermes-gajae-code
-  ${APP_NAME} setup hermes --root /path/to/repo --session-command "gjc --worktree hermes-custom --model <provider/model>"
+  ${APP_NAME} setup hermes --root /path/to/repo --session-command "gjc --worktree hermes-custom"
+  ${APP_NAME} setup hermes --root /path/to/repo --session-command gjc
+  ${APP_NAME} setup hermes --root /path/to/repo --coding-agent-dir /var/lib/gjc/hermes-agent
+  ${APP_NAME} setup hermes --root /path/to/repo --gjc-command "python3 /tmp/gjc-wrapper.py"
+  ${APP_NAME} setup hermes --root /path/to/repo --gjc-command /opt/gjc
 
 ${chalk.bold("Options:")}
   -c, --check       Check if dependencies are installed without installing
   -f, --force       Overwrite existing default workflow skill files
   --json            Output status as JSON
-  --preset          Provider preset: minimax, minimax-cn, or glm (aliases include minimax-code and zai)
+  --preset          Provider preset id (run setup provider --help to list available presets)
   --compat          Provider compatibility: openai or anthropic
   --provider        Provider id to add to models.yml
-  --base-url        Provider API base URL
+  --base-url        Provider API base URL (required for proxy presets: litellm, openai-compatible-proxy)
   --api-key-env     Read provider API key from this environment variable
   --model, --models Model id to add (repeat or comma-separate)
   --models-path     Override models config path
@@ -749,15 +959,21 @@ ${chalk.bold("Options:")}
   --root            Allowed Hermes MCP workdir/artifact root (repeatable)
   --profile         Hermes MCP profile namespace
   --repo            Hermes MCP repo namespace
-  --session-command Explicit GJC session command; disables generated worktree flags
+  --gjc-command     Full command the controller execs: one token = executable (mcp-serve coordinator still appended); multiple tokens = complete server command verbatim, nothing appended; quote-aware, never shell-evaluated
+  --session-command Typed GJC lifecycle selector: gjc | gjc --worktree [name]; disables generated worktree flags
   --no-worktree     Disable default GJC --worktree isolation for Hermes sessions
   --worktree-name   Named GJC --worktree branch for Hermes sessions
+  --timeout         Hermes MCP client call timeout in whole seconds 1-3600 (default 180); host client budget, not a GJC turn deadline
+  --connect-timeout Hermes MCP connect timeout in whole seconds 1-3600 (default 60); host client budget, not a GJC turn deadline
   --mutation        Hermes MCP mutation classes: sessions,questions,reports,all
+  --coding-agent-dir GJC agent-directory override (GJC_CODING_AGENT_DIR, absolute path); distinct from --state-root
   --target          Hermes config file target for config-only install
   --profile-dir     Hermes profile directory for full setup install
   --dry-run         Preview discovered credentials without importing (credentials)
   -y, --yes         Import discovered credentials without an interactive prompt (credentials)
   --keychain        Include Claude macOS Keychain when discovering credentials
+  --remove          Roll back the Paseo registration GJC created (paseo)
+  --mpreset         Register an additional gjc-<preset> Paseo provider (paseo)
 
 ${chalk.bold("Examples:")}
   ${APP_NAME} setup                  Install bundled GJC default workflow skills
@@ -773,5 +989,8 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} setup credentials      Discover & import existing Claude/Codex credentials
   ${APP_NAME} setup credentials --dry-run  Preview importable credentials (redacted)
   ${APP_NAME} setup credentials --yes      Import without an interactive prompt
+  ${APP_NAME} setup paseo            Register GJC as a Paseo ACP provider
+  ${APP_NAME} setup paseo --check    Diagnose the Paseo registration
+  ${APP_NAME} setup paseo --remove   Roll back the Paseo registration
 `);
 }

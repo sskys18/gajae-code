@@ -12,9 +12,9 @@
  * carry subsystem-specific message types — lives in the per-subsystem
  * `types.ts` files and is documented there.
  */
-import type { AgentMessage } from "@gajae-code/agent-core";
+import type { AgentMessage, MidRunMaintenanceOutcome } from "@gajae-code/agent-core";
 import type { CompactionPreparation, CompactionResult } from "@gajae-code/agent-core/compaction";
-import type { ImageContent, TextContent, ToolResultMessage } from "@gajae-code/ai";
+import type { ImageContent, TextContent, ToolResultMessage } from "@gajae-code/ai/core";
 import type { Rule } from "../capability/rule";
 import type { Goal, GoalModeState } from "../goals/state";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry } from "../session/session-manager";
@@ -38,6 +38,9 @@ export interface SessionBeforeSwitchEvent {
 	targetSessionFile?: string;
 }
 
+/** Origin used when an interactive session selector resumes a session. */
+export const INTERACTIVE_SELECTOR_RESUME_ORIGIN = "interactive_selector_resume";
+
 /** Fired after switching to another session */
 export interface SessionSwitchEvent {
 	type: "session_switch";
@@ -45,6 +48,8 @@ export interface SessionSwitchEvent {
 	reason: "new" | "resume" | "fork";
 	/** Session file we came from */
 	previousSessionFile: string | undefined;
+	/** Optional provenance for this session transition. */
+	transition?: { origin: string };
 }
 
 /** Fired before branching a session (can be cancelled) */
@@ -179,6 +184,12 @@ export interface AgentStartEvent {
 export interface AgentEndEvent {
 	type: "agent_end";
 	messages: AgentMessage[];
+	/** Internal SDK queue-owner binding for exact lifecycle attribution. */
+	sdkRunToken?: string;
+	/** Indicates whether the loop ended normally, suspended, cancelled, or entered maintenance. */
+	stopReason?: "completed" | "paused" | "cancelled" | "maintenance";
+	/** Present for maintenance checkpoints; non-aborted checkpoints are not terminal. */
+	maintenanceOutcome?: MidRunMaintenanceOutcome;
 }
 
 /** Fired at the start of each turn */

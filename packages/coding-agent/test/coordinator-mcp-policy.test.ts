@@ -76,6 +76,31 @@ describe("Hermes MCP safety policy", () => {
 		);
 	});
 
+	it("authorizes GJC-managed repository-local worktrees under the repository bucket", async () => {
+		const root = await tempRoot();
+		const bucket = path.join(root, ".worktrees");
+		const worktree = path.join(bucket, "feature-session");
+		await fs.mkdir(worktree, { recursive: true });
+		const config = buildCoordinatorMcpConfig({
+			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+		});
+
+		await expect(assertCoordinatorWorkdir(config, worktree)).resolves.toBe(worktree);
+	});
+
+	it("honors the configured managed worktree bucket", async () => {
+		const root = await tempRoot();
+		const bucket = await tempRoot();
+		const worktree = path.join(bucket, "configured-session");
+		await fs.mkdir(worktree);
+		const config = buildCoordinatorMcpConfig({
+			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+			GJC_WORKTREE_DIR: bucket,
+		});
+
+		await expect(assertCoordinatorWorkdir(config, worktree)).resolves.toBe(worktree);
+	});
+
 	it("rejects artifact symlink escapes and enforces byte caps", async () => {
 		const root = await tempRoot();
 		const outside = await tempRoot();
@@ -94,6 +119,23 @@ describe("Hermes MCP safety policy", () => {
 		expect(safe.path).toBe(safeFile);
 		expect(safe.byteCap).toBe(3);
 		await expect(assertCoordinatorArtifactPath(config, escapedLink)).rejects.toThrow(
+			"coordinator_artifact_outside_allowed_roots",
+		);
+	});
+
+	it("denies an artifact after its parent directory is swapped for an outside symlink", async () => {
+		const root = await tempRoot();
+		const outside = await tempRoot();
+		const parent = path.join(root, "artifacts");
+		await fs.mkdir(parent);
+		await Bun.write(path.join(outside, "secret.txt"), "secret");
+		await fs.rm(parent, { recursive: true });
+		await fs.symlink(outside, parent);
+		const config = buildCoordinatorMcpConfig({
+			GJC_SESSION_ID: "coordinator-policy-test-session",
+			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+		});
+		await expect(assertCoordinatorArtifactPath(config, path.join(parent, "secret.txt"))).rejects.toThrow(
 			"coordinator_artifact_outside_allowed_roots",
 		);
 	});

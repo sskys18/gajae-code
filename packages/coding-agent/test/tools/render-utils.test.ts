@@ -11,6 +11,7 @@ import {
 	getPreviewLines,
 	shortenPath,
 } from "@gajae-code/coding-agent/tools/render-utils";
+import { formatScreenshot as formatBrowserScreenshot } from "../../src/tools/browser/screenshot-format";
 
 describe("parse error formatting", () => {
 	it("deduplicates parse errors while preserving order", () => {
@@ -43,6 +44,9 @@ describe("parse error formatting", () => {
 });
 
 describe("formatScreenshot", () => {
+	it("re-exports the browser formatter implementation", () => {
+		expect(formatScreenshot).toBe(formatBrowserScreenshot);
+	});
 	function fakeResized(
 		overrides?: Partial<{
 			width: number;
@@ -204,5 +208,15 @@ describe("render helper null-safety", () => {
 		expect(shortenPath(null as unknown as string)).toBe("");
 		// Sanity: real input still works.
 		expect(shortenPath("/home/u/x", "/home/u")).toBe("~/x");
+	});
+
+	it("shortenPath only abbreviates paths inside home, not siblings sharing the prefix", () => {
+		expect(shortenPath("/home/woody/a.txt", "/home/woody")).toBe("~/a.txt");
+		expect(shortenPath("/home/woody", "/home/woody")).toBe("~");
+		// Siblings that merely share the string prefix must be returned verbatim.
+		expect(shortenPath("/home/woodyx/notes.txt", "/home/woody")).toBe("/home/woodyx/notes.txt");
+		expect(shortenPath("/home/woody-backup/x", "/home/woody")).toBe("/home/woody-backup/x");
+		expect(shortenPath("/home/woodyshire", "/home/woody")).toBe("/home/woodyshire");
+		expect(shortenPath("/etc/passwd", "/home/woody")).toBe("/etc/passwd");
 	});
 });

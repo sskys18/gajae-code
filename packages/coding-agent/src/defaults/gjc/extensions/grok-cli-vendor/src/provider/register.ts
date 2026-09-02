@@ -2,7 +2,7 @@
  * GJC Grok Build provider — SuperGrok OAuth + cli-chat-proxy models.
  */
 
-import type { Api, Model } from '@gajae-code/ai';
+import type { Api, Model } from '@gajae-code/ai/core';
 import { Effort } from '@gajae-code/ai/model-thinking';
 import type { OAuthCredentials, OAuthLoginCallbacks } from '@gajae-code/ai/utils/oauth/types';
 import { loginXai, refreshXaiToken, XAI_OAUTH_SCOPE } from '@gajae-code/ai/utils/oauth/xai';
@@ -36,7 +36,11 @@ export default function registerGrokCli(api: ExtensionAPI) {
       name: m.name,
       reasoning: m.reasoning,
       thinking: m.reasoning
-        ? { minLevel: Effort.Low, maxLevel: Effort.XHigh, mode: 'effort' }
+        ? {
+            minLevel: Effort.Low,
+            maxLevel: m.maxReasoningEffort ?? Effort.XHigh,
+            mode: 'effort',
+          }
         : undefined,
       input: m.input,
       cost: m.cost,

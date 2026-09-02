@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, test } from "bun:test";
 import { JobsOverlayComponent, type JobsOverlayController } from "../src/modes/components/jobs-overlay";
 import {
 	buildConfirmItems,
@@ -8,6 +8,9 @@ import {
 	parseJobRef,
 } from "../src/modes/components/jobs-overlay-model";
 import type { JobsSnapshot } from "../src/modes/jobs-observer";
+import { initTheme } from "../src/modes/theme/theme";
+
+beforeAll(() => initTheme());
 
 function snapshot(over: Partial<JobsSnapshot> = {}): JobsSnapshot {
 	return {
@@ -97,6 +100,55 @@ describe("jobs overlay model", () => {
 		expect(parseJobRef("noop")).toBeNull();
 		expect(parseJobRef("back")).toBeNull();
 		expect(parseJobRef("other:1")).toBeNull();
+		expect(parseJobRef("folded:bg_1:job%3A1")).toEqual({ kind: "folded", id: "bg_1", generation: "job:1" });
+		expect(parseJobRef("folded:dead-letter-overflow%3Aowner:dead-letter-overflow%3Aowner")).toEqual({
+			kind: "folded",
+			id: "dead-letter-overflow:owner",
+			generation: "dead-letter-overflow:owner",
+		});
+	});
+
+	test("folded job rows are drillable read-only details", () => {
+		const snap = snapshot({
+			foldedJobs: [
+				{
+					id: "bg_1",
+					generation: "job:1",
+					kind: "bash",
+					status: "running",
+					label: "sleep 30",
+					deliveryState: "pending",
+					backgrounded: true,
+				},
+			],
+		});
+		const list = buildJobsListItems(snap);
+		expect(list[0]?.disabled).not.toBe(true);
+		const detail = buildJobDetailItems(snap, { kind: "folded", id: "bg_1", generation: "job:1" });
+		expect(detail.map(item => item.label)).toEqual(["Status", "Kind", "Label", "Generation", "Back"]);
+		expect(detail.some(item => item.value.startsWith("action:"))).toBe(false);
+	});
+
+	test("folded overflow rows round-trip colon-bearing identity into details", () => {
+		const identity = "dead-letter-overflow:owner";
+		const snap = snapshot({
+			foldedJobs: [
+				{
+					id: identity,
+					generation: identity,
+					kind: "dead-letter",
+					status: "failed",
+					label: identity,
+					deliveryState: "failed-visible",
+					backgrounded: false,
+				},
+			],
+		});
+		const item = buildJobsListItems(snap)[0];
+		if (!item) throw new Error("expected folded overflow row");
+		const ref = parseJobRef(item.value);
+		expect(ref).toEqual({ kind: "folded", id: identity, generation: identity });
+		expect(buildJobDetailItems(snap, ref!).at(-1)).toEqual({ value: "back", label: "Back" });
 	});
 
 	test("AC9 monitor detail shows status + last output line and a cancel action", () => {

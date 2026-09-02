@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as z from "zod/v4";
+import { Effort } from "../src/model-thinking";
 import { getBundledModel } from "../src/models";
 import { convertMessages, detectCompat, streamOpenAICompletions } from "../src/providers/openai-completions";
 import { resolveOpenAICompat } from "../src/providers/openai-completions-compat";
-import type { AssistantMessage, Context, Model, OpenAICompat, Tool } from "../src/types";
+import type { AssistantMessage, AssistantMessageEvent, Context, Model, OpenAICompat, Tool } from "../src/types";
+import { EMPTY_RESPONSE_PROVIDER_CODE } from "../src/utils/fallback-transport";
 
 const originalFetch = global.fetch;
 
@@ -33,6 +35,12 @@ function getNestedBoolean(value: unknown, key: string): boolean | undefined {
 	const property = Reflect.get(obj, key);
 	return typeof property === "boolean" ? property : undefined;
 }
+function getNestedString(value: unknown, key: string): string | undefined {
+	const obj = toObject(value);
+	if (!obj) return undefined;
+	const property = Reflect.get(obj, key);
+	return typeof property === "string" ? property : undefined;
+}
 
 function createSseResponse(events: unknown[]): Response {
 	const payload = `${events.map(event => `data: ${typeof event === "string" ? event : JSON.stringify(event)}`).join("\n\n")}\n\n`;
@@ -50,6 +58,33 @@ function createMockFetch(events: unknown[]): typeof fetch {
 	return Object.assign(mockFetch, { preconnect: originalFetch.preconnect });
 }
 
+function createSuccessfulCompletionResponse(): Response {
+	return createSseResponse([
+		{
+			id: "chatcmpl-success",
+			object: "chat.completion.chunk",
+			created: 0,
+			model: "gpt-4o-mini",
+			choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }],
+		},
+		"[DONE]",
+	]);
+}
+
+function createEmptyResponseModel(
+	cost: Model<"openai-completions">["cost"] = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+): Model<"openai-completions"> {
+	return {
+		...getBundledModel("openai", "gpt-4o-mini"),
+		api: "openai-completions",
+		provider: "kilo",
+		id: "stealth/ox-alpha",
+		name: "Ox Alpha",
+		baseUrl: "https://api.kilo.ai/api/gateway",
+		cost,
+	};
+}
+
 function baseContext(): Context {
 	return {
 		messages: [
@@ -63,6 +98,203 @@ function baseContext(): Context {
 }
 
 describe("openai-completions compatibility", () => {
+	it("never sends reasoning controls to Groq compound systems after late metadata overrides", async () => {
+		for (const id of ["groq/compound", "groq/compound-mini"] as const) {
+			const model: Model<"openai-completions"> = {
+				id,
+				name: id,
+				api: "openai-completions",
+				provider: "groq",
+				baseUrl: "https://api.groq.com/openai/v1",
+				reasoning: true,
+				thinking: { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.High },
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 131_072,
+				maxTokens: 8_192,
+				compat: { supportsReasoningEffort: true },
+			};
+			const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+			streamOpenAICompletions(model, baseContext(), {
+				apiKey: "test-key",
+				reasoning: "high",
+				signal: createAbortedSignal(),
+				onPayload: payload => resolve(payload as Record<string, unknown>),
+			});
+
+			const payload = await promise;
+			expect(payload.reasoning_effort).toBeUndefined();
+			expect(payload.reasoning).toBeUndefined();
+			expect(payload.enable_thinking).toBeUndefined();
+			expect(payload.chat_template_kwargs).toBeUndefined();
+		}
+	});
+
+	it("serializes direct xAI Grok 4.5 and 4.6 reasoning efforts without changing other Grok routes", async () => {
+		async function captureXaiPayload(modelId: "grok-4.5" | "grok-4.6", reasoning: "low" | "xhigh") {
+			const model: Model<"openai-completions"> = {
+				id: modelId,
+				name: modelId,
+				api: "openai-completions",
+				provider: "xai",
+				baseUrl: "https://api.x.ai/v1",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 500_000,
+				maxTokens: 64_000,
+			};
+			const { promise, resolve } = Promise.withResolvers<unknown>();
+			streamOpenAICompletions(model, baseContext(), {
+				apiKey: "test-key",
+				reasoning,
+				signal: createAbortedSignal(),
+				onPayload: payload => resolve(payload),
+			});
+			return (await promise) as Record<string, unknown>;
+		}
+
+		expect(
+			resolveOpenAICompat({
+				id: "grok-4.5",
+				name: "Grok 4.5",
+				api: "openai-completions",
+				provider: "xai",
+				baseUrl: "https://api.x.ai/v1",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 500_000,
+				maxTokens: 64_000,
+			}).supportsReasoningEffort,
+		).toBe(true);
+		expect((await captureXaiPayload("grok-4.5", "low")).reasoning_effort).toBe("low");
+		expect((await captureXaiPayload("grok-4.6", "xhigh")).reasoning_effort).toBe("xhigh");
+		expect(
+			resolveOpenAICompat({
+				id: "grok-4.6",
+				name: "Grok 4.6",
+				api: "openai-completions",
+				provider: "openrouter",
+				baseUrl: "https://openrouter.ai/api/v1",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 500_000,
+				maxTokens: 64_000,
+			}).supportsReasoningEffort,
+		).toBe(true);
+	});
+
+	it("fails closed for arbitrary custom reasoning transports and honors explicit opt-in", async () => {
+		async function captureCustomPayload(
+			options: { compat?: OpenAICompat; id?: string; provider?: string; baseUrl?: string } = {},
+		) {
+			const model: Model<"openai-completions"> = {
+				id: options.id ?? "reasoning-model",
+				name: "Reasoning Model",
+				api: "openai-completions",
+				provider: options.provider ?? "my-proxy",
+				baseUrl: options.baseUrl ?? "https://proxy.example.com/v1",
+				reasoning: true,
+				thinking: { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.High },
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128_000,
+				maxTokens: 32_000,
+				compat: options.compat,
+			};
+			const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+			streamOpenAICompletions(model, baseContext(), {
+				apiKey: "test-key",
+				reasoning: "high",
+				signal: createAbortedSignal(),
+				onPayload: payload => resolve(payload as Record<string, unknown>),
+			});
+			return { model, payload: await promise };
+		}
+
+		const implicit = await captureCustomPayload();
+		expect(resolveOpenAICompat(implicit.model).supportsReasoningEffort).toBe(false);
+		expect(implicit.payload).not.toHaveProperty("reasoning_effort");
+
+		const disabled = await captureCustomPayload({ compat: { supportsReasoningEffort: false } });
+		expect(disabled.payload).not.toHaveProperty("reasoning_effort");
+
+		const knownLabelOnUnknownEndpoint = await captureCustomPayload({
+			provider: "litellm",
+			baseUrl: "http://localhost:4000/v1",
+		});
+		expect(knownLabelOnUnknownEndpoint.payload).not.toHaveProperty("reasoning_effort");
+
+		const qwenByNameOnly = await captureCustomPayload({
+			id: "qwen-custom-reasoner",
+			compat: { supportsReasoningEffort: false },
+		});
+		expect(qwenByNameOnly.payload).not.toHaveProperty("enable_thinking");
+		expect(qwenByNameOnly.payload).not.toHaveProperty("reasoning_effort");
+
+		const optedIn = await captureCustomPayload({
+			id: "qwen-custom-reasoner",
+			compat: {
+				supportsReasoningEffort: true,
+				reasoningEffortMap: { high: "provider-high" },
+			},
+		});
+		expect(optedIn.payload.reasoning_effort).toBe("provider-high");
+		expect(optedIn.payload).not.toHaveProperty("enable_thinking");
+
+		const qwenOnOpenAI = await captureCustomPayload({
+			id: "qwen-custom-reasoner",
+			provider: "custom",
+			baseUrl: "https://api.openai.com/dashscope/v1",
+		});
+		expect(qwenOnOpenAI.payload.reasoning_effort).toBe("high");
+		expect(qwenOnOpenAI.payload).not.toHaveProperty("enable_thinking");
+
+		const explicitQwenFormat = await captureCustomPayload({
+			id: "qwen-custom-reasoner",
+			compat: { supportsReasoningEffort: true, thinkingFormat: "qwen" },
+		});
+		expect(explicitQwenFormat.payload.enable_thinking).toBe(true);
+		expect(explicitQwenFormat.payload).not.toHaveProperty("reasoning_effort");
+
+		const disabledExplicitQwenFormat = await captureCustomPayload({
+			id: "qwen-custom-reasoner",
+			compat: { supportsReasoningEffort: false, thinkingFormat: "qwen" },
+		});
+		expect(disabledExplicitQwenFormat.payload).not.toHaveProperty("enable_thinking");
+		expect(disabledExplicitQwenFormat.payload).not.toHaveProperty("reasoning_effort");
+
+		const disabledAuditedQwenFormat = await captureCustomPayload({
+			id: "qwen-custom-reasoner",
+			baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+			compat: { supportsReasoningEffort: false, thinkingFormat: "qwen" },
+		});
+		expect(disabledAuditedQwenFormat.payload).not.toHaveProperty("enable_thinking");
+		expect(disabledAuditedQwenFormat.payload).not.toHaveProperty("reasoning_effort");
+
+		const disabledInjectedThinking = await captureCustomPayload({
+			compat: {
+				supportsReasoningEffort: false,
+				extraBody: { thinking: { type: "enabled" } },
+			},
+		});
+		expect(disabledInjectedThinking.payload).not.toHaveProperty("thinking");
+
+		const zaiPathLookalike = await captureCustomPayload({
+			baseUrl: "https://api.openai.com/v1/api.z.ai",
+		});
+		expect(zaiPathLookalike.payload.reasoning_effort).toBe("high");
+		expect(zaiPathLookalike.payload).not.toHaveProperty("thinking");
+
+		const openRouterPathLookalike = await captureCustomPayload({
+			baseUrl: "https://api.openai.com/v1/openrouter.ai",
+		});
+		expect(openRouterPathLookalike.payload.reasoning_effort).toBe("high");
+		expect(openRouterPathLookalike.payload).not.toHaveProperty("reasoning");
+	});
+
 	it("serializes assistant text content as a plain string", () => {
 		const model: Model<"openai-completions"> = {
 			...getBundledModel("openai", "gpt-4o-mini"),
@@ -72,6 +304,9 @@ describe("openai-completions compatibility", () => {
 			supportsStore: true,
 			supportsDeveloperRole: true,
 			sendSessionHeaders: false,
+			supportsResponsesSessionAffinity: false,
+			supportsServiceTier: false,
+			reservedToolNames: [],
 			supportsMultipleSystemMessages: true,
 			supportsReasoningEffort: true,
 			reasoningEffortMap: {},
@@ -351,12 +586,147 @@ describe("openai-completions compatibility", () => {
 		expect(result.usage.totalTokens).toBe(15);
 	});
 
+	it("types an empty zero-usage completion as a retryable transport failure", async () => {
+		const model = createEmptyResponseModel();
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-empty",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+				usage: { prompt_tokens: 0, completion_tokens: 0 },
+			},
+			"[DONE]",
+		]);
+
+		const stream = streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" });
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Provider returned an empty response with zero token usage");
+		expect(result.transportFailure).toEqual({
+			kind: "transport",
+			providerCode: EMPTY_RESPONSE_PROVIDER_CODE,
+		});
+		expect(events.filter(event => event.type === "error")).toHaveLength(1);
+		expect(events.filter(event => event.type === "done")).toHaveLength(0);
+	});
+
+	it("leaves low nonzero empty completion usage untyped for overflow recovery", async () => {
+		const model = createEmptyResponseModel({ input: 2, output: 4, cacheRead: 1, cacheWrite: 3 });
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-low-usage-empty",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+				usage: { prompt_tokens: 1, completion_tokens: 1 },
+			},
+			"[DONE]",
+		]);
+
+		const stream = streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" });
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([]);
+		expect(result.usage).toMatchObject({ input: 1, output: 1 });
+		expect(result.usage.cost).toEqual({
+			input: 0.000002,
+			output: 0.000004,
+			cacheRead: 0,
+			cacheWrite: 0,
+			total: 0.000006,
+		});
+		expect(result.transportFailure).toBeUndefined();
+		expect(events.filter(event => event.type === "error")).toHaveLength(0);
+		expect(events.filter(event => event.type === "done")).toHaveLength(1);
+	});
+
+	it("leaves empty completions without explicit usage on overflow recovery", async () => {
+		const model = createEmptyResponseModel();
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-usage-absent",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([]);
+		expect(result.usage.totalTokens).toBe(0);
+		expect(result.transportFailure).toBeUndefined();
+	});
+
+	it("preserves total-token-only evidence on empty completions", async () => {
+		const model = createEmptyResponseModel();
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-total-only",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+				usage: { total_tokens: 2 },
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.usage.totalTokens).toBe(2);
+		expect(result.transportFailure).toBeUndefined();
+	});
+
+	it("does not let duplicate zero usage erase earlier nonzero evidence", async () => {
+		const model = createEmptyResponseModel();
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-nonzero-first",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [],
+				usage: { prompt_tokens: 1, completion_tokens: 1 },
+			},
+			{
+				id: "chatcmpl-zero-last",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+				usage: { prompt_tokens: 0, completion_tokens: 0 },
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.usage).toMatchObject({ input: 1, output: 1, totalTokens: 2 });
+		expect(result.transportFailure).toBeUndefined();
+	});
+
 	it("maps qwen chat template reasoning into chat_template_kwargs", async () => {
 		const model: Model<"openai-completions"> = {
 			...getBundledModel("openai", "gpt-4o-mini"),
 			api: "openai-completions",
 			reasoning: true,
 			compat: {
+				supportsReasoningEffort: true,
 				thinkingFormat: "qwen-chat-template",
 			},
 		};
@@ -370,6 +740,30 @@ describe("openai-completions compatibility", () => {
 		const payload = await promise;
 		const chatTemplateArgs = getNestedObject(payload, "chat_template_kwargs");
 		expect(getNestedBoolean(chatTemplateArgs, "enable_thinking")).toBe(true);
+	});
+	it("maps oMLX reasoning effort into chat_template_kwargs.reasoning_effort", async () => {
+		const model: Model<"openai-completions"> = {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			provider: "omlx",
+			id: "Qwen3.6-35B-A3B-8bit",
+			reasoning: true,
+			compat: {
+				thinkingFormat: "qwen-chat-template",
+				supportsReasoningEffort: true,
+			},
+		};
+		const { promise, resolve } = Promise.withResolvers<unknown>();
+		streamOpenAICompletions(model, baseContext(), {
+			apiKey: "test-key",
+			reasoning: "high",
+			signal: createAbortedSignal(),
+			onPayload: payload => resolve(payload),
+		});
+		const payload = await promise;
+		const chatTemplateArgs = getNestedObject(payload, "chat_template_kwargs");
+		expect(getNestedBoolean(chatTemplateArgs, "enable_thinking")).toBe(true);
+		expect(getNestedString(chatTemplateArgs, "reasoning_effort")).toBe("high");
 	});
 
 	it("treats finish_reason end as stop", async () => {
@@ -473,6 +867,85 @@ describe("openai-completions compatibility", () => {
 		expect(assistantObject ? Reflect.get(assistantObject, "reasoning_text") : undefined).toBe("inspect tool output");
 		expect(assistantObject ? Reflect.get(assistantObject, "reasoning_content") : undefined).toBeUndefined();
 	});
+	it("preserves duplicate endpoint query parameters across SDK requests", async () => {
+		const model: Model<"openai-completions"> = {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			provider: "custom" as Model["provider"],
+			baseUrl: "https://example.invalid/v1?scope=read&scope=write&sig=a%2fb%20c",
+		};
+		const requests: string[] = [];
+		let attempt = 0;
+		const fetch = Object.assign(
+			async (input: string | URL | Request): Promise<Response> => {
+				requests.push(input instanceof Request ? input.url : String(input));
+				attempt++;
+				if (attempt === 1) {
+					return new Response("retry", { status: 500, headers: { "retry-after-ms": "0" } });
+				}
+				return createSuccessfulCompletionResponse();
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+
+		const result = await streamOpenAICompletions(model, baseContext(), {
+			apiKey: "test-key",
+			fetch,
+			requestMaxRetries: 1,
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(requests).toHaveLength(2);
+		for (const request of requests) {
+			expect(new URL(request).searchParams.getAll("scope")).toEqual(["read", "write"]);
+			expect(request).toContain("sig=a%2fb%20c");
+		}
+	});
+	it("preserves a percent-encoded explicit Azure API version from the endpoint", async () => {
+		const model: Model<"openai-completions"> = {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			provider: "custom" as Model["provider"],
+			baseUrl: "https://example.openai.azure.com/openai/v1?api%2Dversion=2025-04-01-preview",
+		};
+		const requests: string[] = [];
+		const fetch = Object.assign(
+			async (input: string | URL | Request): Promise<Response> => {
+				requests.push(input instanceof Request ? input.url : String(input));
+				return createSuccessfulCompletionResponse();
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key", fetch }).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(requests).toHaveLength(1);
+		expect(new URL(requests[0]!).searchParams.getAll("api-version")).toEqual(["2025-04-01-preview"]);
+		expect(requests[0]).toContain("?api%2Dversion=2025-04-01-preview");
+	});
+	it("appends the default Azure API version after endpoint query entries", async () => {
+		const model: Model<"openai-completions"> = {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			provider: "custom" as Model["provider"],
+			baseUrl: "https://example.openai.azure.com/openai/v1?scope=read&scope=write",
+		};
+		const requests: string[] = [];
+		const fetch = Object.assign(
+			async (input: string | URL | Request): Promise<Response> => {
+				requests.push(input instanceof Request ? input.url : String(input));
+				return createSuccessfulCompletionResponse();
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key", fetch }).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(requests).toHaveLength(1);
+		expect(new URL(requests[0]!).search).toStartWith("?scope=read&scope=write&api-version=");
+	});
 });
 
 describe("kimi model detection via detectCompat", () => {
@@ -511,6 +984,7 @@ describe("kimi model detection via detectCompat", () => {
 
 	async function captureOpenCodeGoPayload(
 		options: Parameters<typeof streamOpenAICompletions>[2],
+		modelId = "kimi-k2.7-code",
 	): Promise<Record<string, unknown>> {
 		const tool: Tool = {
 			name: "search",
@@ -519,7 +993,7 @@ describe("kimi model detection via detectCompat", () => {
 		};
 		const { promise, resolve } = Promise.withResolvers<unknown>();
 		streamOpenAICompletions(
-			getBundledModel("opencode-go", "kimi-k2.5") as Model<"openai-completions">,
+			getBundledModel("opencode-go", modelId) as Model<"openai-completions">,
 			{ ...baseContext(), tools: [tool] },
 			{
 				...options,
@@ -530,26 +1004,40 @@ describe("kimi model detection via detectCompat", () => {
 		);
 		return (await promise) as Record<string, unknown>;
 	}
-	it("disables reasoning for forced tool_choice on official OpenCode Go models", () => {
-		const model = getBundledModel("opencode-go", "kimi-k2.5");
-		expect(model.provider).toBe("opencode-go");
-		expect(model.reasoning).toBe(true);
+	it("captures OpenCode Go Kimi effort gaps and forced tool_choice support per variant", () => {
+		const cases = [
+			{ id: "kimi-k2.5", effortMap: { minimal: "low" } },
+			{ id: "kimi-k2.6", effortMap: {} },
+			{ id: "kimi-k2.7-code", effortMap: { xhigh: "high", max: "high" } },
+		] as const;
 
-		const compat = detectCompat(model as Model<"openai-completions">);
+		for (const { id, effortMap } of cases) {
+			const model = getBundledModel("opencode-go", id);
+			expect(model.provider).toBe("opencode-go");
+			expect(model.reasoning).toBe(true);
 
-		expect(compat.disableReasoningOnForcedToolChoice).toBe(true);
+			const compat = detectCompat(model as Model<"openai-completions">);
+
+			expect(compat.reasoningEffortMap).toEqual(expect.objectContaining(effortMap));
+			expect(compat.disableReasoningOnForcedToolChoice).toBe(true);
+			expect(compat.supportsForcedToolChoice).toBe(false);
+		}
 	});
 
-	it("drops reasoning, not forced tool_choice, for OpenCode Go forced tool_choice payloads", async () => {
-		const payload = await captureOpenCodeGoPayload({
-			reasoning: "high",
-			toolChoice: { type: "function", function: { name: "search" } },
-		});
+	it("omits forced tool_choice for every OpenCode Go Kimi payload", async () => {
+		for (const modelId of ["kimi-k2.5", "kimi-k2.6", "kimi-k2.7-code"]) {
+			const payload = await captureOpenCodeGoPayload(
+				{
+					reasoning: "high",
+					toolChoice: { type: "function", function: { name: "search" } },
+				},
+				modelId,
+			);
 
-		expect(payload.tools).toBeDefined();
-		expect(payload.tool_choice).toEqual({ type: "function", function: { name: "search" } });
-		expect(payload.reasoning_effort).toBeUndefined();
-		expect(payload.reasoning).toBeUndefined();
+			expect(payload.tools).toBeDefined();
+			expect(payload.tool_choice).toBeUndefined();
+			expect(payload.reasoning_effort).toBe("high");
+		}
 	});
 
 	it("preserves reasoning for OpenCode Go auto tool_choice payloads", async () => {
@@ -558,6 +1046,23 @@ describe("kimi model detection via detectCompat", () => {
 		expect(payload.tools).toBeDefined();
 		expect(payload.tool_choice).toBe("auto");
 		expect(payload.reasoning_effort).toBe("high");
+	});
+
+	it("maps only the OpenCode Go Kimi efforts rejected in live probes", async () => {
+		const k25MinimalPayload = await captureOpenCodeGoPayload(
+			{ reasoning: "minimal", toolChoice: "auto" },
+			"kimi-k2.5",
+		);
+		const k25MaxPayload = await captureOpenCodeGoPayload({ reasoning: "max", toolChoice: "auto" }, "kimi-k2.5");
+		const k26MaxPayload = await captureOpenCodeGoPayload({ reasoning: "max", toolChoice: "auto" }, "kimi-k2.6");
+		const k27XhighPayload = await captureOpenCodeGoPayload({ reasoning: "xhigh", toolChoice: "auto" });
+		const k27MaxPayload = await captureOpenCodeGoPayload({ reasoning: "max", toolChoice: "auto" });
+
+		expect(k25MinimalPayload.reasoning_effort).toBe("low");
+		expect(k25MaxPayload.reasoning_effort).toBe("max");
+		expect(k26MaxPayload.reasoning_effort).toBe("max");
+		expect(k27XhighPayload.reasoning_effort).toBe("high");
+		expect(k27MaxPayload.reasoning_effort).toBe("high");
 	});
 
 	it("does not inject reasoning_content placeholder for kimi on opencode-go", () => {
@@ -754,6 +1259,77 @@ describe("kimi model detection via detectCompat", () => {
 		};
 		const compat = detectCompat(model);
 		expect(compat.requiresReasoningContentForToolCalls).toBe(true);
+	});
+});
+
+describe("DeepSeek strict mode via OpenRouter", () => {
+	function deepseekModel(overrides: Partial<Model<"openai-completions">> = {}): Model<"openai-completions"> {
+		return {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			id: "deepseek/deepseek-v4-pro",
+			reasoning: true,
+			...overrides,
+		} as Model<"openai-completions">;
+	}
+
+	it("disables strict mode for DeepSeek V4 via OpenRouter", () => {
+		const model = deepseekModel({
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+		});
+		const compat = detectCompat(model);
+		expect(compat.supportsStrictMode).toBe(false);
+	});
+
+	it("disables strict mode for DeepSeek V4 flash via OpenRouter", () => {
+		const model = deepseekModel({
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			id: "deepseek/deepseek-v4-flash",
+		});
+		const compat = detectCompat(model);
+		expect(compat.supportsStrictMode).toBe(false);
+	});
+
+	it("keeps strict mode enabled for non-DeepSeek models via OpenRouter", () => {
+		const model = deepseekModel({
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			id: "anthropic/claude-sonnet-4-20250514",
+		});
+		const compat = detectCompat(model);
+		expect(compat.supportsStrictMode).toBe(true);
+	});
+
+	it("keeps strict mode enabled for GPT via OpenRouter", () => {
+		const model = deepseekModel({
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			id: "openai/gpt-5",
+		});
+		const compat = detectCompat(model);
+		expect(compat.supportsStrictMode).toBe(true);
+	});
+
+	it("keeps strict mode enabled for DeepSeek direct API", () => {
+		const model = deepseekModel({
+			provider: "deepseek",
+			baseUrl: "https://api.deepseek.com/v1",
+			id: "deepseek-chat",
+		});
+		const compat = detectCompat(model);
+		expect(compat.supportsStrictMode).toBe(true);
+	});
+
+	it("keeps strict mode disabled for DeepSeek via NVIDIA NIM (nvidia does not support strict)", () => {
+		const model = deepseekModel({
+			provider: "nvidia",
+			baseUrl: "https://integrate.api.nvidia.com/v1",
+			id: "deepseek-ai/deepseek-v4-flash",
+		});
+		const compat = detectCompat(model);
+		expect(compat.supportsStrictMode).toBe(false);
 	});
 });
 

@@ -1,12 +1,39 @@
 import { dlopen, FFIType, ptr } from "bun:ffi";
 import * as fs from "node:fs";
-import { $env, $flag } from "@gajae-code/utils";
+import { $env, $flag, $pickenv } from "@gajae-code/utils";
 import { setKittyProtocolActive } from "./keys";
 import { StdinBuffer } from "./stdin-buffer";
 
 const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
 const TERMINAL_PROGRESS_CLEAR_SEQUENCE = "\x1b]9;4;0;\x07";
+
+/**
+ * Capability-probe reply shapes that only this layer solicits (OSC 11 background
+ * color, the Mode 2031 appearance DSR, and the Kitty keyboard-flags report).
+ * These are terminal-to-host replies and are NEVER legitimate user input, so a
+ * reply that arrives outside its pending-query window is dropped defensively.
+ *
+ * DA1 is deliberately absent: `Tui` issues its own DA1 request for the sixel
+ * probe and consumes that reply downstream.
+ */
+export const PROBE_REPLY_PATTERNS: ReadonlyArray<{ name: string; issuedProbe: string; pattern: RegExp }> = [
+	{
+		name: "osc11-background",
+		issuedProbe: "\x1b]11;?\x07",
+		pattern: /^\x1b\]11;rgba?:[0-9a-fA-F]{1,4}\/[0-9a-fA-F]{1,4}\/[0-9a-fA-F]{1,4}(?:\x07|\x1b\\)$/,
+	},
+	{ name: "mode2031-dsr", issuedProbe: "\x1b[?2031h", pattern: /^\x1b\[\?997;[12]n$/ },
+	{ name: "kitty-flags", issuedProbe: "\x1b[?u", pattern: /^\x1b\[\?\d+u$/ },
+];
+
+/** True when `sequence` is one of the probe replies above. */
+export function isUnsolicitedProbeReply(sequence: string): boolean {
+	for (const entry of PROBE_REPLY_PATTERNS) {
+		if (entry.pattern.test(sequence)) return true;
+	}
+	return false;
+}
 
 /**
  * Whether GJC may reprogram the keyboard with enhanced input protocols
@@ -22,6 +49,10 @@ const TERMINAL_PROGRESS_CLEAR_SEQUENCE = "\x1b]9;4;0;\x07";
  */
 export function keyboardEnhancementEnabled(): boolean {
 	return $flag("GJC_TUI_KEYBOARD_PROTOCOL", true);
+}
+
+function isAppleTerminal(): boolean {
+	return $env.TERM_PROGRAM === "Apple_Terminal";
 }
 
 /**
@@ -51,7 +82,9 @@ export function emergencyTerminalRestore(): void {
 			process.stdout.write(
 				"\x1b[?2004l" + // Disable bracketed paste
 					"\x1b[?1000l" + // Disable normal mouse reporting
+					"\x1b[?1002l" + // Disable button-event mouse reporting
 					"\x1b[?1006l" + // Disable SGR extended mouse reporting
+					"\x1b[?1007l" + // Disable alternate-scroll wheel-to-cursor translation
 					"\x1b[?2031l" + // Disable Mode 2031 appearance notifications
 					"\x1b[<u" + // Pop kitty keyboard protocol
 					"\x1b[>4;0m" + // Disable modifyOtherKeys fallback
@@ -73,6 +106,9 @@ export interface Terminal {
 
 	// Stop the terminal and restore state
 	stop(): void;
+	// Enable or disable opt-in SGR mouse reporting. Implementations that do not
+	// own a real terminal may ignore this.
+	setMouseEnabled?(enabled: boolean): void;
 
 	/**
 	 * Drain stdin before exiting to prevent Kitty key release events from
@@ -82,11 +118,23 @@ export interface Terminal {
 	 */
 	drainInput(maxMs?: number, idleMs?: number): Promise<void>;
 
+	/**
+	 * Wait for pending stdin to go quiet without changing terminal protocols or
+	 * the active input handler. Capability probes use this non-destructive drain;
+	 * shutdown paths must continue using drainInput().
+	 * @param maxMs - Maximum time to wait (default: 1000ms)
+	 * @param idleMs - Exit early if no input arrives within this time (default: 50ms)
+	 */
+	drainPendingInput?(maxMs?: number, idleMs?: number): Promise<void>;
+
 	// Write output to terminal
 	write(data: string): void;
 
 	// Whether terminal output is still writable
 	get available(): boolean;
+
+	// True for the real process stdin/stdout terminal (not virtual test terminals).
+	readonly isProcessTerminal?: boolean;
 
 	// Get terminal dimensions
 	get columns(): number;
@@ -168,6 +216,68 @@ function isWindowsSubsystemForLinux(): boolean {
 	return process.platform === "linux" && (!!$env.WSL_DISTRO_NAME || !!$env.WSL_INTEROP);
 }
 const STDOUT_ERROR_HANDLER_GRACE_MS = 250;
+const stdoutErrorSubscribers = new Set<(err: Error) => void>();
+export function __stdoutErrorSubscriberCountForTests(): number {
+	return stdoutErrorSubscribers.size;
+}
+export function __stdoutErrorDispatcherInstalledForTests(): boolean {
+	return process.stdout.listeners("error").includes(dispatchStdoutError);
+}
+const dispatchStdoutError = (err: Error): void => {
+	for (const subscriber of stdoutErrorSubscribers) subscriber(err);
+};
+
+function subscribeToStdoutErrors(subscriber: (err: Error) => void): void {
+	if (stdoutErrorSubscribers.size === 0) process.stdout.on("error", dispatchStdoutError);
+	stdoutErrorSubscribers.add(subscriber);
+}
+
+function unsubscribeFromStdoutErrors(subscriber: (err: Error) => void): void {
+	stdoutErrorSubscribers.delete(subscriber);
+	if (stdoutErrorSubscribers.size === 0) process.stdout.removeListener("error", dispatchStdoutError);
+}
+
+const STDIN_ERROR_HANDLER_GRACE_MS = 250;
+const stdinErrorSubscribers = new Set<(err: Error) => void>();
+export function __stdinErrorSubscriberCountForTests(): number {
+	return stdinErrorSubscribers.size;
+}
+export function __stdinErrorDispatcherInstalledForTests(): boolean {
+	return process.stdin.listeners("error").includes(dispatchStdinError);
+}
+/**
+ * A vanished controlling terminal fails the in-flight stdin read with EIO.
+ * That is the only stdin error this module owns; every other failure
+ * (EBADF, EPIPE, an unexpected platform error) keeps its default
+ * EventEmitter propagation so it stays observable instead of being
+ * downgraded to a silently retired terminal.
+ */
+function isTerminalDetachStdinError(err: Error): boolean {
+	return (err as NodeJS.ErrnoException).code === "EIO";
+}
+const dispatchStdinError = (err: Error): void => {
+	if (!isTerminalDetachStdinError(err)) {
+		// Our listener must not be the reason a non-EIO error stops propagating.
+		// When no other "error" listener exists, EventEmitter would have thrown;
+		// rethrowing from inside emit() reproduces that exact contract.
+		const hasOtherListener = process.stdin.listeners("error").some(listener => listener !== dispatchStdinError);
+		if (!hasOtherListener) throw err;
+		return;
+	}
+	for (const subscriber of stdinErrorSubscribers) subscriber(err);
+};
+
+function subscribeToStdinErrors(subscriber: (err: Error) => void): void {
+	if (stdinErrorSubscribers.size === 0) process.stdin.on("error", dispatchStdinError);
+	stdinErrorSubscribers.add(subscriber);
+}
+
+function unsubscribeFromStdinErrors(subscriber: (err: Error) => void): void {
+	stdinErrorSubscribers.delete(subscriber);
+	if (stdinErrorSubscribers.size === 0) process.stdin.removeListener("error", dispatchStdinError);
+}
+type Osc11QuerySource = "startup" | "poll" | "mode2031";
+type Osc11QueuedSource = Exclude<Osc11QuerySource, "startup">;
 
 /**
  * Real terminal using process.stdin/stdout
@@ -182,21 +292,33 @@ export class ProcessTerminal implements Terminal {
 	#stdinBuffer?: StdinBuffer;
 	#stdinDataHandler?: (data: string | Buffer) => void;
 	#dead = false;
-	#writeLogPath = $env.PI_TUI_WRITE_LOG || "";
+	#writeLogPath = $pickenv("GJC_TUI_WRITE_LOG", "PI_TUI_WRITE_LOG") || "";
 	#detachLogPath = $env.PI_TUI_TERMINAL_DETACH_LOG || "";
 	#windowsVTInputRestore?: () => void;
 	#stdoutErrorHandler?: (err: Error) => void;
 	#stdoutErrorHandlerCleanupTimer?: Timer;
+	#stdinErrorHandler?: (err: Error) => void;
+	#stdinErrorHandlerCleanupTimer?: Timer;
 	#appearanceCallbacks: Array<(appearance: TerminalAppearance) => void> = [];
 	#appearance: TerminalAppearance | undefined;
 	#osc11Pending = false;
-	#osc11QueryQueued = false;
+	#osc11QueuedSource?: Osc11QueuedSource;
 	#osc11ResponseBuffer = "";
 	#privateCsiResponseBuffer = "";
 	#pendingDa1Sentinels = 0;
 	#osc11PollTimer?: Timer;
+	// Bounds the OSC 11 / DA1 pending-query window so a dropped or mangled reply
+	// (multiplexer, TERM=dumb host) cannot latch #osc11Pending forever and freeze
+	// stdin.
+	#osc11QueryWatchdog?: Timer;
 	#mode2031DebounceTimer?: Timer;
 	#progressTimer?: ReturnType<typeof setInterval>;
+	#mouseEnabled = false;
+	#started = false;
+
+	get isProcessTerminal(): boolean {
+		return true;
+	}
 
 	get kittyProtocolActive(): boolean {
 		return this.#kittyProtocolActive;
@@ -210,9 +332,20 @@ export class ProcessTerminal implements Terminal {
 		this.#appearanceCallbacks.push(callback);
 	}
 
+	setMouseEnabled(enabled: boolean): void {
+		this.#mouseEnabled = enabled;
+		if (this.#started)
+			this.#safeWrite(
+				this.#mouseEnabled
+					? "\x1b[?1000l\x1b[?1002h\x1b[?1006h\x1b[?1007l"
+					: "\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?1007l",
+			);
+	}
+
 	start(onInput: (data: string) => void, onResize: () => void): void {
 		this.#inputHandler = onInput;
 		this.#resizeHandler = onResize;
+		this.#started = true;
 
 		// Register for emergency cleanup
 		activeTerminal = this;
@@ -232,6 +365,15 @@ export class ProcessTerminal implements Terminal {
 
 		// Enable bracketed paste mode - terminal will wrap pastes in \x1b[200~ ... \x1b[201~
 		this.#safeWrite("\x1b[?2004h");
+		// Button-event reporting preserves wheel input while also letting the TUI implement drag selection.
+		// Alternate-scroll must stay disabled: otherwise Windows Terminal/tmux can translate wheel notches
+		// into cursor Up/Down input, which the focused composer interprets as prompt history.
+		// Clear both tracking variants first so stale modes from another application cannot leak across startup.
+		this.#safeWrite(
+			this.#mouseEnabled
+				? "\x1b[?1000l\x1b[?1002h\x1b[?1006h\x1b[?1007l"
+				: "\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?1007l",
+		);
 
 		// Set up resize handler immediately
 		process.stdout.on("resize", this.#resizeHandler);
@@ -243,7 +385,22 @@ export class ProcessTerminal implements Terminal {
 			this.#stdoutErrorHandler = (err: Error) => {
 				this.#markUnavailable(err, "stdout-error");
 			};
-			process.stdout.on("error", this.#stdoutErrorHandler);
+			subscribeToStdoutErrors(this.#stdoutErrorHandler);
+		}
+		// stdin carries the same hazard as stdout: when the controlling PTY
+		// disappears (tmux pane killed, SSH dropped, terminal closed) the next
+		// read fails with EIO. `process.stdin` is an EventEmitter, so an
+		// unobserved "error" event is rethrown as an uncaught exception that
+		// kills the whole agent process instead of just retiring the terminal.
+		if (this.#stdinErrorHandlerCleanupTimer) {
+			clearTimeout(this.#stdinErrorHandlerCleanupTimer);
+			this.#stdinErrorHandlerCleanupTimer = undefined;
+		}
+		if (!this.#stdinErrorHandler) {
+			this.#stdinErrorHandler = (err: Error) => {
+				this.#markUnavailable(err, "stdin-error");
+			};
+			subscribeToStdinErrors(this.#stdinErrorHandler);
 		}
 
 		// Refresh terminal dimensions - they may be stale after suspend/resume
@@ -267,12 +424,13 @@ export class ProcessTerminal implements Terminal {
 		// sequences in order, so if DA1 arrives before OSC 11 response,
 		// the terminal does not support OSC 11. This avoids indefinite hangs.
 		// Technique used by Neovim, bat, fish, and terminal-colorsaurus.
-		this.#queryBackgroundColor();
+		this.#queryBackgroundColor("startup");
 
 		// Subscribe to Mode 2031 appearance change notifications.
 		// When the terminal reports a change, we re-query OSC 11 to get the
 		// actual background color (following Neovim convention) with 100ms debounce.
 		this.#safeWrite("\x1b[?2031h");
+		this.#stdinBuffer?.noteProbeIssued();
 
 		// Start periodic OSC 11 re-query for terminals without Mode 2031
 		// (Warp, Alacritty, WezTerm, iTerm2). Self-disables once Mode 2031 fires.
@@ -370,10 +528,11 @@ export class ProcessTerminal implements Terminal {
 			// flush timeout elapses mid-sequence, the prefix `\x1b[?<digits>` arrives as
 			// one event and the tail `;...<terminator>` arrives as individual character
 			// events that would otherwise leak into the prompt as keystrokes. See #1238.
-			if (
-				this.#privateCsiResponseBuffer ||
-				(privateCsiPartialPattern.test(sequence) && this.#pendingDa1Sentinels > 0)
-			) {
+			// Reassembly is keyed on the reply's shape, not on `#pendingDa1Sentinels`:
+			// replies the terminal still owed after a counter reset (stop()/start()
+			// around a foreground command) otherwise leaked into the editor one
+			// character at a time. No keystroke can produce this prefix.
+			if (this.#privateCsiResponseBuffer || privateCsiPartialPattern.test(sequence)) {
 				if (this.#privateCsiResponseBuffer && sequence.startsWith("\x1b")) {
 					// New escape arrived mid-reassembly — abandon partial and re-process the new sequence.
 					this.#privateCsiResponseBuffer = "";
@@ -427,16 +586,22 @@ export class ProcessTerminal implements Terminal {
 			// already succeeded. Other terminal probes should never see these replies.
 			if (da1ResponsePattern.test(sequence) && this.#pendingDa1Sentinels > 0) {
 				this.#pendingDa1Sentinels--;
-				if (this.#osc11Pending) {
-					// DA1 arrived before OSC 11 response: terminal does not support
-					// OSC 11. Clear the pending state without starting a queued query
-					// (queued query is started below, after sentinel is consumed).
+				const negativeEvidence = this.#osc11Pending;
+				const queuedSource = this.#osc11QueuedSource;
+				this.#osc11QueuedSource = undefined;
+				if (negativeEvidence) {
+					// DA1 arrived before OSC 11: this cycle proved OSC 11 unsupported.
+					// Stop futile polling, but retain one stronger Mode 2031 push request.
 					this.#osc11Pending = false;
 					this.#osc11ResponseBuffer = "";
-				}
-				// Now that this DA1 cycle is complete, start any queued query.
-				if (this.#osc11QueryQueued && !this.#dead) {
-					this.#osc11QueryQueued = false;
+					this.#clearOsc11QueryWatchdog();
+					this.#stopOsc11Poll();
+					if (queuedSource === "mode2031" && !this.#dead) {
+						this.#startOsc11Query();
+					}
+				} else if (queuedSource && !this.#dead) {
+					// A positive OSC reply arrived first. The delayed sentinel only
+					// closes that successful cycle, so preserve its single follow-up.
 					this.#startOsc11Query();
 				}
 				return;
@@ -446,7 +611,7 @@ export class ProcessTerminal implements Terminal {
 			// Accumulate fragments until the BEL/ST terminator arrives, then parse once.
 			// If a new escape sequence arrives (not the ST terminator), abort buffering
 			// and forward it as normal input so user keystrokes are never swallowed.
-			if (this.#osc11Pending && (this.#osc11ResponseBuffer || sequence.startsWith("\x1b]11;"))) {
+			if (this.#osc11ResponseBuffer || sequence.startsWith("\x1b]11;")) {
 				if (this.#osc11ResponseBuffer && sequence.startsWith("\x1b") && sequence !== "\x1b\\") {
 					// New escape sequence arrived mid-buffer — not an OSC 11 continuation.
 					this.#osc11ResponseBuffer = "";
@@ -454,12 +619,26 @@ export class ProcessTerminal implements Terminal {
 				} else {
 					this.#osc11ResponseBuffer += sequence;
 					const osc11Match = this.#osc11ResponseBuffer.match(osc11ResponsePattern);
-					if (!osc11Match) return;
-					const [, rHex, gHex, bHex] = osc11Match;
-					this.#osc11Pending = false;
-					this.#osc11ResponseBuffer = "";
-					this.#handleOsc11Response(rHex!, gHex!, bHex!);
-					return;
+					if (osc11Match) {
+						const [, rHex, gHex, bHex] = osc11Match;
+						this.#osc11ResponseBuffer = "";
+						if (!this.#osc11Pending) return;
+						this.#osc11Pending = false;
+						this.#clearOsc11QueryWatchdog();
+						this.#handleOsc11Response(rHex!, gHex!, bHex!);
+						return;
+					}
+					// Bound the reassembly buffer. A real reply is <= ~25 bytes; if the
+					// terminator is dropped or mangled (multiplexer, TERM=dumb) an unbounded
+					// buffer swallows every following keystroke and freezes input. Past the
+					// cap, abandon reassembly and let the sequence fall through as input.
+					if (this.#osc11ResponseBuffer.length > 64) {
+						this.#osc11Pending = false;
+						this.#osc11ResponseBuffer = "";
+						this.#clearOsc11QueryWatchdog();
+					} else {
+						return;
+					}
 				}
 			}
 
@@ -471,8 +650,15 @@ export class ProcessTerminal implements Terminal {
 				if (this.#mode2031DebounceTimer) clearTimeout(this.#mode2031DebounceTimer);
 				this.#mode2031DebounceTimer = setTimeout(() => {
 					this.#mode2031DebounceTimer = undefined;
-					this.#queryBackgroundColor();
+					this.#queryBackgroundColor("mode2031");
 				}, 100);
+				return;
+			}
+			// Defensive backstop. A capability-probe reply reaching this point arrived
+			// outside its pending-query window, so none of the handlers above consumed
+			// it. These shapes are never user input, and paste content never reaches
+			// this handler, so dropping is always safe.
+			if (isUnsolicitedProbeReply(sequence)) {
 				return;
 			}
 			if (this.#inputHandler) {
@@ -498,25 +684,95 @@ export class ProcessTerminal implements Terminal {
 	 * DA1 avoids indefinite hangs: if DA1 response arrives before OSC 11,
 	 * the terminal does not support OSC 11.
 	 */
-	#queryBackgroundColor(): void {
+	#queryBackgroundColor(source: Osc11QuerySource): void {
 		if (this.#dead) return;
-		// Queue if an OSC 11 query is in flight or its DA1 sentinel hasn't been
-		// consumed yet. Starting a new query while a DA1 is outstanding would
-		// increment the sentinel counter, and the old DA1 arrival would then
-		// prematurely clear the new query's pending state.
+		// Queue if an OSC 11 query is in flight or its DA1 sentinel has not yet
+		// been consumed. Mode 2031 push evidence outranks a periodic poll.
 		if (this.#osc11Pending || this.#pendingDa1Sentinels > 0) {
-			this.#osc11QueryQueued = true;
+			if (source === "mode2031" || (source === "poll" && this.#osc11QueuedSource === undefined)) {
+				this.#osc11QueuedSource = source;
+			}
 			return;
 		}
 		this.#startOsc11Query();
 	}
 
+	/**
+	 * Re-assert raw mode before writing a capability probe.
+	 *
+	 * `start()` enables raw mode once and never re-checks it. A foreground child
+	 * that inherits the real tty (ssh, sudo, a pager, anything that dies before
+	 * restoring termios) can leave it in cooked mode while the OSC 11 poll keeps
+	 * firing every 2s. The kernel then echoes the terminal's replies to the
+	 * screen and line-buffers them, so they never reach the stdin parser at all -
+	 * the probe-reply reassembly in #handleSequence cannot help - and each tick
+	 * appends another `\x1b]11;rgb:...\x07\x1b[?62;22;52c` pair to the display
+	 * while keystrokes stall in the line buffer.
+	 */
+	#ensureRawModeForProbe(): boolean {
+		if (!this.#started || this.#dead) return false;
+		if (!process.stdin.isTTY) return true;
+		if (typeof process.stdin.setRawMode !== "function") return false;
+		try {
+			// `isRaw` and setRawMode() both trust the runtime's last requested mode.
+			// A child can change the shared tty's termios directly without updating
+			// that cache, so a repeated setRawMode(true) is a no-op in Node and Bun.
+			// Cycle through cooked mode synchronously to force a real raw-mode apply;
+			// no JavaScript or input callback can run between these two operations.
+			process.stdin.setRawMode(false);
+			process.stdin.setRawMode(true);
+			// On Windows setRawMode() resets console input flags. Restore VT input so
+			// modified keys keep arriving as escape sequences after self-healing.
+			this.#enableWindowsVTInput();
+			return true;
+		} catch {
+			// Do not write a probe into a tty whose input mode is unknown. A later
+			// poll can retry if the terminal becomes usable again.
+			return false;
+		}
+	}
+
 	#startOsc11Query(): void {
+		if (!this.#ensureRawModeForProbe()) return;
 		this.#osc11Pending = true;
 		this.#osc11ResponseBuffer = "";
 		this.#pendingDa1Sentinels++;
 		this.#safeWrite("\x1b]11;?\x07"); // OSC 11 query (BEL terminated)
 		this.#safeWrite("\x1b[c"); // DA1 sentinel
+		this.#stdinBuffer?.noteProbeIssued();
+		this.#armOsc11QueryWatchdog();
+	}
+
+	/**
+	 * OSC 11 pending-query watchdog. If neither the OSC 11 reply nor its DA1
+	 * sentinel comes back (dropped by a multiplexer or a TERM=dumb host),
+	 * #osc11Pending / #pendingDa1Sentinels latch forever: #queryBackgroundColor
+	 * stops re-querying and the reassembly branch swallows keystrokes.
+	 * Force-resolve the cycle after a bounded wait so the state machine self-heals.
+	 */
+	#armOsc11QueryWatchdog(): void {
+		this.#clearOsc11QueryWatchdog();
+		this.#osc11QueryWatchdog = setTimeout(() => {
+			this.#osc11QueryWatchdog = undefined;
+			if (this.#dead) return;
+			if (!this.#osc11Pending && this.#pendingDa1Sentinels === 0) return;
+			const queuedSource = this.#osc11QueuedSource;
+			this.#osc11QueuedSource = undefined;
+			this.#osc11Pending = false;
+			this.#osc11ResponseBuffer = "";
+			this.#pendingDa1Sentinels = 0;
+			if (queuedSource && !this.#dead) {
+				this.#startOsc11Query();
+			}
+		}, 1000);
+		this.#osc11QueryWatchdog.unref?.();
+	}
+
+	#clearOsc11QueryWatchdog(): void {
+		if (this.#osc11QueryWatchdog) {
+			clearTimeout(this.#osc11QueryWatchdog);
+			this.#osc11QueryWatchdog = undefined;
+		}
 	}
 	/**
 	 * Parse an OSC 11 background color response and compute BT.601 luminance.
@@ -553,7 +809,7 @@ export class ProcessTerminal implements Terminal {
 				this.#stopOsc11Poll();
 				return;
 			}
-			this.#queryBackgroundColor();
+			this.#queryBackgroundColor("poll");
 		}, 2_000);
 		this.#osc11PollTimer.unref();
 	}
@@ -586,6 +842,21 @@ export class ProcessTerminal implements Terminal {
 			return;
 		}
 		this.#safeWrite("\x1b[?u");
+		this.#stdinBuffer?.noteProbeIssued();
+		// Windows Terminal and Apple Terminal do not implement the Kitty keyboard
+		// protocol, so the query above never activates it there. They do honor the
+		// modifyOtherKeys fallback below — but that mode breaks CJK/Hangul IME
+		// composition: Alt+Enter (and other chords) bypass the IME commit, so the
+		// syllable still being composed is never delivered to the app and the
+		// action fires on empty text (e.g. queue-message no-ops unless the user
+		// types a trailing space to force a commit first). Skip the fallback on
+		// these terminals; legacy encodings still deliver Alt+Enter (ESC CR) and
+		// the newline chords, and IME composition works again. Opt back in with
+		// GJC_TUI_KEYBOARD_PROTOCOL=0 disabling all enhancement, or force-enable
+		// elsewhere if a Kitty-capable terminal appears.
+		if (process.platform === "win32" || isAppleTerminal()) {
+			return;
+		}
 		this.#modifyOtherKeysTimeout = setTimeout(() => {
 			this.#modifyOtherKeysTimeout = undefined;
 			if (this.#kittyProtocolActive || this.#modifyOtherKeysActive) {
@@ -594,6 +865,30 @@ export class ProcessTerminal implements Terminal {
 			this.#safeWrite("\x1b[>4;2m");
 			this.#modifyOtherKeysActive = true;
 		}, 150);
+	}
+
+	async drainPendingInput(maxMs = 1000, idleMs = 50): Promise<void> {
+		let lastDataTime = Date.now();
+		const onData = () => {
+			lastDataTime = Date.now();
+		};
+
+		process.stdin.on("data", onData);
+		const endTime = Date.now() + maxMs;
+
+		try {
+			while (true) {
+				const now = Date.now();
+				const timeLeft = endTime - now;
+				if (timeLeft <= 0) break;
+				if (now - lastDataTime >= idleMs) break;
+				const { promise, resolve } = Promise.withResolvers<void>();
+				setTimeout(resolve, Math.min(idleMs, timeLeft));
+				await promise;
+			}
+		} finally {
+			process.stdin.removeListener("data", onData);
+		}
 	}
 
 	async drainInput(maxMs = 1000, idleMs = 50): Promise<void> {
@@ -649,9 +944,13 @@ export class ProcessTerminal implements Terminal {
 		}
 
 		// Disable bracketed paste mode
+		this.#started = false;
+		this.#mouseEnabled = false;
 		this.#safeWrite("\x1b[?2004l");
 		this.#safeWrite("\x1b[?1000l");
+		this.#safeWrite("\x1b[?1002l");
 		this.#safeWrite("\x1b[?1006l");
+		this.#safeWrite("\x1b[?1007l");
 
 		// Disable Mode 2031 appearance change notifications
 		this.#safeWrite("\x1b[?2031l");
@@ -662,7 +961,7 @@ export class ProcessTerminal implements Terminal {
 		}
 		this.#appearanceCallbacks = [];
 		this.#osc11Pending = false;
-		this.#osc11QueryQueued = false;
+		this.#osc11QueuedSource = undefined;
 		this.#osc11ResponseBuffer = "";
 		this.#privateCsiResponseBuffer = "";
 		this.#pendingDa1Sentinels = 0;
@@ -701,6 +1000,7 @@ export class ProcessTerminal implements Terminal {
 			this.#resizeHandler = undefined;
 		}
 		this.#scheduleStdoutErrorHandlerCleanup();
+		this.#scheduleStdinErrorHandlerCleanup();
 
 		// Pause stdin to prevent any buffered input (e.g., Ctrl+D) from being
 		// re-interpreted after raw mode is disabled. This fixes a race condition
@@ -722,12 +1022,28 @@ export class ProcessTerminal implements Terminal {
 		// of surfacing as uncaught exceptions that kill the tmux pane.
 		this.#stdoutErrorHandlerCleanupTimer = setTimeout(() => {
 			if (this.#stdoutErrorHandler) {
-				process.stdout.removeListener("error", this.#stdoutErrorHandler);
+				unsubscribeFromStdoutErrors(this.#stdoutErrorHandler);
 				this.#stdoutErrorHandler = undefined;
 			}
 			this.#stdoutErrorHandlerCleanupTimer = undefined;
 		}, STDOUT_ERROR_HANDLER_GRACE_MS);
 		this.#stdoutErrorHandlerCleanupTimer.unref?.();
+	}
+
+	#scheduleStdinErrorHandlerCleanup(): void {
+		if (!this.#stdinErrorHandler) return;
+		if (this.#stdinErrorHandlerCleanupTimer) clearTimeout(this.#stdinErrorHandlerCleanupTimer);
+		// stdin.pause() below does not cancel a read already in flight, so a PTY
+		// that vanishes during teardown still delivers EIO after stop() returns.
+		// Keep the listener armed for the same grace window as stdout.
+		this.#stdinErrorHandlerCleanupTimer = setTimeout(() => {
+			if (this.#stdinErrorHandler) {
+				unsubscribeFromStdinErrors(this.#stdinErrorHandler);
+				this.#stdinErrorHandler = undefined;
+			}
+			this.#stdinErrorHandlerCleanupTimer = undefined;
+		}, STDIN_ERROR_HANDLER_GRACE_MS);
+		this.#stdinErrorHandlerCleanupTimer.unref?.();
 	}
 
 	write(data: string): void {

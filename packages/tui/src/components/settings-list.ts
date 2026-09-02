@@ -1,6 +1,7 @@
 import { getKeybindings } from "../keybindings";
+import { extractPrintableText, matchesKey } from "../keys";
 import type { Component } from "../tui";
-import { Ellipsis, padding, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "../utils";
+import { Ellipsis, getSegmenter, padding, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "../utils";
 
 export interface SettingItem {
 	/** Unique identifier for this setting */
@@ -26,7 +27,9 @@ export interface SettingsListTheme {
 }
 
 export class SettingsList implements Component {
+	#allItems: SettingItem[];
 	#items: SettingItem[];
+	#searchQuery = "";
 	#theme: SettingsListTheme;
 	#selectedIndex = 0;
 	#maxVisible: number;
@@ -48,6 +51,7 @@ export class SettingsList implements Component {
 		onSelectionChange?: (item: SettingItem | undefined) => void,
 		descriptionRows = 0,
 	) {
+		this.#allItems = items;
 		this.#items = items;
 		this.#maxVisible = maxVisible;
 		this.#theme = theme;
@@ -58,9 +62,17 @@ export class SettingsList implements Component {
 		this.#notifySelectionChange();
 	}
 
+	#clampSelectedIndex(): void {
+		if (this.#items.length === 0) {
+			this.#selectedIndex = 0;
+			return;
+		}
+		this.#selectedIndex = Math.max(0, Math.min(this.#selectedIndex, this.#items.length - 1));
+	}
+
 	/** Update an item's currentValue */
 	updateValue(id: string, newValue: string): void {
-		const item = this.#items.find(i => i.id === id);
+		const item = this.#allItems.find(i => i.id === id);
 		if (item) {
 			item.currentValue = newValue;
 		}
@@ -74,12 +86,21 @@ export class SettingsList implements Component {
 	 * restored index against the new list on the way out.
 	 */
 	setItems(items: SettingItem[]): void {
-		this.#items = items;
-		if (this.#items.length === 0) {
-			this.#selectedIndex = 0;
-		} else if (this.#selectedIndex >= this.#items.length) {
-			this.#selectedIndex = this.#items.length - 1;
-		}
+		this.#allItems = items;
+		this.#items = this.#filterItems();
+		this.#clampSelectedIndex();
+		this.#notifySelectionChange();
+	}
+
+	#filterItems(): SettingItem[] {
+		const query = this.#searchQuery.toLocaleLowerCase();
+		return query ? this.#allItems.filter(item => item.label.toLocaleLowerCase().includes(query)) : this.#allItems;
+	}
+
+	#setSearchQuery(query: string): void {
+		this.#searchQuery = query.normalize("NFC");
+		this.#items = this.#filterItems();
+		this.#selectedIndex = 0;
 		this.#notifySelectionChange();
 	}
 
@@ -102,9 +123,17 @@ export class SettingsList implements Component {
 
 	#renderMainList(width: number): string[] {
 		const lines: string[] = [];
+		if (this.#searchQuery) {
+			lines.push(this.#theme.hint(truncateToWidth(`  Search: ${this.#searchQuery}`, width)));
+			lines.push("");
+		}
 
 		if (this.#items.length === 0) {
-			lines.push(this.#theme.hint("  No settings available"));
+			lines.push(this.#theme.hint(this.#searchQuery ? "  No matching settings" : "  No settings available"));
+			if (this.#searchQuery) {
+				lines.push("");
+				lines.push(this.#theme.hint(truncateToWidth("  Type to search · Backspace to edit · Esc to clear", width)));
+			}
 			return lines;
 		}
 
@@ -116,7 +145,11 @@ export class SettingsList implements Component {
 		const endIndex = Math.min(startIndex + this.#maxVisible, this.#items.length);
 
 		// Calculate max label width for alignment
-		const maxLabelWidth = Math.min(30, Math.max(...this.#items.map(item => visibleWidth(item.label))));
+		const maxLabelWidth = Math.min(
+			30,
+			Math.max(0, width - 12),
+			Math.max(...this.#items.map(item => visibleWidth(item.label))),
+		);
 
 		// Render visible items
 		for (let i = startIndex; i < endIndex; i++) {
@@ -128,13 +161,15 @@ export class SettingsList implements Component {
 			const prefixWidth = visibleWidth(prefix);
 
 			// Pad label to align values
-			const labelPadded = item.label + padding(Math.max(0, maxLabelWidth - visibleWidth(item.label)));
+			const labelPadded =
+				truncateToWidth(item.label, maxLabelWidth, Ellipsis.Omit) +
+				padding(Math.max(0, maxLabelWidth - visibleWidth(item.label)));
 			const labelText = this.#theme.label(labelPadded, isSelected);
 
 			// Calculate space for value
 			const separator = "  ";
 			const usedWidth = prefixWidth + maxLabelWidth + visibleWidth(separator);
-			const valueMaxWidth = width - usedWidth - 2;
+			const valueMaxWidth = Math.max(0, width - usedWidth - 2);
 
 			const valueText = this.#theme.value(
 				truncateToWidth(item.currentValue, valueMaxWidth, Ellipsis.Omit),
@@ -171,7 +206,10 @@ export class SettingsList implements Component {
 
 		// Add hint
 		lines.push("");
-		lines.push(truncateToWidth(this.#theme.hint("  Enter/Space to change · Esc to cancel"), width));
+		const hint = this.#searchQuery
+			? "  Type to search · Enter to change · Backspace to edit · Esc to clear"
+			: "  Type to search · Enter/Space to change · Esc to cancel";
+		lines.push(truncateToWidth(this.#theme.hint(hint), width));
 
 		return lines;
 	}
@@ -186,17 +224,44 @@ export class SettingsList implements Component {
 
 		// Main list input handling
 		const kb = getKeybindings();
-		if (kb.matches(data, "tui.select.up")) {
+		if (this.#items.length > 0 && kb.matches(data, "tui.select.up")) {
 			this.#selectedIndex = this.#selectedIndex === 0 ? this.#items.length - 1 : this.#selectedIndex - 1;
 			this.#notifySelectionChange();
-		} else if (kb.matches(data, "tui.select.down")) {
+			return;
+		}
+		if (this.#items.length > 0 && kb.matches(data, "tui.select.down")) {
 			this.#selectedIndex = this.#selectedIndex === this.#items.length - 1 ? 0 : this.#selectedIndex + 1;
 			this.#notifySelectionChange();
-		} else if (kb.matches(data, "tui.select.confirm") || data === " " || data === "\n") {
-			this.#activateItem();
-		} else if (kb.matches(data, "tui.select.cancel")) {
-			this.#onCancel();
+			return;
 		}
+		if (
+			this.#items.length > 0 &&
+			(kb.matches(data, "tui.select.confirm") || data === "\n" || (data === " " && !this.#searchQuery))
+		) {
+			this.#activateItem();
+			return;
+		}
+		if (kb.matches(data, "tui.select.cancel")) {
+			if (this.#searchQuery) {
+				this.#setSearchQuery("");
+			} else {
+				this.#onCancel();
+			}
+			return;
+		}
+		if (this.#searchQuery && matchesKey(data, "backspace")) {
+			const graphemes = [...getSegmenter().segment(this.#searchQuery)];
+			this.#setSearchQuery(
+				graphemes
+					.slice(0, -1)
+					.map(part => part.segment)
+					.join(""),
+			);
+			return;
+		}
+
+		const printableText = extractPrintableText(data);
+		if (printableText) this.#setSearchQuery(this.#searchQuery + printableText);
 	}
 
 	#activateItem(): void {
@@ -228,6 +293,7 @@ export class SettingsList implements Component {
 		// Restore selection to the item that opened the submenu
 		if (this.#submenuItemIndex !== null) {
 			this.#selectedIndex = this.#submenuItemIndex;
+			this.#clampSelectedIndex();
 			this.#submenuItemIndex = null;
 			this.#notifySelectionChange();
 		}

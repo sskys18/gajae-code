@@ -45,6 +45,20 @@ function getUserAgentDirs(): string[] {
 	return [PATHS.userAgent];
 }
 
+/**
+ * GJC's user-scope config directory.
+ *
+ * Home-relative `<home>/.gjc/agent` is only its default location: an agent
+ * directory profile (`--agent-dir`, `GJC_CODING_AGENT_DIR`, `setAgentDir()`)
+ * moves the whole user scope, and the writers (`getMCPConfigPath("user")` and
+ * everything `gjc mcp add` reaches) already follow it. Resolving from the home
+ * default instead would hide a profile's own registrations and load the default
+ * profile's servers into it.
+ */
+function resolveUserAgentDir(ctx: LoadContext): string {
+	return ctx.userAgentDir ?? path.join(ctx.home, PATHS.userAgent);
+}
+
 function getProjectConfigDirs(): string[] {
 	return [PATHS.projectDir];
 }
@@ -70,11 +84,9 @@ async function getConfigDirs(ctx: LoadContext): Promise<Array<{ dir: string; lev
 			result.push({ dir: projectDir, level: "project" });
 		}
 	}
-	for (const userAgentDir of getUserAgentDirs()) {
-		const userDir = await ifNonEmptyDir(ctx.home, userAgentDir);
-		if (userDir) {
-			result.push({ dir: userDir, level: "user" });
-		}
+	const userDir = await ifNonEmptyDir(resolveUserAgentDir(ctx));
+	if (userDir) {
+		result.push({ dir: userDir, level: "user" });
 	}
 
 	return result;
@@ -165,13 +177,39 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 				timeout = undefined;
 			}
 
+			// Validate autoload: boolean only, warn on other types
+			let autoload: boolean | undefined;
+			if (serverConfig.autoload === undefined || serverConfig.autoload === null) {
+				autoload = undefined;
+			} else if (typeof serverConfig.autoload === "boolean") {
+				autoload = serverConfig.autoload;
+			} else {
+				logger.warn(`MCP server "${serverName}": invalid autoload type ${typeof serverConfig.autoload}, ignoring`);
+				autoload = undefined;
+			}
+
+			// Validate noInheritEnv: boolean only, warn on other types
+			let noInheritEnv: boolean | undefined;
+			if (serverConfig.noInheritEnv === undefined || serverConfig.noInheritEnv === null) {
+				noInheritEnv = undefined;
+			} else if (typeof serverConfig.noInheritEnv === "boolean") {
+				noInheritEnv = serverConfig.noInheritEnv;
+			} else {
+				logger.warn(
+					`MCP server "${serverName}": invalid noInheritEnv type ${typeof serverConfig.noInheritEnv}, ignoring`,
+				);
+				noInheritEnv = undefined;
+			}
+
 			result.push({
 				name: serverName,
 				enabled,
+				autoload,
 				timeout,
 				command: serverConfig.command as string | undefined,
 				args: serverConfig.args as string[] | undefined,
 				env: serverConfig.env as Record<string, string> | undefined,
+				noInheritEnv,
 				cwd: serverConfig.cwd as string | undefined,
 				url: serverConfig.url as string | undefined,
 				headers: serverConfig.headers as Record<string, string> | undefined,
@@ -200,15 +238,14 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 		return result;
 	};
 
+	const userAgentDir = resolveUserAgentDir(ctx);
 	const paths = [
 		...getProjectConfigDirs().flatMap(projectConfigDir => [
 			{ path: path.join(ctx.cwd, projectConfigDir, "mcp.json"), level: "project" as const },
 			{ path: path.join(ctx.cwd, projectConfigDir, ".mcp.json"), level: "project" as const },
 		]),
-		...getUserAgentDirs().flatMap(userAgentDir => [
-			{ path: path.join(ctx.home, userAgentDir, "mcp.json"), level: "user" as const },
-			{ path: path.join(ctx.home, userAgentDir, ".mcp.json"), level: "user" as const },
-		]),
+		{ path: path.join(userAgentDir, "mcp.json"), level: "user" as const },
+		{ path: path.join(userAgentDir, ".mcp.json"), level: "user" as const },
 	];
 
 	const contents = await Promise.allSettled(
@@ -296,15 +333,15 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 		),
 	);
 
-	// User-level scan from ~/.gjc/agent/skills/
-	const userScans = getUserAgentDirs().map(userAgentDir =>
+	// User-level scan from the active agent-directory profile.
+	const userScans = [
 		scanSkillsFromDir(ctx, {
-			dir: path.join(ctx.home, userAgentDir, "skills"),
+			dir: path.join(resolveUserAgentDir(ctx), "skills"),
 			providerId: PROVIDER_ID,
 			level: "user",
 			requireDescription: true,
 		}),
-	);
+	];
 
 	const results = await Promise.all([...projectScans, ...userScans]);
 
@@ -375,11 +412,9 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	// turn so they keep hold across long conversations".
 	// User scope:    ~/.gjc/agent/RULES.md
 	// Project scope: nearest .gjc/RULES.md walking up from cwd to repoRoot
-	for (const userAgentDir of getUserAgentDirs()) {
-		const userRulesFile = path.join(ctx.home, userAgentDir, "RULES.md");
-		const userRule = await loadStickyRulesFile(userRulesFile, "user");
-		if (userRule) items.push(userRule);
-	}
+	const userRulesFile = path.join(resolveUserAgentDir(ctx), "RULES.md");
+	const userRule = await loadStickyRulesFile(userRulesFile, "user");
+	if (userRule) items.push(userRule);
 
 	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot);
 	if (nearestProjectConfigDir) {

@@ -25,14 +25,21 @@
  * Reference: https://docs.searxng.org/dev/search_api.html
  */
 
-import type { AuthStorage } from "@gajae-code/ai";
-
+import * as path from "node:path";
+import type { AuthStorage } from "@gajae-code/ai/core";
+import { $credentialEnv, parseEnvFile } from "@gajae-code/utils";
+import type { Settings } from "../../../config/settings";
 import { settings } from "../../../config/settings";
 import type { SearchResponse, SearchSource } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
 import { clampNumResults, dateToAgeSeconds } from "../utils";
-import type { SearchParams } from "./base";
-import { SearchProvider } from "./base";
+import {
+	SEARXNG_BASIC_CREDENTIAL_PREFIX,
+	SEARXNG_BEARER_CREDENTIAL_PREFIX,
+	type SearchParams,
+	SearchProvider,
+	type SearchProviderSettings,
+} from "./base";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
 
 const DEFAULT_NUM_RESULTS = 10;
@@ -74,47 +81,88 @@ interface SearXNGAuth {
 }
 
 /** Find SearXNG endpoint from settings or environment. */
-function findEndpoint(): string | null {
+/**
+ * SearXNG environment value, from trusted sources only, preserving an
+ * intentionally empty setting.
+ *
+ * These four names decide where search requests go and what credential they
+ * carry, and `$env` merges the caller's `cwd/.env` into `process.env`, so a
+ * repository could otherwise redirect the search and hand over the basic-auth
+ * material.
+ *
+ * `$credentialEnv` is the resolver for that boundary, but it collapses an empty
+ * value to `undefined` — and SearXNG basic auth treats "set but empty" as
+ * meaningful (`alice:` and `:s3cret` are both valid). So an empty value is
+ * recovered explicitly, and only when the project `.env` is not what set it.
+ */
+function trustedSearxngEnv(name: string): string | null {
+	const trusted = $credentialEnv(name);
+	if (trusted !== undefined) return trusted;
+
+	const raw = process.env[name];
+	if (raw === undefined || raw.trim().length > 0) return null;
+	// Empty-but-set. Honour it unless the project `.env` is the source.
+	const projectValue = parseEnvFile(path.join(process.cwd(), ".env"))[name];
+	if (projectValue !== undefined && projectValue.trim().length === 0) return null;
+	return "";
+}
+
+/** Test seam: the SearXNG endpoint and auth material as resolved from trusted env. */
+export function resolveSearxngConfigForTest(): {
+	endpoint: string | null;
+	token: string | null;
+	basicUsername: string | null;
+	basicPassword: string | null;
+} {
+	return {
+		endpoint: findEndpoint(),
+		token: findToken(),
+		basicUsername: findBasicUsername(),
+		basicPassword: findBasicPassword(),
+	};
+}
+
+function findEndpoint(activeSettings?: Settings): string | null {
 	try {
-		const endpoint = settings.get("searxng.endpoint");
+		const endpoint = (activeSettings ?? settings).get("searxng.endpoint");
 		if (endpoint) return endpoint;
 	} catch {
 		// Settings not initialized yet
 	}
-	return process.env.SEARXNG_ENDPOINT ?? null;
+	return trustedSearxngEnv("SEARXNG_ENDPOINT");
 }
 
 /** Find SearXNG bearer token from settings or environment. */
-function findToken(): string | null {
+function findToken(activeSettings?: Settings): string | null {
 	try {
-		const token = settings.get("searxng.token");
+		const token = (activeSettings ?? settings).get("searxng.token");
 		if (token) return token;
 	} catch {
 		// Settings not initialized yet
 	}
-	return process.env.SEARXNG_TOKEN ?? null;
+	return trustedSearxngEnv("SEARXNG_TOKEN");
 }
 
 /** Find SearXNG Basic auth username from settings or environment. */
-function findBasicUsername(): string | null {
+function findBasicUsername(activeSettings?: Settings): string | null {
 	try {
-		const username = settings.get("searxng.basicUsername");
+		const username = (activeSettings ?? settings).get("searxng.basicUsername");
 		if (username !== undefined) return username;
 	} catch {
 		// Settings not initialized yet
 	}
-	return process.env.SEARXNG_BASIC_USERNAME ?? null;
+	return trustedSearxngEnv("SEARXNG_BASIC_USERNAME");
 }
 
 /** Find SearXNG Basic auth password from settings or environment. */
-function findBasicPassword(): string | null {
+function findBasicPassword(activeSettings?: Settings): string | null {
 	try {
-		const password = settings.get("searxng.basicPassword");
+		const password = (activeSettings ?? settings).get("searxng.basicPassword");
 		if (password !== undefined) return password;
 	} catch {
 		// Settings not initialized yet
 	}
-	return process.env.SEARXNG_BASIC_PASSWORD ?? null;
+	return trustedSearxngEnv("SEARXNG_BASIC_PASSWORD");
 }
 
 /** Build the RFC 7617 Basic auth credential using UTF-8 bytes. */
@@ -128,9 +176,17 @@ function hasControlCharacters(value: string): boolean {
 }
 
 /** Find SearXNG authentication from settings or environment. Basic auth takes precedence over bearer tokens. */
-function findAuth(): SearXNGAuth | null {
-	const basicUsername = findBasicUsername();
-	const basicPassword = findBasicPassword();
+function findAuth(activeSettings?: Settings): SearXNGAuth | null {
+	const basicUsername = findBasicUsername(activeSettings);
+	const basicPassword = findBasicPassword(activeSettings);
+	return resolveBasicOrBearerAuth(basicUsername, basicPassword, findToken(activeSettings));
+}
+
+function resolveBasicOrBearerAuth(
+	basicUsername: string | null,
+	basicPassword: string | null,
+	token: string | null,
+): SearXNGAuth | null {
 	if (basicUsername !== null || basicPassword !== null) {
 		if (basicUsername === null || basicPassword === null) {
 			throw new Error(
@@ -146,8 +202,28 @@ function findAuth(): SearXNGAuth | null {
 		return { type: "basic", value: buildBasicAuthValue(basicUsername, basicPassword) };
 	}
 
-	const token = findToken();
 	return token ? { type: "bearer", value: token } : null;
+}
+
+async function findAuthFromStorage(authStorage: AuthStorage): Promise<SearXNGAuth | null> {
+	const encoded = await authStorage.getApiKey("searxng");
+	if (!encoded) return null;
+	if (encoded.startsWith(SEARXNG_BASIC_CREDENTIAL_PREFIX)) {
+		try {
+			const parsed = JSON.parse(
+				Buffer.from(encoded.slice(SEARXNG_BASIC_CREDENTIAL_PREFIX.length), "base64").toString("utf8"),
+			) as { username?: unknown; password?: unknown };
+			const username = typeof parsed.username === "string" ? parsed.username : null;
+			const password = typeof parsed.password === "string" ? parsed.password : null;
+			return resolveBasicOrBearerAuth(username, password, null);
+		} catch {
+			throw new Error("Invalid SearXNG Basic auth credential in the session auth broker.");
+		}
+	}
+	if (encoded.startsWith(SEARXNG_BEARER_CREDENTIAL_PREFIX)) {
+		return { type: "bearer", value: encoded.slice(SEARXNG_BEARER_CREDENTIAL_PREFIX.length) };
+	}
+	return { type: "bearer", value: encoded };
 }
 
 /** Build the search URL and headers for a SearXNG request */
@@ -233,23 +309,31 @@ export async function searchSearXNG(params: {
 	num_results?: number;
 	recency?: "day" | "week" | "month" | "year";
 	signal?: AbortSignal;
+	settings?: Settings;
+	providerSettings?: SearchProviderSettings;
+	authStorage?: AuthStorage;
 }): Promise<SearchResponse> {
 	const numResults = clampNumResults(params.num_results, DEFAULT_NUM_RESULTS, MAX_NUM_RESULTS);
 
-	const endpoint = findEndpoint();
+	const endpoint = params.providerSettings?.searxng?.endpoint ?? findEndpoint(params.settings);
 	if (!endpoint) {
 		throw new Error(
 			"SearXNG endpoint not configured. Set searxng.endpoint in settings or SEARXNG_ENDPOINT in environment.",
 		);
 	}
 
-	const auth = findAuth();
+	const auth = params.authStorage ? await findAuthFromStorage(params.authStorage) : findAuth(params.settings);
 
 	let categories: string | undefined;
 	let language: string | undefined;
 	try {
-		categories = settings.get("searxng.categories") ?? undefined;
-		language = settings.get("searxng.language") ?? undefined;
+		categories = params.providerSettings?.searxng?.categories ?? undefined;
+		language = params.providerSettings?.searxng?.language ?? undefined;
+		if (params.providerSettings === undefined) {
+			const activeSettings = params.settings ?? settings;
+			categories = activeSettings.get("searxng.categories") ?? undefined;
+			language = activeSettings.get("searxng.language") ?? undefined;
+		}
 	} catch {
 		// Settings not initialized yet
 	}
@@ -290,9 +374,9 @@ export class SearXNGProvider extends SearchProvider {
 	readonly id = "searxng";
 	readonly label = "SearXNG";
 
-	isAvailable(_authStorage: AuthStorage): boolean {
+	isAvailable(_authStorage: AuthStorage, activeSettings?: SearchProviderSettings): boolean {
 		try {
-			return !!findEndpoint();
+			return !!(activeSettings?.searxng?.endpoint ?? trustedSearxngEnv("SEARXNG_ENDPOINT"));
 		} catch {
 			return false;
 		}
@@ -304,6 +388,8 @@ export class SearXNGProvider extends SearchProvider {
 			num_results: params.numSearchResults ?? params.limit,
 			recency: params.recency,
 			signal: params.signal,
+			providerSettings: params.settings,
+			authStorage: params.authStorage,
 		});
 	}
 }

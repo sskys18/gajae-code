@@ -2,11 +2,24 @@
  * Direct MCP server registration CLI helpers.
  *
  * This surface only writes explicit user-provided server definitions to GJC's
- * own MCP config. It never imports or inherits live configs from other agents.
+ * own native MCP config (project `./.gjc/mcp.json` or user `~/.gjc/agent/mcp.json`)
+ * through the canonical scope-aware reader/writer. It never imports or inherits
+ * live configs from other agents. Registrations written here are consumed by
+ * ordinary standalone sessions at startup (conventional autoload) unless
+ * disabled or opted out via `--no-mcp`.
  */
-import { getMCPConfigPath, getProjectDir } from "@gajae-code/utils";
-import { getMCPServer, readMCPConfigFile, removeMCPServer, upsertMCPServer } from "../runtime-mcp/config-writer";
-import type { MCPConfigFile, MCPServerConfig } from "../runtime-mcp/types";
+import { getProjectDir } from "@gajae-code/utils";
+import { redactMCPEndpoint } from "../runtime-mcp/redaction";
+import {
+	getScopeMCPServer,
+	type MCPConfigScope,
+	readScopeDisabledServers,
+	readScopeMCPConfig,
+	removeScopeMCPServer,
+	resolveScopeMCPConfigPath,
+	upsertScopeMCPServer,
+} from "../runtime-mcp/scope-config";
+import type { MCPServerConfig } from "../runtime-mcp/types";
 
 export type MCPAction = "add" | "list" | "remove";
 
@@ -26,6 +39,7 @@ export interface MCPCommandArgs {
 		header?: string[];
 		cwd?: string;
 		timeout?: number;
+		sharing?: "per-session" | "shared";
 	};
 	cwd?: string;
 }
@@ -33,22 +47,62 @@ export interface MCPCommandArgs {
 export class MCPArgsError extends Error {}
 
 interface ScopedPath {
-	scope: "user" | "project";
+	scope: MCPConfigScope;
 	path: string;
 }
+
+/** Runtime status of a stored registration for conventional autoload. */
+type AutoloadStatus = "autoload" | "autoload-off" | "disabled";
 
 interface RedactedServerEntry {
 	name: string;
 	config: MCPServerConfig;
 }
 
+interface RuntimeServerEntry extends RedactedServerEntry {
+	scope: "user" | "project";
+	path: string;
+	/** Whether ordinary standalone sessions load this registration at startup. */
+	runtimeStatus: AutoloadStatus;
+	/** Human-readable explanation of the runtime status. */
+	runtimeNote: string;
+}
+
 const REDACTED = "<redacted>";
 const SENSITIVE_KEY_PATTERN =
 	/(?:token|secret|key|credential|password|passwd|pwd|authorization|auth|bearer|cookie|session)/i;
 
+/**
+ * Compute the conventional-autoload status of a stored server.
+ *
+ * - `autoload-off`: the server opted out of startup connection via `autoload: false`.
+ * - `disabled`: the server is disabled via `enabled: false` or the `disabledServers` list.
+ * - `autoload`: connected by ordinary standalone sessions at startup.
+ */
+export function computeAutoloadStatus(
+	name: string,
+	config: MCPServerConfig,
+	disabledServers: ReadonlySet<string>,
+): AutoloadStatus {
+	if (config.enabled === false || disabledServers.has(name)) return "disabled";
+	if (config.autoload === false) return "autoload-off";
+	return "autoload";
+}
+
+function autoloadStatusNote(status: AutoloadStatus): string {
+	switch (status) {
+		case "autoload":
+			return "Loaded by ordinary standalone gjc sessions at startup.";
+		case "autoload-off":
+			return "Configured but not auto-loaded at startup (autoload: false); connect on demand via /mcp.";
+		case "disabled":
+			return "Disabled; not loaded by sessions. Re-enable to autoload.";
+	}
+}
+
 function resolvePath(args: MCPCommandArgs): ScopedPath {
-	const scope = args.flags.project ? "project" : "user";
-	return { scope, path: getMCPConfigPath(scope, args.cwd ?? getProjectDir()) };
+	const scope: MCPConfigScope = args.flags.project ? "project" : "user";
+	return { scope, path: resolveScopeMCPConfigPath(scope, args.cwd ?? getProjectDir()) };
 }
 
 function parsePairs(values: string[] | undefined, label: string): Record<string, string> | undefined {
@@ -71,7 +125,10 @@ function parsePairs(values: string[] | undefined, label: string): Record<string,
 function buildServerConfig(args: MCPCommandArgs): MCPServerConfig {
 	const type = args.flags.type ?? (args.flags.url ? "http" : "stdio");
 	const timeout = args.flags.timeout;
-	const shared = timeout === undefined ? {} : { timeout };
+	const shared = {
+		...(timeout === undefined ? {} : { timeout }),
+		sharing: args.flags.sharing ?? "per-session",
+	} as const;
 
 	if (type === "stdio") {
 		const command = args.flags.command ?? args.commandArgs?.[0];
@@ -128,6 +185,32 @@ function redactRecord(
 	);
 }
 
+function redactArgs(args: string[] | undefined): string[] | undefined {
+	if (!args) return undefined;
+	const redacted: string[] = [];
+	let redactNext = false;
+	for (const arg of args) {
+		if (redactNext) {
+			redacted.push(REDACTED);
+			redactNext = false;
+			continue;
+		}
+		const equalsIndex = arg.indexOf("=");
+		if (equalsIndex > 0) {
+			const key = arg.slice(0, equalsIndex);
+			redacted.push(SENSITIVE_KEY_PATTERN.test(key) ? `${key}=${REDACTED}` : arg);
+			continue;
+		}
+		if (arg.startsWith("-") && SENSITIVE_KEY_PATTERN.test(arg)) {
+			redacted.push(arg);
+			redactNext = true;
+			continue;
+		}
+		redacted.push(SENSITIVE_KEY_PATTERN.test(arg) ? REDACTED : arg);
+	}
+	return redacted;
+}
+
 export function redactMCPServerConfig(config: MCPServerConfig): MCPServerConfig {
 	const redacted = { ...config } as MCPServerConfig;
 	if ("env" in redacted) {
@@ -138,11 +221,19 @@ export function redactMCPServerConfig(config: MCPServerConfig): MCPServerConfig 
 		const headers = redactRecord(redacted.headers, true);
 		if (headers) redacted.headers = headers;
 	}
+	if ("url" in redacted) {
+		const url = redactMCPEndpoint(redacted.url);
+		if (url) redacted.url = url;
+	}
+	if ("args" in redacted) {
+		const args = redactArgs(redacted.args);
+		if (args) redacted.args = args;
+	}
 	if (redacted.auth) {
 		redacted.auth = {
 			type: redacted.auth.type,
 			credentialId: redacted.auth.credentialId ? REDACTED : undefined,
-			tokenUrl: redacted.auth.tokenUrl,
+			tokenUrl: redactMCPEndpoint(redacted.auth.tokenUrl),
 			clientId: redacted.auth.clientId ? REDACTED : undefined,
 			clientSecret: redacted.auth.clientSecret ? REDACTED : undefined,
 		};
@@ -151,7 +242,7 @@ export function redactMCPServerConfig(config: MCPServerConfig): MCPServerConfig 
 		redacted.oauth = {
 			clientId: redacted.oauth.clientId ? REDACTED : undefined,
 			clientSecret: redacted.oauth.clientSecret ? REDACTED : undefined,
-			redirectUri: redacted.oauth.redirectUri,
+			redirectUri: redactMCPEndpoint(redacted.oauth.redirectUri),
 			callbackPort: redacted.oauth.callbackPort,
 			callbackPath: redacted.oauth.callbackPath,
 		};
@@ -159,10 +250,32 @@ export function redactMCPServerConfig(config: MCPServerConfig): MCPServerConfig 
 	return redacted;
 }
 
-function collectEntries(config: MCPConfigFile): RedactedServerEntry[] {
-	return Object.entries(config.mcpServers ?? {})
+function withRuntimeDisclosure<T extends object>(
+	value: T,
+	status: AutoloadStatus,
+): T & { runtimeStatus: AutoloadStatus; runtimeNote: string } {
+	return { ...value, runtimeStatus: status, runtimeNote: autoloadStatusNote(status) };
+}
+
+async function collectEntries(scoped: ScopedPath, cwd?: string): Promise<RuntimeServerEntry[]> {
+	const [config, disabled] = await Promise.all([
+		readScopeMCPConfig(scoped.scope, cwd),
+		readScopeDisabledServers(scoped.scope, cwd),
+	]);
+	const disabledSet = new Set(disabled);
+	return Object.entries(config.config.mcpServers ?? {})
 		.sort(([a], [b]) => a.localeCompare(b))
-		.map(([name, serverConfig]) => ({ name, config: redactMCPServerConfig(serverConfig) }));
+		.map(([name, serverConfig]) => {
+			const runtimeStatus = computeAutoloadStatus(name, serverConfig, disabledSet);
+			return {
+				name,
+				scope: scoped.scope,
+				path: scoped.path,
+				runtimeStatus,
+				runtimeNote: autoloadStatusNote(runtimeStatus),
+				config: redactMCPServerConfig(serverConfig),
+			};
+		});
 }
 
 function writeJson(value: unknown): void {
@@ -185,33 +298,56 @@ function renderDetails(entry: RedactedServerEntry): string {
 async function runAdd(args: MCPCommandArgs, scoped: ScopedPath): Promise<void> {
 	if (!args.name) throw new MCPArgsError("`gjc mcp add` requires a server name.");
 	const config = buildServerConfig(args);
-	const result = await upsertMCPServer(scoped.path, args.name, config, { force: args.flags.force });
+	const { result, config: storedConfig } = await upsertScopeMCPServer(
+		scoped.scope,
+		args.name,
+		config,
+		{
+			force: args.flags.force,
+		},
+		args.cwd,
+	);
 	const redacted = redactMCPServerConfig(config);
+	const disabled = new Set(storedConfig.disabledServers ?? (await readScopeDisabledServers(scoped.scope, args.cwd)));
+	const runtimeStatus = computeAutoloadStatus(args.name, config, disabled);
 	if (args.flags.json) {
-		writeJson({
-			action: "add",
-			status: result.status,
-			name: args.name,
-			scope: scoped.scope,
-			path: scoped.path,
-			config: redacted,
-		});
+		writeJson(
+			withRuntimeDisclosure(
+				{
+					action: "add",
+					status: result.status,
+					name: args.name,
+					scope: scoped.scope,
+					path: scoped.path,
+					config: redacted,
+				},
+				runtimeStatus,
+			),
+		);
 		return;
 	}
 	if (result.status === "skipped") {
 		process.stdout.write(
-			`MCP server "${args.name}" already exists in ${scoped.scope} config. Pass --force to overwrite.\n`,
+			`MCP server "${args.name}" already exists in ${scoped.scope} config. Pass --force to overwrite. ` +
+				`Runtime: ${autoloadStatusNote(runtimeStatus)}\n`,
 		);
 		return;
 	}
-	process.stdout.write(`MCP server "${args.name}" ${result.status} in ${scoped.scope} config: ${scoped.path}\n`);
+	process.stdout.write(
+		`MCP server "${args.name}" ${result.status} in ${scoped.scope} config: ${scoped.path}\n` +
+			`Runtime: ${autoloadStatusNote(runtimeStatus)}\n`,
+	);
 }
 
 async function runList(args: MCPCommandArgs, scoped: ScopedPath): Promise<void> {
-	const config = await readMCPConfigFile(scoped.path);
-	const entries = collectEntries(config);
+	const entries = await collectEntries(scoped, args.cwd);
 	if (args.flags.json) {
-		writeJson({ action: "list", scope: scoped.scope, path: scoped.path, servers: entries });
+		writeJson({
+			action: "list",
+			scope: scoped.scope,
+			path: scoped.path,
+			servers: entries,
+		});
 		return;
 	}
 	if (entries.length === 0) {
@@ -221,17 +357,18 @@ async function runList(args: MCPCommandArgs, scoped: ScopedPath): Promise<void> 
 	process.stdout.write(`MCP servers in ${scoped.scope} config: ${scoped.path}\n`);
 	for (const entry of entries) {
 		process.stdout.write(`${renderDetails(entry)}\n`);
+		process.stdout.write(`Runtime: ${entry.runtimeNote}\n`);
 	}
 }
 
 async function runRemove(args: MCPCommandArgs, scoped: ScopedPath): Promise<void> {
 	if (!args.name) throw new MCPArgsError("`gjc mcp remove` requires a server name.");
-	const existing = await getMCPServer(scoped.path, args.name);
-	if (!existing) {
+	const existing = await getScopeMCPServer(scoped.scope, args.name, args.cwd);
+	if (!existing.config) {
 		throw new MCPArgsError(`MCP server "${args.name}" not found in ${scoped.scope} config.`);
 	}
-	await removeMCPServer(scoped.path, args.name);
-	const entry = { name: args.name, config: redactMCPServerConfig(existing) };
+	await removeScopeMCPServer(scoped.scope, args.name, args.cwd);
+	const entry = { name: args.name, config: redactMCPServerConfig(existing.config) };
 	if (args.flags.json) {
 		writeJson({
 			action: "remove",

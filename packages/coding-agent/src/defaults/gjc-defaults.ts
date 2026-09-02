@@ -1,17 +1,10 @@
+import { readFileSync } from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getAgentDir, isEnoent, parseFrontmatter } from "@gajae-code/utils";
-import autoAnswerUncertainFragment from "./gjc/skills/deep-interview/auto-answer-uncertain.md" with { type: "text" };
-import autoResearchGreenfieldFragment from "./gjc/skills/deep-interview/auto-research-greenfield.md" with {
-	type: "text",
-};
-import lateralReviewPanelFragment from "./gjc/skills/deep-interview/lateral-review-panel.md" with { type: "text" };
-import deepInterviewSkill from "./gjc/skills/deep-interview/SKILL.md" with { type: "text" };
-import ralplanSkill from "./gjc/skills/ralplan/SKILL.md" with { type: "text" };
-import teamSkill from "./gjc/skills/team/SKILL.md" with { type: "text" };
-import aiSlopCleanerFragment from "./gjc/skills/ultragoal/ai-slop-cleaner.md" with { type: "text" };
-import ultragoalSkill from "./gjc/skills/ultragoal/SKILL.md" with { type: "text" };
+import { getAgentDir, isEnoent } from "@gajae-code/utils";
+import { BUNDLED_GJC_SKILL_CATALOG, type BundledGjcSkillCatalogEntry } from "./gjc-skills.generated";
 
-export const DEFAULT_GJC_DEFINITION_NAMES = ["deep-interview", "ralplan", "team", "ultragoal"] as const;
+export const DEFAULT_GJC_DEFINITION_NAMES = ["autoresearch", "deep-interview", "ralplan", "ultragoal"] as const;
 export type DefaultGjcDefinitionName = (typeof DEFAULT_GJC_DEFINITION_NAMES)[number];
 export type DefaultGjcDefinitionKind = "skill" | "skill-fragment";
 export type EmbeddedDefaultGjcSkill = {
@@ -21,7 +14,9 @@ export type EmbeddedDefaultGjcSkill = {
 	baseDir: string;
 	source: "bundled:default";
 	hide?: boolean;
+	/** Content is loaded on demand to keep startup free of bundled Markdown bodies. */
 	content: string;
+	loadContent: () => Promise<string>;
 };
 export type DefaultGjcInstallStatus = "different" | "matching" | "missing" | "skipped" | "written";
 
@@ -30,6 +25,7 @@ export interface DefaultGjcSkillDefinition {
 	name: DefaultGjcDefinitionName;
 	relativePath: string;
 	content: string;
+	loadContent: () => Promise<string>;
 }
 
 export interface DefaultGjcSkillFragmentDefinition {
@@ -37,6 +33,7 @@ export interface DefaultGjcSkillFragmentDefinition {
 	parentSkillName: DefaultGjcDefinitionName;
 	relativePath: string;
 	content: string;
+	loadContent: () => Promise<string>;
 }
 
 export type DefaultGjcDefinition = DefaultGjcSkillDefinition | DefaultGjcSkillFragmentDefinition;
@@ -68,6 +65,32 @@ export type DefaultGjcDefinitionInstallFile =
 			status: DefaultGjcInstallStatus;
 	  };
 
+/**
+ * Bundled workflow definitions that GJC used to ship and no longer does.
+ *
+ * Installing defaults only ever wrote the CURRENT set, so a definition dropped
+ * from the bundle stayed on disk under the agent dir forever — where
+ * filesystem skill discovery still found it and `/skill:<name>` still resolved.
+ * `team` was the first removal, so it was the first to expose that gap.
+ *
+ * Retirement QUARANTINES rather than deletes: the directory is moved aside to
+ * `<targetRoot>/retired/<name>.<timestamp>/`. A user who customized the skill
+ * keeps their content, and nothing is destroyed to satisfy a rename.
+ */
+export const RETIRED_GJC_DEFINITION_NAMES = ["team"] as const;
+export type RetiredGjcDefinitionName = (typeof RETIRED_GJC_DEFINITION_NAMES)[number];
+
+export type RetiredGjcDefinitionStatus = "absent" | "quarantined";
+
+export interface RetiredGjcDefinitionFile {
+	name: RetiredGjcDefinitionName;
+	/** Directory that held the retired definition. */
+	path: string;
+	/** Where it was moved, when quarantined. */
+	quarantinedTo?: string;
+	status: RetiredGjcDefinitionStatus;
+}
+
 export interface DefaultGjcDefinitionInstallResult {
 	targetRoot: string;
 	total: number;
@@ -77,43 +100,81 @@ export interface DefaultGjcDefinitionInstallResult {
 	missing: number;
 	different: number;
 	files: DefaultGjcDefinitionInstallFile[];
+	/** Retired bundled definitions found under `targetRoot`, and what happened to them. */
+	retired: RetiredGjcDefinitionFile[];
+}
+function sourcePathForBundledEntry(entry: BundledGjcSkillCatalogEntry): string {
+	const relative = entry.kind === "skill" ? entry.relativePath : entry.relativePath.replace(/^skill-fragments\//, "");
+	return entry.kind === "skill"
+		? path.join(import.meta.dir, "gjc", relative)
+		: path.join(import.meta.dir, "gjc", "skills", relative);
 }
 
-const DEFAULT_GJC_DEFINITIONS: readonly DefaultGjcDefinition[] = [
-	{
-		kind: "skill",
-		name: "deep-interview",
-		relativePath: "skills/deep-interview/SKILL.md",
-		content: deepInterviewSkill,
-	},
-	{ kind: "skill", name: "ralplan", relativePath: "skills/ralplan/SKILL.md", content: ralplanSkill },
-	{ kind: "skill", name: "team", relativePath: "skills/team/SKILL.md", content: teamSkill },
-	{ kind: "skill", name: "ultragoal", relativePath: "skills/ultragoal/SKILL.md", content: ultragoalSkill },
-	{
-		kind: "skill-fragment",
-		parentSkillName: "deep-interview",
-		relativePath: "skill-fragments/deep-interview/auto-research-greenfield.md",
-		content: autoResearchGreenfieldFragment,
-	},
-	{
-		kind: "skill-fragment",
-		parentSkillName: "deep-interview",
-		relativePath: "skill-fragments/deep-interview/auto-answer-uncertain.md",
-		content: autoAnswerUncertainFragment,
-	},
-	{
-		kind: "skill-fragment",
-		parentSkillName: "deep-interview",
-		relativePath: "skill-fragments/deep-interview/lateral-review-panel.md",
-		content: lateralReviewPanelFragment,
-	},
-	{
-		kind: "skill-fragment",
-		parentSkillName: "ultragoal",
-		relativePath: "skill-fragments/ultragoal/ai-slop-cleaner.md",
-		content: aiSlopCleanerFragment,
-	},
-];
+export class BundledDefaultContentError extends Error {
+	readonly code = "BUNDLED_DEFAULT_CONTENT_UNREADABLE";
+	constructor(
+		message: string,
+		readonly sourcePath: string,
+		readonly cause: unknown,
+	) {
+		super(message, { cause });
+		this.name = "BundledDefaultContentError";
+	}
+}
+
+export function readBundledContentSync(entry: BundledGjcSkillCatalogEntry): string {
+	const sourcePath = sourcePathForBundledEntry(entry);
+	try {
+		return readFileSync(sourcePath, "utf8");
+	} catch (cause) {
+		const detail = cause instanceof Error ? cause.message : String(cause);
+		throw new BundledDefaultContentError(
+			`Unable to read bundled GJC definition ${sourcePath}: ${detail}`,
+			sourcePath,
+			cause,
+		);
+	}
+}
+
+function withLazyBundledContent<T extends object>(
+	value: T,
+	entry: BundledGjcSkillCatalogEntry,
+): T & { content: string } {
+	Object.defineProperty(value, "content", {
+		enumerable: true,
+		configurable: false,
+		get: () => readBundledContentSync(entry),
+	});
+	return value as T & { content: string };
+}
+
+function asDefaultDefinition(entry: BundledGjcSkillCatalogEntry): DefaultGjcDefinition {
+	if (entry.kind === "skill") {
+		if (!entry.name) throw new Error(`Bundled skill catalog entry is missing name: ${entry.relativePath}`);
+		return withLazyBundledContent(
+			{
+				kind: "skill",
+				name: entry.name as DefaultGjcDefinitionName,
+				relativePath: entry.relativePath,
+				loadContent: entry.loadContent,
+			},
+			entry,
+		);
+	}
+	if (!entry.parentSkillName)
+		throw new Error(`Bundled skill fragment catalog entry is missing parent: ${entry.relativePath}`);
+	return withLazyBundledContent(
+		{
+			kind: "skill-fragment",
+			parentSkillName: entry.parentSkillName as DefaultGjcDefinitionName,
+			relativePath: entry.relativePath,
+			loadContent: entry.loadContent,
+		},
+		entry,
+	);
+}
+
+const DEFAULT_GJC_DEFINITIONS: readonly DefaultGjcDefinition[] = BUNDLED_GJC_SKILL_CATALOG.map(asDefaultDefinition);
 
 export function getDefaultGjcDefinitions(): readonly DefaultGjcDefinition[] {
 	return DEFAULT_GJC_DEFINITIONS;
@@ -136,21 +197,24 @@ export function getEmbeddedDefaultGjcSkills(): EmbeddedDefaultGjcSkill[] {
 	return DEFAULT_GJC_DEFINITIONS.filter(
 		(definition): definition is DefaultGjcSkillDefinition => definition.kind === "skill",
 	).map(definition => {
-		const { frontmatter } = parseFrontmatter(definition.content, {
-			source: `embedded:gjc/${definition.relativePath}`,
-			level: "warn",
-		});
-		const description =
-			typeof frontmatter.description === "string" ? frontmatter.description : `GJC ${definition.name} workflow`;
-		return {
-			name: definition.name,
-			description,
-			filePath: `embedded:gjc/${definition.relativePath}`,
-			baseDir: `embedded:gjc/skills/${definition.name}`,
-			source: "bundled:default",
-			hide: frontmatter.hide === true,
-			content: definition.content,
-		};
+		const catalogEntry = BUNDLED_GJC_SKILL_CATALOG.find(
+			entry => entry.kind === "skill" && entry.name === definition.name,
+		);
+		if (!catalogEntry) {
+			throw new Error(`Bundled GJC skill catalog invariant violated for "${definition.name}"`);
+		}
+		const description = catalogEntry.description ?? `GJC ${definition.name} workflow`;
+		return withLazyBundledContent(
+			{
+				name: definition.name,
+				description,
+				filePath: `embedded:gjc/${definition.relativePath}`,
+				baseDir: `embedded:gjc/skills/${definition.name}`,
+				source: "bundled:default",
+				loadContent: definition.loadContent,
+			},
+			catalogEntry,
+		);
 	});
 }
 
@@ -161,25 +225,26 @@ export async function installDefaultGjcDefinitions(
 	const files: DefaultGjcDefinitionInstallFile[] = [];
 
 	for (const definition of DEFAULT_GJC_DEFINITIONS) {
+		const content = await definition.loadContent();
 		const destination = path.join(targetRoot, definition.relativePath);
 		const existing = await readExistingText(destination);
 		let status: DefaultGjcInstallStatus;
 
 		if (options.check) {
-			status = existing === undefined ? "missing" : existing === definition.content ? "matching" : "different";
+			status = existing === undefined ? "missing" : existing === content ? "matching" : "different";
 		} else if (options.refreshOnly) {
 			if (existing === undefined) {
 				status = "missing";
-			} else if (existing === definition.content) {
+			} else if (existing === content) {
 				status = "matching";
 			} else {
-				await Bun.write(destination, definition.content);
+				await Bun.write(destination, content);
 				status = "written";
 			}
 		} else if (existing !== undefined && !options.force) {
 			status = "skipped";
 		} else {
-			await Bun.write(destination, definition.content);
+			await Bun.write(destination, content);
 			status = "written";
 		}
 
@@ -200,7 +265,63 @@ export async function installDefaultGjcDefinitions(
 		}
 	}
 
-	return summarizeInstallResult(targetRoot, files);
+	const retired = await retireRemovedGjcDefinitions(targetRoot, { check: options.check === true });
+	return summarizeInstallResult(targetRoot, files, retired);
+}
+
+/**
+ * Quarantine any retired bundled definition still present under `targetRoot`.
+ *
+ * `check` reports what WOULD move without touching the filesystem, so
+ * `--check` callers stay read-only.
+ */
+export async function retireRemovedGjcDefinitions(
+	targetRoot: string,
+	options: { check?: boolean } = {},
+): Promise<RetiredGjcDefinitionFile[]> {
+	const results: RetiredGjcDefinitionFile[] = [];
+	for (const name of RETIRED_GJC_DEFINITION_NAMES) {
+		const directory = path.join(targetRoot, "skills", name);
+		if (!(await directoryExists(directory))) {
+			results.push({ name, path: directory, status: "absent" });
+			continue;
+		}
+		if (options.check) {
+			results.push({ name, path: directory, status: "quarantined" });
+			continue;
+		}
+		const quarantinedTo = await reserveQuarantinePath(path.join(targetRoot, "retired"), name);
+		await fs.rename(directory, quarantinedTo);
+		results.push({ name, path: directory, quarantinedTo, status: "quarantined" });
+	}
+	return results;
+}
+
+/**
+ * Reserve a unique quarantine directory.
+ *
+ * A timestamp alone is not enough: two retirements inside the same millisecond
+ * resolve to the same path, which would silently overwrite the earlier
+ * quarantine. Disambiguate with a counter until an unused path is found.
+ */
+async function reserveQuarantinePath(retiredRoot: string, name: string): Promise<string> {
+	const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+	await fs.mkdir(retiredRoot, { recursive: true });
+	const base = path.join(retiredRoot, `${name}.${stamp}`);
+	if (!(await directoryExists(base))) return base;
+	for (let attempt = 2; ; attempt += 1) {
+		const candidate = `${base}-${attempt}`;
+		if (!(await directoryExists(candidate))) return candidate;
+	}
+}
+
+async function directoryExists(candidate: string): Promise<boolean> {
+	try {
+		return (await fs.stat(candidate)).isDirectory();
+	} catch (error) {
+		if (isEnoent(error)) return false;
+		throw error;
+	}
 }
 
 async function readExistingText(filePath: string): Promise<string | undefined> {
@@ -215,6 +336,7 @@ async function readExistingText(filePath: string): Promise<string | undefined> {
 function summarizeInstallResult(
 	targetRoot: string,
 	files: DefaultGjcDefinitionInstallFile[],
+	retired: RetiredGjcDefinitionFile[],
 ): DefaultGjcDefinitionInstallResult {
 	return {
 		targetRoot,
@@ -225,6 +347,7 @@ function summarizeInstallResult(
 		missing: countStatus(files, "missing"),
 		different: countStatus(files, "different"),
 		files,
+		retired,
 	};
 }
 

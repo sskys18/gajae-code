@@ -2,13 +2,22 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 import type { AgentMessage } from "@gajae-code/agent-core";
-import type { CredentialDisabledEvent, ImageContent, Model, ProviderResponseMetadata } from "@gajae-code/ai";
+import type { AttemptScope } from "@gajae-code/agent-core/attempt-scope";
+import type {
+	AttemptScopeRef,
+	CredentialDisabledEvent,
+	ImageContent,
+	Model,
+	ProviderResponseMetadata,
+} from "@gajae-code/ai/core";
 import type { KeyId } from "@gajae-code/tui";
 import { logger } from "@gajae-code/utils";
 import type { ModelRegistry } from "../../config/model-registry";
-import type { WorkflowGateEmitter } from "../../modes/shared/agent-wire/unattended-session";
+import type { Settings } from "../../config/settings";
+import type { WorkflowGateEmitter } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import { type Theme, theme } from "../../modes/theme/theme";
-import type { SessionManager } from "../../session/session-manager";
+import type { AttemptRecordStore } from "../../session/attempt-record-store";
+import { createReadonlySessionManager, type SessionManager } from "../../session/session-manager";
 import type {
 	AfterProviderResponseEvent,
 	BeforeAgentStartEvent,
@@ -52,6 +61,7 @@ import type {
 	UserPythonEvent,
 	UserPythonEventResult,
 } from "./types";
+import { createExtensionSettings } from "./types";
 
 /** Combined result from all before_agent_start handlers */
 interface BeforeAgentStartCombinedResult {
@@ -61,16 +71,32 @@ interface BeforeAgentStartCombinedResult {
 
 export type ExtensionErrorListener = (error: ExtensionError) => void;
 
+/** Bounded timeout for session_shutdown handlers — generous but never infinite. */
+export const SESSION_SHUTDOWN_HANDLER_TIMEOUT_MS = 60_000;
 export const EXTENSION_HANDLER_TIMEOUT_MS = 30_000;
 let extensionHandlerTimeoutMs = EXTENSION_HANDLER_TIMEOUT_MS;
+let sessionShutdownHandlerTimeoutMs = SESSION_SHUTDOWN_HANDLER_TIMEOUT_MS;
 
 export function testSetExtensionHandlerTimeoutMs(timeoutMs: number): void {
 	extensionHandlerTimeoutMs = timeoutMs;
+}
+export function testSetSessionShutdownHandlerTimeoutMs(timeoutMs: number): void {
+	sessionShutdownHandlerTimeoutMs = timeoutMs;
 }
 
 const EXTENSION_HANDLER_TIMEOUT = Symbol("extensionHandlerTimeout");
 
 const MAX_PENDING_CREDENTIAL_DISABLED = 32;
+function createHandlerContext(ctx: ExtensionContext, signal: AbortSignal): ExtensionContext {
+	const descriptors = Object.getOwnPropertyDescriptors(ctx);
+	descriptors.signal = {
+		configurable: true,
+		enumerable: true,
+		writable: true,
+		value: signal,
+	};
+	return Object.defineProperties({}, descriptors) as ExtensionContext;
+}
 
 /**
  * Events handled by the generic emit() method.
@@ -111,6 +137,8 @@ type RunnerEmitResult<TEvent extends RunnerEmitEvent> = TEvent extends { type: "
 				: TEvent extends { type: "session.compacting" }
 					? SessionCompactingResult | undefined
 					: undefined;
+type Handler = Extension["handlers"] extends Map<string, Array<infer T>> ? T : never;
+type IndexedHandler = { ext: Extension; handler: Handler };
 
 export type NewSessionHandler = (options?: {
 	parentSession?: string;
@@ -173,15 +201,60 @@ const noOpUIContext: ExtensionUIContext = {
 export class ExtensionRunner {
 	#uiContext: ExtensionUIContext;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
+	#handlersByEvent: Map<string, IndexedHandler[]> = new Map();
+	#attemptRecordStore: AttemptRecordStore | undefined;
+
 	#getModel: () => Model | undefined = () => undefined;
+	#getCredentialSessionId: () => string = () => "";
 	#isIdleFn: () => boolean = () => true;
+	#getActivePromptHandleFn: () => string | undefined = () => undefined;
 	#waitForIdleFn: () => Promise<void> = async () => {};
-	#abortFn: () => void = () => {};
+	#abortFn: () => void | Promise<void> = () => {};
+	#abortPromptAndWaitFn: NonNullable<ExtensionContextActions["abortPromptAndWait"]> = async () => {
+		throw new Error("abortPromptAndWait binding is unavailable");
+	};
 	#hasPendingMessagesFn: () => boolean = () => false;
+	#getPendingMessageCountsFn: () => { steering: number; followUp: number; nextTurn: number } = () => ({
+		steering: 0,
+		followUp: 0,
+		nextTurn: 0,
+	});
 	#getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	#compactFn: (instructionsOrOptions?: string | CompactOptions) => Promise<void> = async () => {};
 	#getSystemPromptFn: () => string[] = () => [];
 	#getWorkflowGateFn: () => WorkflowGateEmitter | undefined = () => undefined;
+	#clearContextFn: () => Promise<boolean> = async () => false;
+	#getTranscriptFn: ExtensionContext["getTranscript"] = () => [];
+	#getTranscriptBodyFn: ExtensionContext["getTranscriptBody"] = () => undefined;
+	#getGoalStateFn: ExtensionContext["getGoalState"] = () => undefined;
+	#getTodoStateFn: ExtensionContext["getTodoState"] = () => undefined;
+	#getQueuedMessagesFn: ExtensionContext["getQueuedMessages"] = () => [];
+	#getActiveToolsFn: ExtensionContext["getActiveTools"] = () => [];
+	#getAllToolsFn: ExtensionContext["getAllTools"] = () => [];
+	#getResolveToolFn: ExtensionContext["resolveTool"] = () => undefined;
+	#cycleModelFn: ExtensionContextActions["cycleModel"] = undefined;
+	#setModelProfileFn: ExtensionContextActions["setModelProfile"] = undefined;
+	#setDefaultModelProfileFn: ExtensionContextActions["setDefaultModelProfile"] = undefined;
+	#getActiveModelProfileFn: ExtensionContextActions["getActiveModelProfile"] = undefined;
+	#withSdkControlMutationFn: ExtensionContextActions["withSdkControlMutation"] = undefined;
+	#cycleThinkingLevelFn: ExtensionContextActions["cycleThinkingLevel"] = undefined;
+	#setQueueModeFn: ExtensionContextActions["setQueueMode"] = undefined;
+	#getSkillStateFn: ExtensionContextActions["getSkillState"] = undefined;
+	#getConfigItemsFn: ExtensionContextActions["getConfigItems"] = undefined;
+	#getBranchCandidatesFn: ExtensionContextActions["getBranchCandidates"] = undefined;
+	#getExtensionsFn: ExtensionContextActions["getExtensions"] = undefined;
+	#getArtifactFn: ExtensionContextActions["getArtifact"] = undefined;
+	#getArtifactRangeFn: ExtensionContextActions["getArtifactRange"] = undefined;
+
+	#getJobsFn: ExtensionContextActions["getJobs"] = undefined;
+	#sdkControlFn: ExtensionContextActions["sdkControl"] = undefined;
+	#setSdkPermissionProviderFn: ExtensionContextActions["setSdkPermissionProvider"] = undefined;
+	#setSdkClientBridgeFn: ExtensionContextActions["setSdkClientBridge"] = undefined;
+
+	#invokeSkillFn: ExtensionContextActions["invokeSkill"] = undefined;
+	#setPlanModeFn: ExtensionContextActions["setPlanMode"] = undefined;
+	#operateGoalFn: ExtensionContextActions["operateGoal"] = undefined;
+
 	#newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	#branchHandler: BranchHandler = async () => ({ cancelled: false });
 	#navigateTreeHandler: NavigateTreeHandler = async () => ({ cancelled: false });
@@ -205,8 +278,30 @@ export class ExtensionRunner {
 		private readonly cwd: string,
 		private readonly sessionManager: SessionManager,
 		private readonly modelRegistry: ModelRegistry,
+		private readonly sessionMetadata?: ExtensionContext["sessionMetadata"],
+		private readonly settings?: Settings,
+		credentialSessionIdGetter?: () => string,
 	) {
 		this.#uiContext = noOpUIContext;
+		this.#getCredentialSessionId = credentialSessionIdGetter ?? (() => "");
+		this.#handlersByEvent = ExtensionRunner.#indexHandlers(extensions);
+	}
+
+	static #indexHandlers(extensions: Extension[]): Map<string, IndexedHandler[]> {
+		const handlersByEvent = new Map<string, IndexedHandler[]>();
+		for (const ext of extensions) {
+			for (const [eventType, handlers] of ext.handlers) {
+				let indexedHandlers = handlersByEvent.get(eventType);
+				if (!indexedHandlers) {
+					indexedHandlers = [];
+					handlersByEvent.set(eventType, indexedHandlers);
+				}
+				for (const handler of handlers) {
+					indexedHandlers.push({ ext, handler });
+				}
+			}
+		}
+		return handlersByEvent;
 	}
 
 	initialize(
@@ -221,22 +316,71 @@ export class ExtensionRunner {
 		this.runtime.appendEntry = actions.appendEntry;
 		this.runtime.getActiveTools = actions.getActiveTools;
 		this.runtime.getAllTools = actions.getAllTools;
+		this.runtime.resolveTool = actions.resolveTool ?? (() => undefined);
 		this.runtime.setActiveTools = actions.setActiveTools;
 		this.runtime.getCommands = actions.getCommands;
 		this.runtime.setModel = actions.setModel;
 		this.runtime.getThinkingLevel = actions.getThinkingLevel;
 		this.runtime.setThinkingLevel = actions.setThinkingLevel;
+		this.runtime.getThinkingVisibility = actions.getThinkingVisibility;
+		this.runtime.setThinkingVisibility = actions.setThinkingVisibility;
+		this.runtime.cycleThinkingLevel = actions.cycleThinkingLevel;
+		this.runtime.setThinkingLevelForControl = actions.setThinkingLevelForControl;
+		this.runtime.setThinkingVisibilityForControl = actions.setThinkingVisibilityForControl;
+		this.runtime.setModelTemporaryForControl = actions.setModelTemporaryForControl;
+		this.runtime.fetchUsageReportsForControl = actions.fetchUsageReportsForControl;
+		this.runtime.getThinkingScopeForControl = actions.getThinkingScopeForControl;
 		this.runtime.getSessionName = actions.getSessionName;
 		this.runtime.setSessionName = actions.setSessionName;
 
 		// Context actions (required)
 		this.#getModel = contextActions.getModel;
+		this.#getCredentialSessionId = contextActions.getCredentialSessionId ?? (() => "");
 		this.#isIdleFn = contextActions.isIdle;
+		this.#getActivePromptHandleFn = contextActions.getActivePromptHandle ?? (() => undefined);
 		this.#abortFn = contextActions.abort;
+		this.#abortPromptAndWaitFn =
+			contextActions.abortPromptAndWait ??
+			(async () => {
+				throw new Error("abortPromptAndWait binding is unavailable");
+			});
 		this.#hasPendingMessagesFn = contextActions.hasPendingMessages;
+		this.#getPendingMessageCountsFn =
+			contextActions.getPendingMessageCounts ?? (() => ({ steering: 0, followUp: 0, nextTurn: 0 }));
 		this.#shutdownHandler = contextActions.shutdown;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
 		this.#getWorkflowGateFn = contextActions.getWorkflowGate ?? (() => undefined);
+		this.#clearContextFn = contextActions.clearContext ?? (async () => false);
+		this.#getTranscriptFn = contextActions.getTranscript ?? (() => []);
+		this.#getTranscriptBodyFn = contextActions.getTranscriptBody ?? (() => undefined);
+		this.#getGoalStateFn = contextActions.getGoalState ?? (() => undefined);
+		this.#getTodoStateFn = contextActions.getTodoState ?? (() => undefined);
+		this.#getQueuedMessagesFn = contextActions.getQueuedMessages ?? (() => []);
+		this.#getActiveToolsFn = contextActions.getActiveTools ?? (() => []);
+		this.#getAllToolsFn = contextActions.getAllTools ?? (() => []);
+		this.#getResolveToolFn = contextActions.resolveTool ?? (() => undefined);
+		this.#cycleModelFn = contextActions.cycleModel;
+		this.#setModelProfileFn = contextActions.setModelProfile;
+		this.#setDefaultModelProfileFn = contextActions.setDefaultModelProfile;
+		this.#getActiveModelProfileFn = contextActions.getActiveModelProfile;
+		this.#withSdkControlMutationFn = contextActions.withSdkControlMutation;
+		this.#cycleThinkingLevelFn = contextActions.cycleThinkingLevel;
+		this.#setQueueModeFn = contextActions.setQueueMode;
+		this.#getSkillStateFn = contextActions.getSkillState;
+		this.#invokeSkillFn = contextActions.invokeSkill;
+		this.#setPlanModeFn = contextActions.setPlanMode;
+		this.#operateGoalFn = contextActions.operateGoal;
+
+		this.#getConfigItemsFn = contextActions.getConfigItems;
+		this.#getBranchCandidatesFn = contextActions.getBranchCandidates;
+		this.#getExtensionsFn = contextActions.getExtensions;
+		this.#getArtifactFn = contextActions.getArtifact;
+		this.#getArtifactRangeFn = contextActions.getArtifactRange;
+
+		this.#getJobsFn = contextActions.getJobs;
+		this.#sdkControlFn = contextActions.sdkControl;
+		this.#setSdkPermissionProviderFn = contextActions.setSdkPermissionProvider;
+		this.#setSdkClientBridgeFn = contextActions.setSdkClientBridge;
 
 		// Command context actions (optional, only for interactive mode)
 		if (commandContextActions) {
@@ -274,8 +418,8 @@ export class ExtensionRunner {
 	 * Forward a `credential_disabled` event from `AuthStorage` to extension handlers.
 	 *
 	 * If {@link initialize} has not yet run, the event is buffered and replayed once
-	 * initialize wires the runtime/UI context. This matters because mode controllers
-	 * (interactive, RPC, ACP, print, subagent) call `initialize()` AFTER `createAgentSession`
+	 * initialize wires the runtime/UI context. This matters because session frontends
+	 * (interactive, ACP, print, and subagent) call `initialize()` AFTER `createAgentSession`
 	 * returns, but `AuthStorage` can fire `credential_disabled` during startup model probes
 	 * inside `createAgentSession()`. Without deferral, extension handlers would observe
 	 * `hasUI=false`, an unset model, and no-op runtime actions on exactly the headline
@@ -395,13 +539,28 @@ export class ExtensionRunner {
 	}
 
 	hasHandlers(eventType: string): boolean {
-		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get(eventType);
-			if (handlers && handlers.length > 0) {
-				return true;
-			}
-		}
-		return false;
+		return (this.#handlersByEvent.get(eventType)?.length ?? 0) > 0;
+	}
+
+	setAttemptRecordStore(store: AttemptRecordStore): void {
+		this.#attemptRecordStore = store;
+	}
+
+	#markAttemptExecuted(scope: AttemptScopeRef | undefined): void {
+		if (scope !== undefined) this.#attemptRecordStore?.markExecuted(scope as AttemptScope);
+	}
+
+	/**
+	 * Scope-presence guard. When the AttemptScope facility is active but a
+	 * handler-capable delivery lacks a scope, the handler is still delivered
+	 * (backward-compatible) but NO mark is recorded. The record stays
+	 * unknown/missing → `isClean` returns false → admission refuses
+	 * (fail-closed at the decision point, not at delivery).
+	 */
+	#requireScopeOrFailClosed(_scope: AttemptScopeRef | undefined, _eventLabel: string): void {
+		// No throw — handler is delivered (backward-compatible); mark is not
+		// recorded when scope is absent. isClean returns false for an
+		// unmarked scope → admission refuses (fail-closed at decision point).
 	}
 
 	getMessageRenderer(customType: string): MessageRenderer | undefined {
@@ -451,24 +610,85 @@ export class ExtensionRunner {
 
 	createContext(): ExtensionContext {
 		const getModel = this.#getModel;
+		const getCredentialSessionId = this.#getCredentialSessionId;
 		return {
 			ui: this.#uiContext,
 			getContextUsage: () => this.#getContextUsageFn(),
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
 			hasUI: this.hasUI(),
 			cwd: this.cwd,
-			sessionManager: this.sessionManager,
+			sessionManager: createReadonlySessionManager(this.sessionManager),
+			sessionMetadata: this.sessionMetadata,
 			modelRegistry: this.modelRegistry,
+			settings: this.settings ? createExtensionSettings(this.settings) : undefined,
+			get credentialSessionId() {
+				return getCredentialSessionId();
+			},
 			get model() {
 				return getModel();
 			},
+			getActivePromptHandle: () => this.#getActivePromptHandleFn(),
 			isIdle: () => this.#isIdleFn(),
 			abort: () => this.#abortFn(),
+			abortPromptAndWait: (handle, options) => this.#abortPromptAndWaitFn(handle, options),
 			hasPendingMessages: () => this.#hasPendingMessagesFn(),
+			getPendingMessageCounts: () => this.#getPendingMessageCountsFn(),
+			getTranscript: () => this.#getTranscriptFn(),
+			getTranscriptBody: entryId => this.#getTranscriptBodyFn(entryId),
+			getGoalState: () => this.#getGoalStateFn(),
+			getTodoState: () => this.#getTodoStateFn(),
+			getQueuedMessages: () => this.#getQueuedMessagesFn(),
+			getActiveTools: () => this.#getActiveToolsFn(),
+			getAllTools: () => this.#getAllToolsFn(),
+			resolveTool: name => this.#getResolveToolFn(name),
+			cycleModel: async () => await this.#cycleModelFn?.(),
+			setModelProfile: async name => (await this.#setModelProfileFn?.(name)) ?? false,
+			setDefaultModelProfile: async (name, options) =>
+				(await this.#setDefaultModelProfileFn?.(name, options)) ?? { changed: false, id: name },
+			getActiveModelProfile: () => this.#getActiveModelProfileFn?.(),
+			withSdkControlMutation: body => this.#withSdkControlMutationFn?.(body) ?? body(),
+			cycleThinkingLevel: () => this.#cycleThinkingLevelFn?.(),
+			setQueueMode: (kind, mode) => this.#setQueueModeFn?.(kind, mode) ?? false,
+			invokeSkill: async (name, args, options) => await this.#invokeSkillFn?.(name, args, options),
+
+			setPlanMode: on => this.#setPlanModeFn?.(on),
+			operateGoal: async (op, objective) => await this.#operateGoalFn?.(op, objective),
+
+			getSkillState: () => this.#getSkillStateFn?.(),
+			getConfigItems: () => this.#getConfigItemsFn?.(),
+			getBranchCandidates: () => this.#getBranchCandidatesFn?.(),
+			getExtensions: () => this.#getExtensionsFn?.(),
+			getArtifact: id => this.#getArtifactFn?.(id),
+			getArtifactRange: (id, offset, length) => this.#getArtifactRangeFn?.(id, offset, length),
+
+			getJobs: () => this.#getJobsFn?.(),
+			sdkControl: (operation, input) => this.#sdkControlFn?.(operation, input),
+			setSdkPermissionProvider: provider => this.#setSdkPermissionProviderFn?.(provider),
+			setSdkClientBridge: bridge => this.#setSdkClientBridgeFn?.(bridge),
+			sdkBindings: () => [
+				...(this.#cycleModelFn ? ["cycleModel"] : []),
+				...(this.#setModelProfileFn ? ["setModelProfile"] : []),
+				...(this.#setDefaultModelProfileFn ? ["setDefaultModelProfile"] : []),
+				...(this.#getActiveModelProfileFn ? ["getActiveModelProfile"] : []),
+				...(this.#withSdkControlMutationFn ? ["withSdkControlMutation"] : []),
+				...(this.#cycleThinkingLevelFn ? ["cycleThinkingLevel"] : []),
+				...(this.#setQueueModeFn ? ["setQueueMode"] : []),
+				...(this.#getSkillStateFn ? ["getSkillState"] : []),
+				...(this.#getConfigItemsFn ? ["getConfigItems"] : []),
+				...(this.#getBranchCandidatesFn ? ["getBranchCandidates"] : []),
+				...(this.#getExtensionsFn ? ["getExtensions"] : []),
+				...(this.#getArtifactRangeFn ? ["getArtifactRange"] : []),
+				...(this.#getJobsFn ? ["getJobs"] : []),
+				...(this.#sdkControlFn ? ["sdkControl"] : []),
+				...(this.#invokeSkillFn ? ["invokeSkill"] : []),
+				...(this.#setPlanModeFn ? ["setPlanMode"] : []),
+				...(this.#operateGoalFn ? ["operateGoal"] : []),
+			],
 			shutdown: () => this.#shutdownHandler(),
-			getSystemPrompt: () => this.#getSystemPromptFn(),
+			getSystemPrompt: () => [...this.#getSystemPromptFn()],
 			hasQueuedMessages: () => this.#hasPendingMessagesFn(), // deprecated alias
 			workflowGate: this.#getWorkflowGateFn(),
+			clearContext: () => this.#clearContextFn(),
 		};
 	}
 
@@ -507,15 +727,25 @@ export class ExtensionRunner {
 		event: TEvent,
 		ctx: ExtensionContext,
 		ext: Extension,
-		timeoutMs: number,
+		timeoutMs: number | undefined,
 	): Promise<TResult | undefined> {
+		let timeout: NodeJS.Timeout | undefined;
+		const abortController = new AbortController();
+		const handlerContext = createHandlerContext(ctx, abortController.signal);
 		try {
-			const handlerResult = await Promise.race([
-				Promise.resolve(handler(event, ctx)),
-				Bun.sleep(timeoutMs).then(() => EXTENSION_HANDLER_TIMEOUT),
-			]);
+			if (timeoutMs === undefined) return await handler(event, handlerContext);
+			const timeoutPromise = new Promise<typeof EXTENSION_HANDLER_TIMEOUT>(resolve => {
+				timeout = setTimeout(() => resolve(EXTENSION_HANDLER_TIMEOUT), timeoutMs);
+			});
+			const handlerResult = await Promise.race([Promise.resolve(handler(event, handlerContext)), timeoutPromise]);
+			if (timeout !== undefined) {
+				clearTimeout(timeout);
+				timeout = undefined;
+			}
+
 			if (handlerResult === EXTENSION_HANDLER_TIMEOUT) {
 				const error = `handler timed out after ${timeoutMs}ms`;
+				abortController.abort(new Error(error));
 				logger.warn("Extension handler timed out", {
 					extensionPath: ext.path,
 					event: event.type,
@@ -539,73 +769,91 @@ export class ExtensionRunner {
 				stack,
 			});
 			return undefined;
+		} finally {
+			if (timeout !== undefined) {
+				clearTimeout(timeout);
+			}
 		}
 	}
 
-	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
+	async emit<TEvent extends RunnerEmitEvent>(
+		event: TEvent,
+		continueWhile?: () => boolean,
+		scope?: AttemptScopeRef,
+	): Promise<RunnerEmitResult<TEvent>> {
+		const handlers = this.#handlersByEvent.get(event.type) ?? [];
+		if (handlers.length === 0) return undefined as RunnerEmitResult<TEvent>;
+		this.#requireScopeOrFailClosed(scope, event.type);
+
 		const ctx = this.createContext();
 		let result: SessionBeforeEventResult | SessionCompactingResult | undefined;
+		let marked = false;
 
-		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get(event.type);
-			if (!handlers || handlers.length === 0) continue;
+		for (const { ext, handler } of handlers) {
+			if (continueWhile && !continueWhile()) return result as RunnerEmitResult<TEvent>;
+			if (!marked) {
+				this.#markAttemptExecuted(scope);
+				marked = true;
+			}
+			const handlerResult = await this.#runHandlerWithTimeout(
+				handler,
+				event,
+				ctx,
+				ext,
+				event.type === "session_shutdown" ? sessionShutdownHandlerTimeoutMs : extensionHandlerTimeoutMs,
+			);
+			if (continueWhile && !continueWhile()) return result as RunnerEmitResult<TEvent>;
 
-			for (const handler of handlers) {
-				const handlerResult = await this.#runHandlerWithTimeout(
-					handler,
-					event,
-					ctx,
-					ext,
-					extensionHandlerTimeoutMs,
-				);
-
-				if (this.#isSessionBeforeEvent(event) && handlerResult) {
-					result = handlerResult as SessionBeforeEventResult;
-					if (result.cancel) {
-						return result as RunnerEmitResult<TEvent>;
-					}
+			if (this.#isSessionBeforeEvent(event) && handlerResult) {
+				result = handlerResult as SessionBeforeEventResult;
+				if (result.cancel) {
+					return result as RunnerEmitResult<TEvent>;
 				}
+			}
 
-				if (event.type === "session.compacting" && handlerResult) {
-					result = handlerResult as SessionCompactingResult;
-				}
+			if (event.type === "session.compacting" && handlerResult) {
+				result = handlerResult as SessionCompactingResult;
 			}
 		}
 
 		return result as RunnerEmitResult<TEvent>;
 	}
 
-	async emitToolResult(event: ToolResultEvent): Promise<ToolResultEventResult | undefined> {
+	async emitToolResult(event: ToolResultEvent, scope?: AttemptScopeRef): Promise<ToolResultEventResult | undefined> {
+		const handlers = this.#handlersByEvent.get("tool_result") ?? [];
+		if (handlers.length === 0) return undefined;
+		this.#requireScopeOrFailClosed(scope, "tool_result");
+
 		const ctx = this.createContext();
 		const currentEvent: ToolResultEvent = { ...event };
 		let modified = false;
+		let marked = false;
 
-		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get("tool_result");
-			if (!handlers || handlers.length === 0) continue;
+		for (const { ext, handler } of handlers) {
+			if (!marked) {
+				this.#markAttemptExecuted(scope);
+				marked = true;
+			}
+			const handlerResult = (await this.#runHandlerWithTimeout(
+				handler,
+				currentEvent,
+				ctx,
+				ext,
+				extensionHandlerTimeoutMs,
+			)) as ToolResultEventResult | undefined;
+			if (!handlerResult) continue;
 
-			for (const handler of handlers) {
-				const handlerResult = (await this.#runHandlerWithTimeout(
-					handler,
-					currentEvent,
-					ctx,
-					ext,
-					extensionHandlerTimeoutMs,
-				)) as ToolResultEventResult | undefined;
-				if (!handlerResult) continue;
-
-				if (handlerResult.content !== undefined) {
-					currentEvent.content = handlerResult.content;
-					modified = true;
-				}
-				if (handlerResult.details !== undefined) {
-					currentEvent.details = handlerResult.details;
-					modified = true;
-				}
-				if (handlerResult.isError !== undefined) {
-					currentEvent.isError = handlerResult.isError;
-					modified = true;
-				}
+			if (handlerResult.content !== undefined) {
+				currentEvent.content = handlerResult.content;
+				modified = true;
+			}
+			if (handlerResult.details !== undefined) {
+				currentEvent.details = handlerResult.details;
+				modified = true;
+			}
+			if (handlerResult.isError !== undefined) {
+				currentEvent.isError = handlerResult.isError;
+				modified = true;
 			}
 		}
 
@@ -618,35 +866,39 @@ export class ExtensionRunner {
 		};
 	}
 
-	async emitToolCall(event: ToolCallEvent): Promise<ToolCallEventResult | undefined> {
+	async emitToolCall(event: ToolCallEvent, scope?: AttemptScopeRef): Promise<ToolCallEventResult | undefined> {
+		const handlers = this.#handlersByEvent.get("tool_call") ?? [];
+		if (handlers.length === 0) return undefined;
+		this.#requireScopeOrFailClosed(scope, "tool_call");
+
 		const ctx = this.createContext();
 		let result: ToolCallEventResult | undefined;
+		let marked = false;
 
-		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get("tool_call");
-			if (!handlers || handlers.length === 0) continue;
+		for (const { ext, handler } of handlers) {
+			if (!marked) {
+				this.#markAttemptExecuted(scope);
+				marked = true;
+			}
+			try {
+				const handlerResult = await handler(event, ctx);
 
-			for (const handler of handlers) {
-				try {
-					const handlerResult = await handler(event, ctx);
-
-					if (handlerResult) {
-						result = handlerResult as ToolCallEventResult;
-						if (result.block) {
-							return result;
-						}
+				if (handlerResult) {
+					result = handlerResult as ToolCallEventResult;
+					if (result.block) {
+						return result;
 					}
-				} catch (err) {
-					const message = err instanceof Error ? err.message : String(err);
-					const stack = err instanceof Error ? err.stack : undefined;
-					this.emitError({
-						extensionPath: ext.path,
-						event: "tool_call",
-						error: message,
-						stack,
-					});
-					return { block: true, reason: `Extension ${ext.path} failed: ${message}` };
 				}
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				const stack = err instanceof Error ? err.stack : undefined;
+				this.emitError({
+					extensionPath: ext.path,
+					event: "tool_call",
+					error: message,
+					stack,
+				});
+				return { block: true, reason: `Extension ${ext.path} failed: ${message}` };
 			}
 		}
 
@@ -665,23 +917,15 @@ export class ExtensionRunner {
 		event: UserBashEvent | UserPythonEvent,
 		eventName: "user_bash" | "user_python",
 	): Promise<R | undefined> {
+		const handlers = this.#handlersByEvent.get(eventName) ?? [];
+		if (handlers.length === 0) return undefined;
+
 		const ctx = this.createContext();
 
-		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get(eventName);
-			if (!handlers || handlers.length === 0) continue;
-
-			for (const handler of handlers) {
-				const handlerResult = await this.#runHandlerWithTimeout(
-					handler,
-					event,
-					ctx,
-					ext,
-					extensionHandlerTimeoutMs,
-				);
-				if (handlerResult) {
-					return handlerResult as R;
-				}
+		for (const { ext, handler } of handlers) {
+			const handlerResult = await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
+			if (handlerResult) {
+				return handlerResult as R;
 			}
 		}
 
@@ -696,35 +940,26 @@ export class ExtensionRunner {
 		promptPaths: Array<{ path: string; extensionPath: string }>;
 		themePaths: Array<{ path: string; extensionPath: string }>;
 	}> {
+		const handlers = this.#handlersByEvent.get("resources_discover") ?? [];
+		if (handlers.length === 0) return { skillPaths: [], promptPaths: [], themePaths: [] };
 		const ctx = this.createContext();
 		const skillPaths: Array<{ path: string; extensionPath: string }> = [];
 		const promptPaths: Array<{ path: string; extensionPath: string }> = [];
 		const themePaths: Array<{ path: string; extensionPath: string }> = [];
 
-		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get("resources_discover");
-			if (!handlers || handlers.length === 0) continue;
+		for (const { ext, handler } of handlers) {
+			const event: ResourcesDiscoverEvent = { type: "resources_discover", cwd, reason };
+			const handlerResult = await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
+			const result = handlerResult as ResourcesDiscoverResult | undefined;
 
-			for (const handler of handlers) {
-				const event: ResourcesDiscoverEvent = { type: "resources_discover", cwd, reason };
-				const handlerResult = await this.#runHandlerWithTimeout(
-					handler,
-					event,
-					ctx,
-					ext,
-					extensionHandlerTimeoutMs,
-				);
-				const result = handlerResult as ResourcesDiscoverResult | undefined;
-
-				if (result?.skillPaths?.length) {
-					skillPaths.push(...result.skillPaths.map(path => ({ path, extensionPath: ext.path })));
-				}
-				if (result?.promptPaths?.length) {
-					promptPaths.push(...result.promptPaths.map(path => ({ path, extensionPath: ext.path })));
-				}
-				if (result?.themePaths?.length) {
-					themePaths.push(...result.themePaths.map(path => ({ path, extensionPath: ext.path })));
-				}
+			if (result?.skillPaths?.length) {
+				skillPaths.push(...result.skillPaths.map(path => ({ path, extensionPath: ext.path })));
+			}
+			if (result?.promptPaths?.length) {
+				promptPaths.push(...result.promptPaths.map(path => ({ path, extensionPath: ext.path })));
+			}
+			if (result?.themePaths?.length) {
+				themePaths.push(...result.themePaths.map(path => ({ path, extensionPath: ext.path })));
 			}
 		}
 
@@ -735,41 +970,36 @@ export class ExtensionRunner {
 	async emitInput(
 		text: string,
 		images: ImageContent[] | undefined,
-		source: "interactive" | "rpc" | "extension",
+		source: "interactive" | "sdk" | "extension",
 	): Promise<InputEventResult> {
+		const handlers = this.#handlersByEvent.get("input") ?? [];
+		if (handlers.length === 0) return {};
+
 		const ctx = this.createContext();
 		let currentText = text;
 		let currentImages = images;
 
-		for (const ext of this.extensions) {
-			for (const handler of ext.handlers.get("input") ?? []) {
-				const event: InputEvent = { type: "input", text: currentText, images: currentImages, source };
-				const result = (await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs)) as
-					| InputEventResult
-					| undefined;
-				if (result?.handled) return result;
-				if (result?.text !== undefined) {
-					currentText = result.text;
-					currentImages = result.images ?? currentImages;
-				}
+		for (const { ext, handler } of handlers) {
+			const event: InputEvent = { type: "input", text: currentText, images: currentImages, source };
+			const result = (await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs)) as
+				| InputEventResult
+				| undefined;
+			if (result?.handled) return result;
+			if (result?.text !== undefined) {
+				currentText = result.text;
+				currentImages = result.images ?? currentImages;
 			}
 		}
+
 		return currentText !== text || currentImages !== images ? { text: currentText, images: currentImages } : {};
 	}
 
-	async emitContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
+	async emitContext(messages: AgentMessage[], scope?: AttemptScopeRef): Promise<AgentMessage[]> {
+		const handlers = this.#handlersByEvent.get("context") ?? [];
+		if (handlers.length === 0) return messages;
+		this.#requireScopeOrFailClosed(scope, "context");
+
 		const ctx = this.createContext();
-
-		// Check if any extensions actually have context handlers before cloning
-		let hasContextHandlers = false;
-		for (const ext of this.extensions) {
-			if (ext.handlers.get("context")?.length) {
-				hasContextHandlers = true;
-				break;
-			}
-		}
-		if (!hasContextHandlers) return messages;
-
 		let currentMessages: AgentMessage[];
 		try {
 			currentMessages = structuredClone(messages);
@@ -779,76 +1009,79 @@ export class ExtensionRunner {
 			// return new message arrays rather than mutating in place.
 			currentMessages = [...messages];
 		}
+		let marked = false;
 
-		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get("context");
-			if (!handlers || handlers.length === 0) continue;
+		for (const { ext, handler } of handlers) {
+			if (!marked) {
+				this.#markAttemptExecuted(scope);
+				marked = true;
+			}
+			const event: ContextEvent = { type: "context", messages: currentMessages };
+			const handlerResult = await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
 
-			for (const handler of handlers) {
-				const event: ContextEvent = { type: "context", messages: currentMessages };
-				const handlerResult = await this.#runHandlerWithTimeout(
-					handler,
-					event,
-					ctx,
-					ext,
-					extensionHandlerTimeoutMs,
-				);
-
-				if (handlerResult && (handlerResult as ContextEventResult).messages) {
-					currentMessages = (handlerResult as ContextEventResult).messages!;
-				}
+			if (handlerResult && (handlerResult as ContextEventResult).messages) {
+				currentMessages = (handlerResult as ContextEventResult).messages!;
 			}
 		}
 
 		return currentMessages;
 	}
 
-	async emitBeforeProviderRequest(payload: unknown): Promise<BeforeProviderRequestEventResult> {
+	async emitBeforeProviderRequest(
+		payload: unknown,
+		scope?: AttemptScopeRef,
+	): Promise<BeforeProviderRequestEventResult> {
+		const handlers = this.#handlersByEvent.get("before_provider_request") ?? [];
+		if (handlers.length === 0) return payload;
+		this.#requireScopeOrFailClosed(scope, "before_provider_request");
+
 		const ctx = this.createContext();
 		let currentPayload = payload;
+		let marked = false;
 
-		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get("before_provider_request");
-			if (!handlers || handlers.length === 0) continue;
-
-			for (const handler of handlers) {
-				const event: BeforeProviderRequestEvent = {
-					type: "before_provider_request",
-					payload: currentPayload,
-				};
-				const handlerResult = await this.#runHandlerWithTimeout(
-					handler,
-					event,
-					ctx,
-					ext,
-					extensionHandlerTimeoutMs,
-				);
-				if (handlerResult !== undefined) {
-					currentPayload = handlerResult;
-				}
+		for (const { ext, handler } of handlers) {
+			if (!marked) {
+				this.#markAttemptExecuted(scope);
+				marked = true;
+			}
+			const event: BeforeProviderRequestEvent = {
+				type: "before_provider_request",
+				payload: currentPayload,
+			};
+			const handlerResult = await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
+			if (handlerResult !== undefined) {
+				currentPayload = handlerResult;
 			}
 		}
 
 		return currentPayload;
 	}
 
-	async emitAfterProviderResponse(response: ProviderResponseMetadata, _model?: Model): Promise<void> {
+	async emitAfterProviderResponse(
+		response: ProviderResponseMetadata,
+		_model?: Model,
+		scope?: AttemptScopeRef,
+	): Promise<void> {
+		const handlers = this.#handlersByEvent.get("after_provider_response") ?? [];
+		if (handlers.length === 0) return;
+		this.#requireScopeOrFailClosed(scope, "after_provider_response");
+
 		const ctx = this.createContext();
+		let marked = false;
 
-		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get("after_provider_response");
-			if (!handlers || handlers.length === 0) continue;
-
-			for (const handler of handlers) {
-				const event: AfterProviderResponseEvent = {
-					type: "after_provider_response",
-					status: response.status,
-					headers: response.headers,
-					requestId: response.requestId,
-					metadata: response.metadata,
-				};
-				await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
+		for (const { ext, handler } of handlers) {
+			if (!marked) {
+				this.#markAttemptExecuted(scope);
+				marked = true;
 			}
+			const event: AfterProviderResponseEvent = {
+				type: "after_provider_response",
+				status: response.status,
+				headers: response.headers,
+				requestId: response.requestId,
+				metadata: response.metadata,
+			};
+			await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
 		}
 	}
 
@@ -857,39 +1090,31 @@ export class ExtensionRunner {
 		images: ImageContent[] | undefined,
 		systemPrompt: string[],
 	): Promise<BeforeAgentStartCombinedResult | undefined> {
+		const handlers = this.#handlersByEvent.get("before_agent_start") ?? [];
+		if (handlers.length === 0) return undefined;
+
 		const ctx = this.createContext();
 		const messages: NonNullable<BeforeAgentStartEventResult["message"]>[] = [];
 		let currentSystemPrompt = systemPrompt;
 		let systemPromptModified = false;
 
-		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get("before_agent_start");
-			if (!handlers || handlers.length === 0) continue;
+		for (const { ext, handler } of handlers) {
+			const event: BeforeAgentStartEvent = {
+				type: "before_agent_start",
+				prompt,
+				images,
+				systemPrompt: currentSystemPrompt,
+			};
+			const handlerResult = await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
 
-			for (const handler of handlers) {
-				const event: BeforeAgentStartEvent = {
-					type: "before_agent_start",
-					prompt,
-					images,
-					systemPrompt: currentSystemPrompt,
-				};
-				const handlerResult = await this.#runHandlerWithTimeout(
-					handler,
-					event,
-					ctx,
-					ext,
-					extensionHandlerTimeoutMs,
-				);
-
-				if (handlerResult) {
-					const result = handlerResult as BeforeAgentStartEventResult;
-					if (result.message) {
-						messages.push(result.message);
-					}
-					if (result.systemPrompt !== undefined) {
-						currentSystemPrompt = result.systemPrompt;
-						systemPromptModified = true;
-					}
+			if (handlerResult) {
+				const result = handlerResult as BeforeAgentStartEventResult;
+				if (result.message) {
+					messages.push(result.message);
+				}
+				if (result.systemPrompt !== undefined) {
+					currentSystemPrompt = result.systemPrompt;
+					systemPromptModified = true;
 				}
 			}
 		}

@@ -1,9 +1,23 @@
 import type { ResolvedTmuxBinary } from "./psmux-detect";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
 
+export {
+	assertGjcTmuxMutationAuthoritySync,
+	bindGjcTmuxProviderAuthority,
+	buildTmuxProviderCommand,
+	hasGjcTmuxProviderAuthoritySync,
+	type ProviderAuthority,
+	type ProviderContext,
+	persistGjcTmuxProviderAuthoritySync,
+	readGjcTmuxProviderAuthoritySync,
+	resolveGjcTmuxProviderContext,
+	type TmuxProviderKind,
+} from "./tmux-provider-context";
+
 export const GJC_DEFAULT_TMUX_SESSION = "gajae_code";
 export const GJC_TMUX_SESSION_PREFIX = `${GJC_DEFAULT_TMUX_SESSION}_`;
 export const GJC_TMUX_COMMAND_ENV = "GJC_TMUX_COMMAND";
+export const GJC_TMUX_ACTIVE_SESSION_ENV = "GJC_TMUX_ACTIVE_SESSION";
 export const GJC_TMUX_PROFILE_ENV = "GJC_TMUX_PROFILE";
 export const GJC_TMUX_MOUSE_ENV = "GJC_MOUSE";
 export const GJC_TMUX_PROFILE_OPTION = "@gjc-profile";
@@ -13,6 +27,9 @@ export const GJC_TMUX_BRANCH_SLUG_OPTION = "@gjc-branch-slug";
 export const GJC_TMUX_PROJECT_OPTION = "@gjc-project";
 export const GJC_TMUX_SESSION_ID_OPTION = "@gjc-session-id";
 export const GJC_TMUX_SESSION_STATE_FILE_OPTION = "@gjc-session-state-file";
+export const GJC_TMUX_OWNER_GENERATION_OPTION = "@gjc-owner-generation";
+export const GJC_TMUX_OWNER_SERVER_KEY_OPTION = "@gjc-owner-server-key";
+
 export const GJC_TMUX_VERSION_OPTION = "@gjc-version";
 export const GJC_PSMUX_PROFILE_FORCE_ENV = "GJC_PSMUX_PROFILE_FORCE";
 
@@ -39,14 +56,14 @@ export function envDisabled(value: string | undefined): boolean {
  * Resolve the tmux (or tmux-compatible multiplexer) command GJC should invoke.
  *
  * This is the shared entry point used by every GJC code path that needs to talk
- * to a multiplexer: `gjc --tmux` planning, `gjc session ...`, `gjc team ...`,
+ * to a multiplexer: `gjc --tmux` planning and `gjc session ...`,
  * the lifecycle controller, and the harness resident owner. Routing all of
  * them through the same resolver means a single `GJC_TMUX_COMMAND` override or
  * a single Windows psmux / pmux detection wins for the whole process — the
  * failure mode where `gjc --tmux` creates a psmux-backed session and then
  * `gjc session status` fails because it queries literal `tmux` is closed off.
  *
- * Explicit `GJC_TMUX_COMMAND` / `GJC_TEAM_TMUX_COMMAND` overrides are honored on
+ * Explicit `GJC_TMUX_COMMAND` overrides are honored on
  * every platform. On native Windows without an override the resolver walks
  * `psmux`, then `pmux`, then `tmux` and uses the first binary present on PATH.
  * On POSIX the resolver returns `tmux` (the historical default) and only
@@ -107,11 +124,10 @@ export const GJC_TMUX_UNTAGGED_REASON = "gjc_tmux_session_untagged";
 export function buildGjcTmuxUntaggedSessionHint(tmuxCommand: string): string {
 	return (
 		`the active multiplexer "${tmuxCommand}" lists this session but did not return GJC's ${GJC_TMUX_PROFILE_OPTION} ownership tag; ` +
-		"GJC-managed sessions and `gjc team` require a tmux provider that round-trips tmux user options. " +
-		"For psmux on Windows, cwd/start-directory flags such as `-c` do not isolate the server namespace; psmux uses the tmux-compatible global `-L <namespace>` flag for that. " +
-		"GJC_TMUX_COMMAND and GJC_TEAM_TMUX_COMMAND are binary overrides, not shell command lines, so `psmux -L name` is not a supported value. " +
-		"Alternative multiplexers such as psmux on Windows do not reliably persist user options yet, so the Windows-native psmux path is not fully supported; " +
-		"use real tmux for GJC-managed session and team flows."
+		"GJC-managed sessions require a tmux provider that round-trips tmux user options. " +
+		"On Windows psmux, GJC persists a ProviderAuthority that binds the exact executable identity and an isolated `-L <namespace>` server namespace for the owner generation. " +
+		"Recover through GJC so it reuses that persisted authority; do not retry against ambient tmux/psmux or a raw `-L` namespace. " +
+		"GJC_TMUX_COMMAND is a binary override, not a shell command line."
 	);
 }
 
@@ -157,15 +173,13 @@ export function buildGjcTmuxRequiredProfileCommands(
 		project?: string | null;
 		sessionId?: string | null;
 		sessionStateFile?: string | null;
+		ownerGeneration?: string | null;
+		ownerServerKey?: string | null;
 		version?: string | null;
 	} = {},
 ): GjcTmuxProfileCommand[] {
-	const commands: GjcTmuxProfileCommand[] = [
-		{
-			description: "mark GJC tmux ownership",
-			args: ["set-option", "-t", target, GJC_TMUX_PROFILE_OPTION, GJC_TMUX_PROFILE_VALUE],
-		},
-	];
+	const commands: GjcTmuxProfileCommand[] = [];
+
 	if (metadata.branch)
 		commands.push({
 			description: "record GJC branch identity",
@@ -191,11 +205,26 @@ export function buildGjcTmuxRequiredProfileCommands(
 			description: "record GJC session state marker",
 			args: ["set-option", "-t", target, GJC_TMUX_SESSION_STATE_FILE_OPTION, metadata.sessionStateFile],
 		});
+	if (metadata.ownerGeneration)
+		commands.push({
+			description: "record GJC owner generation",
+			args: ["set-option", "-t", target, GJC_TMUX_OWNER_GENERATION_OPTION, metadata.ownerGeneration],
+		});
+	if (metadata.ownerServerKey)
+		commands.push({
+			description: "record GJC owner server key",
+			args: ["set-option", "-t", target, GJC_TMUX_OWNER_SERVER_KEY_OPTION, metadata.ownerServerKey],
+		});
+
 	if (metadata.version)
 		commands.push({
 			description: "record GJC version identity",
 			args: ["set-option", "-t", target, GJC_TMUX_VERSION_OPTION, metadata.version],
 		});
+	commands.push({
+		description: "mark GJC tmux ownership",
+		args: ["set-option", "-t", target, GJC_TMUX_PROFILE_OPTION, GJC_TMUX_PROFILE_VALUE],
+	});
 	return commands;
 }
 
@@ -204,7 +233,7 @@ export function buildGjcTmuxRequiredProfileCommands(
  * 3.3.0. psmux does not support the tmux `set-window-option` command at all
  * (it reports "unknown command: set-window-option") and silently drops several
  * `set-option` keys. The list lives here so every code path that tags a tmux
- * session (gjc --tmux planning, gjc session create, gjc team bootstrap)
+ * session (gjc --tmux planning, gjc session create)
  * applies the same filter.
  */
 const PSMUX_UNSUPPORTED_PROFILE_KEYS = new Set(["mouse", "set-clipboard", "mode-style"]);
@@ -218,6 +247,8 @@ export function buildGjcTmuxProfileCommands(
 		project?: string | null;
 		sessionId?: string | null;
 		sessionStateFile?: string | null;
+		ownerGeneration?: string | null;
+		ownerServerKey?: string | null;
 		version?: string | null;
 	} = {},
 	opts: { platform?: NodeJS.Platform; tmuxCommand?: string } = {},
@@ -239,11 +270,11 @@ export function buildGjcTmuxProfileCommands(
 	// psmux does not implement set-window-option and historically drops
 	// mouse / set-clipboard / mode-style. Filter the UX profile commands
 	// centrally so every code path that tags a session (gjc --tmux planning,
-	// gjc session create, gjc team bootstrap) drops the same set. The
+	// gjc session create) drops the same set. The
 	// GJC_PSMUX_PROFILE_FORCE override lets the operator opt back in when
 	// running on a psmux build that has caught up. The ownership-tag
 	// round-trip (set-option @gjc-*) is never filtered, since gjc session /
-	// gjc team rely on it.
+	// tmux-backed sessions rely on it.
 	// The filter is opt-in: callers that explicitly pass `opts.tmuxCommand`
 	// name a psmux-class multiplexer (psmux / pmux) when they want the UX
 	// profile filtered. Auto-detect on Windows hosts where psmux happens
@@ -259,7 +290,8 @@ export function buildGjcTmuxProfileCommands(
 		tmuxName.endsWith("/pmux") ||
 		tmuxName.endsWith("\\psmux") ||
 		tmuxName.endsWith("\\pmux");
-	const dropUx = isPsmuxClass && !envDisabled(env[GJC_PSMUX_PROFILE_FORCE_ENV]);
+	const forcePsmuxProfile = env[GJC_PSMUX_PROFILE_FORCE_ENV] === "true" || env[GJC_PSMUX_PROFILE_FORCE_ENV] === "1";
+	const dropUx = isPsmuxClass && !forcePsmuxProfile;
 	if (dropUx) {
 		return commands.filter(command => {
 			const flag = command.args[0];

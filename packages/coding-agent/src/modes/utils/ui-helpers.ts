@@ -1,6 +1,6 @@
 import type { AgentMessage } from "@gajae-code/agent-core";
-import type { AssistantMessage, ImageContent, Message } from "@gajae-code/ai";
-import { type Component, Spacer, Text, TruncatedText } from "@gajae-code/tui";
+import type { AssistantMessage, ImageContent, Message } from "@gajae-code/ai/core";
+import { type Component, Loader, Spacer, Text, TruncatedText, type TUI, truncateToWidth } from "@gajae-code/tui";
 import { settings } from "../../config/settings";
 import { resolveSubskillActivationForSkillInvocation } from "../../extensibility/gjc-plugins";
 import { buildSkillPromptMessage, parseSkillInvocations } from "../../extensibility/skills";
@@ -20,20 +20,190 @@ import { SkillMessageComponent } from "../../modes/components/skill-message";
 import { ToolExecutionComponent } from "../../modes/components/tool-execution";
 import { UserMessageComponent } from "../../modes/components/user-message";
 import { theme } from "../../modes/theme/theme";
-import type { CompactionQueuedMessage, InteractiveModeContext } from "../../modes/types";
+import {
+	type CompactionQueuedMessage,
+	type ComposerSubmissionOptions,
+	canApplyComposerSubmission,
+	type InteractiveModeContext,
+	type IrcArrivalSnapshot,
+	type TranscriptRebuildPolicy,
+} from "../../modes/types";
 import {
 	type CustomMessage,
 	isSilentAbort,
 	SKILL_PROMPT_MESSAGE_TYPE,
 	type SkillPromptDetails,
 } from "../../session/messages";
-import type { SessionContext } from "../../session/session-manager";
+import {
+	associateSessionMessageViewportAnchorId,
+	getSessionMessageEntryId,
+	getSessionMessageViewportAnchorId,
+	type SessionContext,
+} from "../../session/session-manager";
 import { formatBytes, formatDuration } from "../../tools/render-utils";
 import { buildAbortDisplayMessage } from "./abort-message";
+import {
+	formatIrcMessageBlock,
+	isIrcCustomType,
+	type ParsedIrcMessage,
+	parseIrcMessage,
+	projectIrcText,
+} from "./irc-message";
 
+export type { TranscriptRebuildPolicy } from "../../modes/types";
+
+const IRC_INLINE_MAX_RENDER_ROWS = 2_048;
+const IRC_INLINE_MAX_SOURCE_UTF8_BYTES = 64 * 1_024;
+const IRC_INLINE_ELISION = "  … message elided …";
+
+class BoundedIrcTextComponent implements Component {
+	#text: Text;
+	#sourceTruncated: boolean;
+
+	constructor(text: string, sourceTruncated: boolean) {
+		this.#text = new Text(text, 0, 0);
+		this.#sourceTruncated = sourceTruncated;
+	}
+
+	render(width: number): string[] {
+		const rendered = this.#text.render(width);
+		if (!this.#sourceTruncated && rendered.length <= IRC_INLINE_MAX_RENDER_ROWS) return rendered;
+		const lines = rendered.slice(0, IRC_INLINE_MAX_RENDER_ROWS);
+		const marker = truncateToWidth(theme.fg("dim", IRC_INLINE_ELISION), width);
+		if (lines.length === 0) return [marker];
+		if (this.#sourceTruncated && rendered.length < IRC_INLINE_MAX_RENDER_ROWS) lines.push(marker);
+		else lines[lines.length - 1] = marker;
+		return lines;
+	}
+
+	invalidate(): void {
+		this.#text.invalidate();
+	}
+}
+
+export function prepareTranscriptRebuild(ui: TUI, policy: TranscriptRebuildPolicy): void {
+	if (policy === "replace-identity") ui.resetViewportAnchorIntent();
+	else ui.prepareViewportAnchorForTranscriptRebuild();
+}
+
+export const RESUME_PROGRESS_COMMIT_TIMEOUT_MS = 250;
+
+export interface ResumeProgressLease {
+	readonly committed: Promise<boolean>;
+	clear(): void;
+}
+
+/**
+ * Mount a resume loader on the live status rail and wait for its render generation
+ * to commit before session I/O begins. The commit is advisory: a stopped or
+ * unavailable terminal resolves false and callers continue without blocking.
+ *
+ * Fail open (no-op lease, committed=false) when the status rail or UI lacks the
+ * child-mutation/render-commit surface required to mount progress. Headless and
+ * minimal controller contexts keep resume/migration semantics; full interactive
+ * TUI containers retain progress-before-switch.
+ */
+export function acquireResumeProgressLease(
+	ctx: Pick<InteractiveModeContext, "ui" | "statusContainer">,
+): ResumeProgressLease {
+	if (!canMountResumeProgressLease(ctx)) {
+		return {
+			committed: Promise.resolve(false),
+			clear(): void {},
+		};
+	}
+
+	const statusContainer = ctx.statusContainer as ResumeProgressStatusSurface;
+	const ui = ctx.ui as ResumeProgressUiSurface;
+	const loader = new Loader(
+		ui,
+		spinner => theme?.fg?.("accent", spinner) ?? spinner,
+		message => theme?.fg?.("muted", message) ?? message,
+		"Resuming session…",
+	);
+	statusContainer.addChild(loader);
+	const generation = ui.requestRenderWithGeneration(false, "resume-progress");
+	let active = true;
+	const committed = ui.waitForRenderCommit(generation, RESUME_PROGRESS_COMMIT_TIMEOUT_MS).catch(() => false);
+	return {
+		committed,
+		clear(): void {
+			if (!active) return;
+			active = false;
+			if (statusContainer.children.includes(loader)) statusContainer.removeChild(loader);
+			else loader.stop();
+			ui.requestRender(false, "resume-progress-clear");
+		},
+	};
+}
+
+type ResumeProgressStatusSurface = {
+	addChild: (child: Component) => void;
+	removeChild: (child: Component) => void;
+	children: Component[];
+};
+
+type ResumeProgressUiSurface = InteractiveModeContext["ui"] & {
+	requestRenderWithGeneration: (force?: boolean, source?: string) => number;
+	waitForRenderCommit: (generation: number, timeoutMs?: number) => Promise<boolean>;
+	requestRender: (force?: boolean, source?: string) => void;
+};
+
+function canMountResumeProgressLease(ctx: Pick<InteractiveModeContext, "ui" | "statusContainer">): boolean {
+	const status = ctx.statusContainer as
+		| Partial<{
+				addChild: unknown;
+				removeChild: unknown;
+				children: unknown;
+		  }>
+		| null
+		| undefined;
+	const ui = ctx.ui as
+		| Partial<{
+				requestRenderWithGeneration: unknown;
+				waitForRenderCommit: unknown;
+				requestRender: unknown;
+		  }>
+		| null
+		| undefined;
+
+	return (
+		!!status &&
+		typeof status.addChild === "function" &&
+		typeof status.removeChild === "function" &&
+		Array.isArray(status.children) &&
+		!!ui &&
+		typeof ui.requestRenderWithGeneration === "function" &&
+		typeof ui.waitForRenderCommit === "function" &&
+		typeof ui.requestRender === "function"
+	);
+}
 type TextBlock = { type: "text"; text: string };
 interface RenderInitialMessagesOptions {
 	preserveExistingChat?: boolean;
+}
+
+function cloneRenderArgs(args: Record<string, unknown>): Record<string, unknown> {
+	try {
+		return structuredClone(args);
+	} catch {
+		return { ...args };
+	}
+}
+
+export function argsWithPartialJson(args: unknown, partialJson: unknown): unknown {
+	if (typeof partialJson !== "string" || !args || typeof args !== "object" || Array.isArray(args)) return args;
+	// Keep the transient streaming buffer on a renderer-only snapshot. The live
+	// assistant message args are later validated/executed, so UI-only metadata or
+	// renderer mutations must never share that object reference.
+	const renderArgs = cloneRenderArgs(args as Record<string, unknown>);
+	Object.defineProperty(renderArgs, "__partialJson", {
+		value: partialJson,
+		enumerable: false,
+		configurable: true,
+		writable: true,
+	});
+	return renderArgs;
 }
 
 type QueuedMessages = {
@@ -41,8 +211,275 @@ type QueuedMessages = {
 	followUp: string[];
 };
 
+const CHAT_CHILD_CAP = 400;
+const CHAT_COLLAPSE_BATCH_SIZE = 300;
+
+const chatChildAddedAt = new WeakMap<Component, number>();
+
+export class CollapsedChatHistoryComponent implements Component {
+	readonly isCollapsedChatHistory = true;
+	count: number;
+	startTime: number;
+	endTime: number;
+
+	constructor(count: number, startTime: number, endTime: number) {
+		this.count = count;
+		this.startTime = startTime;
+		this.endTime = endTime;
+	}
+
+	merge(count: number, startTime: number, endTime: number): void {
+		this.count += count;
+		this.startTime = Math.min(this.startTime, startTime);
+		this.endTime = Math.max(this.endTime, endTime);
+	}
+
+	render(_width: number): string[] {
+		const label = `[${this.count} earlier messages collapsed — ${formatChatCollapseTime(this.startTime)} to ${formatChatCollapseTime(this.endTime)}]`;
+		return [theme.fg("dim", label)];
+	}
+
+	invalidate(): void {}
+}
+
+function formatChatCollapseTime(timestamp: number): string {
+	return new Date(timestamp).toLocaleTimeString(undefined, {
+		hour: "2-digit",
+		minute: "2-digit",
+		hour12: false,
+	});
+}
+
+function isCollapsedChatHistory(component: Component): component is CollapsedChatHistoryComponent {
+	return component instanceof CollapsedChatHistoryComponent;
+}
+
+function isActiveChatChild(ctx: InteractiveModeContext, component: Component): boolean {
+	if ([...ctx.pendingTools.values()].includes(component as never)) return true;
+	if (ctx.pendingBashComponents.includes(component as never)) return true;
+	if (ctx.pendingPythonComponents.includes(component as never)) return true;
+	return component === ctx.bashComponent || component === ctx.pythonComponent || component === ctx.streamingComponent;
+}
+
+function getChatChildTime(component: Component): number {
+	return chatChildAddedAt.get(component) ?? Date.now();
+}
+
+function stableSemanticIdPart(value: string): string {
+	let hash = 0xcbf29ce484222325n;
+	for (const char of value) {
+		hash ^= BigInt(char.codePointAt(0)!);
+		hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+	}
+	return hash.toString(36);
+}
+
+export function addChatChild(ctx: InteractiveModeContext, component: Component): void {
+	ctx.chatContainer.addChild(component);
+
+	chatChildAddedAt.set(component, Date.now());
+	trimChatChildren(ctx);
+}
+
+/**
+ * Parked `!`/`$` execution components are listed in `pendingBashComponents` /
+ * `pendingPythonComponents`, but `pendingMessagesContainer` is the only
+ * authority on parentage: `/clear`, `/context-clear`, extension redraws and the
+ * selector all call `pendingMessagesContainer.clear()`, which disposes and
+ * evicts parked components without touching those arrays. Drop every entry the
+ * container no longer holds so nothing downstream can move a dead component.
+ */
+export function syncPendingExecutionComponents(ctx: InteractiveModeContext): void {
+	const container = ctx.pendingMessagesContainer;
+	ctx.pendingBashComponents = ctx.pendingBashComponents.filter(component => container.hasLiveChild(component));
+	ctx.pendingPythonComponents = ctx.pendingPythonComponents.filter(component => container.hasLiveChild(component));
+}
+
+/**
+ * Whether the session already owns this execution's message, i.e. the rebuilt
+ * transcript renders the block from session state. Set by the controller when
+ * `executeBash()` / `executePython()` reports the result as persisted.
+ */
+function hasPersistedExecutionResult(component: Component): boolean {
+	if (component instanceof BashExecutionComponent) return component.hasPersistedResult();
+	if (component instanceof EvalExecutionComponent) return component.hasPersistedResult();
+	return false;
+}
+
+export function trimChatChildren(ctx: InteractiveModeContext): void {
+	const children = ctx.chatContainer.children;
+
+	// Collapse the oldest completed children into history placeholders until the cap is
+	// satisfied or no further reduction is structurally possible. Active (pending/running)
+	// children and existing placeholders are never collapsed, so a conversation whose
+	// top-level children are dominated by active components may legitimately exceed the cap.
+	let scanFrom = 0;
+	while (children.length > CHAT_CHILD_CAP) {
+		// Advance to the oldest collapsible completed child, skipping active children and
+		// existing placeholders so the cap is enforced even when the oldest child is active.
+		while (
+			scanFrom < children.length &&
+			(isActiveChatChild(ctx, children[scanFrom]) || isCollapsedChatHistory(children[scanFrom]))
+		) {
+			scanFrom++;
+		}
+		if (scanFrom >= children.length) return; // only active/placeholder children remain
+
+		// Extend over the oldest contiguous run of completed children (up to the batch size).
+		let collapseEndExclusive = scanFrom;
+		const maxEnd = Math.min(children.length, scanFrom + CHAT_COLLAPSE_BATCH_SIZE);
+		while (
+			collapseEndExclusive < maxEnd &&
+			!isActiveChatChild(ctx, children[collapseEndExclusive]) &&
+			!isCollapsedChatHistory(children[collapseEndExclusive])
+		) {
+			collapseEndExclusive++;
+		}
+		const collapseCount = collapseEndExclusive - scanFrom;
+
+		const prev = scanFrom > 0 ? children[scanFrom - 1] : undefined;
+		const mergeTarget = prev && isCollapsedChatHistory(prev) ? prev : undefined;
+		// A lone completed child with no adjacent placeholder to merge into cannot reduce
+		// the child count (collapsing it yields a 1-count placeholder). Skip past it.
+		if (!mergeTarget && collapseCount <= 1) {
+			scanFrom += Math.max(collapseCount, 1);
+			continue;
+		}
+
+		const collapsed = children.slice(scanFrom, collapseEndExclusive);
+		const startTime = getChatChildTime(collapsed[0]);
+		const endTime = getChatChildTime(collapsed[collapsed.length - 1]);
+		for (const child of collapsed) {
+			child.dispose?.();
+		}
+
+		if (mergeTarget) {
+			mergeTarget.merge(collapseCount, startTime, endTime);
+			children.splice(scanFrom, collapseCount);
+			chatChildAddedAt.set(mergeTarget, mergeTarget.startTime);
+			// scanFrom stays; whatever follows the merged run is next.
+		} else {
+			const placeholder = new CollapsedChatHistoryComponent(collapseCount, startTime, endTime);
+			children.splice(scanFrom, collapseCount, placeholder);
+			chatChildAddedAt.set(placeholder, startTime);
+			scanFrom++; // step past the freshly created placeholder
+		}
+	}
+}
+
 export class UiHelpers {
+	#compactionFlushRetryScheduled = false;
+	#renderedIrcInlineComponents = new Map<string, readonly Component[]>();
+	#viewportAnchorOccurrences = new WeakMap<object, { base: string; epoch: number; id: string }>();
+	#nextViewportAnchorOccurrence = new Map<string, number>();
+	#viewportAnchorOccurrenceEpoch = 0;
+	#ircSidebarHintShown = false;
+
 	constructor(private ctx: InteractiveModeContext) {}
+
+	#resetViewportAnchorOccurrencePass(): void {
+		this.#viewportAnchorOccurrenceEpoch += 1;
+		this.#nextViewportAnchorOccurrence.clear();
+	}
+
+	#viewportAnchorOccurrenceId(message: object, base: string): string {
+		const existing = this.#viewportAnchorOccurrences.get(message);
+		if (existing?.base === base && existing.epoch === this.#viewportAnchorOccurrenceEpoch) return existing.id;
+		const occurrence = this.#nextViewportAnchorOccurrence.get(base) ?? 0;
+		this.#nextViewportAnchorOccurrence.set(base, occurrence + 1);
+		const id = `${base}:occurrence:${occurrence}`;
+		this.#viewportAnchorOccurrences.set(message, {
+			base,
+			epoch: this.#viewportAnchorOccurrenceEpoch,
+			id,
+		});
+		return id;
+	}
+
+	assistantViewportAnchorId(message: AssistantMessage): string {
+		const semanticId = getSessionMessageViewportAnchorId(message);
+		if (semanticId) return semanticId;
+		const entryId = getSessionMessageEntryId(message);
+		if (entryId) return `assistant:entry:${entryId}`;
+		const base = `assistant:${message.api}:${message.provider}:${message.model}:${message.timestamp}`;
+		const id = this.#viewportAnchorOccurrenceId(message, base);
+		associateSessionMessageViewportAnchorId(message, id);
+		return id;
+	}
+
+	#userViewportAnchorId(message: Extract<Message, { role: "user" }>): string {
+		const semanticId = getSessionMessageViewportAnchorId(message);
+		if (semanticId) return semanticId;
+		const entryId = getSessionMessageEntryId(message);
+		if (entryId) {
+			const id = `user:entry:${entryId}`;
+			associateSessionMessageViewportAnchorId(message, id);
+			return id;
+		}
+		const base = `user:local:${message.timestamp}:${stableSemanticIdPart(JSON.stringify(message.content))}`;
+		const id = this.#viewportAnchorOccurrenceId(message, base);
+		associateSessionMessageViewportAnchorId(message, id);
+		return id;
+	}
+
+	getRenderedIrcInlineComponents(): Map<string, readonly Component[]> {
+		return this.#renderedIrcInlineComponents;
+	}
+
+	removeRenderedIrcInlineComponents(observationId: string): readonly Component[] | undefined {
+		const components = this.#renderedIrcInlineComponents.get(observationId);
+		this.#renderedIrcInlineComponents.delete(observationId);
+		return components;
+	}
+
+	resetRenderedIrcInlineComponents(): readonly (readonly Component[])[] {
+		const components = [...this.#renderedIrcInlineComponents.values()];
+		this.#renderedIrcInlineComponents.clear();
+		return components;
+	}
+
+	#addIrcObservationToChat(message: ParsedIrcMessage, sidebarHint?: string): Component[] {
+		const bodyProjection = projectIrcText(message.text, IRC_INLINE_MAX_SOURCE_UTF8_BYTES);
+		const block = formatIrcMessageBlock({ ...message, text: bodyProjection.text });
+		const components: Component[] = [];
+		const header = `${theme.fg("accent", `[IRC] ${block.sender} → ${block.recipient} · ${block.time}`)}${sidebarHint ? theme.fg("dim", sidebarHint) : ""}`;
+		const headerComponent = new Text(header, 1, 0);
+		addChatChild(this.ctx, headerComponent);
+		components.push(headerComponent);
+		if (block.bodyLines.length > 0 || bodyProjection.truncated) {
+			const bodyComponent = new BoundedIrcTextComponent(
+				theme.fg("muted", `  ${block.bodyLines.join("\n  ")}`),
+				bodyProjection.truncated,
+			);
+			addChatChild(this.ctx, bodyComponent);
+			components.push(bodyComponent);
+		}
+		return components;
+	}
+
+	addLiveIrcObservationToChat(message: ParsedIrcMessage, arrival: IrcArrivalSnapshot): Component[] {
+		// Requested-open panels that merely yielded at narrow widths must not
+		// advertise the toggle key: pressing it would close the pending request.
+		const showSidebarHint =
+			!arrival.panelVisible &&
+			!arrival.panelRequestedVisible &&
+			arrival.sidebarAvailable &&
+			Boolean(arrival.resolvedToggleKey) &&
+			!this.#ircSidebarHintShown;
+		if (showSidebarHint) this.#ircSidebarHintShown = true;
+		return this.#addIrcObservationToChat(
+			message,
+			showSidebarHint ? ` · ${arrival.resolvedToggleKey} opens sidebar` : undefined,
+		);
+	}
+
+	addRebuiltIrcObservationToChat(message: ParsedIrcMessage): Component[] {
+		return this.#addIrcObservationToChat(message);
+	}
+
+	resetIrcSidebarHint(): void {
+		this.#ircSidebarHintShown = false;
+	}
 
 	/** Extract text content from a user message */
 	getUserMessageText(message: Message): string {
@@ -78,8 +515,8 @@ export class UiHelpers {
 
 		const spacer = new Spacer(1);
 		const text = new Text(rendered, 1, 0);
-		this.ctx.chatContainer.addChild(spacer);
-		this.ctx.chatContainer.addChild(text);
+		addChatChild(this.ctx, spacer);
+		addChatChild(this.ctx, text);
 		this.ctx.lastStatusSpacer = spacer;
 		this.ctx.lastStatusText = text;
 		this.ctx.ui.requestRender();
@@ -95,7 +532,7 @@ export class UiHelpers {
 				component.setComplete(message.exitCode, message.cancelled, {
 					truncation: message.meta?.truncation,
 				});
-				this.ctx.chatContainer.addChild(component);
+				addChatChild(this.ctx, component);
 				break;
 			}
 			case "pythonExecution": {
@@ -106,7 +543,7 @@ export class UiHelpers {
 				component.setComplete(message.exitCode, message.cancelled, {
 					truncation: message.meta?.truncation,
 				});
-				this.ctx.chatContainer.addChild(component);
+				addChatChild(this.ctx, component);
 				break;
 			}
 			case "hookMessage":
@@ -150,60 +587,19 @@ export class UiHelpers {
 							]
 								.filter(Boolean)
 								.join(" ");
-							this.ctx.chatContainer.addChild(new Text(line, 1, 0));
+							addChatChild(this.ctx, new Text(line, 1, 0));
 						}
 						break;
 					}
 					if (message.customType === SKILL_PROMPT_MESSAGE_TYPE) {
 						const component = new SkillMessageComponent(message as CustomMessage<SkillPromptDetails>);
 						component.setExpanded(this.ctx.toolOutputExpanded);
-						this.ctx.chatContainer.addChild(component);
+						addChatChild(this.ctx, component);
 						break;
 					}
-					if (
-						message.customType === "irc:incoming" ||
-						message.customType === "irc:autoreply" ||
-						message.customType === "irc:relay"
-					) {
-						const details = (
-							message as CustomMessage<{
-								from?: string;
-								to?: string;
-								message?: string;
-								reply?: string;
-								body?: string;
-								kind?: "message" | "reply";
-							}>
-						).details;
-						let arrow: string;
-						let body: string;
-						if (message.customType === "irc:incoming") {
-							const peer = details?.from ?? "?";
-							body = details?.message ?? "";
-							arrow = `⇦ ${peer}`;
-						} else if (message.customType === "irc:autoreply") {
-							const peer = details?.to ?? "?";
-							body = details?.reply ?? "";
-							arrow = `⇨ ${peer}`;
-						} else {
-							const from = details?.from ?? "?";
-							const to = details?.to ?? "?";
-							body = details?.body ?? "";
-							arrow = `${from} ⇨ ${to}`;
-						}
-						const components: Component[] = [];
-						const header = `${theme.fg("accent", `[IRC] ${arrow}`)}`;
-						const headerComponent = new Text(header, 1, 0);
-						this.ctx.chatContainer.addChild(headerComponent);
-						components.push(headerComponent);
-						if (body) {
-							for (const line of body.split("\n")) {
-								const lineComponent = new Text(theme.fg("muted", `  ${line}`), 0, 0);
-								this.ctx.chatContainer.addChild(lineComponent);
-								components.push(lineComponent);
-							}
-						}
-						return components;
+					if (message.role === "custom" && isIrcCustomType(message.customType)) {
+						const parsed = parseIrcMessage(message);
+						if (parsed) return this.addRebuiltIrcObservationToChat(parsed);
 					}
 					if (message.customType === "subagent:steer" || message.customType === "subagent:steer:relay") {
 						const details = (
@@ -217,12 +613,12 @@ export class UiHelpers {
 						const components: Component[] = [];
 						const header = `${theme.fg("accent", `[Steer ${details?.state ?? "queued"}] ${details?.from ?? "?"} ⇨ ${details?.to ?? "?"}`)}`;
 						const headerComponent = new Text(header, 1, 0);
-						this.ctx.chatContainer.addChild(headerComponent);
+						addChatChild(this.ctx, headerComponent);
 						components.push(headerComponent);
 						if (details?.body) {
 							for (const line of details.body.split("\n")) {
 								const lineComponent = new Text(theme.fg("muted", `  ${line}`), 0, 0);
-								this.ctx.chatContainer.addChild(lineComponent);
+								addChatChild(this.ctx, lineComponent);
 								components.push(lineComponent);
 							}
 						}
@@ -232,22 +628,22 @@ export class UiHelpers {
 					// Both HookMessage and CustomMessage have the same structure, cast for compatibility
 					const component = new CustomMessageComponent(message as CustomMessage<unknown>, renderer);
 					component.setExpanded(this.ctx.toolOutputExpanded);
-					this.ctx.chatContainer.addChild(component);
+					addChatChild(this.ctx, component);
 				}
 				break;
 			}
 			case "compactionSummary": {
-				this.ctx.chatContainer.addChild(new Spacer(1));
+				addChatChild(this.ctx, new Spacer(1));
 				const component = new CompactionSummaryMessageComponent(message);
 				component.setExpanded(this.ctx.toolOutputExpanded);
-				this.ctx.chatContainer.addChild(component);
+				addChatChild(this.ctx, component);
 				break;
 			}
 			case "branchSummary": {
-				this.ctx.chatContainer.addChild(new Spacer(1));
+				addChatChild(this.ctx, new Spacer(1));
 				const component = new BranchSummaryMessageComponent(message);
 				component.setExpanded(this.ctx.toolOutputExpanded);
-				this.ctx.chatContainer.addChild(component);
+				addChatChild(this.ctx, component);
 				break;
 			}
 			case "fileMention": {
@@ -268,7 +664,7 @@ export class UiHelpers {
 						"accent",
 						file.path,
 					)} ${theme.fg("dim", suffix)}`;
-					this.ctx.chatContainer.addChild(new Text(text, 0, 0));
+					addChatChild(this.ctx, new Text(text, 0, 0));
 				}
 				break;
 			}
@@ -277,8 +673,12 @@ export class UiHelpers {
 				const textContent = this.ctx.getUserMessageText(message);
 				if (textContent) {
 					const isSynthetic = message.role === "developer" ? true : (message.synthetic ?? false);
-					const userComponent = new UserMessageComponent(textContent, isSynthetic);
-					this.ctx.chatContainer.addChild(userComponent);
+					const userComponent = new UserMessageComponent(
+						textContent,
+						isSynthetic,
+						message.role === "user" && !isSynthetic ? this.#userViewportAnchorId(message) : undefined,
+					);
+					addChatChild(this.ctx, userComponent);
 					if (options?.populateHistory && message.role === "user" && !isSynthetic) {
 						this.ctx.editor.addToHistory(textContent);
 					}
@@ -286,10 +686,15 @@ export class UiHelpers {
 				break;
 			}
 			case "assistant": {
-				const assistantComponent = new AssistantMessageComponent(message, this.ctx.hideThinkingBlock, () =>
-					this.ctx.ui.requestRender(),
+				const assistantComponent = new AssistantMessageComponent(
+					message,
+					this.ctx.hideThinkingBlock,
+					() => this.ctx.ui.requestRender(),
+					this.assistantViewportAnchorId(message),
+					undefined,
+					this.ctx.session,
 				);
-				this.ctx.chatContainer.addChild(assistantComponent);
+				addChatChild(this.ctx, assistantComponent);
 				break;
 			}
 			case "toolResult": {
@@ -325,12 +730,35 @@ export class UiHelpers {
 		const readToolCallArgs = new Map<string, Record<string, unknown>>();
 		const readToolCallAssistantComponents = new Map<string, AssistantMessageComponent>();
 		const deferredMessages: AgentMessage[] = [];
+		const persistedIrcObservationIds = new Set<string>();
+		const now = Date.now();
+		this.#resetViewportAnchorOccurrencePass();
+		this.#renderedIrcInlineComponents.clear();
 		for (const message of sessionContext.messages) {
 			// Defer compaction summaries so they render at the bottom (visible after scroll)
 			if (message.role === "compactionSummary") {
 				deferredMessages.push(message);
 				continue;
 			}
+			if (message.role === "custom" && isIrcCustomType(message.customType)) {
+				const parsed = parseIrcMessage(message);
+				if (parsed) {
+					persistedIrcObservationIds.add(parsed.observationId);
+					const record = this.ctx.ircLedger.getRecord(parsed.observationId);
+					if (
+						record &&
+						(record.mode === "persistent" || now < record.expiresAt!) &&
+						!this.#renderedIrcInlineComponents.has(record.observationId)
+					) {
+						this.#renderedIrcInlineComponents.set(
+							record.observationId,
+							this.addRebuiltIrcObservationToChat(record),
+						);
+					}
+				}
+				continue;
+			}
+
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
 				this.ctx.addMessageToChat(message);
@@ -369,7 +797,7 @@ export class UiHelpers {
 									showContentPreview: this.ctx.settings.get("read.toolResultPreview"),
 								});
 								readGroup.setExpanded(this.ctx.toolOutputExpanded);
-								this.ctx.chatContainer.addChild(readGroup);
+								addChatChild(this.ctx, readGroup);
 							}
 							readGroup.updateArgs(content.arguments, content.id);
 							readGroup.updateResult(
@@ -392,10 +820,10 @@ export class UiHelpers {
 
 					readGroup = null;
 					const tool = this.ctx.session.getToolByName(content.name);
-					const renderArgs =
-						"partialJson" in content
-							? { ...content.arguments, __partialJson: content.partialJson }
-							: content.arguments;
+					const renderArgs = argsWithPartialJson(
+						content.arguments,
+						"partialJson" in content ? content.partialJson : undefined,
+					);
 					const component = new ToolExecutionComponent(
 						content.name,
 						renderArgs,
@@ -411,7 +839,7 @@ export class UiHelpers {
 						content.id,
 					);
 					component.setExpanded(this.ctx.toolOutputExpanded);
-					this.ctx.chatContainer.addChild(component);
+					addChatChild(this.ctx, component);
 
 					if (hasErrorStop && errorMessage) {
 						component.updateResult(
@@ -449,7 +877,7 @@ export class UiHelpers {
 								showContentPreview: this.ctx.settings.get("read.toolResultPreview"),
 							});
 							readGroup.setExpanded(this.ctx.toolOutputExpanded);
-							this.ctx.chatContainer.addChild(readGroup);
+							addChatChild(this.ctx, readGroup);
 						}
 						const args = readToolCallArgs.get(message.toolCallId);
 						if (args) {
@@ -481,6 +909,15 @@ export class UiHelpers {
 		for (const message of deferredMessages) {
 			this.ctx.addMessageToChat(message, options);
 		}
+		for (const record of this.ctx.ircLedger.getInlineProjection(now)) {
+			if (
+				persistedIrcObservationIds.has(record.observationId) ||
+				this.#renderedIrcInlineComponents.has(record.observationId)
+			) {
+				continue;
+			}
+			this.#renderedIrcInlineComponents.set(record.observationId, this.addRebuiltIrcObservationToChat(record));
+		}
 
 		this.ctx.pendingTools.clear();
 		this.ctx.ui.requestRender();
@@ -490,10 +927,24 @@ export class UiHelpers {
 		// This path is used to rebuild the visible chat transcript (e.g. after custom/debug UI).
 		// Clear existing rendered chat first to avoid duplicating the full session in the container.
 		const preservedChatChildren = options.preserveExistingChat ? this.ctx.chatContainer.children : undefined;
+		// A still-running deferred `!`/`$` block is the only rendering of output whose
+		// message has not been published to the session yet, so the rebuild must keep it
+		// parked instead of disposing it. Finished blocks are dropped here: the rebuilt
+		// transcript renders them from the session. A block whose result was persisted
+		// while its controller was still suspended is finished for this purpose — keeping
+		// it would render the same execution twice.
+		const runningExecutionComponents = this.#detachPendingMessages(
+			component =>
+				(component === this.ctx.bashComponent || component === this.ctx.pythonComponent) &&
+				!hasPersistedExecutionResult(component),
+		);
+		this.ctx.pendingBashComponents = this.ctx.pendingBashComponents.filter(component =>
+			runningExecutionComponents.includes(component),
+		);
+		this.ctx.pendingPythonComponents = this.ctx.pendingPythonComponents.filter(component =>
+			runningExecutionComponents.includes(component),
+		);
 		this.ctx.chatContainer.clear();
-		this.ctx.pendingMessagesContainer.clear();
-		this.ctx.pendingBashComponents = [];
-		this.ctx.pendingPythonComponents = [];
 
 		// Reuse a pre-built context when available (e.g. from navigateTree) to avoid a second O(N) walk.
 		const context = prebuiltContext ?? this.ctx.sessionManager.buildSessionContext();
@@ -514,9 +965,12 @@ export class UiHelpers {
 			const times = compactionCount === 1 ? "1 time" : `${compactionCount} times`;
 			this.ctx.showStatus(`Session compacted ${times}`);
 		}
+		for (const component of runningExecutionComponents) {
+			this.ctx.pendingMessagesContainer.addChild(component);
+		}
 		if (preservedChatChildren && preservedChatChildren.length > 0) {
 			for (const child of preservedChatChildren) {
-				this.ctx.chatContainer.addChild(child);
+				addChatChild(this.ctx, child);
 			}
 			this.ctx.ui.requestRender();
 		}
@@ -536,8 +990,8 @@ export class UiHelpers {
 			process.stderr.write(`Error: ${errorMessage}\n`);
 			return;
 		}
-		this.ctx.chatContainer.addChild(new Spacer(1));
-		this.ctx.chatContainer.addChild(new Text(theme.fg("error", `Error: ${errorMessage}`), 1, 0));
+		addChatChild(this.ctx, new Spacer(1));
+		addChatChild(this.ctx, new Text(theme.fg("error", `Error: ${errorMessage}`), 1, 0));
 		this.ctx.ui.requestRender();
 	}
 
@@ -546,15 +1000,16 @@ export class UiHelpers {
 			process.stderr.write(`Warning: ${warningMessage}\n`);
 			return;
 		}
-		this.ctx.chatContainer.addChild(new Spacer(1));
-		this.ctx.chatContainer.addChild(new Text(theme.fg("warning", `Warning: ${warningMessage}`), 1, 0));
+		addChatChild(this.ctx, new Spacer(1));
+		addChatChild(this.ctx, new Text(theme.fg("warning", `Warning: ${warningMessage}`), 1, 0));
 		this.ctx.ui.requestRender();
 	}
 
 	showNewVersionNotification(newVersion: string): void {
-		this.ctx.chatContainer.addChild(new Spacer(1));
-		this.ctx.chatContainer.addChild(new DynamicBorder(text => theme.fg("warning", text)));
-		this.ctx.chatContainer.addChild(
+		addChatChild(this.ctx, new Spacer(1));
+		addChatChild(this.ctx, new DynamicBorder(text => theme.fg("warning", text)));
+		addChatChild(
+			this.ctx,
 			new Text(
 				theme.bold(theme.fg("warning", "Update Available")) +
 					"\n" +
@@ -564,12 +1019,39 @@ export class UiHelpers {
 				0,
 			),
 		);
-		this.ctx.chatContainer.addChild(new DynamicBorder(text => theme.fg("warning", text)));
+		addChatChild(this.ctx, new DynamicBorder(text => theme.fg("warning", text)));
 		this.ctx.ui.requestRender();
 	}
 
+	/**
+	 * Empty the pending container, disposing the queued-message chips but handing back
+	 * the parked `!`/`$` execution components matched by `retain`, in render order.
+	 *
+	 * `Container.clear()` disposes every child, which would tear down a running
+	 * execution block mid-flight; retained components are reused instances that the
+	 * caller re-attaches (pending area or chat transcript).
+	 */
+	#detachPendingMessages(retain: (component: Component) => boolean): Component[] {
+		syncPendingExecutionComponents(this.ctx);
+		const parked = new Set<Component>([...this.ctx.pendingBashComponents, ...this.ctx.pendingPythonComponents]);
+		const retained: Component[] = [];
+		for (const child of this.ctx.pendingMessagesContainer.children) {
+			if (parked.has(child) && retain(child)) {
+				retained.push(child);
+			} else {
+				child.dispose?.();
+			}
+		}
+		this.ctx.pendingMessagesContainer.detachAll();
+		return retained;
+	}
+
 	updatePendingMessagesDisplay(): void {
-		this.ctx.pendingMessagesContainer.clear();
+		// Rebuild only the queued-message chips: parked execution components stay attached
+		// so a mid-turn queue/dequeue event cannot dispose a streaming `!`/`$` block.
+		for (const component of this.#detachPendingMessages(() => true)) {
+			this.ctx.pendingMessagesContainer.addChild(component);
+		}
 		const queuedMessages = this.ctx.session.getQueuedMessages() as QueuedMessages;
 
 		const steeringMessages: Array<{ message: string; label: string }> = [];
@@ -599,16 +1081,24 @@ export class UiHelpers {
 				const queuedText = theme.fg("dim", `${entry.label}: ${entry.message}`);
 				this.ctx.pendingMessagesContainer.addChild(new TruncatedText(queuedText, 1, 0));
 			}
-			const dequeueKey = this.ctx.keybindings.getDisplayString("app.message.dequeue") || "Alt+Up";
-			const hintText = theme.fg("dim", `${theme.tree.hook} ${dequeueKey} to edit`);
-			this.ctx.pendingMessagesContainer.addChild(new TruncatedText(hintText, 1, 0));
+			const dequeueKey = this.ctx.keybindings.getDisplayString("app.message.dequeue");
+			if (dequeueKey) {
+				const hintText = theme.fg("dim", `${theme.tree.hook} ${dequeueKey} to select/edit/reorder`);
+				this.ctx.pendingMessagesContainer.addChild(new TruncatedText(hintText, 1, 0));
+			}
 		}
 	}
 
-	queueCompactionMessage(text: string, mode: "steer" | "followUp"): void {
-		this.ctx.compactionQueuedMessages.push({ text, mode } as CompactionQueuedMessage);
-		this.ctx.editor.addToHistory(text);
-		this.ctx.editor.setText("");
+	queueCompactionMessage(text: string, mode: "steer" | "followUp", options?: ComposerSubmissionOptions): void {
+		const entry: CompactionQueuedMessage = { text, mode };
+		if (mode === "followUp") {
+			entry.followUpQueuePolicy = "sequential";
+		}
+		this.ctx.compactionQueuedMessages.push(entry);
+		if (canApplyComposerSubmission(options, this.ctx.editor)) {
+			this.ctx.editor.addToHistory(text);
+			this.ctx.editor.setText("");
+		}
 		this.ctx.updatePendingMessagesDisplay();
 		this.ctx.showStatus("Queued message for after compaction");
 	}
@@ -618,6 +1108,11 @@ export class UiHelpers {
 
 	#isCompactionCommandMessage(text: string): boolean {
 		return this.#hasSkillInvocations(text) || this.isKnownSlashCommand(text);
+	}
+
+	#compactionFollowUpQueuePolicy(message: CompactionQueuedMessage): "sequential" | undefined {
+		if (message.mode !== "followUp") return undefined;
+		return message.followUpQueuePolicy ?? "sequential";
 	}
 
 	async #deliverQueuedSkillMessage(message: CompactionQueuedMessage): Promise<boolean> {
@@ -662,6 +1157,13 @@ export class UiHelpers {
 				continue;
 			}
 
+			const promptOptions =
+				message.mode === "followUp"
+					? {
+							streamingBehavior: message.mode,
+							followUpQueuePolicy: this.#compactionFollowUpQueuePolicy(message),
+						}
+					: { streamingBehavior: message.mode };
 			await this.ctx.session.promptCustomMessage(
 				{
 					customType: SKILL_PROMPT_MESSAGE_TYPE,
@@ -670,7 +1172,7 @@ export class UiHelpers {
 					details,
 					attribution: "user",
 				},
-				{ streamingBehavior: message.mode },
+				promptOptions,
 			);
 		}
 
@@ -690,7 +1192,11 @@ export class UiHelpers {
 			return;
 		}
 		await this.ctx.withLocalSubmission(message.text, () =>
-			message.mode === "followUp" ? this.ctx.session.followUp(message.text) : this.ctx.session.steer(message.text),
+			message.mode === "followUp"
+				? this.ctx.session.followUp(message.text, undefined, {
+						followUpQueuePolicy: this.#compactionFollowUpQueuePolicy(message),
+					})
+				: this.ctx.session.steer(message.text),
 		);
 	}
 
@@ -714,6 +1220,23 @@ export class UiHelpers {
 	}
 
 	async flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void> {
+		if (this.ctx.session.isCompacting || this.ctx.session.isBashRunning || this.ctx.session.isEvalRunning) {
+			if (!this.#compactionFlushRetryScheduled) {
+				this.#compactionFlushRetryScheduled = true;
+				void (async () => {
+					while (
+						this.ctx.session.isCompacting ||
+						this.ctx.session.isBashRunning ||
+						this.ctx.session.isEvalRunning
+					) {
+						await Bun.sleep(50);
+					}
+					this.#compactionFlushRetryScheduled = false;
+					await this.flushCompactionQueue(options);
+				})();
+			}
+			return;
+		}
 		if (this.ctx.compactionQueuedMessages.length === 0) {
 			return;
 		}
@@ -781,14 +1304,17 @@ export class UiHelpers {
 			// `restoreQueue` rather than rethrown, so we use the primitive
 			// recordLocalSubmission and dispose manually in the catch.
 			const disposeFirstPrompt = this.ctx.recordLocalSubmission(firstPrompt.text);
-			const promptPromise = this.ctx.session
-				.prompt(firstPrompt.text, {
-					streamingBehavior: firstPrompt.mode === "followUp" ? "followUp" : "steer",
-				})
-				.catch((error: unknown) => {
-					disposeFirstPrompt();
-					restoreQueue(error);
-				});
+			const firstPromptOptions =
+				firstPrompt.mode === "followUp"
+					? {
+							streamingBehavior: "followUp" as const,
+							followUpQueuePolicy: this.#compactionFollowUpQueuePolicy(firstPrompt),
+						}
+					: { streamingBehavior: "steer" as const };
+			const promptPromise = this.ctx.session.prompt(firstPrompt.text, firstPromptOptions).catch((error: unknown) => {
+				disposeFirstPrompt();
+				restoreQueue(error);
+			});
 
 			for (const message of rest) {
 				await this.#deliverQueuedMessage(message);
@@ -800,20 +1326,21 @@ export class UiHelpers {
 		}
 	}
 
-	/** Move pending bash components from pending area to chat */
+	/** Move pending bash/python components from the pending area to chat */
 	flushPendingBashComponents(): void {
 		// Move (detach, not dispose) the live execution components from the pending
 		// area into the chat transcript — they are reused instances, so a disposing
-		// removeChild() would tear them down before re-adding.
-		for (const component of this.ctx.pendingBashComponents) {
+		// removeChild() would tear them down before re-adding. Walk the container so
+		// the transcript keeps the order the pending area rendered, and so a
+		// component the container no longer holds can never be re-parented.
+		syncPendingExecutionComponents(this.ctx);
+		const parked = new Set<Component>([...this.ctx.pendingBashComponents, ...this.ctx.pendingPythonComponents]);
+		for (const component of [...this.ctx.pendingMessagesContainer.children]) {
+			if (!parked.has(component)) continue;
 			this.ctx.pendingMessagesContainer.detachChild(component);
-			this.ctx.chatContainer.addChild(component);
+			addChatChild(this.ctx, component);
 		}
 		this.ctx.pendingBashComponents = [];
-		for (const component of this.ctx.pendingPythonComponents) {
-			this.ctx.pendingMessagesContainer.detachChild(component);
-			this.ctx.chatContainer.addChild(component);
-		}
 		this.ctx.pendingPythonComponents = [];
 	}
 

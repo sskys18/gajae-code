@@ -14,6 +14,8 @@ function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+const RESERVED_OUTPUT_EXTENSIONS_PATTERN = "(?:md|jsonl|patch)";
+
 /**
  * Manages agent output ID allocation to ensure uniqueness.
  *
@@ -24,41 +26,61 @@ function escapeRegExp(value: string): string {
  */
 export class AgentOutputManager {
 	#nextId = 0;
-	#initialized = false;
+	#initPromise: Promise<void> | undefined;
 	readonly #getArtifactsDir: () => string | null;
 	readonly #parentPrefix: string | undefined;
+	readonly #getAuthorizedArtifactsDirs: (() => readonly string[]) | undefined;
 
-	constructor(getArtifactsDir: () => string | null, options?: { parentPrefix?: string }) {
+	constructor(
+		getArtifactsDir: () => string | null,
+		options?: { parentPrefix?: string; getAuthorizedArtifactsDirs?: () => readonly string[] },
+	) {
 		this.#getArtifactsDir = getArtifactsDir;
 		this.#parentPrefix = options?.parentPrefix;
+		this.#getAuthorizedArtifactsDirs = options?.getAuthorizedArtifactsDirs;
+	}
+
+	/**
+	 * Memoize the in-flight scan so concurrent `allocate*`/`peekNextIndex`
+	 * calls await the SAME `readdir` before `#nextId` is derived. Assigning the
+	 * promise synchronously (before any `await`) closes the TOCTOU window where a
+	 * boolean "initialized" flag, flipped ahead of the awaited scan, let a second
+	 * caller allocate at `#nextId === 0` while the first was still scanning —
+	 * producing duplicate indices that overwrite prior outputs on resume.
+	 */
+	#ensureInitialized(): Promise<void> {
+		this.#initPromise ??= this.#scanExistingOutputs();
+		return this.#initPromise;
 	}
 
 	/**
 	 * Scan existing agent output files to find the next available ID.
 	 * This ensures we don't overwrite outputs when resuming a session.
 	 */
-	async #ensureInitialized(): Promise<void> {
-		if (this.#initialized) return;
-		this.#initialized = true;
-
-		const dir = this.#getArtifactsDir();
-		if (!dir) return;
-
-		let files: string[];
-		try {
-			files = await fs.readdir(dir);
-		} catch {
-			return; // Directory doesn't exist yet
-		}
+	async #scanExistingOutputs(): Promise<void> {
+		const dirs: string[] = [];
+		const add = (dir: string | null | undefined) => {
+			if (!dir || dirs.includes(dir)) return;
+			dirs.push(dir);
+		};
+		add(this.#getArtifactsDir());
+		for (const dir of this.#getAuthorizedArtifactsDirs?.() ?? []) add(dir);
+		if (dirs.length === 0) return;
 
 		const pattern = this.#parentPrefix
-			? new RegExp(`^${escapeRegExp(this.#parentPrefix)}\\.(\\d+)-.*\\.md$`)
-			: /^(\d+)-.*\.md$/;
-
+			? new RegExp(`^${escapeRegExp(this.#parentPrefix)}\\.(\\d+)-.*\\.${RESERVED_OUTPUT_EXTENSIONS_PATTERN}$`)
+			: new RegExp(`^(\\d+)-.*\\.${RESERVED_OUTPUT_EXTENSIONS_PATTERN}$`);
 		let maxId = -1;
-		for (const file of files) {
-			const match = file.match(pattern);
-			if (match) {
+		for (const dir of dirs) {
+			let files: string[];
+			try {
+				files = await fs.readdir(dir);
+			} catch {
+				continue;
+			}
+			for (const file of files) {
+				const match = file.match(pattern);
+				if (!match) continue;
 				const id = Number.parseInt(match[1], 10);
 				if (id > maxId) maxId = id;
 			}
@@ -103,6 +125,6 @@ export class AgentOutputManager {
 	 */
 	reset(): void {
 		this.#nextId = 0;
-		this.#initialized = false;
+		this.#initPromise = undefined;
 	}
 }

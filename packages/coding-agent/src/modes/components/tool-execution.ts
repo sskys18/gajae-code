@@ -1,5 +1,6 @@
-import type { AgentTool } from "@gajae-code/agent-core";
+import { type AgentTool, isToolFailureEnvelope } from "@gajae-code/agent-core";
 import {
+	type AnimationRegistration,
 	Box,
 	type Component,
 	Container,
@@ -7,6 +8,8 @@ import {
 	Image,
 	ImageProtocol,
 	imageFallback,
+	isTerminalGraphicsFallbackActive,
+	registerAnimationCallback,
 	Spacer,
 	TERMINAL,
 	Text,
@@ -14,6 +17,8 @@ import {
 } from "@gajae-code/tui";
 import { getProjectDir, logger, sanitizeText } from "@gajae-code/utils";
 import { EDIT_MODE_STRATEGIES, type EditMode, type PerFileDiffPreview } from "../../edit";
+import { type EditRenderContext, getPerFileEditRenderArgs, getPerFileEditRenderContext } from "../../edit/renderer";
+import { getEditRequestTargetInventory, orderedDistinctPaths } from "../../edit/streaming";
 import type { Theme } from "../../modes/theme/theme";
 import { theme } from "../../modes/theme/theme";
 import { BASH_DEFAULT_PREVIEW_LINES } from "../../tools/bash";
@@ -31,7 +36,7 @@ import {
 import { formatExpandHint, replaceTabs, resolveImageOptions, truncateToWidth } from "../../tools/render-utils";
 import { toolRenderers } from "../../tools/renderers";
 import { renderStatusLine } from "../../tui";
-import { sanitizeWithOptionalSixelPassthrough } from "../../utils/sixel";
+import { containsSixelSequence, getSixelLineMask, sanitizeWithOptionalSixelPassthrough } from "../../utils/sixel";
 import { renderDiff } from "./diff";
 
 function ensureInvalidate(component: unknown): Component {
@@ -42,6 +47,23 @@ function ensureInvalidate(component: unknown): Component {
 	return c as Component;
 }
 
+const SIXEL_FALLBACK_PLACEHOLDER = "[SIXEL image hidden while IRC sidebar is visible]";
+
+function replaceSixelOutputForGraphicsFallback(text: string): string {
+	const lines = text.split("\n");
+	const sixelLineMask = getSixelLineMask(lines);
+	if (!sixelLineMask.some(Boolean)) return text;
+
+	return lines
+		.flatMap((line, index) => {
+			if (!sixelLineMask[index]) return [line];
+			return index === 0 || !sixelLineMask[index - 1] || containsSixelSequence(line)
+				? [SIXEL_FALLBACK_PLACEHOLDER]
+				: [];
+		})
+		.join("\n");
+}
+
 function cloneToolArgs<T>(args: T): T {
 	if (args === null || args === undefined) return args;
 	try {
@@ -49,6 +71,22 @@ function cloneToolArgs<T>(args: T): T {
 	} catch {
 		return args;
 	}
+}
+
+// Built-in tool renderers that treat call args as read-only, so streaming UI can
+// avoid per-delta defensive clone churn. Kept here (not in the tool renderer
+// registry) because it is a rendering-perf capability of these renderers, not a
+// tool-registration concern.
+const READONLY_ARG_RENDERER_TOOLS = new Set(["bash", "recipe", "eval", "edit", "apply_patch"]);
+
+function argsCanBeSharedWithRenderer(toolName: string, tool: AgentTool | undefined): boolean {
+	return !tool?.renderCall && !tool?.renderResult && READONLY_ARG_RENDERER_TOOLS.has(toolName);
+}
+
+function previewPayloadKey(args: unknown): string | undefined {
+	const partialJson =
+		args && typeof args === "object" ? (args as { __partialJson?: unknown }).__partialJson : undefined;
+	return typeof partialJson === "string" ? `${partialJson.length}:${partialJson}` : undefined;
 }
 
 /**
@@ -94,6 +132,21 @@ function stabilizeStreamingPreviews(previews: PerFileDiffPreview[]): PerFileDiff
 	return changed ? next : previews;
 }
 
+function previewsAreEqual(a: PerFileDiffPreview[] | undefined, b: PerFileDiffPreview[]): boolean {
+	return (
+		a?.length === b.length &&
+		a.every((preview, index) => {
+			const next = b[index];
+			return (
+				preview.path === next?.path &&
+				preview.diff === next.diff &&
+				preview.error === next.error &&
+				preview.firstChangedLine === next.firstChangedLine
+			);
+		})
+	);
+}
+
 function isEditLikeToolName(toolName: string): boolean {
 	return toolName === "edit" || toolName === "apply_patch";
 }
@@ -109,6 +162,8 @@ export interface ToolExecutionOptions {
 	editFuzzyThreshold?: number;
 	editAllowFuzzy?: boolean;
 	hashlineAutoDropPureInsertDuplicates?: boolean;
+	/** Internal observer for visible asynchronous renderer mutations. */
+	onVisibleTranscriptMutation?: () => void;
 }
 
 export interface ToolExecutionHandle {
@@ -124,6 +179,20 @@ export interface ToolExecutionHandle {
 	): void;
 	setArgsComplete(toolCallId?: string): void;
 	setExpanded(expanded: boolean): void;
+	/**
+	 * Applies an explicit fold choice for this renderer instance. The pin lasts
+	 * only for this instance; transcript rebuilds recreate it from global state.
+	 * Optional for source compatibility: this interface is publicly exported and
+	 * pre-existing structural implementers must keep compiling. Dispatchers must
+	 * guard with `typeof handle.setManuallyExpanded === "function"` and fall
+	 * back to {@link setExpanded}.
+	 */
+	setManuallyExpanded?(expanded: boolean): void;
+	/**
+	 * Internal capability for dispatchers that need exact synchronous visible-output
+	 * detection. Optional so existing structural handles remain source compatible.
+	 */
+	consumeVisibleTranscriptChange?(): boolean;
 }
 
 /**
@@ -132,6 +201,7 @@ export interface ToolExecutionHandle {
 export class ToolExecutionComponent extends Container {
 	#contentBox: Box; // Used for custom tools and bash visual truncation
 	#contentText: Text; // For built-in tools (with its own padding/bg)
+	#usesContentBox: boolean; // Which of the two the constructor put in the tree
 	#multiFileBoxes: (Box | Spacer)[] = []; // Extra boxes for multi-file edit results
 	#imageComponents: Image[] = [];
 	#imageSpacers: Spacer[] = [];
@@ -139,6 +209,7 @@ export class ToolExecutionComponent extends Container {
 	#toolLabel: string;
 	#args: any;
 	#expanded = false;
+	#manuallyExpanded: boolean | undefined;
 	#showImages: boolean;
 	#editFuzzyThreshold: number | undefined;
 	#editAllowFuzzy: boolean | undefined;
@@ -152,17 +223,31 @@ export class ToolExecutionComponent extends Container {
 		isError?: boolean;
 		details?: any;
 	};
-	#textOutputCache?: { content: unknown; showImages: boolean; terminalImageProtocol: unknown; output: string };
+	#textOutputCache?: {
+		content: unknown;
+		showImages: boolean;
+		terminalImageProtocol: unknown;
+		graphicsFallbackActive: boolean;
+		output: string;
+	};
+	#displayBuiltWithGraphicsFallback: boolean | undefined;
 	// Edit preview state
 	#editMode?: EditMode;
 	#editDiffPreview?: PerFileDiffPreview[];
 	#editDiffAbort?: AbortController;
 	#editDiffLastArgsKey?: string;
-	// Cached converted images for Kitty protocol (which requires PNG), keyed by index
-	#convertedImages: Map<number, { data: string; mimeType: string }> = new Map();
+	#argsIdentityVersion = 0;
+	#lastArgsReference: any;
+
+	#shareArgsWithRenderer = false;
+	// Cached converted images for Kitty protocol (which requires PNG), keyed by index and source.
+	#convertedImages: Map<number, { data: string; mimeType: string; source: string }> = new Map();
+	#imageConversionGenerations = new Map<number, number>();
+	#imageConversionsInFlight = new Map<number, string>();
+
 	// Spinner animation for partial task results
 	#spinnerFrame?: number;
-	#spinnerInterval?: NodeJS.Timeout;
+	#spinnerAnimation?: AnimationRegistration;
 	// Track if args are still being streamed (for edit/write spinner)
 	#argsComplete = false;
 	#renderState: {
@@ -174,6 +259,10 @@ export class ToolExecutionComponent extends Container {
 		expanded: false,
 		isPartial: true,
 	};
+	#onVisibleTranscriptMutation?: () => void;
+	#visibleTranscriptChanged = false;
+	#visibleProjection = "";
+	#disposed = false;
 
 	constructor(
 		toolName: string,
@@ -191,10 +280,14 @@ export class ToolExecutionComponent extends Container {
 		this.#editFuzzyThreshold = options.editFuzzyThreshold;
 		this.#editAllowFuzzy = options.editAllowFuzzy;
 		this.#hashlineAutoDropPureInsertDuplicates = options.hashlineAutoDropPureInsertDuplicates;
+		this.#onVisibleTranscriptMutation = options.onVisibleTranscriptMutation;
+
 		this.#tool = tool;
 		this.#ui = ui;
 		this.#cwd = cwd;
-		this.#args = cloneToolArgs(args);
+		this.#shareArgsWithRenderer = argsCanBeSharedWithRenderer(toolName, tool);
+		this.#lastArgsReference = args;
+		this.#args = this.#shareArgsWithRenderer ? args : cloneToolArgs(args);
 
 		this.addChild(new Spacer(1));
 
@@ -207,7 +300,8 @@ export class ToolExecutionComponent extends Container {
 		// Use Box for custom tools or built-in tools that have renderers
 		const hasRenderer = toolName in toolRenderers;
 		const hasCustomRenderer = !!(tool?.renderCall || tool?.renderResult);
-		if (hasCustomRenderer || hasRenderer) {
+		this.#usesContentBox = hasCustomRenderer || hasRenderer;
+		if (this.#usesContentBox) {
 			this.addChild(this.#contentBox);
 		} else {
 			this.addChild(this.#contentText);
@@ -216,14 +310,24 @@ export class ToolExecutionComponent extends Container {
 		this.#editMode = resolveEditModeForTool(toolName, tool);
 
 		this.#updateDisplay();
+		this.#visibleProjection = this.#captureLogicalVisibleProjection();
+
 		void this.#runPreviewDiff();
 	}
 
 	updateArgs(args: any, _toolCallId?: string): void {
-		this.#args = cloneToolArgs(args);
+		const argsChanged = !Bun.deepEquals(this.#args, args);
+		if (!argsChanged && !this.#editMode) return;
+
+		if (args !== this.#lastArgsReference) {
+			this.#lastArgsReference = args;
+			this.#argsIdentityVersion += 1;
+		}
+		this.#args = argsChanged ? (this.#shareArgsWithRenderer ? args : cloneToolArgs(args)) : this.#args;
 		this.#updateSpinnerAnimation();
 		void this.#runPreviewDiff();
 		this.#updateDisplay();
+		this.#markVisibleMutationIfChanged();
 	}
 
 	/**
@@ -234,6 +338,8 @@ export class ToolExecutionComponent extends Container {
 		this.#argsComplete = true;
 		this.#updateSpinnerAnimation();
 		void this.#runPreviewDiff();
+		this.#updateDisplay();
+		this.#markVisibleMutationIfChanged();
 	}
 
 	async #runPreviewDiff(): Promise<void> {
@@ -253,13 +359,14 @@ export class ToolExecutionComponent extends Container {
 			effectiveArgs = args;
 		}
 
-		// Coalesce duplicate computes for identical args.
-		let argsKey: string;
-		try {
-			argsKey = JSON.stringify(effectiveArgs);
-		} catch {
-			argsKey = String(Date.now());
-		}
+		// The streamed partial JSON is the exact payload snapshot. Its length alone
+		// cannot distinguish same-size replacements. Completed calls lack that
+		// snapshot, so retain identity invalidation for their distinct arg objects.
+		const argsKey = [
+			this.#toolName,
+			previewPayloadKey(args) ?? `identity:${this.#argsIdentityVersion}`,
+			this.#argsComplete ? 1 : 0,
+		].join(":");
 		if (argsKey === this.#editDiffLastArgsKey) return;
 		this.#editDiffLastArgsKey = argsKey;
 
@@ -277,14 +384,17 @@ export class ToolExecutionComponent extends Container {
 				hashlineAutoDropPureInsertDuplicates: this.#hashlineAutoDropPureInsertDuplicates,
 				isStreaming,
 			});
-			if (controller.signal.aborted) return;
+			if (this.#disposed || controller.signal.aborted) return;
 			if (previews) {
-				this.#editDiffPreview = isStreaming ? stabilizeStreamingPreviews(previews) : previews;
+				const nextPreview = isStreaming ? stabilizeStreamingPreviews(previews) : previews;
+				const changed = !previewsAreEqual(this.#editDiffPreview, nextPreview);
+				this.#editDiffPreview = nextPreview;
 				this.#updateDisplay();
 				this.#ui.requestRender();
+				if (changed) this.#markVisibleMutationIfChanged(true);
 			}
 		} catch (err) {
-			if (controller.signal.aborted) return;
+			if (this.#disposed || controller.signal.aborted) return;
 			logger.warn("Edit preview diff failed", { tool: this.#toolName, error: String(err) });
 		}
 	}
@@ -298,8 +408,10 @@ export class ToolExecutionComponent extends Container {
 		isPartial = false,
 		_toolCallId?: string,
 	): void {
+		if (this.#isPartial === isPartial && Bun.deepEquals(this.#result, result)) return;
 		this.#textOutputCache = undefined;
 		this.#result = result;
+		this.#invalidateStaleKittyConversions();
 		this.#isPartial = isPartial;
 		// When tool is complete, ensure args are marked complete so spinner stops
 		if (!isPartial) {
@@ -309,6 +421,7 @@ export class ToolExecutionComponent extends Container {
 		this.#updateDisplay();
 		// Convert non-PNG images to PNG for Kitty protocol (async)
 		this.#maybeConvertImagesForKitty();
+		this.#markVisibleMutationIfChanged();
 	}
 
 	/**
@@ -322,38 +435,113 @@ export class ToolExecutionComponent extends Container {
 		return [...contentImages, ...detailImages];
 	}
 
-	/**
-	 * Convert non-PNG images to PNG for Kitty graphics protocol.
-	 * Kitty requires PNG format (f=100), so JPEG/GIF/WebP won't display.
-	 */
+	#imageSource(image: { data?: string; mimeType?: string }): string | undefined {
+		return image.data && image.mimeType ? `${image.mimeType}\u0000${image.data}` : undefined;
+	}
+
+	#invalidateStaleKittyConversions(): void {
+		const images = this.#getAllImageBlocks();
+		const indices = new Set<number>();
+		for (let index = 0; index < images.length; index++) {
+			const source = this.#imageSource(images[index]);
+			if (!source) continue;
+			indices.add(index);
+			if (this.#convertedImages.get(index)?.source !== source) this.#convertedImages.delete(index);
+			if (this.#imageConversionsInFlight.get(index) !== source) {
+				this.#imageConversionsInFlight.delete(index);
+				this.#imageConversionGenerations.set(index, (this.#imageConversionGenerations.get(index) ?? 0) + 1);
+			}
+		}
+		for (const index of this.#convertedImages.keys()) {
+			if (!indices.has(index)) this.#convertedImages.delete(index);
+		}
+		for (const index of this.#imageConversionsInFlight.keys()) {
+			if (!indices.has(index)) {
+				this.#imageConversionsInFlight.delete(index);
+				this.#imageConversionGenerations.set(index, (this.#imageConversionGenerations.get(index) ?? 0) + 1);
+			}
+		}
+	}
+
+	/** Convert non-PNG images to PNG for Kitty graphics protocol. */
 	#maybeConvertImagesForKitty(): void {
-		// Only needed for Kitty protocol
 		if (TERMINAL.imageProtocol !== ImageProtocol.Kitty) return;
-		if (!this.#result) return;
-
-		const imageBlocks = this.#getAllImageBlocks();
-
-		for (let i = 0; i < imageBlocks.length; i++) {
-			const img = imageBlocks[i];
-			if (!img.data || !img.mimeType) continue;
-			// Skip if already PNG or already converted
-			if (img.mimeType === "image/png") continue;
-			if (this.#convertedImages.has(i)) continue;
-
-			// Convert async - catch errors from processing
-			const index = i;
-			new Bun.Image(Buffer.from(img.data, "base64"))
+		for (const [index, image] of this.#getAllImageBlocks().entries()) {
+			const source = this.#imageSource(image);
+			if (!source || image.mimeType === "image/png") continue;
+			if (
+				this.#convertedImages.get(index)?.source === source ||
+				this.#imageConversionsInFlight.get(index) === source
+			)
+				continue;
+			const generation = this.#imageConversionGenerations.get(index) ?? 0;
+			this.#imageConversionsInFlight.set(index, source);
+			new Bun.Image(Buffer.from(image.data!, "base64"))
 				.png()
 				.toBase64()
 				.then(data => {
-					this.#convertedImages.set(index, { data, mimeType: "image/png" });
+					if (
+						this.#disposed ||
+						this.#imageConversionGenerations.get(index) !== generation ||
+						this.#imageConversionsInFlight.get(index) !== source ||
+						this.#imageSource(this.#getAllImageBlocks()[index] ?? {}) !== source
+					)
+						return;
+					this.#imageConversionsInFlight.delete(index);
+					this.#convertedImages.set(index, { data, mimeType: "image/png", source });
 					this.#updateDisplay();
 					this.#ui.requestRender();
+					this.#markVisibleMutationIfChanged(true);
 				})
 				.catch(() => {
-					// Ignore conversion failures - display will use original image format
+					if (
+						this.#disposed ||
+						this.#imageConversionGenerations.get(index) !== generation ||
+						this.#imageConversionsInFlight.get(index) !== source
+					)
+						return;
+					this.#imageConversionsInFlight.delete(index);
 				});
 		}
+	}
+
+	#captureLogicalVisibleProjection(): string {
+		const rendered = this.render(10_000).join("\n");
+		// The sticky-viewport source tracks semantic transcript output, not just
+		// the literal pixels. A result-first collapsed edit card intentionally
+		// hides in-flight diff previews, so preview resolution changes the
+		// rendered text by nothing — yet it is still semantic progress the
+		// viewport must re-anchor on (the preview becomes visible the moment the
+		// user expands, and downstream snapshot/replay keys off this revision).
+		// Fold a compact fingerprint of resolved-preview state into the logical
+		// projection so it advances independently of the sparse collapsed render.
+		const preview = this.#editDiffPreview;
+		if (!preview || preview.length === 0) return rendered;
+		const fingerprint = preview
+			.map(file => `${file.path}:${file.diff ? "1" : "0"}:${file.firstChangedLine ?? ""}:${file.error ? "1" : "0"}`)
+			.join("|");
+		return `${rendered}\u0000preview:${fingerprint}`;
+	}
+
+	#markVisibleMutationIfChanged(notify = false): void {
+		const projection = this.#captureLogicalVisibleProjection();
+		if (projection === this.#visibleProjection) return;
+		this.#visibleProjection = projection;
+		this.#markVisibleMutation(notify);
+	}
+
+	#markVisibleMutation(notify = false): void {
+		if (notify) {
+			this.#onVisibleTranscriptMutation?.();
+			return;
+		}
+		this.#visibleTranscriptChanged = true;
+	}
+
+	consumeVisibleTranscriptChange(): boolean {
+		const changed = this.#visibleTranscriptChanged;
+		this.#visibleTranscriptChanged = false;
+		return changed;
 	}
 
 	/**
@@ -367,18 +555,18 @@ export class ToolExecutionComponent extends Container {
 			(this.#result?.details as { async?: { state?: string } } | undefined)?.async?.state === "running";
 		const isPartialTask = this.#isPartial && this.#toolName === "task" && !isBackgroundAsyncTask;
 		const needsSpinner = isStreamingArgs || isPartialTask;
-		if (needsSpinner && !this.#spinnerInterval) {
-			this.#spinnerInterval = setInterval(() => {
+		if (needsSpinner && !this.#spinnerAnimation) {
+			this.#spinnerAnimation = registerAnimationCallback(() => {
+				if (this.#disposed) return;
 				const frameCount = theme.spinnerFrames.length;
 				if (frameCount === 0) return;
 				this.#spinnerFrame = ((this.#spinnerFrame ?? -1) + 1) % frameCount;
 				this.#renderState.spinnerFrame = this.#spinnerFrame;
 				this.#ui.requestRender();
 			}, 80);
-			this.#spinnerInterval?.unref?.();
-		} else if (!needsSpinner && this.#spinnerInterval) {
-			clearInterval(this.#spinnerInterval);
-			this.#spinnerInterval = undefined;
+		} else if (!needsSpinner && this.#spinnerAnimation) {
+			this.#spinnerAnimation.unregister();
+			this.#spinnerAnimation = undefined;
 		}
 	}
 
@@ -386,9 +574,9 @@ export class ToolExecutionComponent extends Container {
 	 * Stop spinner animation and cleanup resources.
 	 */
 	stopAnimation(): void {
-		if (this.#spinnerInterval) {
-			clearInterval(this.#spinnerInterval);
-			this.#spinnerInterval = undefined;
+		if (this.#spinnerAnimation) {
+			this.#spinnerAnimation.unregister();
+			this.#spinnerAnimation = undefined;
 			this.#spinnerFrame = undefined;
 		}
 		this.#editDiffAbort?.abort();
@@ -396,11 +584,28 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	override dispose(): void {
+		if (this.#disposed) return;
+		this.#disposed = true;
+		this.#imageConversionGenerations.clear();
+		this.#imageConversionsInFlight.clear();
+		this.#convertedImages.clear();
 		this.stopAnimation();
 		super.dispose();
 	}
 
+	/** Applies automatic expansion unless this renderer instance has an explicit fold choice. */
 	setExpanded(expanded: boolean): void {
+		if (this.#manuallyExpanded !== undefined) return;
+		this.#expanded = expanded;
+		this.#updateDisplay();
+	}
+
+	/**
+	 * Applies and pins an explicit fold choice for this renderer instance only.
+	 * Transcript rebuilds recreate components from global state and drop this pin.
+	 */
+	setManuallyExpanded(expanded: boolean): void {
+		this.#manuallyExpanded = expanded;
 		this.#expanded = expanded;
 		this.#updateDisplay();
 	}
@@ -416,6 +621,13 @@ export class ToolExecutionComponent extends Container {
 		this.#updateDisplay();
 	}
 
+	override render(width: number): string[] {
+		if (this.#displayBuiltWithGraphicsFallback !== isTerminalGraphicsFallbackActive()) {
+			this.#updateDisplay();
+		}
+		return super.render(width);
+	}
+
 	#updateDisplay(): void {
 		// Set background based on state
 		const bgFn = this.#isPartial
@@ -429,8 +641,26 @@ export class ToolExecutionComponent extends Container {
 		this.#renderState.isPartial = this.#isPartial;
 		this.#renderState.spinnerFrame = this.#spinnerFrame;
 
-		// Check for custom tool rendering
-		if (this.#tool && (this.#tool.renderCall || this.#tool.renderResult)) {
+		// A call the loop rejected carries the loop's failure envelope in place of the
+		// tool's own details. A renderer owns only its own detail shape, so handing it
+		// the envelope either throws — leaving the TUI's bare `[render error: Box]`
+		// fallback line — or paints the tool's own card while the rejection reason is
+		// dropped. The reason is the only content left, so render it the way a tool
+		// without a renderer already reports failure.
+		if (this.#usesContentBox && this.#result?.isError && isToolFailureEnvelope(this.#result.details)) {
+			for (const box of this.#multiFileBoxes) {
+				this.removeChild(box);
+			}
+			this.#multiFileBoxes = [];
+			this.#contentBox.setBgFn(bgFn);
+			this.#contentBox.clear();
+			this.#contentBox.addChild(new Text(renderStatusLine({ icon: "error", title: this.#toolLabel }, theme), 0, 0));
+			const reason = this.#getTextOutput().trimEnd();
+			if (reason) {
+				this.#contentBox.addChild(new Text(theme.fg("toolOutput", replaceTabs(reason)), 0, 0));
+			}
+		} else if (this.#tool && (this.#tool.renderCall || this.#tool.renderResult)) {
+			// Custom tool rendering
 			const tool = this.#tool;
 			const mergeCallAndResult = Boolean((tool as { mergeCallAndResult?: boolean }).mergeCallAndResult);
 			// Custom tools use Box for flexible component rendering
@@ -507,13 +737,17 @@ export class ToolExecutionComponent extends Container {
 			const perFileResults = this.#result?.details?.perFileResults as
 				| Array<{ path: string; isError?: boolean }>
 				| undefined;
-			if (perFileResults && perFileResults.length > 1) {
+			const requestedEditFiles = isEditLikeToolName(this.#toolName)
+				? getEditRequestTargetInventory(this.#args, this.#editMode, { isPartial: this.#isPartial }).paths.length
+				: 0;
+			if (perFileResults && (perFileResults.length > 1 || (this.#isPartial && requestedEditFiles > 1))) {
 				// Multi-file: render each file as its own Box (identical to separate tool calls)
 				this.#contentBox.setBgFn(undefined);
 				this.#contentBox.clear();
 
 				const renderContext = this.#buildRenderContext();
 				this.#renderState.renderContext = renderContext;
+				const callArgs = this.#getCallArgsForRender();
 
 				for (let i = 0; i < perFileResults.length; i++) {
 					const fileResult = perFileResults[i];
@@ -527,10 +761,17 @@ export class ToolExecutionComponent extends Container {
 						: (text: string) => theme.bg("toolSuccessBg", text);
 					const fileBox = new Box(1, 0, fileBgFn);
 					try {
+						const fileRenderState = {
+							...this.#renderState,
+							renderContext: getPerFileEditRenderContext(renderContext as EditRenderContext, fileResult.path) as
+								| Record<string, unknown>
+								| undefined,
+						};
 						const resultComponent = renderer.renderResult(
 							{ content: [], details: fileResult, isError: fileResult.isError },
-							this.#renderState,
+							fileRenderState,
 							theme,
+							getPerFileEditRenderArgs(callArgs, fileResult.path, this.#editMode),
 						);
 						if (resultComponent) {
 							fileBox.addChild(ensureInvalidate(resultComponent));
@@ -543,10 +784,11 @@ export class ToolExecutionComponent extends Container {
 				}
 
 				// Show pending indicator for remaining files
-				const totalFiles = this.#args?.edits
-					? new Set((this.#args.edits as any[]).map((e: any) => e?.path).filter(Boolean)).size
-					: 0;
-				const remaining = Math.max(0, totalFiles - perFileResults.length);
+				const requestedFiles = getEditRequestTargetInventory(this.#args, this.#editMode, {
+					isPartial: this.#isPartial,
+				}).paths.length;
+				const representedFiles = orderedDistinctPaths(perFileResults.map(file => file.path)).length;
+				const remaining = Math.max(0, requestedFiles - representedFiles);
 				if (remaining > 0 && this.#isPartial) {
 					const pendingSpacer = new Spacer(1);
 					this.#multiFileBoxes.push(pendingSpacer);
@@ -653,13 +895,14 @@ export class ToolExecutionComponent extends Container {
 						imageData,
 						imageMimeType,
 						{ fallbackColor: (s: string) => theme.fg("toolOutput", s) },
-						resolveImageOptions(),
+						{ ...resolveImageOptions(), refetch: () => imageData },
 					);
 					this.#imageComponents.push(imageComponent);
 					this.addChild(imageComponent);
 				}
 			}
 		}
+		this.#displayBuiltWithGraphicsFallback = isTerminalGraphicsFallbackActive();
 	}
 
 	#getCallArgsForRender(): any {
@@ -715,11 +958,11 @@ export class ToolExecutionComponent extends Container {
 						? { error: first.error }
 						: { diff: first.diff ?? "", firstChangedLine: first.firstChangedLine };
 				}
-				if (previews.length > 1) {
+				if (previews.some(preview => preview.path.length > 0)) {
 					context.perFileDiffPreview = previews;
 				}
 			}
-			if (!previews?.some(preview => preview.diff)) {
+			if (this.#expanded && !previews?.some(preview => preview.diff)) {
 				const editMode = this.#editMode;
 				const strategy = editMode ? EDIT_MODE_STRATEGIES[editMode] : undefined;
 				const fallback = strategy?.renderStreamingFallback(this.#args, theme);
@@ -736,11 +979,13 @@ export class ToolExecutionComponent extends Container {
 
 		const content = this.#result.content;
 		const terminalImageProtocol = TERMINAL.imageProtocol;
+		const graphicsFallbackActive = isTerminalGraphicsFallbackActive();
 		const cached = this.#textOutputCache;
 		if (
 			cached?.content === content &&
 			cached.showImages === this.#showImages &&
-			cached.terminalImageProtocol === terminalImageProtocol
+			cached.terminalImageProtocol === terminalImageProtocol &&
+			cached.graphicsFallbackActive === graphicsFallbackActive
 		) {
 			return cached.output;
 		}
@@ -748,8 +993,8 @@ export class ToolExecutionComponent extends Container {
 		const textParts: string[] = [];
 		for (const block of content ?? []) {
 			if (block.type !== "text") continue;
-			const text = block.text || "";
-			textParts.push(sanitizeWithOptionalSixelPassthrough(text, sanitizeText));
+			const text = sanitizeWithOptionalSixelPassthrough(block.text || "", sanitizeText);
+			textParts.push(graphicsFallbackActive ? replaceSixelOutputForGraphicsFallback(text) : text);
 		}
 		let output = textParts.join("\n");
 
@@ -764,7 +1009,13 @@ export class ToolExecutionComponent extends Container {
 			output = output ? `${output}\n${imageIndicators}` : imageIndicators;
 		}
 
-		this.#textOutputCache = { content, showImages: this.#showImages, terminalImageProtocol, output };
+		this.#textOutputCache = {
+			content,
+			showImages: this.#showImages,
+			terminalImageProtocol,
+			graphicsFallbackActive,
+			output,
+		};
 		return output;
 	}
 

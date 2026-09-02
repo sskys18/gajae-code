@@ -2,7 +2,13 @@
  * Shared utilities for Google Generative AI and Google Cloud Code Assist providers.
  */
 
-import { extractHttpStatusFromError, readSseJson } from "@gajae-code/utils";
+import { extractHttpStatusFromError, readJsonl, readSseJson } from "@gajae-code/utils";
+import type { ProviderSafetyStopAdapterInvocation } from "../adapter-internals/provider-safety-stop";
+import {
+	isProviderSafetyStopAdapterInvocation,
+	mintProviderSafetyStop,
+	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+} from "../adapter-internals/provider-safety-stop";
 import { calculateCost } from "../models";
 import type {
 	Api,
@@ -18,8 +24,9 @@ import type {
 	Tool,
 	ToolCall,
 } from "../types";
-import { normalizeSystemPrompts } from "../utils";
+import { normalizeSystemPrompts, sanitizeJsonStrings } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
+import { transportFailureFacts } from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump, withHttpStatus } from "../utils/http-inspector";
 import { normalizeSchemaForCCA, normalizeSchemaForGoogle, toolWireSchema } from "../utils/schema";
 import {
@@ -51,6 +58,43 @@ export type {
 export { normalizeSchemaForGoogle };
 
 type GoogleApiType = "google-generative-ai" | "google-gemini-cli" | "google-vertex";
+export const PROVIDER_SAFETY_STOP = "provider_safety_stop";
+
+export function isGoogleCandidateSafetyStopReason(reason: string): boolean {
+	switch (reason) {
+		case "SAFETY":
+		case "IMAGE_SAFETY":
+		case "PROHIBITED_CONTENT":
+		case "IMAGE_PROHIBITED_CONTENT":
+		case "SPII":
+		case "BLOCKLIST":
+		case "RECITATION":
+		case "IMAGE_RECITATION":
+		case "MODEL_ARMOR":
+			return true;
+		default:
+			return false;
+	}
+}
+
+export function isGooglePromptSafetyStopReason(reason: string): boolean {
+	switch (reason) {
+		case "SAFETY":
+		case "IMAGE_SAFETY":
+		case "PROHIBITED_CONTENT":
+		case "BLOCKLIST":
+		case "MODEL_ARMOR":
+		case "JAILBREAK":
+			return true;
+		default:
+			return false;
+	}
+}
+
+export function getGooglePromptBlockReason(promptFeedback: { blockReason?: unknown } | undefined): string | undefined {
+	const blockReason = promptFeedback?.blockReason;
+	return typeof blockReason === "string" && blockReason.length > 0 ? blockReason : undefined;
+}
 
 /**
  * Thinking level for Gemini 3 models. Mirrors Google's `ThinkingLevel` enum values.
@@ -219,11 +263,23 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 					// Otherwise convert to plain text (no tags to avoid model mimicking them)
 					if (isSameProviderAndModel) {
 						const thoughtSignature = resolveThoughtSignature(isSameProviderAndModel, block.thinkingSignature);
-						parts.push({
-							thought: true,
-							text: block.thinking.toWellFormed(),
-							...(thoughtSignature && { thoughtSignature }),
-						});
+						// An unsigned `thought: true` part cannot be replayed: Cloud Code Assist
+						// maps it to an Anthropic `thinking` block and rejects the whole request
+						// with `thinking.signature: Field required` (#4630). Persisted signatures
+						// can be missing entirely or cleared to "" (oversized-signature
+						// persistence), so degrade those blocks to the same plain-text treatment
+						// cross-model reasoning already gets. Signed thinking still replays natively.
+						if (!thoughtSignature) {
+							parts.push({
+								text: block.thinking.toWellFormed(),
+							});
+						} else {
+							parts.push({
+								thought: true,
+								text: block.thinking.toWellFormed(),
+								thoughtSignature,
+							});
+						}
 					} else {
 						parts.push({
 							text: block.thinking.toWellFormed(),
@@ -237,7 +293,7 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 					const part: Part = {
 						functionCall: {
 							name: block.name,
-							args: block.arguments ?? {},
+							args: sanitizeJsonStrings(block.arguments ?? {}) as Record<string, unknown>,
 							...(requiresToolCallId(model.id) ? { id: block.id } : {}),
 						},
 					};
@@ -467,7 +523,7 @@ export function pushToolCallEvents(
 	stream.push({
 		type: "toolcall_delta",
 		contentIndex,
-		delta: JSON.stringify(toolCall.arguments),
+		delta: JSON.stringify(sanitizeJsonStrings(toolCall.arguments)),
 		partial: output,
 	});
 	stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
@@ -518,16 +574,29 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 	output: AssistantMessage;
 	stream: AssistantMessageEventStream;
 	model: Model<T>;
-	options: { signal?: AbortSignal } | undefined;
+	options: { signal?: AbortSignal; fetch?: unknown } | undefined;
+	callerFetch?: unknown;
+	adapterInvocation?: ProviderSafetyStopAdapterInvocation;
 	/** Vertex preserves `textSignature` on streamed text deltas; google-generative-ai does not. */
 	retainTextSignature?: boolean;
 	onFirstToken?: () => void;
 }): Promise<void> {
-	const { googleStream, output, stream, model, options, retainTextSignature, onFirstToken } = args;
+	const {
+		googleStream,
+		output,
+		stream,
+		model,
+		options,
+		callerFetch,
+		adapterInvocation,
+		retainTextSignature,
+		onFirstToken,
+	} = args;
 	const blocks = output.content;
 	const blockIndex = () => blocks.length - 1;
 	let currentBlock: TextContent | ThinkingContent | null = null;
 	let firstTokenSeen = false;
+	let providerSafetyStop = false;
 
 	const flushCurrent = () => {
 		if (!currentBlock) return;
@@ -607,9 +676,57 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 		}
 
 		if (candidate?.finishReason) {
-			output.stopReason = mapStopReason(candidate.finishReason);
-			if (output.content.some(b => b.type === "toolCall")) {
-				output.stopReason = "toolUse";
+			if (isGoogleCandidateSafetyStopReason(candidate.finishReason)) {
+				providerSafetyStop = true;
+				// Terminal authority is minted by the adapter after parsing the
+				// structured candidate finish reason; a wire-assignable field
+				// alone never carries it (#4777).
+				const authenticated = mintProviderSafetyStop(
+					output,
+					candidate.finishReason,
+					PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+					callerFetch,
+					adapterInvocation,
+				);
+				output.stopReason = "error";
+				if (!authenticated) {
+					output.transportFailure = {
+						kind: "transport",
+						status: 500,
+						providerCode: "untrusted_safety_stop",
+					};
+				}
+			} else if (!providerSafetyStop) {
+				output.stopReason = mapStopReason(candidate.finishReason);
+				if (output.stopReason === "stop" && output.content.some(b => b.type === "toolCall")) {
+					output.stopReason = "toolUse";
+				}
+			}
+		}
+
+		const blockReason = getGooglePromptBlockReason(chunk.promptFeedback);
+		if (blockReason) {
+			if (isGooglePromptSafetyStopReason(blockReason)) {
+				providerSafetyStop = true;
+				// Prompt-level block reasons carry the same adapter-minted
+				// authority as candidate finish reasons (#4777).
+				const authenticated = mintProviderSafetyStop(
+					output,
+					blockReason,
+					PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+					callerFetch,
+					adapterInvocation,
+				);
+				output.stopReason = "error";
+				if (!authenticated) {
+					output.transportFailure = {
+						kind: "transport",
+						status: 500,
+						providerCode: "untrusted_safety_stop",
+					};
+				}
+			} else if (!providerSafetyStop) {
+				output.stopReason = "error";
 			}
 		}
 
@@ -782,7 +899,7 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 		try {
 			const plan = await prepare();
 			let params = plan.params;
-			const replacement = await options?.onPayload?.(params, model);
+			const replacement = await options?.onPayload?.(params, model, options?.attemptScope);
 			if (replacement !== undefined) {
 				params = replacement as GenerateContentParameters;
 			}
@@ -804,6 +921,7 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 				options.toolChoice !== "auto" &&
 				options.toolChoice !== "none";
 			const fetchImpl = plan.fetch ?? options?.fetch ?? (globalThis.fetch.bind(globalThis) as FetchImpl);
+			options?.onStreamCreated?.();
 			let response = await fetchImpl(plan.url, {
 				method: "POST",
 				headers: { ...plan.headers, "Content-Type": "application/json", Accept: "text/event-stream" },
@@ -816,7 +934,12 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 					new Error(`Google API error (${response.status}): ${extractGoogleErrorMessage(errorText)}`),
 					response.status,
 				);
-				if (firstTokenTime === undefined && isForcedToolChoiceUnsupportedError(error, true)) {
+				if (
+					!options?.fallbackManaged &&
+					!options?.disableProviderRetries &&
+					firstTokenTime === undefined &&
+					isForcedToolChoiceUnsupportedError(error, true)
+				) {
 					const beforeMark = resolveToolChoice(model, options?.toolChoice);
 					markToolChoiceIncapability(model, "auto", error.message);
 					stream.push({
@@ -836,6 +959,7 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 					params = retryParams;
 					rawRequestDump = { ...rawRequestDump, body: params };
 					wireBody = paramsToWireBody(params);
+					options?.onStreamCreated?.();
 					response = await fetchImpl(plan.url, {
 						method: "POST",
 						headers: { ...plan.headers, "Content-Type": "application/json", Accept: "text/event-stream" },
@@ -857,9 +981,36 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 				throw new Error("Google API returned an empty response body");
 			}
 
-			const googleStream = readSseJson<GenerateContentResponse>(response.body, options?.signal, event =>
-				options?.onSseEvent?.({ event: event.event, data: event.data, raw: [...event.raw] }, model),
-			);
+			const mediaType = (response.headers.get("content-type") ?? "").split(";", 1)[0]?.trim().toLowerCase() ?? "";
+			const isJsonLines =
+				mediaType === "application/x-ndjson" ||
+				mediaType === "application/ndjson" ||
+				mediaType === "application/jsonl" ||
+				mediaType === "application/x-jsonl";
+			const rawEventObserver = options?.onSseEvent;
+			const googleStream = isJsonLines
+				? readJsonl<GenerateContentResponse>(
+						response.body,
+						options?.signal,
+						rawEventObserver
+							? raw => {
+									if (raw.trim().length === 0) return;
+									rawEventObserver({ event: null, data: raw, raw: [raw] }, model, options?.attemptScope);
+								}
+							: undefined,
+					)
+				: readSseJson<GenerateContentResponse>(
+						response.body,
+						options?.signal,
+						rawEventObserver
+							? event =>
+									rawEventObserver(
+										{ event: event.event, data: event.data, raw: [...event.raw] },
+										model,
+										options?.attemptScope,
+									)
+							: undefined,
+					);
 
 			stream.push({ type: "start", partial: output });
 			await consumeGoogleStream({
@@ -868,6 +1019,8 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 				stream,
 				model,
 				options,
+				callerFetch: plan.fetch ?? options?.fetch,
+				adapterInvocation: isProviderSafetyStopAdapterInvocation(options),
 				retainTextSignature,
 				onFirstToken: () => {
 					firstTokenTime = Date.now();
@@ -886,6 +1039,7 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(error);
+			output.transportFailure = transportFailureFacts(error) ?? output.transportFailure;
 			output.errorMessage = await finalizeErrorMessage(error, rawRequestDump);
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;

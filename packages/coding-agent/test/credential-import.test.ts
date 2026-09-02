@@ -16,6 +16,7 @@ import {
 	filterAutoImportOAuthCredentials,
 	formatCredentialSummary,
 	formatDiscoverySummary,
+	getAutoImportOAuthCredentialSkips,
 	importCredentials,
 	isAutoImportOAuthCredential,
 } from "../src/setup/credential-import";
@@ -332,6 +333,98 @@ describe("discoverExternalCredentials", () => {
 		const result = await discover();
 		expect(result.skipped[0]!.reason).toBe("malformed credential file (SyntaxError)");
 	});
+
+	// Claude Code and Codex both relocate their own credential file through the
+	// environment, and Orca-style account switchers rely on that redirect. gjc
+	// used to read `~/.claude` / `~/.codex` unconditionally, so it imported the
+	// wrong account whenever the launching shell selected another one.
+	describe("relocated external CLI config roots", () => {
+		let redirectDir = "";
+
+		beforeEach(async () => {
+			redirectDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cred-redirect-"));
+		});
+
+		afterEach(async () => {
+			await fs.rm(redirectDir, { recursive: true, force: true });
+		});
+
+		test("CLAUDE_CONFIG_DIR redirects Claude discovery", async () => {
+			await writeClaude({ claudeAiOauth: { accessToken: "sk-ant-oat01-home-account", refreshToken: "r" } });
+			await fs.writeFile(path.join(redirectDir, ".credentials.json"), JSON.stringify(validClaude));
+			const result = await discoverExternalCredentials({
+				homeDir,
+				platform: "linux",
+				env: { CLAUDE_CONFIG_DIR: redirectDir },
+			});
+			expect(result.importable).toHaveLength(1);
+			const cred = result.importable[0]!;
+			expect(cred.origin).toBe("claude-code-file");
+			expect(cred.credential.type === "oauth" && cred.credential.access).toBe(CLAUDE_ACCESS);
+			expect(cred.source).toBe("Claude Code ($CLAUDE_CONFIG_DIR/.credentials.json)");
+			expect(cred.source).not.toContain(redirectDir);
+		});
+
+		test("CODEX_HOME redirects Codex discovery", async () => {
+			await writeCodex({ tokens: { access_token: "stale", refresh_token: "stale-refresh" } });
+			await fs.writeFile(path.join(redirectDir, "auth.json"), JSON.stringify(validCodexOAuth));
+			const result = await discoverExternalCredentials({
+				homeDir,
+				platform: "linux",
+				env: { CODEX_HOME: redirectDir },
+			});
+			const codex = result.importable.find(c => c.origin === "codex-file");
+			expect(codex).toBeDefined();
+			expect(codex!.credential.type === "oauth" && codex!.credential.refresh).toBe(CODEX_REFRESH);
+			expect(codex!.source).toBe("Codex CLI ($CODEX_HOME/auth.json)");
+			expect(codex!.source).not.toContain(redirectDir);
+		});
+
+		test("an unreadable redirected root is reported without the resolved path", async () => {
+			// A directory where the credential file is expected keeps read() from
+			// returning ENOENT, so the failure reaches `skipped`.
+			await fs.mkdir(path.join(redirectDir, "auth.json"), { recursive: true });
+			const result = await discoverExternalCredentials({
+				homeDir,
+				platform: "linux",
+				env: { CODEX_HOME: redirectDir },
+			});
+			expect(result.skipped).toHaveLength(1);
+			expect(result.skipped[0]!.source).toBe("Codex CLI ($CODEX_HOME/auth.json)");
+			expect(result.skipped[0]!.reason).not.toContain(redirectDir);
+		});
+
+		test.each([
+			["relative", "relative/codex-home"],
+			["blank", "   "],
+			["empty", ""],
+		])("a %s CODEX_HOME falls back to the home default", async (_label, value) => {
+			await writeCodex(validCodexOAuth);
+			const result = await discoverExternalCredentials({
+				homeDir,
+				platform: "linux",
+				env: { CODEX_HOME: value },
+			});
+			const codex = result.importable.find(c => c.origin === "codex-file");
+			expect(codex).toBeDefined();
+			expect(codex!.source).toBe("Codex CLI (~/.codex/auth.json)");
+		});
+
+		test("explicit options win over the environment", async () => {
+			await fs.mkdir(path.join(redirectDir, "codex"), { recursive: true });
+			await fs.writeFile(path.join(redirectDir, "codex", "auth.json"), JSON.stringify(validCodexOAuth));
+			await writeCodex({ tokens: { access_token: "stale", refresh_token: "stale-refresh" } });
+			const result = await discoverExternalCredentials({
+				homeDir,
+				platform: "linux",
+				env: { CODEX_HOME: path.join(redirectDir, "missing") },
+				codexHome: path.join(redirectDir, "codex"),
+			});
+			const codex = result.importable.find(c => c.origin === "codex-file");
+			expect(codex).toBeDefined();
+			expect(codex!.credential.type === "oauth" && codex!.credential.refresh).toBe(CODEX_REFRESH);
+		});
+	});
 });
 
 describe("importCredentials", () => {
@@ -419,47 +512,34 @@ describe("auto-import OAuth filter and orchestrator", () => {
 			origin: "claude-code-file" as const,
 			source: "Claude Code (test)",
 			kind: "oauth" as const,
+			expiresAt: Date.now() + 60_000,
 			redactedToken: "sk-a…oken",
-			credential: { type: "oauth" as const, access: "a", refresh: "r", expires: Date.now() },
+			credential: { type: "oauth" as const, access: "a", refresh: "r", expires: Date.now() + 60_000 },
 			...overrides,
 		};
 	}
 
-	test("OAuth-only accept/reject matrix", () => {
-		const accepted = [
-			oauthCredential(),
-			oauthCredential({ origin: "claude-code-keychain", source: "Claude Code (macOS Keychain)" }),
-			oauthCredential({ provider: "openai-codex", origin: "codex-file", source: "Codex CLI (~/.codex/auth.json)" }),
-		];
+	test("auto-import requires a finite OAuth expiry strictly after the captured clock", () => {
+		const now = 1_000;
+		const futureClaude = oauthCredential();
+		const futureCodex = oauthCredential({ provider: "openai-codex", origin: "codex-file" });
 		const rejected = [
-			oauthCredential({
-				provider: "openai-codex",
-				origin: "codex-file",
-				kind: "api_key",
-				credential: { type: "api_key", key: "k" },
-			}),
-			oauthCredential({
-				provider: "anthropic",
-				origin: "claude-code-file",
-				kind: "oauth",
-				credential: { type: "api_key", key: "k" },
-			}),
-			oauthCredential({
-				provider: "anthropic",
-				origin: "claude-code-keychain",
-				kind: "api_key",
-				credential: { type: "api_key", key: "k" },
-			}),
-			oauthCredential({
-				provider: "openai-codex",
-				origin: "codex-file",
-				kind: "oauth",
-				credential: { type: "api_key", key: "k" },
-			}),
+			oauthCredential({ expiresAt: undefined }),
+			oauthCredential({ expiresAt: Number.NaN }),
+			oauthCredential({ expiresAt: 0 }),
+			oauthCredential({ expiresAt: now }),
+			oauthCredential({ expiresAt: now - 1 }),
+			oauthCredential({ provider: "openai-codex", origin: "codex-file", expiresAt: undefined }),
 		];
-		for (const credential of accepted) expect(isAutoImportOAuthCredential(credential)).toBe(true);
-		for (const credential of rejected) expect(isAutoImportOAuthCredential(credential)).toBe(false);
-		expect(filterAutoImportOAuthCredentials([...accepted, ...rejected])).toEqual(accepted);
+
+		for (const credential of [futureClaude, futureCodex])
+			expect(isAutoImportOAuthCredential(credential, now)).toBe(true);
+		for (const credential of rejected) expect(isAutoImportOAuthCredential(credential, now)).toBe(false);
+		expect(getAutoImportOAuthCredentialSkips([...rejected, futureClaude], now)).toHaveLength(rejected.length);
+		expect(filterAutoImportOAuthCredentials([...rejected, futureClaude, futureCodex])).toEqual([
+			futureClaude,
+			futureCodex,
+		]);
 	});
 
 	test("provider-origin pairings reject impossible source/provider combinations", () => {
@@ -470,12 +550,12 @@ describe("auto-import OAuth filter and orchestrator", () => {
 		const invalidCodexClaudeFile = oauthCredential({ provider: "openai-codex", origin: "claude-code-file" });
 		const invalidCodexClaudeKeychain = oauthCredential({ provider: "openai-codex", origin: "claude-code-keychain" });
 
-		expect(isAutoImportOAuthCredential(validAnthropicFile)).toBe(true);
-		expect(isAutoImportOAuthCredential(validAnthropicKeychain)).toBe(true);
-		expect(isAutoImportOAuthCredential(validCodexFile)).toBe(true);
-		expect(isAutoImportOAuthCredential(invalidAnthropicCodexFile)).toBe(false);
-		expect(isAutoImportOAuthCredential(invalidCodexClaudeFile)).toBe(false);
-		expect(isAutoImportOAuthCredential(invalidCodexClaudeKeychain)).toBe(false);
+		expect(isAutoImportOAuthCredential(validAnthropicFile, 1_000)).toBe(true);
+		expect(isAutoImportOAuthCredential(validAnthropicKeychain, 1_000)).toBe(true);
+		expect(isAutoImportOAuthCredential(validCodexFile, 1_000)).toBe(true);
+		expect(isAutoImportOAuthCredential(invalidAnthropicCodexFile, 1_000)).toBe(false);
+		expect(isAutoImportOAuthCredential(invalidCodexClaudeFile, 1_000)).toBe(false);
+		expect(isAutoImportOAuthCredential(invalidCodexClaudeKeychain, 1_000)).toBe(false);
 		expect(
 			filterAutoImportOAuthCredentials([
 				validAnthropicFile,
@@ -504,6 +584,26 @@ describe("auto-import OAuth filter and orchestrator", () => {
 		expect(calls).toEqual(["anthropic"]);
 		expect(result.imported).toEqual([credential]);
 		expect(result.discovered).toBe(true);
+	});
+	test("orchestrator leaves expired discoveries available for UI inspection without importing them", async () => {
+		const expired = oauthCredential({
+			expiresAt: 0,
+			credential: { type: "oauth", access: "a", refresh: "r", expires: 0 },
+		});
+		const calls: string[] = [];
+		const result = await runExternalCredentialAutoImport({
+			authStorage: {
+				importCredentialIfAbsent: async (provider: string) => {
+					calls.push(provider);
+					return { inserted: true, reason: "inserted", provider, entries: [] };
+				},
+			},
+			discover: async () => ({ importable: [expired], skipped: [], environment: [] }),
+			trigger: "startup",
+		});
+		expect(calls).toEqual([]);
+		expect(result.imported).toEqual([]);
+		expect(result.discovery?.importable).toEqual([expired]);
 	});
 
 	test("notice is emitted only when imported and includes exact rotation warning", () => {

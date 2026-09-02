@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/can1357/gajae-code/main/packages/coding-agent/src/config/mcp-schema.json",
+  "$id": "https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/packages/coding-agent/src/config/mcp-schema.json",
   "title": "GJC MCP configuration",
-  "description": "Schema for mcp.json, .mcp.json, .gjc/mcp.json, and ~/.gjc/agent/mcp.json used by the GJC coding agent.",
+  "description": "Schema for stored MCP server definitions in mcp.json, .mcp.json, .gjc/mcp.json, and ~/.gjc/agent/mcp.json. Ordinary standalone gjc sessions consume enabled registrations at startup (conventional autoload); --no-mcp opts a session out.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -12,7 +12,7 @@
     },
     "mcpServers": {
       "type": "object",
-      "description": "Map of MCP server name to server configuration.",
+      "description": "Map of MCP server name to stored server configuration.",
       "propertyNames": {
         "pattern": "^[a-zA-Z0-9_.-]{1,100}$"
       },
@@ -22,7 +22,7 @@
     },
     "disabledServers": {
       "type": "array",
-      "description": "User-level denylist for disabling discovered servers by name.",
+      "description": "Denylist for explicit runtime MCP consumers that load discovered or stored servers by name.",
       "items": {
         "type": "string",
         "minLength": 1
@@ -40,11 +40,16 @@
     "authConfig": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type"],
+      "required": [
+        "type"
+      ],
       "properties": {
         "type": {
           "type": "string",
-          "enum": ["oauth", "apikey"],
+          "enum": [
+            "oauth",
+            "apikey"
+          ],
           "description": "Auth strategy understood by GJC."
         },
         "credentialId": {
@@ -94,12 +99,35 @@
       "properties": {
         "enabled": {
           "type": "boolean",
-          "description": "Whether GJC should try to connect this server."
+          "description": "Whether explicit runtime MCP consumers should try to connect this server."
+        },
+        "autoload": {
+          "type": "boolean",
+          "description": "Whether an explicit runtime MCP consumer should connect this server automatically when that consumer starts (default: true). Ordinary standalone gjc, gjc --tmux, and print-mode sessions honor autoload for conventional registrations; false keeps the server configured for on-demand /mcp connection, and --no-mcp opts a session out."
+        },
+        "sharing": {
+          "type": "string",
+          "enum": [
+            "per-session",
+            "shared"
+          ],
+          "default": "per-session",
+          "description": "MCP connection pool identity mode; W2 defaults to one connection per session."
         },
         "timeout": {
           "type": "number",
           "exclusiveMinimum": 0,
           "description": "Connection timeout in milliseconds."
+        },
+        "protocol": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "2026-07-28",
+            "legacy"
+          ],
+          "default": "auto",
+          "description": "Protocol preference for remote (http/sse) servers: auto negotiates MCP 2026-07-28 (stateless) first with a bounded observable legacy fallback; 2026-07-28 is strict modern-only; legacy forces the bounded compatibility handshake. Ignored by stdio servers."
         },
         "auth": {
           "$ref": "#/$defs/authConfig"
@@ -110,18 +138,22 @@
       }
     },
     "stdioServer": {
+      "type": "object",
+      "unevaluatedProperties": false,
       "allOf": [
         {
           "$ref": "#/$defs/serverBase"
         },
         {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["command"],
+          "required": [
+            "command"
+          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": ["stdio"],
+              "enum": [
+                "stdio"
+              ],
               "description": "Default transport when omitted."
             },
             "command": {
@@ -134,11 +166,15 @@
               "items": {
                 "type": "string"
               },
-              "description": "Arguments passed to the stdio server process."
+              "description": "Arguments passed to the stdio server process. Public CLI output redacts sensitive-looking argument values."
             },
             "env": {
               "$ref": "#/$defs/stringMap",
-              "description": "Environment variables passed to the stdio process."
+              "description": "Environment variables passed to the stdio process. Public CLI output redacts values."
+            },
+            "noInheritEnv": {
+              "type": "boolean",
+              "description": "When true, explicit runtime consumers should avoid inheriting the host environment and pass only a minimal allowlist plus explicit env keys."
             },
             "cwd": {
               "type": "string",
@@ -146,69 +182,85 @@
             }
           },
           "not": {
-            "required": ["url"]
+            "required": [
+              "url"
+            ]
           }
         }
       ]
     },
     "httpServer": {
+      "type": "object",
+      "unevaluatedProperties": false,
       "allOf": [
         {
           "$ref": "#/$defs/serverBase"
         },
         {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["type", "url"],
+          "required": [
+            "type",
+            "url"
+          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": ["http"],
+              "enum": [
+                "http"
+              ],
               "description": "Streamable HTTP transport."
             },
             "url": {
               "type": "string",
               "minLength": 1,
-              "description": "MCP endpoint URL."
+              "description": "MCP endpoint URL. Public CLI output redacts userinfo, query values, and fragments."
             },
             "headers": {
               "$ref": "#/$defs/stringMap",
-              "description": "HTTP headers sent with MCP requests."
+              "description": "HTTP headers sent with MCP requests. Public CLI output redacts values."
             }
           },
           "not": {
-            "required": ["command"]
+            "required": [
+              "command"
+            ]
           }
         }
       ]
     },
     "sseServer": {
+      "type": "object",
+      "unevaluatedProperties": false,
       "allOf": [
         {
           "$ref": "#/$defs/serverBase"
         },
         {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["type", "url"],
+          "required": [
+            "type",
+            "url"
+          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": ["sse"],
+              "enum": [
+                "sse"
+              ],
               "description": "Legacy SSE transport kept for compatibility. Prefer http for new configs."
             },
             "url": {
               "type": "string",
               "minLength": 1,
-              "description": "Legacy SSE endpoint URL."
+              "description": "Legacy SSE endpoint URL. Public CLI output redacts userinfo, query values, and fragments."
             },
             "headers": {
               "$ref": "#/$defs/stringMap",
-              "description": "HTTP headers sent with the SSE transport."
+              "description": "HTTP headers sent with the SSE transport. Public CLI output redacts values."
             }
           },
           "not": {
-            "required": ["command"]
+            "required": [
+              "command"
+            ]
           }
         }
       ]

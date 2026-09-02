@@ -3,10 +3,10 @@
  * Replaces per-provider JSON files with a single cache.db.
  */
 import { Database } from "bun:sqlite";
-import { getModelDbPath } from "@gajae-code/utils";
+import { getModelDbPath } from "@gajae-code/utils/dirs";
 import type { Api, Model } from "./types";
 
-const CACHE_SCHEMA_VERSION = 3;
+const CACHE_SCHEMA_VERSION = 5;
 
 interface CacheRow {
 	provider_id: string;
@@ -14,6 +14,8 @@ interface CacheRow {
 	updated_at: number;
 	authoritative: number;
 	static_fingerprint: string;
+	dynamic_model_ids: string | null;
+	dynamic_model_provenance: string | null;
 	models: string;
 }
 
@@ -33,6 +35,9 @@ interface CacheEntry<TApi extends Api = Api> {
 	 * match — the cache already incorporates the same static state.
 	 */
 	staticFingerprint: string;
+	/** IDs returned by the authoritative dynamic provider catalog, when retained. */
+	dynamicModelIds: string[] | undefined;
+	dynamicModelProvenance: string | undefined;
 }
 
 let sharedDb: Database | null = null;
@@ -56,6 +61,8 @@ function getDb(dbPath?: string): Database {
 			updated_at INTEGER NOT NULL,
 			authoritative INTEGER NOT NULL DEFAULT 0,
 			static_fingerprint TEXT NOT NULL DEFAULT '',
+			dynamic_model_ids TEXT,
+			dynamic_model_provenance TEXT,
 			models TEXT NOT NULL
 		)
 	`);
@@ -66,12 +73,28 @@ function getDb(dbPath?: string): Database {
 	return db;
 }
 
+/** Close the shared cache only when it owns the exact requested database path. */
+export function closeModelCache(dbPath?: string): boolean {
+	const resolvedPath = dbPath ?? getModelDbPath();
+	if (!sharedDb || sharedDbPath !== resolvedPath) return false;
+	sharedDb.close();
+	sharedDb = null;
+	sharedDbPath = null;
+	return true;
+}
+
 function migrateCacheSchema(db: Database): void {
 	const columns = db.prepare("PRAGMA table_info(model_cache)").all() as TableInfoRow[];
 	if (!columns.some(column => column.name === "static_fingerprint")) {
 		db.run("ALTER TABLE model_cache ADD COLUMN static_fingerprint TEXT NOT NULL DEFAULT ''");
 	}
-	db.run("UPDATE model_cache SET version = ? WHERE version = 2", [CACHE_SCHEMA_VERSION]);
+	if (!columns.some(column => column.name === "dynamic_model_ids")) {
+		db.run("ALTER TABLE model_cache ADD COLUMN dynamic_model_ids TEXT");
+	}
+	if (!columns.some(column => column.name === "dynamic_model_provenance")) {
+		db.run("ALTER TABLE model_cache ADD COLUMN dynamic_model_provenance TEXT");
+	}
+	db.run("UPDATE model_cache SET version = ? WHERE version IN (2, 3, 4)", [CACHE_SCHEMA_VERSION]);
 }
 
 export function readModelCache<TApi extends Api>(
@@ -95,6 +118,8 @@ export function readModelCache<TApi extends Api>(
 			authoritative: row.authoritative === 1,
 			updatedAt: row.updated_at,
 			staticFingerprint: row.static_fingerprint ?? "",
+			dynamicModelIds: row.dynamic_model_ids === null ? undefined : (JSON.parse(row.dynamic_model_ids) as string[]),
+			dynamicModelProvenance: row.dynamic_model_provenance ?? undefined,
 		};
 	} catch {
 		return null;
@@ -108,22 +133,104 @@ export function writeModelCache<TApi extends Api>(
 	authoritative: boolean,
 	staticFingerprint: string,
 	dbPath?: string,
+	dynamicModelIds?: readonly string[],
+	dynamicModelProvenance?: string,
 ): void {
 	try {
 		const db = getDb(dbPath);
 		db.run(
-			`INSERT OR REPLACE INTO model_cache (provider_id, version, updated_at, authoritative, static_fingerprint, models)
-			 VALUES (?, ?, ?, ?, ?, ?)`,
+			`INSERT OR REPLACE INTO model_cache (provider_id, version, updated_at, authoritative, static_fingerprint, dynamic_model_ids, dynamic_model_provenance, models)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			[
 				providerId,
 				CACHE_SCHEMA_VERSION,
 				updatedAt,
 				authoritative ? 1 : 0,
 				staticFingerprint,
+				dynamicModelIds === undefined ? null : JSON.stringify(dynamicModelIds),
+				dynamicModelProvenance ?? null,
 				JSON.stringify(models),
 			],
 		);
 	} catch {
 		// Cache writes are best-effort; failures should not break model resolution.
+	}
+}
+
+export function insertModelCacheIfAbsent<TApi extends Api>(
+	providerId: string,
+	updatedAt: number,
+	models: Model<TApi>[],
+	authoritative: boolean,
+	staticFingerprint: string,
+	dbPath?: string,
+	dynamicModelIds?: readonly string[],
+	dynamicModelProvenance?: string,
+): boolean {
+	try {
+		const result = getDb(dbPath).run(
+			`INSERT INTO model_cache (provider_id, version, updated_at, authoritative, static_fingerprint, dynamic_model_ids, dynamic_model_provenance, models)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(provider_id) DO NOTHING`,
+			[
+				providerId,
+				CACHE_SCHEMA_VERSION,
+				updatedAt,
+				authoritative ? 1 : 0,
+				staticFingerprint,
+				dynamicModelIds === undefined ? null : JSON.stringify(dynamicModelIds),
+				dynamicModelProvenance ?? null,
+				JSON.stringify(models),
+			],
+		);
+		return result.changes === 1;
+	} catch {
+		return false;
+	}
+}
+
+export function updateModelCacheIfUnchanged<TApi extends Api>(
+	providerId: string,
+	expectedUpdatedAt: number,
+	expectedDynamicModelIds: readonly string[] | undefined,
+	expectedDynamicModelProvenance: string | undefined,
+	expectedModels: readonly Model<TApi>[],
+	updatedAt: number,
+	models: Model<TApi>[],
+	authoritative: boolean,
+	staticFingerprint: string,
+	dbPath?: string,
+	dynamicModelIds?: readonly string[],
+	dynamicModelProvenance?: string,
+): boolean {
+	try {
+		const expectedIds = expectedDynamicModelIds === undefined ? null : JSON.stringify(expectedDynamicModelIds);
+		const provenance = expectedDynamicModelProvenance ?? null;
+		const nextIds = dynamicModelIds === undefined ? null : JSON.stringify(dynamicModelIds);
+		const nextProvenance = dynamicModelProvenance ?? null;
+		const expectedModelsJson = JSON.stringify(expectedModels);
+		const result = getDb(dbPath).run(
+			`UPDATE model_cache
+			 SET updated_at = ?, authoritative = ?, static_fingerprint = ?, dynamic_model_ids = ?,
+			     dynamic_model_provenance = ?, models = ?
+			 WHERE provider_id = ? AND updated_at = ?
+			   AND dynamic_model_ids IS ? AND dynamic_model_provenance IS ? AND models = ?`,
+			[
+				updatedAt,
+				authoritative ? 1 : 0,
+				staticFingerprint,
+				nextIds,
+				nextProvenance,
+				JSON.stringify(models),
+				providerId,
+				expectedUpdatedAt,
+				expectedIds,
+				provenance,
+				expectedModelsJson,
+			],
+		);
+		return result.changes === 1;
+	} catch {
+		return false;
 	}
 }

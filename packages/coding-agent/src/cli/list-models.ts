@@ -1,7 +1,7 @@
 /**
  * List available models with optional fuzzy search
  */
-import { type Api, getSupportedEfforts, type Model } from "@gajae-code/ai";
+import { type Api, getSupportedEfforts, type Model } from "@gajae-code/ai/core";
 import { fuzzyFilter } from "@gajae-code/tui";
 import { formatNumber } from "@gajae-code/utils";
 import type { ModelRegistry } from "../config/model-registry";
@@ -69,17 +69,14 @@ export async function listModels(modelRegistry: ModelRegistry, searchPattern?: s
 	}
 
 	const filteredCanonical = modelRegistry
-		.getCanonicalModels({ availableOnly: true, candidates: filteredModels })
-		.map(record => {
-			const selected = modelRegistry.resolveCanonicalModel(record.id, {
-				availableOnly: true,
-				candidates: filteredModels,
-			});
+		.getCanonicalModelSelections({ availableOnly: true, candidates: filteredModels })
+		.map(selection => {
+			const selected = selection.model;
 			if (!selected) return undefined;
 			return {
-				canonical: record.id,
+				canonical: selection.record.id,
 				selected: `${selected.provider}/${selected.id}`,
-				variants: String(record.variants.length),
+				variants: String(selection.record.variants.length),
 				context: formatNumber(selected.contextWindow),
 				maxOut: formatNumber(selected.maxTokens),
 			} satisfies CanonicalRow;
@@ -191,7 +188,7 @@ export async function runListModelsCommand(options: RunListModelsOptions): Promi
 		process.stderr.write(`Failed to load extension: ${extPath}: ${error}\n`);
 	}
 
-	// Mirror sdk.ts: drain pending provider registrations into the registry.
+	// Mirror sdk/session.ts: drain pending provider registrations into the registry.
 	const activeSources = extensionsResult.extensions.map(extension => extension.path);
 	modelRegistry.syncExtensionSources(activeSources);
 	for (const sourceId of new Set(activeSources)) {

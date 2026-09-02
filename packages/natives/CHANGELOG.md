@@ -2,6 +2,221 @@
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-02
+
+- Added exact-identity detached cleanup export for safely removing stale claim files without following replacement paths or retaining the JavaScript lifecycle; cleanup dispatch uses a bounded native worker queue and reports queue admission so callers can retry saturation.
+
+## [0.15.6] - 2026-08-30
+
+## [0.15.5] - 2026-08-29
+
+### Added
+
+- `fuzzyFind` subsequence scoring supports Hangul chosung (초성) matching: a bare consonant jamo in the query matches any syllable with that initial consonant. Exact, prefix, and contains tiers are unchanged, so literal matches keep outranking chosung matches.
+## [0.15.4] - 2026-08-29
+
+### Fixed
+
+- `fuzzyFind` NFC-normalizes queries and candidate paths before scoring so composed (NFC) queries match decomposed (NFD) file names as returned by macOS volumes.
+
+## [0.15.3] - 2026-08-27
+
+### Fixed
+
+- Notification hosts can now obtain opaque exact-generation, prerequisite-bound receipts for accepted directed frames and queue a dependent idle on that bounded recipient cohort; raw fallbacks carry their prerequisite and idle in one writer command without global barriers or accumulating timeout waiters.
+- Notification frame fan-out can now exclude explicitly opted-in adapter connections that already accepted the matching positioned SDK event, preserving existing delivery for ordinary direct SDK and raw-only legacy subscribers.
+
+## [0.15.2] - 2026-08-25
+
+### Changed
+
+- Version 0.15.1 was tagged but never published: release automation failed while deriving release notes, before any package reached npm. Everything listed under `## [0.15.1]` below ships in this release.
+
+## [0.15.1] - 2026-08-25
+### Fixed
+
+- Windows bash-tool children no longer open visible console windows when GJC runs as a console-less ACP/GUI host (#4883). The native brush shell spawned every external command with default creation flags, so from a console-less parent each child (python/cmd/powershell) made Windows allocate its own visible top-level console — a flashing, focus-stealing window per bash call. External spawns now add `CREATE_NO_WINDOW` when the host process has no console (`GetConsoleWindow() == null`), composed with `CREATE_NEW_PROCESS_GROUP` so cancellation still works; a hidden console is inherited by grandchildren instead of letting them allocate fresh visible ones (`DETACHED_PROCESS` is deliberately not used). Console-attached interactive sessions are unchanged: they keep inheriting the parent console. The shell-session `where git` probe gets the same treatment, and the contract is covered by Windows-gated Rust tests plus a live windows-latest regression (`windows-hidden-shell.windows.test.ts`) that detaches the host console and asserts child console-window state via P/Invoke.
+
+## [0.15.0] - 2026-08-22
+### Fixed
+
+- Upgraded napi-rs to `napi` 3.12.2 / `napi-derive` 3.6.3. Under Bun 1.4.0 the generated argument-reference container for an async `#[napi]` method asserted on `napi_reference_unref` returning `napi_invalid_arg` during teardown, so an SDK session host aborted with SIGABRT (exit 134) instead of exiting 0 after a graceful `session.close`.
+- Windows installed-package addons are loaded from atomically published, content-addressed cache paths instead of directly from `node_modules`, so a running process no longer locks the package-manager replacement target. The loader holds a Windows read handle that denies write/delete sharing from byte validation through pathname-based native loading; concurrent launches reuse only a byte-identical winner, variant fallback order is preserved, and partial, replaceable, or drifted cache entries fail closed without falling back to the install artifact.
+- Windows AVX2 PowerShell fallback probes are now bounded to 4 seconds with a hard kill, hidden-window execution, and capped output; timeout, spawn-error, and non-decisive results fail closed to the baseline variant while emitting only bounded shape diagnostics (#4781).
+- Windows AVX2 detection no longer flashes a console window on GJC process start (#4652). The native loader and the build-time host probe now ask `kernel32.dll!IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE)` in-process via `bun:ffi` (no subprocess, no window), fall back to a hidden (`windowsHide`) PowerShell probe using an `Add-Type` P/Invoke that also works on stock Windows PowerShell 5.1, and fail safe to the baseline variant when both are unavailable. Previously the probe ran `[System.Runtime.Intrinsics.X86.Avx2]::IsSupported` — unhedded, so detached console-less parents (SDK broker, session hosts) spawned a visible OpenConsole/WindowsTerminal window per process start, and on PowerShell 5.1 the type does not exist, silently forcing the baseline addon on AVX2-capable machines.
+
+## [0.14.2] - 2026-08-20
+
+### Fixed
+- Retained SDK broker heartbeat and watchdog observation run off the JS thread, and shutdown/observation no longer hold the retained writer lock (#4704).
+- Notification debris cleanup binds to native identity instead of re-quarantining native exchange debris on recovery.
+
+## [0.14.1] - 2026-08-18
+### Fixed
+
+- Windows AVX2 detection no longer flashes a console window on GJC process start (#4652). The native loader and the build-time host probe now ask `kernel32.dll!IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE)` in-process via `bun:ffi` (no subprocess, no window), fall back to a hidden (`windowsHide`) PowerShell probe using an `Add-Type` P/Invoke that also works on stock Windows PowerShell 5.1, and fail safe to the baseline variant when both are unavailable. Previously the probe ran `[System.Runtime.Intrinsics.X86.Avx2]::IsSupported` — unhedded, so detached console-less parents (SDK broker, session hosts) spawned a visible OpenConsole/WindowsTerminal window per process start, and on PowerShell 5.1 the type does not exist, silently forcing the baseline addon on AVX2-capable machines.
+
+## [0.14.0] - 2026-08-17
+### Changed
+
+- Managed session files may now be up to 128 MiB, keeping retained-tree validation aligned with large resumable session transcripts and checkpoints.
+- Recovery filesystem roots can now open descriptor-retained regular-file streams with no-follow component traversal for bounded external-session ingestion.
+
+### Added
+
+- `renameNoReplacePathAsync` and `linkNoReplacePathAsync`, async variants of the checked no-replace namespace publication primitives, scheduled on the native blocking-work pool so managed output publication can await the rename/link syscall boundary without blocking the host event loop (#4394).
+
+### Fixed
+- Bounded each SDK connection's queued host-directed frames to the positioned-event replay-ring capacity. Slow or stalled subscribers now reject excess directed sends for replay recovery instead of retaining an unbounded in-memory writer backlog; accepted frames remain serialized through the same connection writer.
+- `exactReplacePath` now retries transient Windows destination-sharing violations (#4330): when another handle denies delete sharing on the destination, the pre-mutation destination open is retried a bounded 30 × 100 ms before failing, and an exhausted retry reports the specific `sharing_violation` category with the underlying hex NTSTATUS (`windowsErrorCode`, e.g. `0xC0000043`) instead of a bare `io_error`. Only the destination open is retried — never after any namespace mutation — so a retry can never publish twice, and permission, path-not-found, disk-full, and identity failures are never retried.
+
+## [0.13.3] - 2026-08-15
+
+### Fixed
+- `break_long_word` no longer spins forever on a lone ESC that is not a valid ANSI sequence inside an over-width word (e.g. binary tool output persisted in a session); a lone ESC is consumed as a zero-width scalar like `truncate`/`slice`/`visible_width` already did, restoring interactive resume of affected sessions (#4437).
+
+## [0.13.2] - 2026-08-13
+
+### Added
+
+- `renameNoReplacePathAsync` and `linkNoReplacePathAsync` schedule checked no-replace namespace publication primitives on the native blocking-work pool, so managed output publication can await the rename/link syscall boundary without blocking the host event loop (#4396 by @Yeachan-Heo; fixes #4394).
+
+## [0.13.1] - 2026-08-11
+
+### Fixed
+
+- `Shell` now exposes `close()`, which aborts in-flight commands and drops the retained session. `abort()` only cancels running commands, so a shell whose command completed kept its session — and its native resources — alive for the rest of the host process. Holding 200 completed one-shot shells retained 14.1 MB with `abort()` versus 6.8 MB with `close()`.
+- Code summarization now runs on the native blocking-work pool and returns a promise, keeping the JavaScript render and input loop responsive while tree-sitter parses source.
+- The macOS computer batch controller is now warning-free under the workspace's strict Clippy configuration, with infallible result construction represented directly instead of wrapped in redundant `Result` values.
+- macOS Terminal.app Meta-wrapped escape sequences such as Option+Arrow are now recognized by the native key matcher and parser.
+- POSIX checked file publication now retains an open source descriptor across no-replace rename/link validation, pins exact replacements behind a verified private source link, and can retire one explicitly authorized staging hard-link name without touching the remaining published alias.
+
+### Removed
+
+- Removed the obsolete `NotificationControlServer` N-API surface. Session lifecycle mutations now enter the coding-agent SDK Broker path instead of a provider-owned native control endpoint.
+
+## [0.12.21] - 2026-08-09
+
+## [0.12.20] - 2026-08-09
+## [0.12.19] - 2026-08-08
+
+## [0.12.18] - 2026-08-08
+
+## [0.12.17] - 2026-08-08
+
+## [0.12.16] - 2026-08-08
+
+## [0.12.15] - 2026-08-06
+
+## [0.12.14] - 2026-08-06
+
+## [0.12.13] - 2026-08-06
+
+## [0.12.12] - 2026-08-05
+
+## [0.12.11] - 2026-08-03
+
+### Fixed
+
+- Native shared filesystem scans now enforce strict per-scan entry and successful-snapshot retained-capacity budgets, precharge logical ownership before allocation requests, reject allocator-granted excess with whole-scan errors instead of partial prefixes, share immutable snapshots without full-vector clones, and prevent stale in-flight scans from repopulating invalidated or TTL-expired cache entries. The byte budget does not claim a hard allocator or transient RSS ceiling. Cache retention remains compatible with #3774's 128 MiB default and zero-byte cache bypass, is bounded by both key count and aggregate bytes, and includes symlink-following behavior in cache identity (#3769, #3780).
+- Side-effecting macOS computer input now restores the global cursor after releasing held input on success, cancellation, action failure, and panic paths. Batches that include input run in one native capture-to-restore transaction; screenshot/wait-only batches stay cursor-neutral, and capture/restore failures are reported without masking the primary action error (#3642, #3781).
+
+## [0.12.10] - 2026-08-03
+
+### Fixed
+
+- Linux retained publish receipts now report the actual `linkat` or `mkdirat` fallback primitive, and a staging `unlinkat` failure after `linkat` publication is reported as committed-but-unproven with bounded errno evidence instead of as a retry-safe pre-mutation failure (#3746).
+- The native `fs_cache` scan cache is now bounded by an approximate byte budget in addition to its entry count. A single scan result larger than the budget is not cached at all, and storing a result evicts the oldest entries until the retained set fits; `FS_SCAN_CACHE_MAX_BYTES` (default `134217728`, 128 MiB) tunes it and `0` disables caching entirely. Previously 16 cached entries could each hold an arbitrarily large directory listing, so scanning a few huge trees pinned unbounded native memory for the process lifetime (#3774).
+- Managed *replacement* now works on filesystems that implement no `renameat2` rename flags. `replace_managed` reached `renameat2(RENAME_EXCHANGE)` directly and had no fallback, so on such a mount every managed replacement failed with `io_error` — and unlike the publish paths fixed in #3735, this one is reached during ordinary use: the session transcript rewrite (`#persistPatch` / `#rewriteFile` → `replaceSync`) goes through it, not just migration. A directory exchange has no window-free emulation, but this one does: `linkat(2)` gives the displaced object a second name, a plain `renameat(2)` then replaces the destination in a single atomic step that never unoccupies the name, and a final rename parks the displaced object under the candidate name where the exchange would have left it. Both objects end single-linked exactly as `RENAME_EXCHANGE` leaves them, so every identity proof the caller re-runs is unchanged. The rollback link is made durable in its own parent *before* anything is displaced, which is what makes the sequence crash-equivalent rather than only terminal-state-equivalent: the single-step primitive can never let the displaced object lose its last name, while a three-step emulation could if the replacing rename reached the disk and the rollback link did not. That sync is fail-closed — an unprovable rollback link is removed and nothing is published — and once the replacement commits, any later sync or proof failure is reported as committed-but-unproven rather than as a retryable pre-mutation failure. The destination descriptor is released between the rollback link and the replacing rename, because NFS silly-renames a still-open name that a rename displaces, which would otherwise leave the displaced object double-linked and fail its `st_nlink == 1` proof.
+
+## [0.12.8] - 2026-08-02
+### Fixed
+
+- POSIX exact directory-tree cleanup now operates only on the caller-authorized retained root, revalidates the root and each direct child against their descriptors before mutation, rejects initial and late hard-link aliases, and scrubs regular-file payloads through verified descriptors. Canonical root detachment remains the separate exact-unlink phase; replayable retained namespaces are never renamed again, and substituted successors are never renamed, unlinked, or truncated.
+
+## [0.12.7] - 2026-07-31
+
+## [0.12.6] - 2026-07-31
+
+### Fixed
+
+- Added `linkNoReplacePath`, the `linkat(2)` stand-in for `renameNoReplacePath` on filesystems that implement no `renameat2` rename flag at all (NFS answers `EINVAL`, kernels older than 3.15 `ENOSYS`). `linkat` fails with `EEXIST` on an occupied destination, so the no-overwrite guarantee is identical on every POSIX filesystem. Unlike a rename it leaves the source name in place, which is what lets a caller hold a descriptor on the staged object across publication and unlink the staging name only after releasing it. Directory sources are rejected before the syscall, since `linkat` cannot hard-link a directory.
+- Managed *tree* rename and removal no longer fail outright on those filesystems. `linkat` cannot stand in for a directory, so the no-replace tree rename and `remove_managed_tree`'s quarantine step now claim the destination name with `mkdirat(2)` — which fails `EEXIST` exactly where `RENAME_NOREPLACE` would — and then move the tree onto that freshly owned empty directory with a plain `renameat(2)`, which POSIX refuses to apply to a non-empty destination. A rename that fails after the claim removes the placeholder again, so a rejected publish never leaves an empty directory squatting the destination.
+- Retained managed publication and detachment now release their staging descriptor between the `linkat(2)` fallback's publishing link and its staging unlink, so the fallback added in 0.12.0 actually works on the filesystems it was written for. NFS silly-renames a still-open name on `unlinkat` instead of removing it, so the staging link survived as `.nfsXXXX`, the object kept a second link, and the terminal proof rejected it (`st_nlink != 1` → `hard_link`). Two launch failures followed on an NFS home directory: the first publish into a scope reported a correctly committed write as `rollback_unavailable`, and every later launch failed in `remove_managed` while reconciling the staged file after a publish that legitimately lost the no-replace race — that detach error replaced the benign `destination_conflict`, surfacing as `Could not prepare managed session scope (binding_invalid: prepare:binding_publish)`. Descriptor authority is still held across publication itself, and `remove_managed` re-proves the detached object from its quarantined name, so neither path is weaker than the `renameat2` primitive it stands in for.
+
+## [0.12.5] - 2026-07-30
+
+## [0.12.4] - 2026-07-30
+
+## [0.12.3] - 2026-07-30
+
+## [0.12.2] - 2026-07-30
+
+## [0.12.1] - 2026-07-29
+
+## [0.12.0] - 2026-07-28
+### Fixed
+
+- Native addon builds now prepend the active `rustup` toolchain's Cargo directory before invoking `napi`, so non-interactive shells without `~/.cargo/bin` on `PATH` no longer fail with opaque `cargo metadata failed to run` errors.
+- Retained managed session publication no longer fails closed on filesystems that do not implement `renameat2` rename flags (NFS and some FUSE/overlay mounts reject them with `EINVAL`; kernels older than 3.15 answer `ENOSYS`), which crashed every launch with a session store on an NFS home directory (`Could not prepare managed session scope: … durability_failed`). The no-replace **file** publish paths (binding, receipt/install, and tombstone) now fall back to an atomic `linkat(2)` create — which fails with `EEXIST` when the destination already exists — so the no-overwrite guarantee is preserved rather than weakened, and the staging link is unlinked so the published file stays single-linked. Directory/tree no-replace still requires kernel `renameat2` flag support.
+
+## [0.11.11] - 2026-07-26
+### Added
+
+- Added the `probeWindowsJobMemory` native API for advisory Windows Job Object memory-limit and usage snapshots.
+
+## [0.11.8] - 2026-07-23
+### Fixed
+
+- No-replace publication now reports dedicated mutation certainty and bounded diagnostics, and retained Linux publication syncs every distinct rename parent without short-circuiting after a failure (#2804).
+
+## [0.11.5] - 2026-07-20
+### Added
+- `Process.signalRoot` exposes stable root-only process signaling, and identity-bound exact unlink reports stale quarantines, live successors, and retained internal exchange-placeholder cleanup paths as distinct recovery evidence.
+- Added Linux-only descriptor-relative recovery filesystem authority with no-follow trusted-root stat, bounded read, exclusive create, no-replace install, fsync, and stable identity operations. Unsupported platforms and unsafe traversal, symlink, special-file, hard-link, oversized-content, or identity-swap evidence fail closed (#2681).
+- Linux owner-only path security now treats only definitive `ENOTSUP`/`EOPNOTSUPP` results from the exact POSIX ACL operation as proof that ACL storage is unsupported, while preserving descriptor-relative no-follow traversal, ownership, exact mode, type, identity, replacement, and fail-closed error checks for files and directories (#2687).
+
+## [0.11.2] - 2026-07-19
+
+### Fixed
+
+- The compiled-binary embedded-addon loader now re-extracts a cached native when its byte size does not match the embedded payload, so an intra-version rebuild that adds or removes native exports can no longer be shadowed by a stale same-version extraction in the per-version cache. The version sentinel alone cannot detect intra-version drift.
+
+## [0.11.0] - 2026-07-15
+
+### Fixed
+
+- Prefer a source-workspace native addon over optional platform packages while validating the current version sentinel on every candidate, so stale local or optional binaries fall through with actionable diagnostics instead of shadowing the active loader (#2168).
+
+### Added
+
+- Added additive SDK v3 workflow-gate bridge APIs (#2171): `registerWorkflowGateAsk` preserves a required nonempty `workflowGateId`; `registerArbitratedAsk` and `retireIfUnclaimed` support exact in-process presentation arbitration without exposing claims, receipts, epochs, routes, or other authority state. Legacy `registerAsk` remains uncorrelated and source-compatible.
+
+### Changed
+
+- Resolved the SDK v3 workflow-gate shipping classification (#2171): `workflowGateId` and Q12 diagnostics are additive SDK v3 surfaces, while `action_needed.id` remains the transient, generic `reply.id` authority. `expectedSessionId` omission remains accepted and audited for the entire SDK v3 line; new clients must send it, and mandatory enforcement or removal can occur no earlier than SDK v4 only after at least one full published deprecation release/window with deployed-client notice. Explicit session mismatches fail closed before resolution; mismatched sessions, stale/reissued actions, and unsafe ambiguity never regain authority.
+- Documented release pairing: the `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon ship from the same source release at exact matching package versions (currently `0.10.2`), with the native loader version sentinel enforcing the pair. Mixed native/runtime versions are unsupported and cannot claim SDK compatibility.
+
+### Added
+
+- Added native canonical existing-directory identity and fail-closed owner-only path-security APIs. POSIX identity is lossless UTF-8 canonicalization; Windows resolves local final volume-GUID paths, rejects network paths, and applies/verifies TokenUser protected-DACL security without following reparse points (#2177).
+
+## [0.10.0] - 2026-07-12
+### Fixed
+
+- Preserved two-cell terminal width for Hangul Filler (U+3164), VS16 emoji-presentation graphemes, and emoji-modifier sequences while aligning TUI display-width measurement with native wrapping and truncation (#1979).
+- Fixed the native notifications server to capability-gate controlled asks per connection, default-deny until `ask_controls_v1` negotiation (reset on reconnect), and send additive non-actionable `action_unavailable` frames instead of stripped option buttons to non-capable clients (#2029).
+
+### Changed
+
+- Renamed the native notifications SDK crate from `gjc-notifications` to `gjc-sdk` as part of the Gajae-Code SDK rename. Sessions and daemons must restart together across the upgrade because discovery moved from `.gjc/state/notifications/` to `.gjc/state/sdk/` without dual-scan compatibility.
+
+## [0.9.1] - 2026-07-08
+
+### Changed
+
+- Declared the glibc runtime requirement in Linux platform package metadata.
+
 ## [0.7.9] - 2026-07-01
 
 ### Changed

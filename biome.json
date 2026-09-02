@@ -32,6 +32,25 @@
 			}
 		}
 	},
+	"overrides": [
+		{
+			"includes": ["packages/coding-agent/src/**"],
+			"linter": {
+				"rules": {
+					"style": {
+						"noRestrictedImports": {
+							"level": "error",
+							"options": {
+								"paths": {
+									"@gajae-code/ai": "Import from @gajae-code/ai/core instead."
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	],
 	"formatter": {
 		"enabled": true,
 		"indentStyle": "tab",
@@ -56,8 +75,10 @@
 			"packages/*/examples/**/*.ts",
 			"packages/*/scripts/**/*.ts",
 			"packages/*/*.ts",
+			"!packages/*/src/**/*.d.ts",
 			"!packages/natives/native/index.d.ts",
 			"!**/vendor/**/*",
+			"!packages/coding-agent/src/defaults/gjc/extensions/grok-cli-vendor/**/*",
 			"!**/node_modules/**/*",
 			"!**/test-sessions.ts",
 			"!**/template.generated.ts",

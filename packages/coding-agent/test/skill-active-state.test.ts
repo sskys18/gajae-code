@@ -2,11 +2,13 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { activeStateDir, modeStatePath } from "../src/gjc-runtime/session-layout";
 import { removeActiveEntry, writeActiveEntry, writeGuardedJsonAtomic } from "../src/gjc-runtime/state-writer";
 import {
 	applyHandoffToActiveState,
 	CANONICAL_GJC_WORKFLOW_SKILLS,
 	getSkillActiveStatePaths,
+	invalidateVisibleSkillActiveStateCache,
 	listActiveSkills,
 	normalizeSkillActiveState,
 	readVisibleSkillActiveState,
@@ -34,7 +36,7 @@ describe("GJC skill-active state", () => {
 		const active = listActiveSkills({
 			active_skills: [
 				{ skill: "", active: true },
-				{ skill: "team", active: false },
+				{ skill: "autoresearch", active: false },
 				{ skill: "ralplan", phase: "draft", session_id: "sess-a" },
 				{ skill: "ralplan", phase: "review", session_id: "sess-a" },
 				{ skill: "ralplan", phase: "root" },
@@ -50,7 +52,7 @@ describe("GJC skill-active state", () => {
 		await withTempCwd(async cwd => {
 			await syncSkillActiveState({
 				cwd,
-				skill: "team",
+				skill: "autoresearch",
 				phase: "running",
 				active: true,
 				sessionId: "sess-a",
@@ -58,7 +60,7 @@ describe("GJC skill-active state", () => {
 			});
 
 			const paths = getSkillActiveStatePaths(cwd, "sess-a");
-			expect(await fs.readFile(paths.rootPath, "utf8")).toContain("team");
+			expect(await fs.readFile(paths.rootPath, "utf8")).toContain("autoresearch");
 			expect(paths.sessionPath).toBeDefined();
 			expect(await fs.readFile(paths.sessionPath ?? "", "utf8")).toContain("running");
 		});
@@ -75,7 +77,13 @@ describe("GJC skill-active state", () => {
 
 	it("filters root fallback entries to the current session", async () => {
 		await withTempCwd(async cwd => {
-			await syncSkillActiveState({ cwd, skill: "team", active: true, phase: "running", sessionId: "sess-a" });
+			await syncSkillActiveState({
+				cwd,
+				skill: "autoresearch",
+				active: true,
+				phase: "running",
+				sessionId: "sess-a",
+			});
 			await syncSkillActiveState({
 				cwd,
 				skill: "deep-interview",
@@ -91,9 +99,9 @@ describe("GJC skill-active state", () => {
 
 	it("clears only the matching session entry", async () => {
 		await withTempCwd(async cwd => {
-			await syncSkillActiveState({ cwd, skill: "team", active: true, sessionId: "sess-a" });
-			await syncSkillActiveState({ cwd, skill: "team", active: true, sessionId: "sess-b" });
-			await syncSkillActiveState({ cwd, skill: "team", active: false, sessionId: "sess-a" });
+			await syncSkillActiveState({ cwd, skill: "autoresearch", active: true, sessionId: "sess-a" });
+			await syncSkillActiveState({ cwd, skill: "autoresearch", active: true, sessionId: "sess-b" });
+			await syncSkillActiveState({ cwd, skill: "autoresearch", active: false, sessionId: "sess-a" });
 
 			const sessionA = await readVisibleSkillActiveState(cwd, "sess-a");
 			const sessionB = await readVisibleSkillActiveState(cwd, "sess-b");
@@ -106,7 +114,7 @@ describe("GJC skill-active state", () => {
 		await withTempCwd(async cwd => {
 			await syncSkillActiveState({
 				cwd,
-				skill: "team",
+				skill: "autoresearch",
 				active: true,
 				sessionId: "sess-old",
 				nowIso: "2000-01-01T00:00:00.000Z",
@@ -114,7 +122,7 @@ describe("GJC skill-active state", () => {
 
 			const visible = await readVisibleSkillActiveState(cwd, "sess-old");
 			const entry = visible?.active_skills?.[0];
-			expect(entry?.skill).toBe("team");
+			expect(entry?.skill).toBe("autoresearch");
 			expect(entry?.stale).toBeUndefined();
 		});
 	});
@@ -423,7 +431,7 @@ describe("GJC skill-active state", () => {
 				JSON.stringify({ skill: "ultragoal", phase: "goal-planning", active: true }),
 			);
 
-			await syncSkillActiveState({ cwd, skill: "team", phase: "running", active: true, sessionId: "sess1" });
+			await syncSkillActiveState({ cwd, skill: "autoresearch", phase: "running", active: true, sessionId: "sess1" });
 
 			const snapshot = JSON.parse(
 				await fs.readFile(path.join(cwd, ".gjc", "_session-sess1", "state", "skill-active-state.json"), "utf-8"),
@@ -598,7 +606,7 @@ describe("GJC skill-active state", () => {
 			});
 			await syncSkillActiveState({
 				cwd,
-				skill: "team",
+				skill: "autoresearch",
 				phase: "running",
 				active: true,
 				sessionId: "foreign-session",
@@ -630,7 +638,7 @@ describe("GJC skill-active state", () => {
 		await withTempCwd(async cwd => {
 			await syncSkillActiveState({
 				cwd,
-				skill: "team",
+				skill: "autoresearch",
 				phase: "running",
 				active: true,
 				sessionId: "sess-thread",
@@ -648,19 +656,25 @@ describe("GJC skill-active state", () => {
 			const visible = await readVisibleSkillActiveState(cwd, "sess-thread");
 			expect(visible?.active_skills?.map(entry => [entry.skill, entry.thread_id])).toEqual([
 				["ultragoal", "thread-b"],
-				["team", "thread-a"],
+				["autoresearch", "thread-a"],
 			]);
 		});
 	});
 
-	it("planning pipeline collapse keeps downstream planning skill while preserving team alongside ultragoal", async () => {
+	it("planning pipeline collapse keeps downstream planning skill while preserving autoresearch alongside ultragoal", async () => {
 		await withTempCwd(async cwd => {
 			await syncSkillActiveState({ cwd, skill: "ralplan", phase: "planner", active: true, sessionId: "sess-pipe" });
-			await syncSkillActiveState({ cwd, skill: "team", phase: "running", active: true, sessionId: "sess-pipe" });
+			await syncSkillActiveState({
+				cwd,
+				skill: "autoresearch",
+				phase: "research",
+				active: true,
+				sessionId: "sess-pipe",
+			});
 			await syncSkillActiveState({ cwd, skill: "ultragoal", phase: "active", active: true, sessionId: "sess-pipe" });
 
 			const visible = await readVisibleSkillActiveState(cwd, "sess-pipe");
-			expect(visible?.active_skills?.map(entry => entry.skill)).toEqual(["ultragoal", "team"]);
+			expect(visible?.active_skills?.map(entry => entry.skill)).toEqual(["ultragoal", "autoresearch"]);
 		});
 	});
 
@@ -692,7 +706,140 @@ describe("GJC skill-active state", () => {
 		});
 	});
 
+	it("security-tier visible reads observe external active-entry changes on the next read", async () => {
+		await withTempCwd(async cwd => {
+			invalidateVisibleSkillActiveStateCache();
+			await syncSkillActiveState({
+				cwd,
+				skill: "deep-interview",
+				phase: "interviewing",
+				active: true,
+				sessionId: "sess-cache",
+			});
+			const first = await readVisibleSkillActiveState(cwd, "sess-cache", { tier: "security" });
+			expect(first?.active_skills?.map(entry => entry.skill)).toEqual(["deep-interview"]);
+
+			await fs.writeFile(
+				path.join(activeStateDir(cwd, "sess-cache"), "ultragoal.json"),
+				JSON.stringify({
+					skill: "ultragoal",
+					phase: "active",
+					active: true,
+					session_id: "sess-cache",
+					updated_at: "2026-01-01T00:10:00.000Z",
+				}),
+			);
+
+			const second = await readVisibleSkillActiveState(cwd, "sess-cache", { tier: "security" });
+			expect(second?.active_skills?.map(entry => entry.skill)).toEqual(["ultragoal"]);
+		});
+	});
+
+	it("hud-tier visible reads may serve stale within TTL while security-tier refreshes", async () => {
+		await withTempCwd(async cwd => {
+			invalidateVisibleSkillActiveStateCache();
+			await syncSkillActiveState({
+				cwd,
+				skill: "autoresearch",
+				phase: "running",
+				active: true,
+				sessionId: "sess-hud-cache",
+			});
+			const initial = await readVisibleSkillActiveState(cwd, "sess-hud-cache", { tier: "hud" });
+			expect(initial?.active_skills?.[0]?.phase).toBe("running");
+
+			await fs.writeFile(
+				path.join(activeStateDir(cwd, "sess-hud-cache"), "autoresearch.json"),
+				JSON.stringify({
+					skill: "autoresearch",
+					phase: "changed-externally-with-longer-size",
+					active: true,
+					session_id: "sess-hud-cache",
+					updated_at: "2026-01-01T00:10:00.000Z",
+				}),
+			);
+
+			const staleHud = await readVisibleSkillActiveState(cwd, "sess-hud-cache", { tier: "hud" });
+			expect(staleHud?.active_skills?.[0]?.phase).toBe("running");
+			const freshSecurity = await readVisibleSkillActiveState(cwd, "sess-hud-cache", { tier: "security" });
+			expect(freshSecurity?.active_skills?.[0]?.phase).toBe("changed-externally-with-longer-size");
+		});
+	});
+
+	it("cache-bypassed visible reads observe same-stat external replacements", async () => {
+		await withTempCwd(async cwd => {
+			invalidateVisibleSkillActiveStateCache();
+			await syncSkillActiveState({
+				cwd,
+				skill: "autoresearch",
+				phase: "running",
+				active: true,
+				sessionId: "sess-bypass-cache",
+			});
+			const autoresearchPath = path.join(activeStateDir(cwd, "sess-bypass-cache"), "autoresearch.json");
+			const original = await fs.readFile(autoresearchPath, "utf8");
+			const replacement = original.replace('"running"', '"stopped"');
+			expect(replacement).not.toBe(original);
+			expect(Buffer.byteLength(replacement)).toBe(Buffer.byteLength(original));
+			const stat = await fs.stat(autoresearchPath);
+			await fs.writeFile(autoresearchPath, replacement);
+			await fs.utimes(autoresearchPath, stat.atime, stat.mtime);
+
+			const visible = await readVisibleSkillActiveState(cwd, "sess-bypass-cache", {
+				tier: "security",
+				bypassCache: true,
+			});
+			expect(visible?.active_skills?.[0]?.phase).toBe("stopped");
+		});
+	});
+
+	it("local active-entry writes invalidate the visible-state cache immediately", async () => {
+		await withTempCwd(async cwd => {
+			invalidateVisibleSkillActiveStateCache();
+			await syncSkillActiveState({
+				cwd,
+				skill: "autoresearch",
+				phase: "research",
+				active: true,
+				sessionId: "sess-local",
+			});
+			expect((await readVisibleSkillActiveState(cwd, "sess-local"))?.active_skills?.[0]?.phase).toBe("research");
+
+			await writeActiveEntry(
+				cwd,
+				"sess-local",
+				"autoresearch",
+				{ skill: "autoresearch", phase: "locally-written", active: true, session_id: "sess-local" },
+				{ cwd },
+			);
+			expect((await readVisibleSkillActiveState(cwd, "sess-local"))?.active_skills?.[0]?.phase).toBe(
+				"locally-written",
+			);
+		});
+	});
+
+	it("security-tier visible reads invalidate on canonical ralplan mode-state phase changes", async () => {
+		await withTempCwd(async cwd => {
+			invalidateVisibleSkillActiveStateCache();
+			await syncSkillActiveState({
+				cwd,
+				skill: "ralplan",
+				phase: "planner",
+				active: true,
+				sessionId: "sess-ralplan",
+			});
+			expect((await readVisibleSkillActiveState(cwd, "sess-ralplan"))?.active_skills?.[0]?.phase).toBe("planner");
+
+			const modePath = modeStatePath(cwd, "sess-ralplan", "ralplan");
+			await fs.mkdir(path.dirname(modePath), { recursive: true });
+			await fs.writeFile(modePath, JSON.stringify({ active: true, current_phase: "handoff" }));
+
+			const visible = await readVisibleSkillActiveState(cwd, "sess-ralplan", { tier: "security" });
+			expect(visible?.active_skills?.[0]?.phase).toBe("handoff");
+		});
+	});
+
 	it("keeps the canonical GJC workflow skill set intentionally small", () => {
-		expect(CANONICAL_GJC_WORKFLOW_SKILLS).toEqual(["deep-interview", "ralplan", "ultragoal", "team"]);
+		expect(CANONICAL_GJC_WORKFLOW_SKILLS).toEqual(["deep-interview", "ralplan", "ultragoal", "autoresearch"]);
 	});
 });

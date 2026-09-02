@@ -3,13 +3,14 @@
  */
 import * as path from "node:path";
 
-import { type Api, type AssistantMessage, completeSimple, type Model, type Tool } from "@gajae-code/ai";
+import { type Api, type AssistantMessage, completeSimple, type Model, type Tool } from "@gajae-code/ai/core";
 import { logger, prompt } from "@gajae-code/utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "text" };
 import { syncCmuxWorkspaceTitle } from "./cmux-workspace";
+import { syncHerdrPaneTitle } from "./herdr-pane";
 
 const TITLE_SYSTEM_PROMPT = prompt.render(titleSystemPrompt);
 
@@ -220,6 +221,7 @@ export function setTerminalTitle(title: string): void {
 export function setSessionTerminalTitle(sessionName: string | undefined, cwd?: string): void {
 	setTerminalTitle(formatSessionTerminalTitle(sessionName, cwd));
 	void syncCmuxWorkspaceTitle(sessionName);
+	syncHerdrPaneTitle(sessionName);
 }
 
 /**

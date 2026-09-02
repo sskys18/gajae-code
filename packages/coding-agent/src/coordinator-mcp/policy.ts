@@ -1,21 +1,75 @@
+import { createHash } from "node:crypto";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { coordinatorMcpStateRoot, gjcRoot } from "../gjc-runtime/session-layout";
+import {
+	DEFAULT_SESSION_IDLE_TTL_MS,
+	DEFAULT_SESSION_SWEEP_INTERVAL_MS,
+	MIN_SESSION_IDLE_TTL_MS,
+	MIN_SESSION_SWEEP_INTERVAL_MS,
+} from "./session-reaper";
 
 export type CoordinatorMutationClass = "sessions" | "questions" | "reports";
+
+/** Artifact reads require Linux's identity-bound `/proc/self/fd` authorization. */
+export function coordinatorArtifactCapability(platform: NodeJS.Platform = process.platform): {
+	available: boolean;
+	reason: "artifact_identity_unavailable" | null;
+} {
+	return platform === "linux"
+		? { available: true, reason: null }
+		: { available: false, reason: "artifact_identity_unavailable" };
+}
 
 export interface CoordinatorNamespace {
 	profile: string | null;
 	repo: string | null;
+	identity: string;
+}
+
+function canonicalJson(value: unknown): string {
+	if (value === null || typeof value === "boolean" || typeof value === "number") return JSON.stringify(value);
+	if (typeof value === "string") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	if (typeof value === "object") {
+		const record = value as Record<string, unknown>;
+		return `{${Object.keys(record)
+			.sort()
+			.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+			.join(",")}}`;
+	}
+	throw new Error("coordinator_namespace_invalid");
+}
+
+export function coordinatorNamespaceIdentity(env: NodeJS.ProcessEnv = process.env): string {
+	return `ns1_${createHash("sha256")
+		.update(
+			canonicalJson({
+				profile_exact: env.GJC_COORDINATOR_MCP_PROFILE ?? null,
+				profile_present: env.GJC_COORDINATOR_MCP_PROFILE !== undefined,
+				repo_exact: env.GJC_COORDINATOR_MCP_REPO ?? null,
+				repo_present: env.GJC_COORDINATOR_MCP_REPO !== undefined,
+			}),
+		)
+		.digest("hex")
+		.slice(0, 32)}`;
 }
 
 export interface CoordinatorMcpConfig {
 	allowedRoots: string[];
+	managedWorktreeRoots: string[];
 	mutationClasses: Set<CoordinatorMutationClass>;
 	artifactByteCap: number;
 	namespace: CoordinatorNamespace;
 	stateRoot: string;
+	codexTokenRoot: string;
 	sessionCommand: string | null;
+	requireWorktree: boolean;
+	sessionIdleTtlMs: number;
+	sessionSweepIntervalMs: number;
+	forceStopEnabled: boolean;
 }
 
 export interface CoordinatorMutationRequest {
@@ -32,6 +86,16 @@ const LEGACY_MUTATION_CLASS_ALIASES = new Map<string, CoordinatorMutationClass>(
 	["report", "reports"],
 ]);
 
+function parsePositiveIntMs(value: string | undefined, fallback: number, floor: number): number {
+	const parsed = Number.parseInt((value ?? "").trim(), 10);
+	if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+	return Math.max(floor, parsed);
+}
+
+function parseBool(value: string | undefined): boolean {
+	return /^(1|true|yes|on)$/i.test((value ?? "").trim());
+}
+
 function parseList(value: string | undefined): string[] {
 	return (value ?? "")
 		.split(/[\n,;:]+/)
@@ -45,6 +109,12 @@ function parseRootList(value: string | undefined): string[] {
 		.split(path.delimiter)
 		.map(part => part.trim())
 		.filter(Boolean);
+}
+
+function resolveManagedWorktreeRoot(root: string, configured: string | undefined): string {
+	const template = (configured?.trim() || "{repo}/.worktrees").replace(/^~(?=\/|$)/, os.homedir());
+	const resolved = template.replaceAll("{repo}", path.basename(root));
+	return path.resolve(path.isAbsolute(resolved) ? resolved : path.join(path.dirname(root), resolved));
 }
 
 function parseMutationClasses(value: string | undefined): Set<CoordinatorMutationClass> {
@@ -86,6 +156,9 @@ export function buildCoordinatorMcpConfig(env: NodeJS.ProcessEnv = process.env):
 	const stateRoot = stateRootOverride || defaultCoordinatorMcpStateRoot(process.cwd(), gjcSessionId);
 	return {
 		allowedRoots: parseRootList(env.GJC_COORDINATOR_MCP_WORKDIR_ROOTS).map(root => path.resolve(root)),
+		managedWorktreeRoots: parseRootList(env.GJC_COORDINATOR_MCP_WORKDIR_ROOTS).map(root =>
+			resolveManagedWorktreeRoot(path.resolve(root), env.GJC_WORKTREE_DIR),
+		),
 		mutationClasses: parseMutationClasses(
 			env.GJC_COORDINATOR_MCP_MUTATIONS ?? env.GJC_COORDINATOR_MCP_ENABLE_MUTATION_CLASSES,
 		),
@@ -95,19 +168,42 @@ export function buildCoordinatorMcpConfig(env: NodeJS.ProcessEnv = process.env):
 		namespace: {
 			profile: cleanScope(env.GJC_COORDINATOR_MCP_PROFILE),
 			repo: cleanScope(env.GJC_COORDINATOR_MCP_REPO),
+			identity: coordinatorNamespaceIdentity(env),
 		},
 		stateRoot: path.resolve(stateRoot),
+		codexTokenRoot: path.resolve(
+			env.GJC_COORDINATOR_MCP_CODEX_TOKEN_ROOT?.trim() || path.join(stateRoot, "codex-tokens"),
+		),
 		sessionCommand: env.GJC_COORDINATOR_MCP_SESSION_COMMAND?.trim() || null,
+		requireWorktree: parseBool(env.GJC_COORDINATOR_MCP_REQUIRE_WORKTREE),
+		sessionIdleTtlMs: parsePositiveIntMs(
+			env.GJC_COORDINATOR_MCP_SESSION_IDLE_TTL_MS,
+			DEFAULT_SESSION_IDLE_TTL_MS,
+			MIN_SESSION_IDLE_TTL_MS,
+		),
+		sessionSweepIntervalMs: parsePositiveIntMs(
+			env.GJC_COORDINATOR_MCP_SESSION_SWEEP_INTERVAL_MS,
+			DEFAULT_SESSION_SWEEP_INTERVAL_MS,
+			MIN_SESSION_SWEEP_INTERVAL_MS,
+		),
+		forceStopEnabled: parseBool(env.GJC_COORDINATOR_MCP_FORCE_STOP),
 	};
 }
 
 async function realpathIfExists(value: string): Promise<string> {
-	try {
-		return await fs.realpath(value);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-		const parent = await fs.realpath(path.dirname(value));
-		return path.join(parent, path.basename(value));
+	let current = path.resolve(value);
+	const missing: string[] = [];
+	while (true) {
+		try {
+			const canonical = await fs.realpath(current);
+			return path.join(canonical, ...missing.reverse());
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			const parent = path.dirname(current);
+			if (parent === current) throw error;
+			missing.push(path.basename(current));
+			current = parent;
+		}
 	}
 }
 
@@ -121,16 +217,69 @@ async function canonicalAllowedRoots(config: CoordinatorMcpConfig): Promise<stri
 	return roots.map(root => path.resolve(root));
 }
 
+async function canonicalSessionRoots(config: CoordinatorMcpConfig): Promise<string[]> {
+	const roots = await canonicalAllowedRoots(config);
+	const managed = await Promise.all(config.managedWorktreeRoots.map(root => realpathIfExists(root)));
+	return [...roots, ...managed.map(root => path.resolve(root))];
+}
+
+async function canonicalPersistedAllowedRoots(
+	config: CoordinatorMcpConfig,
+	canonicalizePath?: (value: string) => Promise<string>,
+): Promise<string[]> {
+	const roots = canonicalizePath
+		? await Promise.all(config.allowedRoots.map(root => canonicalizePath(root)))
+		: await canonicalAllowedRoots(config);
+	const managed = config.managedWorktreeRoots.map(root =>
+		canonicalizePath ? canonicalizePath(root) : realpathIfExists(root),
+	);
+	return [...roots, ...(await Promise.all(managed)).map(root => path.resolve(root))];
+}
+
+function isInsideCanonicalRoot(candidate: string, root: string, platform: NodeJS.Platform): boolean {
+	if (platform !== "win32") return isInside(candidate, root);
+	const windows = (value: string) => value.replaceAll("/", "\\").toLowerCase();
+	const relative = path.win32.relative(windows(root), windows(candidate));
+	return relative === "" || (!!relative && !relative.startsWith("..") && !path.win32.isAbsolute(relative));
+}
+
 export async function assertCoordinatorWorkdir(config: CoordinatorMcpConfig, cwd: unknown): Promise<string> {
 	if (typeof cwd !== "string" || cwd.trim().length === 0) throw new Error("coordinator_workdir_required");
 	if (config.allowedRoots.length === 0) throw new Error("coordinator_workdir_roots_required");
 	const requested = path.resolve(cwd);
 	const canonicalRequested = await realpathIfExists(requested);
-	const roots = await canonicalAllowedRoots(config);
+	const roots = await canonicalSessionRoots(config);
 	if (!roots.some(root => isInside(canonicalRequested, root))) {
 		throw new Error(`coordinator_workdir_outside_allowed_roots:${requested}`);
 	}
 	return requested;
+}
+
+/** Revalidate persisted session locations against the current root policy. */
+export async function assertCoordinatorSessionLocations(
+	config: CoordinatorMcpConfig,
+	cwd: unknown,
+	brokerWorkspace: unknown,
+	options: { canonicalizePath?: (value: string) => Promise<string>; platform?: NodeJS.Platform } = {},
+): Promise<void> {
+	if (typeof cwd !== "string" || cwd.trim().length === 0) throw new Error("coordinator_workdir_required");
+	if (typeof brokerWorkspace !== "string" || brokerWorkspace.trim().length === 0)
+		throw new Error("coordinator_workspace_required");
+	if (config.allowedRoots.length === 0) throw new Error("coordinator_workdir_roots_required");
+	const platform = options.platform ?? process.platform;
+	const canonicalize = options.canonicalizePath ?? realpathIfExists;
+	const [canonicalCwd, canonicalWorkspace, roots] = await Promise.all([
+		canonicalize(cwd),
+		canonicalize(brokerWorkspace),
+		canonicalPersistedAllowedRoots(config, options.canonicalizePath),
+	]);
+	// Reauthorize both persisted locations independently. A managed worktree may
+	// differ from the requested cwd, but neither may escape the current roots.
+	if (
+		!roots.some(root => isInsideCanonicalRoot(canonicalCwd, root, platform)) ||
+		!roots.some(root => isInsideCanonicalRoot(canonicalWorkspace, root, platform))
+	)
+		throw new Error("coordinator_workdir_outside_allowed_roots");
 }
 
 export async function assertCoordinatorArtifactPath(
@@ -142,6 +291,8 @@ export async function assertCoordinatorArtifactPath(
 	if (config.allowedRoots.length === 0) throw new Error("coordinator_artifact_roots_required");
 	const requested = path.resolve(artifactPath);
 	const canonicalRequested = await realpathIfExists(requested);
+	const canonicalStateRoot = await realpathIfExists(config.stateRoot);
+	if (isInside(canonicalRequested, canonicalStateRoot)) throw new Error("coordinator_artifact_state_root_denied");
 	const roots = await canonicalAllowedRoots(config);
 	if (!roots.some(root => isInside(canonicalRequested, root))) {
 		throw new Error(`coordinator_artifact_outside_allowed_roots:${requested}`);
@@ -160,9 +311,33 @@ export function requireCoordinatorMutation(
 }
 
 export function coordinatorNamespacePath(config: CoordinatorMcpConfig): string {
-	return path.join(
-		config.stateRoot,
-		config.namespace.profile ?? "unscoped-profile",
-		config.namespace.repo ?? "unscoped-repo",
-	);
+	return path.join(config.stateRoot, "v1", config.namespace.identity, "projections");
+}
+
+/** Opens and authorizes an artifact by the opened handle identity, not a racy pathname. */
+export async function safeOpenCoordinatorArtifact(
+	config: CoordinatorMcpConfig,
+	artifactPath: unknown,
+): Promise<fs.FileHandle> {
+	if (typeof artifactPath !== "string" || artifactPath.trim().length === 0)
+		throw new Error("coordinator_artifact_path_required");
+	if (config.allowedRoots.length === 0) throw new Error("coordinator_artifact_roots_required");
+	if (!coordinatorArtifactCapability().available) throw new Error("artifact_identity_unavailable");
+	const requested = path.resolve(artifactPath);
+	await assertCoordinatorArtifactPath(config, requested);
+	const handle = await fs.open(requested, nodeFs.constants.O_RDONLY | nodeFs.constants.O_NOFOLLOW);
+	try {
+		const opened = await handle.stat({ bigint: true });
+		if (!opened.isFile()) throw new Error("artifact_identity_unavailable");
+		const canonicalTarget = await fs.realpath(`/proc/self/fd/${handle.fd}`);
+		const canonicalStateRoot = await realpathIfExists(config.stateRoot);
+		const roots = await canonicalAllowedRoots(config);
+		if (isInside(canonicalTarget, canonicalStateRoot)) throw new Error("coordinator_artifact_state_root_denied");
+		if (!roots.some(root => isInside(canonicalTarget, root)))
+			throw new Error(`coordinator_artifact_outside_allowed_roots:${requested}`);
+		return handle;
+	} catch (error) {
+		await handle.close();
+		throw error;
+	}
 }

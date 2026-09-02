@@ -9,12 +9,11 @@ Read files, directories, archives, SQLite databases, images, documents, internal
 ## Parameters
 
 - `path` — required. Local path, internal URI (`agent://`, `artifact://`, `rule://`, `local://`), or URL. Append `:<sel>` for line ranges, raw mode, or special modes (e.g. `src/foo.ts:50-200`, `src/foo.ts:raw`, `db.sqlite:users:42`).
-
+- `truncation` — optional `head` | `last` | `both`; selects which end of an over-budget result to retain. Configured default: {{TRUNCATION_DEFAULT}} (factory default: `last`); non-file routes such as URLs, directories and converted documents default to `head`. A line-range selector still bounds the selection — this only picks which end of that selection survives the byte/line cap. SQLite row queries page via their own `limit`/`offset` and ignore it.
 ## Selectors
-
 Append `:<sel>` to `path`. The bare path falls back to the default mode.
 
-- _(none)_ — parseable code → structural summary (signatures kept, bodies elided); other files → read from the start (up to {{DEFAULT_LIMIT}} lines).
+- _(none)_ — parseable code → structural summary (signatures kept, bodies elided); a plain text file → a bounded receipt of about {{RECEIPT_LINES}} lines or {{RECEIPT_KIB}} KiB, whichever is smaller; the configured truncation direction is {{TRUNCATION_DEFAULT}} (factory default: last). Line+hash anchors keep their real file line numbers and a footer names the omitted range. Archive members use the larger {{DEFAULT_MAX_LINES}}-line / 50 KiB budget. Converted documents, notebooks, URLs and directory listings still start from the beginning.
 - `:50` / `:50-` — read from line 50 onward.
 - `:50-200` — lines 50–200 inclusive.
 - `:50+150` — 150 lines starting at line 50.
@@ -39,6 +38,7 @@ Append `:<sel>` to `path`. The bare path falls back to the default mode.
   `[NN lines across MM elided regions; read <path>:raw or a line range like <path>:1-9999 for verbatim content]`
 
   If the elided body is what you actually need, re-issue the **exact selector the footer names**. NEVER guess what's inside `..` / `…` — those markers carry no content.
+- Directional windows identify the retained first/last lines and the omitted range; use the `re-read <path>:1-<total>` or `:raw` hint in the footer to recover the full content.
 
 # Documents & Notebooks
 
@@ -73,10 +73,7 @@ For `.sqlite`, `.sqlite3`, `.db`, `.db3`:
 `agent://<id>`, `artifact://<id>`, `rule://<name>`, and `local://<name>.md` resolve transparently and accept the same line selectors as filesystem paths. Use `artifact://<id>` to recover full output that a previous bash/eval/tool result spilled or truncated.
 
 <critical>
-- You MUST use `read` for every file, directory, archive, and URL inspection. `cat`, `head`, `tail`, `less`, `more`, `ls`, `tar`, `unzip`, `curl`, `wget` are FORBIDDEN — any such bash call is a bug, regardless of how short or convenient it looks.
-- You MUST prefer `read` over a browser/puppeteer tool for URL content; only reach for a browser when `read` cannot deliver reasonable content.
-- You MUST always include `path`. NEVER call `read` with `{}`.
-- For line ranges, append the selector to `path` (`path="src/foo.ts:50-200"`, `path="src/foo.ts:50+150"`). NEVER substitute `sed -n`, `awk NR`, or `head`/`tail` pipelines.
-- Summary footer says `read <path>:raw …`? Re-issue the exact selector it names. NEVER guess what's inside `..` / `…` markers — they carry no content.
-- You MAY combine selectors with URL reads and internal URIs; both paginate the cached resolved output.
+- Always include `path`; never call `read` with `{}`.
+- For line ranges, append the selector to `path`.
+- Re-issue the selector named by a summary footer before relying on elided content.
 </critical>

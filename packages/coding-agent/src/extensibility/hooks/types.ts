@@ -1,4 +1,4 @@
-import type { ImageContent, Message, Model, TextContent } from "@gajae-code/ai";
+import type { ImageContent, Message, Model, TextContent } from "@gajae-code/ai/core";
 import type { Component, TUI } from "@gajae-code/tui";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { EditToolDetails } from "../../edit";
@@ -45,7 +45,7 @@ export type { ExecOptions, ExecResult } from "../../exec/exec";
 
 /**
  * UI context for hooks to request interactive UI from the harness.
- * Each mode (interactive, RPC, print) provides its own implementation.
+ * Interactive and headless callers provide their own implementation.
  */
 // fallow-ignore-next-line code-duplication
 // Parallel to ExtensionUIContext: hooks expose a deliberately narrower UI

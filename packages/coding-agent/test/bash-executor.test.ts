@@ -8,16 +8,17 @@ import {
 	disposeAllShellSessions,
 	executeBash,
 	getShellSessionCount,
+	normalizeMinimizedSaveResultForTests,
 } from "@gajae-code/coding-agent/exec/bash-executor";
 import { DEFAULT_MAX_BYTES } from "@gajae-code/coding-agent/session/streaming-output";
 import * as shellSnapshot from "@gajae-code/coding-agent/utils/shell-snapshot";
 import type { Shell } from "@gajae-code/natives";
 import * as piNatives from "@gajae-code/natives";
+import { safeRmSync } from "../../../scripts/safe-cleanup";
 
-// Matches the schema default for `tools.artifactHeadBytes` (20 KB) used by
-// OutputSink when bash-executor pulls settings via resolveOutputSinkHeadBytes.
-const ARTIFACT_HEAD_BYTES_DEFAULT = 20 * 1024;
 const BACKGROUND_COMPLETION_RACE_MS = 750;
+// Direct executor callers retain the shared 20 KiB head alongside the 50 KiB tail.
+const ARTIFACT_HEAD_BYTES_DEFAULT = 20 * 1024;
 const KILL_MARKER_DELAY_SECONDS = "0.4";
 const KILL_MARKER_ASSERTION_WAIT_MS = 900;
 
@@ -38,14 +39,53 @@ describe("executeBash", () => {
 		resetSettingsForTest();
 		vi.restoreAllMocks();
 		if (fs.existsSync(tempDir)) {
-			fs.rmSync(tempDir, { recursive: true });
+			safeRmSync(tempDir, { recursive: true });
 		}
+	});
+
+	it("preserves an explicit capped minimizer artifact below the default cap", () => {
+		const result = normalizeMinimizedSaveResultForTests(
+			{ status: "saved", artifactId: "lower-cap", complete: false, omittedBytes: 7 },
+			"short original",
+		);
+
+		expect(result).toEqual({
+			status: "saved",
+			artifactId: "lower-cap",
+			complete: false,
+			omittedBytes: 7,
+		});
 	});
 
 	it("returns non-zero exit codes without cancellation", async () => {
 		const result = await executeBash("exit 7", { cwd: tempDir, timeout: 5000 });
 		expect(result.exitCode).toBe(7);
 		expect(result.cancelled).toBe(false);
+	});
+
+	it("scrubs inherited managed transcript paths from shell sessions", async () => {
+		const previousSessionFile = process.env.GJC_SESSION_FILE;
+		const previousOwnerPath = process.env.GJC_MANAGED_OWNER_TRANSCRIPT_PATH;
+		process.env.GJC_SESSION_FILE = "/managed/session.jsonl";
+		process.env.GJC_MANAGED_OWNER_TRANSCRIPT_PATH = "/managed/owner.jsonl";
+		try {
+			await disposeAllShellSessions();
+			const result = await executeBash(
+				'printf "%s|%s" "$(printenv GJC_SESSION_FILE || printf unset)" "$(printenv GJC_MANAGED_OWNER_TRANSCRIPT_PATH || printf unset)"',
+				{
+					cwd: tempDir,
+					timeout: 5000,
+					sessionKey: "managed-env-scrub",
+				},
+			);
+			expect(result.output).toBe("unset|unset");
+		} finally {
+			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+			else process.env.GJC_SESSION_FILE = previousSessionFile;
+			if (previousOwnerPath === undefined) delete process.env.GJC_MANAGED_OWNER_TRANSCRIPT_PATH;
+			else process.env.GJC_MANAGED_OWNER_TRANSCRIPT_PATH = previousOwnerPath;
+			await disposeAllShellSessions();
+		}
 	});
 
 	it("retains then fully disposes persistent shell sessions (MEM-7)", async () => {
@@ -59,6 +99,19 @@ describe("executeBash", () => {
 		expect(pending).toBeInstanceOf(Promise);
 		await pending;
 		expect(getShellSessionCount()).toBe(0);
+	});
+
+	it("owns and disposes one-shot native shells", async () => {
+		await disposeAllShellSessions();
+		const closeSpy = vi.spyOn(piNatives.Shell.prototype, "close");
+		const abortSpy = vi.spyOn(piNatives.Shell.prototype, "abort");
+
+		const result = await executeBash("echo one-shot", { cwd: tempDir, timeout: 5000, oneShot: true });
+
+		expect(result.output.trim()).toBe("one-shot");
+		expect(getShellSessionCount()).toBe(0);
+		expect(closeSpy).toHaveBeenCalledTimes(1);
+		expect(abortSpy).not.toHaveBeenCalled();
 	});
 
 	it("reports the bash shell-session owner count via runtime resource gauges", async () => {
@@ -260,7 +313,7 @@ describe("executeBash", () => {
 			sessionKey: "hung-native-abort",
 		});
 		expect(next.output.trim()).toBe("next");
-		expect(runCalls).toBe(1);
+		expect(runCalls).toBe(2);
 	});
 
 	it("restores persistent sessions after native abort cleanup settles", async () => {
@@ -417,6 +470,23 @@ describe("executeBash", () => {
 		expect(result.output).toContain("a");
 	});
 
+	it("preserves the shared direct-executor head and tail windows", async () => {
+		if (process.platform === "win32") return;
+		const startSentinel = "DIRECT-EXECUTOR-START";
+		const endSentinel = "DIRECT-EXECUTOR-END";
+		const result = await executeBash(
+			`printf '%s\\n' '${startSentinel}'; seq 1 20000; printf '%s\\n' '${endSentinel}'`,
+			{ cwd: tempDir, timeout: 5_000 },
+		);
+
+		const sharedWindowBudget = DEFAULT_MAX_BYTES + ARTIFACT_HEAD_BYTES_DEFAULT;
+		expect(result.truncated).toBe(true);
+		expect(result.outputBytes).toBeLessThanOrEqual(sharedWindowBudget + 1024);
+		expect(result.output.startsWith(`${startSentinel}\n`)).toBe(true);
+		expect(result.output.endsWith(`${endSentinel}\n`)).toBe(true);
+		expect(result.output).toContain("elided");
+	});
+
 	it("handles multi-million line output without freeze or OOM", async () => {
 		if (process.platform === "win32") return;
 
@@ -445,15 +515,11 @@ describe("executeBash", () => {
 		expect(result.totalBytes).toBeGreaterThan(DEFAULT_MAX_BYTES * 100);
 		expect(result.truncated).toBe(true);
 
-		// Truncated output should be bounded by head + tail + marker overhead
-		// (middle-elision keeps the head budget plus the tail spill window), and the
-		// visible preview must be meaningfully smaller than the captured stream.
+		// Direct executor output remains bounded by the shared head+tail window.
 		expect(result.outputBytes).toBeLessThan(result.totalBytes);
 		expect(result.outputBytes).toBeLessThanOrEqual(DEFAULT_MAX_BYTES + ARTIFACT_HEAD_BYTES_DEFAULT + 1024);
-		expect(result.output.length).toBeGreaterThan(0);
 
-		// The visible tail should reflect the end of the bounded native capture even
-		// when that capture ends before the synthetic seq target.
+		// The visible numeric tail should stay near the end of the generated sequence.
 		const tailValues = result.output
 			.split("\n")
 			.slice(-1000)

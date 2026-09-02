@@ -4,8 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { Settings } from "../src/config/settings";
-import { TELEGRAM_PARSE_MODE } from "../src/notifications/html-format";
-import { TelegramNotificationDaemon } from "../src/notifications/telegram-daemon";
+import { TELEGRAM_PARSE_MODE } from "../src/sdk/bus/html-format";
+import { TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
+import type { AgentDirSessionLifecycleService } from "../src/sdk/lifecycle/client";
+import type { ListRecentSessionsResult } from "../src/sdk/lifecycle/recent-sessions";
 
 function settings(agentDir: string): Settings {
 	const base = Settings.isolated({
@@ -22,134 +24,161 @@ function settings(agentDir: string): Settings {
 	}) as Settings;
 }
 
-interface Call {
-	method: string;
-	body: Record<string, unknown> | null;
+type Call = { operation: string; requestKey?: string; actor?: unknown; target?: unknown };
+
+function lifecycleHarness() {
+	const calls: Call[] = [];
+	let recent: ListRecentSessionsResult = { kind: "complete", entries: [], warnings: [] };
+	const service = {
+		createExternal: async (request: Record<string, unknown>) => {
+			calls.push({
+				operation: "session.create",
+				requestKey: request.requestKey as string,
+				actor: request.actor,
+				target: request.target,
+			});
+			return { ok: true, operation: "session.create", result: { sessionId: "broker-session-1", cwd: "/repo" } };
+		},
+		close: async (request: Record<string, unknown>) => {
+			calls.push({
+				operation: "session.close",
+				requestKey: request.requestKey as string,
+				actor: request.actor,
+				target: request.target,
+			});
+			return { ok: true, operation: "session.close", result: { sessionId: "broker-session-1" } };
+		},
+		resumeExternal: async (request: Record<string, unknown>) => {
+			calls.push({
+				operation: "session.resume",
+				requestKey: request.requestKey as string,
+				actor: request.actor,
+				target: request.target,
+			});
+			return {
+				kind: "result",
+				outcome: { ok: true, operation: "session.resume", result: { sessionId: "broker-session-1", reused: true } },
+			};
+		},
+		listRecent: async () => ({ ...recent }),
+	} as unknown as AgentDirSessionLifecycleService;
+	return { calls, service, setRecent: (value: ListRecentSessionsResult) => (recent = value) };
 }
 
-function spyBot(): { calls: Call[]; api: never } {
-	const calls: Call[] = [];
+function bot() {
+	const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
 	const api = {
-		call: async (method: string, body: Record<string, unknown> | null) => {
+		call: async (method: string, body: Record<string, unknown>) => {
 			calls.push({ method, body });
+			if (method === "getChat") return { ok: true, result: { id: body.chat_id, type: "private" } };
 			return { ok: true, result: [] };
 		},
-	} as never;
-	return { calls, api };
+	};
+	return { api: api as never, calls };
 }
 
-function makeDaemon(agentDir: string, bot: never): TelegramNotificationDaemon {
+function daemon(
+	agentDir: string,
+	botApi: never,
+	service: AgentDirSessionLifecycleService,
+	factoryCalls: { count: number },
+): TelegramNotificationDaemon {
 	return new TelegramNotificationDaemon({
 		settings: settings(agentDir),
 		ownerId: "owner",
 		botToken: "tok",
 		chatId: "42",
-		botApi: bot,
+		botApi,
+		createLifecycleService: () => {
+			factoryCalls.count++;
+			return service;
+		},
 	});
 }
 
-function msg(chatId: string, text: string, updateId: number): unknown {
-	return { update_id: updateId, message: { chat: { id: chatId }, text, message_id: updateId } };
+function message(text: string, updateId: number): unknown {
+	return {
+		update_id: updateId,
+		message: { chat: { id: "42", type: "private" }, from: { id: 42, is_bot: false }, text, message_id: updateId },
+	};
 }
 
-function writeSession(
-	agentDir: string,
-	project: string,
-	id: string,
-	header: object,
-	mtimeMs: number,
-	entries: object[] = [],
-): void {
-	const dir = path.join(agentDir, "sessions", project);
-	fs.mkdirSync(dir, { recursive: true });
-	const file = path.join(dir, `${id}.jsonl`);
-	const suffix = entries.length > 0 ? `${entries.map(entry => JSON.stringify(entry)).join("\n")}\n` : "";
-	fs.writeFileSync(file, `${JSON.stringify(header)}\n${suffix}`);
-	fs.utimesSync(file, new Date(mtimeMs), new Date(mtimeMs));
-}
-
-describe("lifecycle command routing (G009)", () => {
-	test("a paired-chat /session_* command is detected and answered (no injection fallthrough)", async () => {
-		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-"));
-		const { calls, api } = spyBot();
-		const daemon = makeDaemon(agentDir, api);
-		// Control is not started in this unit (lifecycleControlActive=false), so the
-		// command is detected + gated and answered with a not-available notice — it
-		// must NOT fall through to threaded injection.
-		await daemon.handleTelegramUpdate(msg("42", "/session_create path /repo", 1));
-		const sends = calls.filter(c => c.method === "sendMessage");
-		expect(sends.length).toBe(1);
-		expect(String(sends[0]?.body?.chat_id)).toBe("42");
+describe("Telegram lifecycle command routing", () => {
+	test("routes create, close, and resume only through the SDK lifecycle service", async () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-route-"));
+		const { calls, service } = lifecycleHarness();
+		const { api, calls: botCalls } = bot();
+		const factoryCalls = { count: 0 };
+		const daemonInstance = daemon(agentDir, api, service, factoryCalls);
+		await daemonInstance.handleTelegramUpdate(message("/session_create path /repo", 10));
+		await daemonInstance.handleTelegramUpdate(message("/session_close broker-session-1", 11));
+		await daemonInstance.handleTelegramUpdate(message("/session_resume broker-session-1", 12));
+		expect(calls.map(call => call.operation)).toEqual(["session.create", "session.close", "session.resume"]);
+		expect(calls.map(call => call.requestKey)).toEqual(["telegram:42:10", "telegram:42:11", "telegram:42:12"]);
+		expect(calls.every(call => call.actor && typeof call.actor === "object")).toBe(true);
+		expect(JSON.stringify(botCalls)).not.toContain("endpoint");
+		expect(JSON.stringify(botCalls)).not.toContain("token");
+		expect(factoryCalls.count).toBe(1);
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	});
 
-	test("a non-paired chat /session_* command is ignored by the lifecycle path", async () => {
-		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-"));
-		const { calls, api } = spyBot();
-		const daemon = makeDaemon(agentDir, api);
-		await daemon.handleTelegramUpdate(msg("999", "/session_create path /repo", 2));
-		// No lifecycle reply for an unpaired chat.
-		expect(calls.filter(c => c.method === "sendMessage").length).toBe(0);
+	test("duplicate update across daemon restart reuses one stable lifecycle request key", async () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-restart-"));
+		const { calls, service } = lifecycleHarness();
+		const firstBot = bot();
+		const secondBot = bot();
+		const first = daemon(agentDir, firstBot.api, service, { count: 0 });
+		const second = daemon(agentDir, secondBot.api, service, { count: 0 });
+		await first.handleTelegramUpdate(message("/session_create path /repo", 99));
+		await second.handleTelegramUpdate(message("/session_create path /repo", 99));
+		expect(calls.map(call => call.requestKey)).toEqual(["telegram:42:99", "telegram:42:99"]);
+		expect(new Set(calls.map(call => call.requestKey)).size).toBe(1);
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	});
 
-	test("a plain (non-command) paired-chat message is not treated as a lifecycle command", async () => {
-		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-"));
-		const { calls, api } = spyBot();
-		const daemon = makeDaemon(agentDir, api);
-		await daemon.handleTelegramUpdate(msg("42", "hello there", 3));
-		// Not a /session_* command -> no lifecycle not-available reply.
-		expect(calls.filter(c => c.method === "sendMessage").length).toBe(0);
-		fs.rmSync(agentDir, { recursive: true, force: true });
-	});
-	test("/session_recent is sent as escaped bullet rows with inline code", async () => {
-		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-"));
-		const { calls, api } = spyBot();
-		const daemon = makeDaemon(agentDir, api);
-		(daemon as unknown as { lifecycleControlActive: boolean }).lifecycleControlActive = true;
-		for (let i = 0; i < 20; i++) {
-			writeSession(
-				agentDir,
-				"repo",
-				`s-${String(i).padStart(3, "0")}`,
-				{ cwd: `/repo/<tag>&branch/${"x".repeat(100)}` },
-				1000 + i,
-			);
+	test("limits distinct session creates per Telegram actor without blocking idempotent retries", async () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-rate-limit-"));
+		const { calls, service } = lifecycleHarness();
+		const telegram = bot();
+		const daemonInstance = daemon(agentDir, telegram.api, service, { count: 0 });
+		try {
+			await daemonInstance.handleTelegramUpdate(message("/session_create path /repo", 201));
+			await daemonInstance.handleTelegramUpdate(message("/session_create path /repo", 202));
+			await daemonInstance.handleTelegramUpdate(message("/session_create path /repo", 203));
+			await daemonInstance.handleTelegramUpdate(message("/session_create path /repo", 204));
+			expect(calls.filter(call => call.operation === "session.create").map(call => call.requestKey)).toEqual([
+				"telegram:42:201",
+				"telegram:42:202",
+				"telegram:42:203",
+			]);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
 		}
-
-		await daemon.handleTelegramUpdate(msg("42", "/session_recent", 4));
-
-		const sends = calls.filter(c => c.method === "sendMessage");
-		expect(sends.length).toBe(1);
-		expect(sends.every(c => c.body?.parse_mode === TELEGRAM_PARSE_MODE)).toBe(true);
-		expect(sends.every(c => String(c.body?.text).length <= 4096)).toBe(true);
-		const text = sends.map(c => String(c.body?.text)).join("");
-		expect(text).not.toContain("<pre>");
-		expect(text).toContain("<code>s-019</code>");
-		expect(text).toContain("<code>/repo/&lt;tag&gt;&amp;branch/");
-		expect(
-			Array.from(text.matchAll(/^• <code>s-\d{3}<\/code> \(<code>\/repo\/&lt;tag&gt;&amp;branch\/x+<\/code>\)$/gm)),
-		).toHaveLength(10);
-		fs.rmSync(agentDir, { recursive: true, force: true });
 	});
-	test("/session_recent hides internal helper sessions by default", async () => {
-		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lc-route-"));
-		const { calls, api } = spyBot();
-		const daemon = makeDaemon(agentDir, api);
-		(daemon as unknown as { lifecycleControlActive: boolean }).lifecycleControlActive = true;
-		writeSession(agentDir, "repo", "user-session", { cwd: "/repo/user" }, 1000);
-		writeSession(agentDir, "repo", "helper-session", { cwd: "/repo/helper" }, 2000, [{ type: "session_init" }]);
 
-		await daemon.handleTelegramUpdate(msg("42", "/session_recent", 5));
-
-		const text = calls
-			.filter(c => c.method === "sendMessage")
-			.map(c => String(c.body?.text))
-			.join("");
-		expect(text).toContain("user-session");
-		expect(text).toContain("/repo/user");
-		expect(text).not.toContain("helper-session");
-		expect(text).not.toContain("/repo/helper");
+	test("session_recent is provided by lifecycleService.listRecent and rendered without credentials", async () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-recent-"));
+		const { service, setRecent } = lifecycleHarness();
+		setRecent({
+			kind: "complete",
+			entries: [
+				{
+					sessionId: "broker-session-1",
+					path: "/repo",
+					sessionStateFile: "/sessions/broker-session-1.jsonl",
+					mtimeMs: 1,
+				},
+			],
+			warnings: [],
+		});
+		const { api, calls } = bot();
+		const daemonInstance = daemon(agentDir, api, service, { count: 0 });
+		await daemonInstance.handleTelegramUpdate(message("/session_recent", 101));
+		const recent = calls.find(call => call.method === "sendMessage");
+		expect(recent?.body.parse_mode).toBe(TELEGRAM_PARSE_MODE);
+		expect(String(recent?.body.text)).toContain("broker-session-1");
+		expect(JSON.stringify(calls)).not.toContain("endpoint");
+		expect(JSON.stringify(calls)).not.toContain("token");
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	});
 });

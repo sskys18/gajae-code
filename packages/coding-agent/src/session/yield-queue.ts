@@ -4,6 +4,13 @@ import { logger } from "@gajae-code/utils";
 export interface YieldDispatcher<P> {
 	/** Drop entries already delivered through another path. Called per-entry at flush time. */
 	isStale?(entry: P): boolean;
+	/**
+	 * Optional ownership-origin key: when provided, the flush builds ONE
+	 * message per distinct key instead of one message for the whole batch, so
+	 * a later scope:"owned" drop of one origin never suppresses entries of
+	 * another origin (review thread P2).
+	 */
+	groupKey?(entry: P): string;
 	/** Produce one batched AgentMessage from non-stale entries. Return null to skip. */
 	build(survivors: P[]): AgentMessage | null;
 }
@@ -11,14 +18,16 @@ export interface YieldDispatcher<P> {
 export interface YieldQueueOptions {
 	isStreaming: () => boolean;
 	injectStreaming(msg: AgentMessage): void;
-	injectIdle(messages: AgentMessage[]): Promise<void>;
-	scheduleIdleFlush(run: () => Promise<void>): void;
+	injectIdle(messages: AgentMessage[], signal?: AbortSignal): Promise<void>;
+	scheduleIdleFlush(run: (signal?: AbortSignal) => Promise<void>, onSkip: () => void): void;
+	getIdleFlushSignal?(): AbortSignal | undefined;
 }
 
 type YieldFlushMode = "streaming" | "idle";
 
 interface StoredDispatcher {
 	isStale?: (entry: unknown) => boolean;
+	groupKey?: (entry: unknown) => string;
 	build: (survivors: unknown[]) => AgentMessage | null;
 }
 
@@ -31,6 +40,7 @@ export class YieldQueue {
 	readonly #dispatchers = new Map<string, StoredDispatcher>();
 	readonly #entries = new Map<string, unknown[]>();
 	#idleFlushPending = false;
+	#idleFlushPendingOwner: symbol | undefined;
 
 	constructor(options: YieldQueueOptions) {
 		this.#options = options;
@@ -39,6 +49,7 @@ export class YieldQueue {
 	register<P>(kind: string, dispatcher: YieldDispatcher<P>): () => void {
 		const stored: StoredDispatcher = {
 			...(dispatcher.isStale ? { isStale: entry => dispatcher.isStale?.(entry as P) ?? false } : {}),
+			...(dispatcher.groupKey ? { groupKey: entry => dispatcher.groupKey?.(entry as P) ?? "default" } : {}),
 			build: survivors => dispatcher.build(survivors as P[]),
 		};
 		this.#dispatchers.set(kind, stored);
@@ -73,51 +84,84 @@ export class YieldQueue {
 		return false;
 	}
 
-	async flush(mode: YieldFlushMode): Promise<void> {
+	async flush(mode: YieldFlushMode, signal?: AbortSignal): Promise<void> {
 		if (mode === "idle") {
 			this.#idleFlushPending = false;
+			this.#idleFlushPendingOwner = undefined;
 		}
 		const idleMessages: AgentMessage[] = [];
 		for (const [kind, dispatcher] of this.#dispatchers) {
 			const entries = this.#drain(kind);
 			if (entries.length === 0) continue;
-			const message = this.#build(kind, dispatcher, entries);
-			if (!message) continue;
-			if (mode === "streaming") {
-				try {
-					this.#options.injectStreaming(message);
-				} catch (error) {
-					logger.warn("Yield queue streaming dispatch failed", { kind, error: formatError(error) });
+			const messages = this.#build(kind, dispatcher, entries) ?? [];
+			for (const message of messages) {
+				if (mode === "streaming") {
+					try {
+						this.#options.injectStreaming(message);
+					} catch (error) {
+						logger.warn("Yield queue streaming dispatch failed", { kind, error: formatError(error) });
+					}
+				} else {
+					idleMessages.push(message);
 				}
-			} else {
-				idleMessages.push(message);
 			}
 		}
 		if (mode === "idle" && idleMessages.length > 0) {
 			try {
-				await this.#options.injectIdle(idleMessages);
+				await this.#options.injectIdle(idleMessages, signal ?? this.#options.getIdleFlushSignal?.());
 			} catch (error) {
 				logger.warn("Yield queue idle dispatch failed", { error: formatError(error) });
 			}
 		}
 	}
 
-	clear(): void {
+	clear(onDrop?: (kind: string, entries: readonly unknown[]) => void): void {
+		if (onDrop) {
+			for (const [kind, entries] of this.#entries) onDrop(kind, entries);
+		}
 		this.#entries.clear();
 		this.#idleFlushPending = false;
+		this.#idleFlushPendingOwner = undefined;
+	}
+
+	/** Drop only the queued entries of a single kind, leaving other kinds intact. */
+	clearKind(kind: string): void {
+		this.#entries.delete(kind);
+	}
+
+	/**
+	 * Re-schedule an idle flush if work remains and the session is idle. Used after
+	 * a transition (e.g. handoff) releases a delivery fence so entries queued while
+	 * fenced are not stranded until an unrelated enqueue or agent yield.
+	 */
+	rearmIdle(): void {
+		if (this.#options.isStreaming()) return;
+		for (const entries of this.#entries.values()) {
+			if (entries.length > 0) {
+				this.#scheduleIdleFlush();
+				return;
+			}
+		}
 	}
 
 	#scheduleIdleFlush(): void {
 		if (this.#idleFlushPending) return;
 		this.#idleFlushPending = true;
-		try {
-			this.#options.scheduleIdleFlush(async () => {
-				this.#idleFlushPending = false;
-				if (this.#options.isStreaming()) return;
-				await this.flush("idle");
-			});
-		} catch (error) {
+		const owner = Symbol("idle-flush");
+		this.#idleFlushPendingOwner = owner;
+		const releaseOwner = () => {
+			if (this.#idleFlushPendingOwner !== owner) return;
+			this.#idleFlushPendingOwner = undefined;
 			this.#idleFlushPending = false;
+		};
+		try {
+			this.#options.scheduleIdleFlush(async signal => {
+				releaseOwner();
+				if (this.#options.isStreaming()) return;
+				await this.flush("idle", signal);
+			}, releaseOwner);
+		} catch (error) {
+			releaseOwner();
 			logger.warn("Yield queue idle flush scheduling failed", { error: formatError(error) });
 		}
 	}
@@ -129,7 +173,16 @@ export class YieldQueue {
 		return entries;
 	}
 
-	#build(kind: string, dispatcher: StoredDispatcher, entries: unknown[]): AgentMessage | null {
+	#build(kind: string, dispatcher: StoredDispatcher, entries: unknown[]): AgentMessage[] | null {
+		// Corrected turn semantics (terminal abort): turn-scope abort blocks only
+		// deliveries whose origin is a continuation of the aborted turn.
+		// Owned-completion deliveries from work deliberately left running are
+		// intentionally allowed to resume the agent through the normal
+		// followUp/prompt path and receive a fresh turn attempt. A closed
+		// terminal record must never make an allowed owned-completion entry
+		// stale merely because it is closed; stale filtering below applies only
+		// to ordinary manager state (e.g. isDeliverySuppressed) or explicit
+		// blocked-continuation/owned-cleanup entries.
 		const survivors: unknown[] = [];
 		for (const entry of entries) {
 			if (dispatcher.isStale) {
@@ -145,11 +198,34 @@ export class YieldQueue {
 			survivors.push(entry);
 		}
 		if (survivors.length === 0) return null;
-		try {
-			return dispatcher.build(survivors);
-		} catch (error) {
-			logger.warn("Yield queue build failed", { kind, error: formatError(error) });
-			return null;
+		// Build one message per ownership-origin group (when the dispatcher
+		// declares a groupKey) so a later owned-scope drop of one group never
+		// suppresses another group's entries. Groups are partitioned into
+		// CONTIGUOUS origin runs (preserving the queued FIFO chronology): with
+		// entries A1, B1, A2, a map grouping every A together would deliver A2
+		// before the earlier B1, changing the observable order of async results
+		// (review thread P2).
+		const groups: unknown[][] = [];
+		let currentGroupKey: string | undefined;
+		for (const entry of survivors) {
+			const key = dispatcher.groupKey ? dispatcher.groupKey(entry) : "default";
+			const last = groups[groups.length - 1];
+			if (last !== undefined && currentGroupKey === key) {
+				last.push(entry);
+			} else {
+				groups.push([entry]);
+				currentGroupKey = key;
+			}
 		}
+		const messages: AgentMessage[] = [];
+		for (const group of groups.values()) {
+			try {
+				const message = dispatcher.build(group);
+				if (message) messages.push(message);
+			} catch (error) {
+				logger.warn("Yield queue build failed", { kind, error: formatError(error) });
+			}
+		}
+		return messages.length > 0 ? messages : null;
 	}
 }

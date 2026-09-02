@@ -4,7 +4,7 @@ This document maps the main parts of the `gajae-code` repository. The root READM
 
 ## Product shape
 
-Gajae-Code (`gjc`) is centered on `packages/coding-agent/`. The public workflow surface is intentionally fixed at four source-bundled skills and four public role subagents. Runtime state, specs, plans, goals, team state, and local overrides live under `.gjc/`.
+Gajae-Code (`gjc`) is centered on `packages/coding-agent/`. The public workflow surface is intentionally fixed at four source-bundled skills and four public role subagents. Runtime state, specs, plans, goals, research missions, and local overrides live under `.gjc/`.
 
 Default workflow skills are embedded from:
 
@@ -27,15 +27,15 @@ The runtime can still discover project/user overrides, but the bundled defaults 
 Main `gjc` CLI and product runtime.
 
 - `packages/coding-agent/package.json` exposes the `gjc` binary at `src/cli.ts` and the SDK/barrel entrypoint at `src/index.ts`.
-- `packages/coding-agent/src/cli.ts` is the executable bootstrap. It registers CLI commands such as `setup`, `deep-interview`, `ralplan`, `ultragoal`, `team`, and the default launch path.
-- `packages/coding-agent/src/main.ts` adapts CLI options into session creation and dispatches interactive, print, RPC, RPC-UI, ACP, and Bridge modes.
-- `packages/coding-agent/src/sdk.ts` assembles settings, model registry, auth, workspace/context discovery, skills, rules, tools, system prompt, and the underlying `@gajae-code/agent-core` agent.
+- `packages/coding-agent/src/cli.ts` is the executable bootstrap. It registers CLI commands such as `setup`, `deep-interview`, `ralplan`, `ultragoal`, `autoresearch`, and the default launch path.
+- `packages/coding-agent/src/main.ts` adapts CLI options into session creation and dispatches interactive, print, and ACP modes; process-isolated clients use the broker-bound session CLI, Coordinator MCP, or managed adapters.
+- `packages/coding-agent/src/sdk/session.ts` assembles settings, model registry, auth, workspace/context discovery, skills, rules, tools, system prompt, and the underlying `@gajae-code/agent-core` agent.
 - `packages/coding-agent/src/tools/index.ts` is the built-in tool registry for file/code/runtime tools such as read, bash, edit, AST tools, eval, find/search, LSP, browser, task/subagent, recipe, IRC, todo, web search, and write. Memory backends are private integrations, not public coding-harness tools.
 - `packages/coding-agent/src/defaults/gjc-defaults.ts` embeds and installs the default workflow skills.
 - `packages/coding-agent/src/task/agents.ts` embeds bundled task-agent prompts. The public contract is `executor`, `architect`, `planner`, and `critic`; other bundled prompts are internal/runtime utilities.
 - `packages/coding-agent/src/coordinator/contract.ts` defines the transport-neutral third-party coordinator contract used by `gjc mcp-serve coordinator`, `gjc coordinator`, and `gjc setup hermes`.
 - `packages/coding-agent/src/coordinator-mcp/server.ts` implements the outward MCP adapter for bot/coordinator integrations, including session start/register, turn state, question answering, status reports, and artifact reads.
-- `docs/external-control-readiness.md` classifies the public external-control surfaces: Coordinator MCP for multi-session control planes, RPC stdio for subprocess workers, ACP for editor/ACP clients, and Bridge HTTPS as experimental/fail-closed protocol scaffolding.
+- `docs/external-control-readiness.md` classifies the public external-control surfaces: broker-bound SDK session CLI, Coordinator MCP, managed adapters, and ACP. `docs/bot-integration.md` is the end-to-end guide for external controller authors.
 
 ### `packages/ai/`
 
@@ -71,7 +71,7 @@ Native helper layer exposed through N-API.
 
 - `packages/natives/package.json` exports `native/index.js` and generated TypeScript definitions.
 - `packages/natives/native/loader-state.js` resolves platform/CPU-specific native binaries and validates package/native version alignment.
-- `crates/pi-natives/src/lib.rs` is the N-API root for appearance, AST search/editing, clipboard, filesystem scan/cache, grep/glob, syntax highlighting, HTML-to-Markdown, keyboard parsing, process/PTY/shell support, SIXEL, code summarization, token counting, text measurement/wrapping/truncation, workspace scanning, power assertions, and isolation helpers.
+- `crates/pi-natives/src/lib.rs` is the N-API root for appearance, AST search/editing, clipboard, filesystem scan/cache, grep/glob, syntax highlighting, HTML-to-Markdown, keyboard parsing, process/PTY/shell support, SIXEL, code summarization, text measurement/wrapping/truncation, workspace scanning, power assertions, and isolation helpers.
 - `crates/pi-shell/src/lib.rs` exposes brush-based shell execution primitives used by the native shell adapter.
 - `crates/pi-shell/src/shell.rs` implements persistent and one-shot shell execution, streaming, environment handling, cancellation, and output minimizer telemetry.
 - `crates/pi-shell/src/fixup.rs` performs conservative AST-based bash command fixups.
@@ -102,28 +102,15 @@ Private benchmark package for TypeScript edit tasks.
 
 ## Python packages
 
-### `python/gjc-rpc/`
+### External machine interfaces
 
-Typed Python client for `gjc --mode rpc`.
-
-- `python/gjc-rpc/pyproject.toml` packages `gjc-rpc` for Python 3.11+.
-- `python/gjc-rpc/README.md` documents the process-backed stdio client, typed command methods, startup flags, event listeners, todo seeding, host-owned tools, and host-owned URI schemes.
-- `docs/bot-integration.md` is the practical entry guide for generic external controller and bot authors; it ties together coordinator MCP, RPC stdio, bridge limitations, visible tmux fallback, provider-independent smokes, errors, and artifact/report consumption.
-
-### `python/robogjc/`
-
-Self-hosted GitHub triage/fix bot that drives `gjc --mode rpc`.
-
-- `python/robogjc/AGENTS.md` is the authoritative local contract for this subtree.
-- `python/robogjc/pyproject.toml` packages `robogjc` for Python 3.11+ with FastAPI, httpx, pydantic settings, Click, and `gjc-rpc`.
-- `python/robogjc/README.md` documents the webhook-to-worktree-to-gjc flow, GitHub sidecar trust boundary, persistent per-issue sessions, and audit trail.
-- Important modules include `src/server.py`, `src/queue.py`, `src/tasks.py`, `src/worker.py`, `src/host_tools.py`, `src/sandbox.py`, `src/github_client.py`, `src/github_events.py`, `src/db.py`, and `src/config.py`.
+Process-isolated machine clients use the broker-bound session CLI, Coordinator MCP, or managed adapters documented in `docs/sdk.md`. ACP remains the stdio editor protocol. The former Python RPC client and bot integration paths were removed with the RPC ingress mode.
 
 ## Runtime flow
 
-A normal CLI session starts in `packages/coding-agent/src/cli.ts`, routes through command handling, then reaches `packages/coding-agent/src/main.ts`. `main.ts` converts CLI/runtime settings into `CreateAgentSessionOptions` and calls `createAgentSession()` in `packages/coding-agent/src/sdk.ts`.
+A normal CLI session starts in `packages/coding-agent/src/cli.ts`, routes through command handling, then reaches `packages/coding-agent/src/main.ts`. `main.ts` converts CLI/runtime settings into `CreateAgentSessionOptions` and calls `createAgentSession()` in `packages/coding-agent/src/sdk/session.ts`.
 
-The SDK builds the session context, loads the default skills, creates built-in tools, resolves model/auth state through `@gajae-code/ai`, constructs the system prompt, and instantiates `@gajae-code/agent-core`. The agent loop streams model events, executes tools, records tool results, and hands state back to the selected mode: interactive TUI, print, RPC, RPC-UI, ACP, or Bridge.
+The SDK builds the session context, loads the default skills, creates built-in tools, resolves model/auth state through `@gajae-code/ai`, constructs the system prompt, and instantiates `@gajae-code/agent-core`. The agent loop streams model events, executes tools, records tool results, and hands state back to the selected interactive TUI, print, or ACP mode; process-isolated control remains behind broker-bound or managed SDK-core surfaces.
 
 ## Verification and gates
 

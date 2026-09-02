@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, test, vi } from "bun:test";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
 import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
+import type { ModelSelectorValue } from "@gajae-code/coding-agent/config/model-selector-value";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import {
 	ModelSelectorComponent,
@@ -47,8 +48,10 @@ function createRegistry(options: { profiles?: ModelProfileDefinition[]; missingC
 		getError: () => undefined,
 		getAvailable: () => [defaultModel, alternateModel, flatModel],
 		getAll: () => [defaultModel, alternateModel, flatModel],
+		hasConfiguredProviderAuth: () => false,
 		getDiscoverableProviders: () => [],
 		getCanonicalModels: () => [],
+		getCanonicalModelSelections: () => [],
 		resolveCanonicalModel: () => undefined,
 		getModelProfiles: () => new Map(profiles),
 		getModelProfile: (name: string) => profiles.get(name),
@@ -87,7 +90,7 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		"modelProfile.default": "old-profile",
 	});
 	const flush = vi.fn(async () => {});
-	settings.flush = flush as typeof settings.flush;
+	settings.flushOrThrow = flush as typeof settings.flushOrThrow;
 	const setCalls: Array<{ path: string; value: unknown }> = [];
 	const originalSet = settings.set.bind(settings);
 	settings.set = ((path: never, value: never) => {
@@ -106,6 +109,13 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		sessionId: "session-1",
 		scopedModels: [],
 		modelRegistry: createRegistry(options),
+		configuredChains: {} as Record<string, readonly string[]>,
+		getConfiguredModelChain(role: string): readonly string[] | undefined {
+			return this.configuredChains[role];
+		},
+		setConfiguredModelChain(role: string, entries: readonly string[]) {
+			this.configuredChains[role] = entries;
+		},
 		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel }>,
 		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
 			this.setModelTemporaryCalls.push({ model: next, thinkingLevel });
@@ -115,7 +125,7 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 	};
 	const ctx = {
 		ui: { setFocus: vi.fn(), requestRender: vi.fn() },
-		editorContainer: { clear: vi.fn(), addChild: vi.fn() },
+		editorContainer: { clear: vi.fn(), detachChild: vi.fn(), addChild: vi.fn() },
 		editor: {},
 		settings,
 		session,
@@ -199,6 +209,19 @@ describe("model selector profile red-team", () => {
 		]);
 	});
 
+	test("shortcut 'd' key activates profile with Set as default (setDefault: true)", async () => {
+		const selections: ModelSelectorSelection[] = [];
+		const selector = createSelector(selection => {
+			selections.push(selection);
+		});
+		await renderSelector(selector);
+		selector.handleInput("\x1b[C");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+		selector.handleInput("d");
+
+		expect(selections).toEqual([{ kind: "profile", profileName: "profile-a", setDefault: true }]);
+	});
 	test("controller persists only Set as default and leaves Apply for this session non-default", async () => {
 		const sessionOnly = createControllerContext();
 		await selectProfileThroughController(new SelectorController(sessionOnly.ctx as never), false);
@@ -211,6 +234,7 @@ describe("model selector profile red-team", () => {
 		await selectProfileThroughController(new SelectorController(persistent.ctx as never), true);
 
 		expect(persistent.setCalls).toContainEqual({ path: "modelProfile.default", value: "profile-a" });
+		expect(persistent.setCalls).toContainEqual({ path: "defaultThinkingLevel", value: ThinkingLevel.High });
 		expect(persistent.flush).toHaveBeenCalledTimes(1);
 		expect(persistent.ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
 	});
@@ -266,8 +290,20 @@ describe("model selector profile red-team", () => {
 	test("Browse all models switches to flat model rows", async () => {
 		const selector = createSelector(() => {});
 		await renderSelector(selector);
-		selector.handleInput("\x1b[B");
-		selector.handleInput("\x1b[B");
+
+		const visitedRowIdentities = new Set<string>();
+		while (true) {
+			const rowIdentity = selector.__testSelectedPresetRowIdentity();
+			if (!rowIdentity) throw new Error("Expected a selected preset landing row");
+			if (rowIdentity === "browse") break;
+			if (visitedRowIdentities.has(rowIdentity)) {
+				throw new Error(`Preset landing navigation repeated ${rowIdentity} before browse`);
+			}
+			visitedRowIdentities.add(rowIdentity);
+			selector.handleInput("\x1b[B");
+		}
+
+		expect(selector.__testSelectedPresetRowIdentity()).toBe("browse");
 		selector.handleInput("\n");
 		const rendered = normalizeRenderedText(selector.render(240).join("\n"));
 
@@ -279,7 +315,10 @@ describe("model selector profile red-team", () => {
 
 test("delete action restores the profile when post-delete notification fails", async () => {
 	const profiles = new Map<string, ModelProfileDefinition>([[userProfile.name, { ...userProfile }]]);
-	const deletedConfigs: Record<string, { required_providers: string[]; model_mapping: Record<string, string> }> = {};
+	const deletedConfigs: Record<
+		string,
+		{ required_providers: string[]; model_mapping: Record<string, ModelSelectorValue> }
+	> = {};
 	const registry = {
 		...createRegistry({ profiles: [...profiles.values()] }),
 		getModelProfiles: () => new Map(profiles),
@@ -297,7 +336,10 @@ test("delete action restores the profile when post-delete notification fails", a
 			return config;
 		}),
 		saveCustomModelProfile: vi.fn(
-			async (name: string, config: { required_providers: string[]; model_mapping: Record<string, string> }) => {
+			async (
+				name: string,
+				config: { required_providers: string[]; model_mapping: Record<string, ModelSelectorValue> },
+			) => {
 				profiles.set(name, {
 					name,
 					requiredProviders: [...config.required_providers],
@@ -312,7 +354,7 @@ test("delete action restores the profile when post-delete notification fails", a
 	const settings = Settings.isolated({ "modelProfile.default": "unrelated" });
 	const ctx = {
 		ui: { setFocus: vi.fn(), requestRender: vi.fn() },
-		editorContainer: { clear: vi.fn(), addChild: vi.fn() },
+		editorContainer: { clear: vi.fn(), detachChild: vi.fn(), addChild: vi.fn() },
 		editor: {},
 		settings,
 		session: {

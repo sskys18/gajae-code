@@ -1,10 +1,10 @@
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import { prompt } from "@gajae-code/utils";
+import { formatDuration, logger, prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { type AsyncJob, AsyncJobManager, jobElapsedMs, type SubagentRecord } from "../async";
 import subagentDescription from "../prompts/tools/subagent.md" with { type: "text" };
-import type { AgentProgress, AgentSource, TaskToolDetails } from "../task/types";
+import type { AgentProgress, AgentSource, LocalErrorSummary } from "../task/types";
 import { Ellipsis, truncateToWidth } from "../tui";
 import type { ToolSession } from "./index";
 import { replaceTabs } from "./render-utils";
@@ -12,11 +12,24 @@ import { ToolError } from "./tool-errors";
 
 const DEFAULT_AWAIT_TIMEOUT_MS = 30_000;
 const MAX_AWAIT_TIMEOUT_MS = 60 * 60 * 1000;
+/**
+ * Bounded cadence for await liveness: even when the rendered-state signature is
+ * stable (a running subagent emitting no new progress), the await panel re-emits
+ * so a healthy wait never looks like a hung session (issue #4465). Derived from
+ * `heartbeat_ms` so callers keep one knob, floor-bounded so a small heartbeat
+ * cannot turn liveness into transcript spam, and injected for tests.
+ */
+const AWAIT_LIVENESS_MULTIPLIER = 30;
+const AWAIT_LIVENESS_MIN_INTERVAL_MS = 15_000;
 const DEFAULT_LIST_LIMIT = 10;
 const MAX_LIST_LIMIT = 50;
 const RECEIPT_PREVIEW_WIDTH = 280;
 const PREVIEW_WIDTH = 2_000;
 const FULL_PREVIEW_WIDTH = 12_000;
+const RECEIPT_PREVIEW_BYTES = 1_024;
+const PREVIEW_BYTES = 8_192;
+const FULL_PREVIEW_BYTES = 49_152;
+
 const STEER_QUEUED_GUIDANCE =
 	"The steer message is queued for the subagent's next steering boundary and has not necessarily taken effect yet.";
 
@@ -28,6 +41,15 @@ const subagentSchema = z.object({
 	id: z.string().optional().describe("single subagent id or backing job id for resume/steer"),
 	message: z.string().optional().describe("message to deliver when resuming or steering a subagent"),
 	pause: z.boolean().optional().describe("pause after steering a currently running subagent"),
+	condition: z
+		.enum(["all_terminal", "any_terminal"])
+		.optional()
+		.describe("terminal wait condition; defaults to all_terminal"),
+	heartbeat_ms: z
+		.number()
+		.refine(value => value === 0 || (Number.isInteger(value) && value >= 100 && value <= 5000))
+		.optional()
+		.describe("heartbeat interval; 0 disables"),
 	timeout_ms: z.number().min(0).max(MAX_AWAIT_TIMEOUT_MS).optional().describe("await timeout in milliseconds"),
 	limit: z.number().min(1).max(MAX_LIST_LIMIT).optional().describe("maximum subagents to return"),
 	verbosity: z
@@ -61,6 +83,10 @@ export interface SubagentSnapshot {
 	durationMs: number;
 	resultText?: string;
 	errorText?: string;
+	/** Safe setup failure cause retained from the executor launch path. */
+	setupFailureSummary?: string;
+	/** Safe, bounded summary of a terminal local (non-provider) failure (e.g. local_buffer_overflow). */
+	localErrorSummary?: LocalErrorSummary;
 	resultPreview?: string;
 	outputRef?: string;
 	truncated?: boolean;
@@ -68,8 +94,8 @@ export interface SubagentSnapshot {
 	steerMessage?: string;
 	steerState?: "queued" | "resume_queued" | "resume_started";
 	steerPauseRequested?: boolean;
-	/** Live streaming progress for the awaited subagent (await panel only; UI detail). */
-	progress?: AgentProgress;
+	/** Bounded live progress approved for the await panel and public tool details. */
+	progress?: SubagentLiveProgress;
 	/** True when a live in-session progress producer exists for this subagent. */
 	liveProgressAvailable?: boolean;
 	/** Model the subagent actually runs on (after any auth fallback). */
@@ -78,10 +104,83 @@ export interface SubagentSnapshot {
 	requestedModel?: string;
 	/** True when the requested model lacked credentials and fell back to the parent model. */
 	modelFellBack?: boolean;
+	/** True when the effective subagent provider is in fast mode. */
+	fastMode?: boolean;
 }
+
+/**
+ * Public await-panel progress. This is deliberately not `AgentProgress`: raw
+ * progress contains model deltas, tool arguments, arbitrary output, and nested
+ * task payloads that must never enter tool-result, ACP, or telemetry envelopes.
+ */
+export interface SubagentLiveProgress {
+	id: string;
+	status: AgentProgress["status"];
+	currentTool?: string;
+	recentTool?: string;
+	recentOutputSummary?: { lineCount: number };
+	fastMode?: boolean;
+	retryState?: {
+		attempt: number;
+		maxAttempts: number;
+		unbounded?: boolean;
+		kind: NonNullable<AgentProgress["retryState"]>["kind"];
+		provider?: string;
+		lastProviderProgressAtMs?: number;
+		delayMs: number;
+		startedAtMs: number;
+	};
+	retryFailure?: { attempt: number };
+}
+
+function toSubagentLiveProgress(progress: AgentProgress): SubagentLiveProgress {
+	return {
+		id: progress.id,
+		status: progress.status,
+		...(progress.currentTool ? { currentTool: progress.currentTool } : {}),
+		...(progress.currentTool === undefined && progress.recentTools[0]
+			? { recentTool: progress.recentTools[0].tool }
+			: {}),
+		...(progress.recentOutput.length > 0
+			? { recentOutputSummary: { lineCount: Math.min(progress.recentOutput.length, 6) } }
+			: {}),
+		...(progress.fastMode ? { fastMode: true } : {}),
+		...(progress.retryState
+			? {
+					retryState: {
+						attempt: progress.retryState.attempt,
+						maxAttempts: progress.retryState.maxAttempts,
+						...(progress.retryState.unbounded ? { unbounded: true } : {}),
+						kind: progress.retryState.kind,
+						...(progress.retryState.provider ? { provider: progress.retryState.provider } : {}),
+						...(progress.retryState.lastProviderProgressAtMs !== undefined
+							? { lastProviderProgressAtMs: progress.retryState.lastProviderProgressAtMs }
+							: {}),
+						delayMs: progress.retryState.delayMs,
+						startedAtMs: progress.retryState.startedAtMs,
+					},
+				}
+			: {}),
+		...(progress.retryFailure ? { retryFailure: { attempt: progress.retryFailure.attempt } } : {}),
+	};
+}
+
+export type SubagentAwaitOutcome = "completed" | "timed_out" | "interrupted";
+
+const AWAIT_INTERRUPTED_GUIDANCE =
+	"Await interrupted; this subagent continues. Inspect its current state or cancel it only when necessary.";
 
 export interface SubagentToolDetails {
 	subagents: SubagentSnapshot[];
+	/** Await outcome for a live await receipt; omitted when no wait was started. */
+	awaitOutcome?: SubagentAwaitOutcome;
+	waitOutcome?: "completed" | "timed_out_wait" | "interrupted";
+	condition?: "all_terminal" | "any_terminal";
+	heartbeatMs?: number;
+	terminalIds?: string[];
+	acknowledgedTerminalIds?: string[];
+	/** True only when the parent await was interrupted; the child was not cancelled. */
+	interrupted?: true;
 }
 
 export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentToolDetails> {
@@ -92,6 +191,22 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 	readonly parameters = subagentSchema;
 	readonly strict = true;
 	readonly loadMode = "discoverable";
+	/**
+	 * Injected monotonic clock for await-liveness tests. Production callers leave
+	 * this undefined and the await falls back to `Date.now`; tests substitute a
+	 * virtual clock so a 15s+ liveness interval is exercised without any real
+	 * multi-minute sleep (#4465).
+	 */
+	#livenessNowMs?: () => number;
+
+	/** Test-only seam: substitute the liveness clock. Returns a restore function. */
+	withLivenessClock(nowMs: () => number): () => void {
+		const prior = this.#livenessNowMs;
+		this.#livenessNowMs = nowMs;
+		return () => {
+			this.#livenessNowMs = prior;
+		};
+	}
 
 	constructor(private readonly session: ToolSession) {
 		this.description = prompt.render(subagentDescription);
@@ -104,7 +219,16 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		onUpdate?: AgentToolUpdateCallback<SubagentToolDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<SubagentToolDetails>> {
-		const manager = AsyncJobManager.instance();
+		// The session's ENDPOINT-owned manager first: concurrent top-level
+		// sessions register their manager under their endpoint (sdk/session.ts),
+		// so list/pause/resume/message/cancel/await must inspect THIS session's
+		// manager — the process-global instance belongs to the last-created
+		// session, where this session's subagent records and jobs are absent
+		// or belong to a same-id subagent of another session (review thread P1).
+		const manager =
+			this.session.getAsyncJobManager?.() ??
+			AsyncJobManager.forEndpoint(this.session.getSessionId?.() ?? undefined) ??
+			AsyncJobManager.instance();
 		if (!manager) {
 			return {
 				content: [{ type: "text", text: "No subagent manager is available in this session." }],
@@ -210,10 +334,12 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 				records.push(record);
 				terminalGuidanceIds.add(record.subagentId);
 			} else {
-				const result = manager.resumeSubagent(record.subagentId, ownerFilter, params.message);
+				const result = manager.resumeSubagent(record.subagentId, ownerFilter, params.message, _toolCallId);
 				if (!result.ok && result.reason === "context_unavailable") throw new ToolError("context unavailable");
 				if (!result.ok && result.reason === "not_found") {
 					missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
+				} else if (!result.ok) {
+					throw new ToolError(`Failed to resume subagent ${record.subagentId}: ${result.reason ?? "unknown"}.`);
 				} else {
 					records.push(manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record);
 				}
@@ -251,7 +377,6 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			if (!record) {
 				missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
 			} else {
-				if (!record.sessionFile) throw new ToolError(`Subagent ${record.subagentId} has no session file.`);
 				if (record.status === "running") {
 					const handle = manager.getLiveHandle(record.subagentId);
 					if (!handle) throw new ToolError(`Subagent ${record.subagentId} has no live handle.`);
@@ -261,7 +386,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 					records.push(manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record);
 					steerStates.set(record.subagentId, "queued");
 				} else {
-					const result = manager.resumeSubagent(record.subagentId, ownerFilter, message);
+					const result = manager.resumeSubagent(record.subagentId, ownerFilter, message, _toolCallId);
 					if (!result.ok && result.reason === "not_found") {
 						missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
 					} else if (!result.ok) {
@@ -325,80 +450,165 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		signal: AbortSignal | undefined,
 		onUpdate: AgentToolUpdateCallback<SubagentToolDetails> | undefined,
 	): Promise<AgentToolResult<SubagentToolDetails>> {
-		const records = params.ids?.length
-			? this.#visibleRecordsByIds(manager, params.ids, ownerFilter)
+		const ids = params.ids
+			?.map(id => id.trim())
+			.filter(Boolean)
+			.filter((id, index, all) => all.indexOf(id) === index);
+		const records = ids?.length
+			? this.#visibleRecordsByIds(manager, ids, ownerFilter)
 			: this.#runningRecords(manager, ownerFilter);
-		const notFoundIds = this.#notFoundRecordIds(manager, params.ids ?? [], ownerFilter);
-		if (records.length === 0) {
-			const missing = notFoundIds.map(id =>
-				this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."),
+		const notFoundIds = (ids ?? []).filter(id => !this.#findVisibleRecord(manager, id, ownerFilter));
+		if (records.length === 0)
+			return this.#buildSnapshotResult(
+				notFoundIds.map(id =>
+					this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."),
+				),
+				"Subagent await",
 			);
-			return this.#buildSnapshotResult(missing, "Subagent await");
-		}
-
-		const runningJobs = records
-			.filter(record => record.status === "running" && record.currentJobId)
-			.map(record => manager.getJob(record.currentJobId!))
-			.filter((job): job is AsyncJob => job !== undefined);
-		if (runningJobs.length === 0) {
-			return await this.#buildRecordResult(manager, records, {
-				title: "Subagent await",
-				notFoundIds,
-				verbosity: params.verbosity ?? "receipt",
-			});
-		}
-
+		const targets = records
+			.map(record => manager.resolveSubagentWaitTarget(record.subagentId, ownerFilter))
+			.filter((target): target is NonNullable<typeof target> => target !== undefined);
+		if (targets.length === 0) return this.#buildSnapshotResult([], "Subagent await");
+		const condition = params.condition ?? "all_terminal";
+		const handle = manager.subscribeTerminalWait(targets, condition);
 		const timeoutMs = Math.min(
 			MAX_AWAIT_TIMEOUT_MS,
 			Math.max(0, Math.floor(params.timeout_ms ?? DEFAULT_AWAIT_TIMEOUT_MS)),
 		);
-		const watchedJobIds = runningJobs.map(job => job.id);
-		manager.watchJobs(watchedJobIds);
-		let lastEmittedSignature: string | undefined;
-		const emitIfChanged = (force: boolean): void => {
-			if (!onUpdate) return;
-			const result = this.#progressResult(manager, records, true);
-			const signature = subagentAwaitRenderedStateSignature(result.details?.subagents ?? []);
-			if (!force && signature === lastEmittedSignature) return;
-			lastEmittedSignature = signature;
-			onUpdate(result);
-		};
-		const progressTimer = onUpdate ? setInterval(() => emitIfChanged(false), 500) : undefined;
-		// Initial emission so the panel appears immediately; later idle ticks are
-		// gated on a value-based rendered-state signature so unchanged progress no
-		// longer rebuilds the renderer component or mutates transcript lines above
-		// the viewport (the source of the await-panel repaint storms).
-		emitIfChanged(true);
-
-		let timedOut = false;
-		try {
-			const completionPromise = Promise.all(runningJobs.map(job => job.promise));
-			const timeoutPromise = Bun.sleep(timeoutMs).then(() => {
-				timedOut = true;
+		const targetsAlreadyTerminal = targets.every(
+			target =>
+				target.initialStatus === "completed" ||
+				target.initialStatus === "failed" ||
+				target.initialStatus === "cancelled",
+		);
+		if (targetsAlreadyTerminal) {
+			const waitResult = await handle.result;
+			handle.acknowledge(waitResult.terminalJobIds);
+			handle.close();
+			const terminalJobIds = waitResult.terminalJobIds;
+			return await this.#buildRecordResult(manager, records, {
+				title: "Subagent await",
+				verbosity: params.verbosity ?? "receipt",
+				waitOutcome: "completed",
+				condition,
+				terminalIds: terminalJobIds,
 			});
-			if (signal) {
-				const { promise: abortPromise, resolve: abortResolve } = Promise.withResolvers<void>();
-				const onAbort = () => abortResolve();
-				signal.addEventListener("abort", onAbort, { once: true });
-				try {
-					await Promise.race([completionPromise, timeoutPromise, abortPromise]);
-				} finally {
-					signal.removeEventListener("abort", onAbort);
-				}
-			} else {
-				await Promise.race([completionPromise, timeoutPromise]);
+		}
+		const watchedJobIds = targets.map(target => target.jobId).filter((jobId): jobId is string => jobId !== null);
+		const watchHandle = manager.watchJobGenerations(watchedJobIds);
+		const heartbeatMs = params.heartbeat_ms === undefined ? 500 : params.heartbeat_ms;
+		// Liveness interval: force a re-emit even when the rendered-state signature
+		// is stable so a healthy wait never looks like a hung session (#4465). The
+		// `#livenessNowMs` clock is injected for deterministic tests; `Date.now`
+		// is the production fallback. The interval is floor-bounded so a caller who
+		// sets a tiny `heartbeat_ms` cannot turn liveness into transcript spam.
+		const livenessIntervalMs = Math.max(AWAIT_LIVENESS_MIN_INTERVAL_MS, heartbeatMs * AWAIT_LIVENESS_MULTIPLIER);
+		const nowMs = this.#livenessNowMs ?? Date.now;
+		let lastEmitMs = nowMs();
+		let lastEmittedSignature: string | undefined;
+		let streamingDisabled = false;
+		let stopProgressTimer = (): void => {};
+		const disableStreaming = (error: unknown): void => {
+			if (streamingDisabled) return;
+			streamingDisabled = true;
+			stopProgressTimer();
+			try {
+				logger.warn("Subagent await progress update failed; streaming disabled for this wait", {
+					error: safeThrownValue(error),
+				});
+			} catch {
+				// Diagnostics must never turn a recoverable progress-channel failure
+				// into an await or process-lifecycle failure.
+			}
+		};
+		const emitIfChanged = (force: boolean): void => {
+			if (!onUpdate || streamingDisabled) return;
+			try {
+				const result = this.#progressResult(manager, records, true);
+				const signature = subagentAwaitRenderedStateSignature(result.details?.subagents ?? []);
+				const t = nowMs();
+				const livenessDue = force || t - lastEmitMs >= livenessIntervalMs;
+				if (!livenessDue && signature === lastEmittedSignature) return;
+				lastEmittedSignature = signature;
+				lastEmitMs = t;
+				// A TypeScript void-return callback may still be implemented by an
+				// async function. Observe its runtime result so a rejected promise or
+				// thenable cannot become an unhandled rejection outside this span.
+				const updateResult = (onUpdate as (update: AgentToolResult<SubagentToolDetails>) => unknown)(result);
+				if (isPromiseLike(updateResult)) void Promise.resolve(updateResult).catch(disableStreaming);
+			} catch (error) {
+				// The liveness timer fires outside this function's promise chain, so a
+				// throwing progress consumer would otherwise escape `setInterval` as an
+				// uncaught exception, leave the wait's cleanup unreached, and let the
+				// interval keep firing and rethrowing for the rest of the await. Retire
+				// the streaming channel instead and keep waiting: losing progress output
+				// is recoverable, losing the timer and the watch registration is not.
+				disableStreaming(error);
+			}
+		};
+		// The initial emission and the timer own process-lifetime resources together
+		// with the watch registration and the terminal-wait handle, so they all live
+		// inside one guarded span rather than straddling it.
+		let progressTimer: Timer | undefined;
+		let waitOutcome: "completed" | "timed_out_wait" | "interrupted";
+		let onAbort: (() => void) | undefined;
+		let terminalJobIds: string[] | undefined;
+		const steeringWaitAbort = new AbortController();
+		try {
+			progressTimer = onUpdate && heartbeatMs > 0 ? setInterval(() => emitIfChanged(false), heartbeatMs) : undefined;
+			stopProgressTimer = () => {
+				if (progressTimer) clearInterval(progressTimer);
+				progressTimer = undefined;
+			};
+			emitIfChanged(true);
+			const abortPromise = new Promise<"interrupted">(resolve => {
+				onAbort = () => resolve("interrupted");
+				if (signal?.aborted) onAbort();
+				else signal?.addEventListener("abort", onAbort, { once: true });
+			});
+			// A busy user message must not sit behind this observation window: end
+			// the wait as interrupted so the parent's tool boundary handles the
+			// steer next, while the awaited children keep running.
+			const steeringArrival = this.session.waitForUserSteering
+				? [this.session.waitForUserSteering(steeringWaitAbort.signal).then(() => "interrupted" as const)]
+				: [];
+			waitOutcome =
+				targetsAlreadyTerminal && !signal?.aborted
+					? "completed"
+					: await Promise.race([
+							handle.result.then(() => "completed" as const),
+							Bun.sleep(timeoutMs).then(() => "timed_out_wait" as const),
+							abortPromise,
+							...steeringArrival,
+						]);
+			if (waitOutcome === "completed") {
+				terminalJobIds = (await handle.result).terminalJobIds;
+				handle.acknowledge(terminalJobIds);
 			}
 		} finally {
-			manager.unwatchJobs(watchedJobIds);
-			if (progressTimer) clearInterval(progressTimer);
+			steeringWaitAbort.abort();
+			if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+			stopProgressTimer();
+			watchHandle.close();
+			handle.close();
 		}
-
-		return await this.#buildRecordResult(manager, records, {
-			title: "Subagent await",
+		const awaitOutcome: SubagentAwaitOutcome =
+			waitOutcome === "completed" ? "completed" : waitOutcome === "timed_out_wait" ? "timed_out" : "interrupted";
+		const finalRecords = this.#visibleRecordsByIds(
+			manager,
+			records.map(record => record.subagentId),
+			ownerFilter,
+		);
+		return await this.#buildRecordResult(manager, finalRecords, {
+			title: waitOutcome === "interrupted" ? "Subagent await interrupted" : "Subagent await",
 			notFoundIds,
-			timedOut,
+			timedOut: waitOutcome === "timed_out_wait",
 			verbosity: params.verbosity ?? "receipt",
 			attachLiveProgress: true,
+			awaitOutcome,
+			waitOutcome,
+			condition,
+			terminalIds: terminalJobIds,
 		});
 	}
 
@@ -456,7 +666,8 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		if (direct && isSubagentJob(direct) && (!ownerId || direct.ownerId === ownerId)) return direct;
 		return manager
 			.getAllJobs(ownerId ? { ownerId } : undefined)
-			.find(job => isSubagentJob(job) && job.metadata?.subagent?.id === id);
+			.filter(job => isSubagentJob(job) && job.metadata?.subagent?.id === id)
+			.sort((a, b) => b.startTime - a.startTime)[0];
 	}
 
 	#visibleRecordsByIds(
@@ -499,11 +710,10 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		records: SubagentRecord[],
 		attachLiveProgress = false,
 	): AgentToolResult<SubagentToolDetails> {
+		const subagents = this.#recordSnapshots(manager, records, false, "receipt", new Set(), attachLiveProgress);
 		return {
-			content: [{ type: "text", text: "" }],
-			details: {
-				subagents: this.#recordSnapshots(manager, records, false, "receipt", new Set(), attachLiveProgress),
-			},
+			content: [{ type: "text", text: awaitProgressSummary(subagents) }],
+			details: { subagents },
 		};
 	}
 
@@ -516,6 +726,10 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			timedOut?: boolean;
 			verbosity?: SubagentParams["verbosity"];
 			attachLiveProgress?: boolean;
+			awaitOutcome?: SubagentAwaitOutcome;
+			waitOutcome?: "completed" | "timed_out_wait" | "interrupted";
+			condition?: "all_terminal" | "any_terminal";
+			terminalIds?: string[];
 		},
 	): Promise<AgentToolResult<SubagentToolDetails>> {
 		const verifiedOutputIds = await this.#verifiedOutputIds(records);
@@ -530,18 +744,29 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		for (const id of options.notFoundIds ?? []) {
 			snapshots.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
 		}
-		manager.acknowledgeDeliveries(
-			snapshots
-				.filter(
-					s =>
-						s.status !== "running" && s.status !== "paused" && s.status !== "queued" && s.status !== "not_found",
-				)
-				.map(s => s.jobId),
-		);
-		return this.#buildSnapshotResult(snapshots, options.title);
+		if (options.awaitOutcome === "interrupted") {
+			for (const snapshot of snapshots) {
+				if (snapshot.status === "running" || snapshot.status === "paused" || snapshot.status === "queued")
+					snapshot.guidance = AWAIT_INTERRUPTED_GUIDANCE;
+			}
+		}
+		const details: SubagentToolDetails = {
+			subagents: snapshots,
+			...(options.awaitOutcome !== undefined ? { awaitOutcome: options.awaitOutcome } : {}),
+			...(options.waitOutcome !== undefined ? { waitOutcome: options.waitOutcome } : {}),
+			...(options.condition !== undefined ? { condition: options.condition } : {}),
+			...(options.terminalIds !== undefined ? { terminalIds: options.terminalIds } : {}),
+		};
+		if (options.awaitOutcome === "interrupted") details.interrupted = true;
+		return this.#buildSnapshotResult(snapshots, options.title, options.awaitOutcome, details);
 	}
 
-	#buildSnapshotResult(snapshots: SubagentSnapshot[], title: string): AgentToolResult<SubagentToolDetails> {
+	#buildSnapshotResult(
+		snapshots: SubagentSnapshot[],
+		title: string,
+		awaitOutcome?: SubagentAwaitOutcome,
+		extraDetails?: SubagentToolDetails,
+	): AgentToolResult<SubagentToolDetails> {
 		const lines = [`## ${title} (${snapshots.length})`, ""];
 		for (const snapshot of snapshots) {
 			lines.push(`### ${snapshot.id} — ${snapshot.status}`);
@@ -556,6 +781,23 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			}
 			if (snapshot.description) lines.push(`Description: ${snapshot.description}`);
 			if (snapshot.outputRef) lines.push(`Output: ${snapshot.outputRef}`);
+			if (snapshot.setupFailureSummary) lines.push(`Setup failure: ${snapshot.setupFailureSummary}`);
+			if (snapshot.localErrorSummary) {
+				const local = snapshot.localErrorSummary;
+				lines.push(`Local failure (${local.kind}): ${local.summary}`);
+				// Guidance is kind-conditional: an overflow is a local staging
+				// limit that reproduces on re-issue; a snapshot failure is a
+				// serialization defect, which re-issuing does NOT reproduce.
+				if (local.kind === "local_buffer_overflow") {
+					lines.push(
+						"This is a local gjc staging-buffer limit, not a provider or context-window failure; the same request reproduces it.",
+					);
+				} else if (local.kind === "local_snapshot_failure") {
+					lines.push(
+						"This is a local gjc event-serialization defect, not a provider failure; re-issuing is safe to retry.",
+					);
+				}
+			}
 			if (snapshot.assignment) lines.push("Assignment:", "```", snapshot.assignment, "```");
 			if (snapshot.steerMessage) {
 				lines.push(`Steer (${snapshot.steerState ?? "queued"}):`, "```", snapshot.steerMessage, "```");
@@ -571,7 +813,11 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		}
 		return {
 			content: [{ type: "text", text: lines.join("\n").trimEnd() }],
-			details: { subagents: snapshots },
+			details: extraDetails ?? {
+				subagents: snapshots,
+				...(awaitOutcome ? { awaitOutcome } : {}),
+				...(awaitOutcome === "interrupted" ? { interrupted: true } : {}),
+			},
 		};
 	}
 
@@ -595,13 +841,11 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 	): Pick<SubagentSnapshot, "progress" | "liveProgressAvailable"> {
 		if (!attachLiveProgress) return {};
 		const liveProgressAvailable = manager.hasLiveSubagent(record.subagentId);
-		// Only surface progress when a live producer exists; stale/retained progress
-		// for a record with no live producer must degrade to a static snapshot (AC5).
 		if (!liveProgressAvailable) return { liveProgressAvailable: false };
 		const progress = manager.getSubagentProgress(record.subagentId);
 		return {
 			liveProgressAvailable: true,
-			...(progress ? { progress } : {}),
+			...(progress ? { progress: toSubagentLiveProgress(progress) } : {}),
 		};
 	}
 
@@ -644,6 +888,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		if (record.effectiveModel) fields.effectiveModel = record.effectiveModel;
 		if (record.requestedModel) fields.requestedModel = record.requestedModel;
 		if (record.modelFellBack) fields.modelFellBack = true;
+		if (record.fastMode) fields.fastMode = true;
 		return fields;
 	}
 
@@ -678,6 +923,17 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 						...(output.type === "error" ? { errorText: output.preview } : { resultText: output.preview }),
 						resultPreview: output.preview,
 						truncated: output.truncated,
+					}
+				: {}),
+			...(job.setupFailureSummary
+				? { setupFailureSummary: sanitizeText(job.setupFailureSummary, RECEIPT_PREVIEW_WIDTH) }
+				: {}),
+			...(job.localErrorSummary
+				? {
+						localErrorSummary: {
+							kind: job.localErrorSummary.kind,
+							summary: sanitizeText(job.localErrorSummary.summary, RECEIPT_PREVIEW_WIDTH),
+						},
 					}
 				: {}),
 			...(outputRef ? { outputRef } : {}),
@@ -729,6 +985,41 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 	}
 }
 
+/**
+ * Human-readable line for streamed `await` progress.
+ *
+ * Consumers that render structured content (ACP) previously received an empty
+ * text block here, which made `extractStructuredText` fail and the mapper fall
+ * back to serializing the whole result object as the human-readable content. A
+ * real sentence keeps the elapsed time legible there and in any log that only
+ * shows tool text.
+ */
+function awaitProgressSummary(subagents: readonly SubagentSnapshot[]): string {
+	const waiting = subagents.filter(snapshot => !isTerminalStatus(snapshot.status));
+	if (waiting.length === 0) return "";
+	// Accumulate rather than spreading into Math.max: explicit `ids` are not
+	// capped by MAX_LIST_LIMIT, so a large await would hit the argument limit.
+	let longestMs = 0;
+	for (const snapshot of waiting) if (snapshot.durationMs > longestMs) longestMs = snapshot.durationMs;
+	return `Awaiting ${waiting.length} subagent(s) for ${formatDuration(longestMs)}: ${waiting
+		.map(snapshot => snapshot.id)
+		.join(", ")}`;
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+	if ((typeof value !== "object" || value === null) && typeof value !== "function") return false;
+	return typeof (value as { then?: unknown }).then === "function";
+}
+
+function safeThrownValue(error: unknown): string {
+	try {
+		if (error instanceof Error) return error.message;
+		return String(error);
+	} catch {
+		return "[unprintable thrown value]";
+	}
+}
+
 function isTerminalStatus(status: SubagentStatus): boolean {
 	return status === "completed" || status === "failed" || status === "cancelled";
 }
@@ -738,7 +1029,40 @@ function isSubagentJob(job: AsyncJob): boolean {
 }
 
 function sanitizeText(text: string, width: number): string {
-	return truncateToWidth(replaceTabs(text), width, Ellipsis.Unicode);
+	return capCodePointsAndBytes(
+		truncateToWidth(replaceTabs(text), width, Ellipsis.Unicode),
+		width,
+		previewByteCap(width),
+	);
+}
+
+function previewByteCap(width: number): number {
+	return width === FULL_PREVIEW_WIDTH
+		? FULL_PREVIEW_BYTES
+		: width === PREVIEW_WIDTH
+			? PREVIEW_BYTES
+			: RECEIPT_PREVIEW_BYTES;
+}
+
+export function capCodePointsAndBytes(text: string, maxCodePoints: number, maxBytes: number): string {
+	const ellipsis = "…";
+	const collapsed = text.replace(/…{2,}$/u, ellipsis);
+	const codePoints = [...collapsed];
+	if (codePoints.length <= maxCodePoints && Buffer.byteLength(collapsed) <= maxBytes) return collapsed;
+
+	const source = collapsed.endsWith(ellipsis) ? collapsed.slice(0, -ellipsis.length) : collapsed;
+	const ellipsisBytes = Buffer.byteLength(ellipsis);
+	let preview = "";
+	let previewBytes = 0;
+	let previewCodePoints = 0;
+	for (const codePoint of source) {
+		const codePointBytes = Buffer.byteLength(codePoint);
+		if (previewCodePoints + 1 + 1 > maxCodePoints || previewBytes + codePointBytes + ellipsisBytes > maxBytes) break;
+		preview += codePoint;
+		previewBytes += codePointBytes;
+		previewCodePoints++;
+	}
+	return `${preview}${ellipsis}`;
 }
 
 function previewJobOutput(
@@ -754,7 +1078,11 @@ function previewJobOutput(
 	const width =
 		verbosity === "full" ? FULL_PREVIEW_WIDTH : verbosity === "preview" ? PREVIEW_WIDTH : RECEIPT_PREVIEW_WIDTH;
 	const normalized = replaceTabs(source.text);
-	const preview = truncateToWidth(normalized, width, Ellipsis.Unicode);
+	const preview = capCodePointsAndBytes(
+		truncateToWidth(normalized, width, Ellipsis.Unicode),
+		width,
+		previewByteCap(width),
+	);
 	return { type: source.type, preview, truncated: preview !== normalized };
 }
 
@@ -778,8 +1106,15 @@ function previewJobOutput(
  * countdown ticking is sacrificed by design; every real transition still changes
  * the signature.
  */
-export function subagentAwaitRenderedStateSignature(subagents: readonly SubagentSnapshot[]): string {
-	return JSON.stringify(subagents.map(canonicalizeSnapshotForSignature));
+export function subagentAwaitRenderedStateSignature(
+	subagents: readonly SubagentSnapshot[],
+	receipt?: Pick<SubagentToolDetails, "awaitOutcome" | "interrupted">,
+): string {
+	return JSON.stringify({
+		awaitOutcome: receipt?.awaitOutcome ?? null,
+		interrupted: receipt?.interrupted === true,
+		subagents: subagents.map(canonicalizeSnapshotForSignature),
+	});
 }
 
 function canonicalizeSnapshotForSignature(snapshot: SubagentSnapshot): unknown {
@@ -805,89 +1140,30 @@ function canonicalizeSnapshotForSignature(snapshot: SubagentSnapshot): unknown {
 		effectiveModel: snapshot.effectiveModel ?? null,
 		requestedModel: snapshot.requestedModel ?? null,
 		modelFellBack: snapshot.modelFellBack ?? false,
+		fastMode: snapshot.fastMode ?? false,
 		// durationMs intentionally excluded (time-derived; would defeat idle gating).
 		progress: snapshot.progress ? canonicalizeProgressForSignature(snapshot.progress) : null,
 	};
 }
 
-function canonicalizeProgressForSignature(progress: AgentProgress): unknown {
+function canonicalizeProgressForSignature(progress: SubagentLiveProgress): unknown {
 	return {
 		id: progress.id,
-		agent: progress.agent,
-		agentSource: progress.agentSource,
 		status: progress.status,
-		task: progress.task,
-		assignment: progress.assignment ?? null,
-		description: progress.description ?? null,
-		lastIntent: progress.lastIntent ?? null,
 		currentTool: progress.currentTool ?? null,
-		currentToolArgs: progress.currentToolArgs ?? null,
-		// currentToolStartMs intentionally excluded (only drives elapsed rendering).
-		recentTools: progress.recentTools.map(tool => ({ tool: tool.tool, args: tool.args })),
-		recentOutput: progress.recentOutput,
-		toolCount: progress.toolCount,
-		tokens: progress.tokens,
-		contextTokens: progress.contextTokens ?? null,
-		contextWindow: progress.contextWindow ?? null,
-		cost: progress.cost,
-		modelOverride: progress.modelOverride ?? null,
-		modelSubstitutionWarning: progress.modelSubstitutionWarning ?? null,
-		// durationMs intentionally excluded (time-derived).
-		extractedToolData: progress.extractedToolData
-			? canonicalizeExtractedToolDataForSignature(progress.extractedToolData)
-			: null,
+		recentTool: progress.recentTool ?? null,
+		recentOutputSummary: progress.recentOutputSummary ?? null,
+		fastMode: progress.fastMode ?? false,
+		retryFailure: progress.retryFailure ?? null,
 		retryState: progress.retryState
 			? {
 					attempt: progress.retryState.attempt,
 					maxAttempts: progress.retryState.maxAttempts,
 					unbounded: progress.retryState.unbounded ?? false,
+					kind: progress.retryState.kind,
+					provider: progress.retryState.provider ?? null,
 					delayMs: progress.retryState.delayMs,
-					errorMessage: progress.retryState.errorMessage,
-					// startedAtMs intentionally excluded (drives countdown only).
 				}
 			: null,
-		retryFailure: progress.retryFailure ?? null,
-		inflightTaskDetails: progress.inflightTaskDetails
-			? canonicalizeTaskDetailsForSignature(progress.inflightTaskDetails)
-			: null,
 	};
-}
-
-/**
- * Nested `task` data (`extractedToolData.task` and `inflightTaskDetails`) is the
- * one place the await signature reaches into a live, ticking structure: nested
- * `AgentProgress` carries the same time-derived fields excluded above, and
- * `TaskToolDetails` adds `totalDurationMs` / per-result `durationMs`. Signing it
- * wholesale would defeat idle gating whenever an awaited subagent is itself inside
- * a live `task` call, so these helpers canonicalize the rendered, non-time subset
- * recursively (mutually recursive with `canonicalizeProgressForSignature`).
- */
-function canonicalizeExtractedToolDataForSignature(data: Record<string, unknown[]>): Record<string, unknown> {
-	const out: Record<string, unknown> = {};
-	for (const key of Object.keys(data)) {
-		// Only the `task` key holds time-ticking `TaskToolDetails`; other handler
-		// data (yield/report_finding/generic) is stable and passes through as-is.
-		out[key] = key === "task" ? (data[key] as TaskToolDetails[]).map(canonicalizeTaskDetailsForSignature) : data[key];
-	}
-	return out;
-}
-
-function canonicalizeTaskDetailsForSignature(details: TaskToolDetails): unknown {
-	// `extractedToolData` is an untyped boundary (`Record<string, unknown[]>`), so
-	// guard each field instead of trusting the `TaskToolDetails` cast.
-	return {
-		// totalDurationMs intentionally excluded (time-derived).
-		results: Array.isArray(details.results) ? details.results.map(canonicalizeTaskResultForSignature) : null,
-		progress: Array.isArray(details.progress) ? details.progress.map(canonicalizeProgressForSignature) : null,
-		async: details.async
-			? { state: details.async.state, jobId: details.async.jobId, type: details.async.type }
-			: null,
-	};
-}
-
-function canonicalizeTaskResultForSignature(result: TaskToolDetails["results"][number]): unknown {
-	// Completed results do not tick, but drop `durationMs` so the only time-derived
-	// field in the receipt can never reintroduce idle churn.
-	const { durationMs: _durationMs, ...rest } = result;
-	return rest;
 }

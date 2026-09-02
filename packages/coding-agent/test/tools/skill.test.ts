@@ -10,6 +10,7 @@ import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/mess
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { SkillTool } from "@gajae-code/coding-agent/tools/skill";
 import { ToolError } from "@gajae-code/coding-agent/tools/tool-errors";
+import { safeRm } from "../../../../scripts/safe-cleanup";
 
 async function makeSkill(name: string, content: string): Promise<Skill> {
 	const dir = await mkdtemp(path.join(os.tmpdir(), `skill-tool-${name}-`));
@@ -32,6 +33,33 @@ interface CapturedSend {
 
 async function makeTempCwd(): Promise<string> {
 	return mkdtemp(path.join(os.tmpdir(), "skill-tool-cwd-"));
+}
+
+async function makeRuntimeSkill(root: string, name: string, description: string, body: string): Promise<string> {
+	const dir = path.join(root, name);
+	const filePath = path.join(dir, "SKILL.md");
+	await fs.mkdir(dir, { recursive: true });
+	await fs.writeFile(
+		filePath,
+		`---
+name: ${name}
+description: ${description}
+---
+
+${body}
+`,
+		"utf8",
+	);
+	return filePath;
+}
+
+function runtimeSkillSettings(): Settings {
+	return Settings.isolated({
+		"skill.enabled": true,
+		"skills.enabled": true,
+		"skills.enablePiProject": true,
+		"skills.enablePiUser": true,
+	});
 }
 
 function encodeSessionSegment(value: string): string {
@@ -76,6 +104,44 @@ async function readModeState(cwd: string, skill: string, sessionId?: string): Pr
 		if (e.code === "ENOENT") return null;
 		throw err;
 	}
+}
+async function readActiveEntry(
+	cwd: string,
+	skill: string,
+	sessionId?: string,
+): Promise<Record<string, unknown> | null> {
+	try {
+		const raw = await fs.readFile(
+			path.join(stateBaseDir(cwd, sessionId), "active", `${encodeSessionSegment(skill)}.json`),
+			"utf-8",
+		);
+		return JSON.parse(raw) as Record<string, unknown>;
+	} catch (err) {
+		const e = err as NodeJS.ErrnoException;
+		if (e.code === "ENOENT") return null;
+		throw err;
+	}
+}
+async function writeActiveEntry(
+	cwd: string,
+	skill: string,
+	entry: Record<string, unknown>,
+	sessionId?: string,
+): Promise<void> {
+	const filePath = path.join(stateBaseDir(cwd, sessionId), "active", `${encodeSessionSegment(skill)}.json`);
+	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	await fs.writeFile(
+		filePath,
+		JSON.stringify(
+			{
+				skill,
+				...(sessionId ? { session_id: sessionId } : {}),
+				...entry,
+			},
+			null,
+			2,
+		),
+	);
 }
 
 function createTestModel(id: string): Model {
@@ -145,6 +211,217 @@ describe("SkillTool", () => {
 		expect(SkillTool.createIf(session)).toBeNull();
 	});
 
+	it("uses runtime fallback through createIf while session skills retain name precedence", async () => {
+		const cwd = await makeTempCwd();
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "skill-tool-runtime-home-"));
+		const originalGjcConfigDir = process.env.GJC_CONFIG_DIR;
+		const originalPiConfigDir = process.env.PI_CONFIG_DIR;
+		let unrelated: Skill | undefined;
+		let preloaded: Skill | undefined;
+		try {
+			process.env.GJC_CONFIG_DIR = ".gjc";
+			delete process.env.PI_CONFIG_DIR;
+			const runtimePath = await makeRuntimeSkill(
+				path.join(home, ".gjc", "agent", "skills"),
+				"runtime-helper",
+				"Runtime helper",
+				"Runtime fallback body.",
+			);
+			unrelated = await makeSkill("unrelated", "Unrelated body.");
+			const captured: CapturedSend[] = [];
+			const session = createSession(cwd, [unrelated], captured, { settings: runtimeSkillSettings(), home });
+
+			const tool = SkillTool.createIf(session);
+			expect(tool).not.toBeNull();
+			const fallback = await tool!.execute("call-1", { name: "runtime-helper" });
+			expect(captured[0]?.message.content).toContain("Runtime fallback body.");
+			expect(fallback.details?.path).toBe(runtimePath);
+
+			preloaded = await makeSkill("runtime-helper", "Preloaded body.");
+			const preloadedCaptured: CapturedSend[] = [];
+			const preloadedTool = SkillTool.createIf(
+				createSession(cwd, [unrelated, preloaded], preloadedCaptured, {
+					settings: runtimeSkillSettings(),
+				}),
+			);
+			expect(preloadedTool).not.toBeNull();
+			const preloadedResult = await preloadedTool!.execute("call-2", { name: "runtime-helper" });
+			expect(preloadedCaptured[0]?.message.content).toContain("Preloaded body.");
+			expect(preloadedCaptured[0]?.message.content).not.toContain("Runtime fallback body.");
+			expect(preloadedResult.details?.path).toBe(preloaded.filePath);
+		} finally {
+			if (originalGjcConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
+			else process.env.GJC_CONFIG_DIR = originalGjcConfigDir;
+			if (originalPiConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
+			else process.env.PI_CONFIG_DIR = originalPiConfigDir;
+			if (unrelated) await safeRm(unrelated.baseDir, { recursive: true, force: true });
+			if (preloaded) await safeRm(preloaded.baseDir, { recursive: true, force: true });
+			await safeRm(cwd, { recursive: true, force: true });
+			await safeRm(home, { recursive: true, force: true });
+		}
+	});
+
+	it("uses exact runtime fallback precedence across project, canonical, configured, and historical roots", async () => {
+		const cwd = await makeTempCwd();
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "skill-tool-runtime-precedence-home-"));
+		const originalGjcConfigDir = process.env.GJC_CONFIG_DIR;
+		const originalPiConfigDir = process.env.PI_CONFIG_DIR;
+		const originalCodingAgentDir = process.env.GJC_CODING_AGENT_DIR;
+		const originalPiCodingAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
+		let loaded: Skill | undefined;
+		try {
+			delete process.env.GJC_CONFIG_DIR;
+			delete process.env.PI_CONFIG_DIR;
+			const gjcAgentDecoyDir = path.join(home, "gjc-agent-decoy");
+			const piAgentDecoyDir = path.join(home, "pi-agent-decoy");
+			const xdgConfigHome = path.join(home, "xdg-decoy");
+			process.env.GJC_CODING_AGENT_DIR = gjcAgentDecoyDir;
+			process.env.PI_CODING_AGENT_DIR = piAgentDecoyDir;
+			process.env.XDG_CONFIG_HOME = xdgConfigHome;
+			const defaultCanonicalPath = await makeRuntimeSkill(
+				path.join(home, ".gjc", "agent", "skills"),
+				"default-canonical",
+				"Default canonical",
+				"Default canonical body.",
+			);
+			const captured: CapturedSend[] = [];
+			loaded = await makeSkill("loaded", "Loaded");
+			const tool = SkillTool.createIf(
+				createSession(cwd, [loaded], captured, { settings: runtimeSkillSettings(), home }),
+			)!;
+			const defaultResult = await tool.execute("call-default-canonical", { name: "default-canonical" });
+			expect(captured.at(-1)?.message.content).toContain("Default canonical body.");
+			expect(defaultResult.details?.path).toBe(defaultCanonicalPath);
+
+			process.env.GJC_CONFIG_DIR = ".configured-gjc";
+			process.env.PI_CONFIG_DIR = ".configured-pi";
+			const configuredRoot = path.join(home, ".configured-gjc");
+			const canonicalPath = await makeRuntimeSkill(
+				path.join(configuredRoot, "agent", "skills"),
+				"canonical-only",
+				"Canonical",
+				"Canonical body.",
+			);
+			const configuredPath = await makeRuntimeSkill(
+				path.join(configuredRoot, "skills"),
+				"configured-only",
+				"Configured legacy",
+				"Configured legacy body.",
+			);
+			const historicalPath = await makeRuntimeSkill(
+				path.join(home, ".gjc", "skills"),
+				"historical-only",
+				"Historical legacy",
+				"Historical body.",
+			);
+			const projectPath = await makeRuntimeSkill(
+				path.join(cwd, ".gjc", "skills"),
+				"winner",
+				"Project",
+				"Project body.",
+			);
+			await makeRuntimeSkill(
+				path.join(configuredRoot, "agent", "skills"),
+				"winner",
+				"Canonical",
+				"Canonical winner body.",
+			);
+			await makeRuntimeSkill(path.join(configuredRoot, "skills"), "winner", "Configured", "Configured winner body.");
+			await makeRuntimeSkill(path.join(home, ".gjc", "skills"), "winner", "Historical", "Historical winner body.");
+			const canonicalDuplicatePath = await makeRuntimeSkill(
+				path.join(configuredRoot, "agent", "skills"),
+				"canonical-configured-historical",
+				"Canonical duplicate",
+				"Canonical duplicate body.",
+			);
+			await makeRuntimeSkill(
+				path.join(configuredRoot, "skills"),
+				"canonical-configured-historical",
+				"Configured duplicate",
+				"Configured duplicate body.",
+			);
+			await makeRuntimeSkill(
+				path.join(home, ".gjc", "skills"),
+				"canonical-configured-historical",
+				"Historical duplicate",
+				"Historical duplicate body.",
+			);
+			const configuredDuplicatePath = await makeRuntimeSkill(
+				path.join(configuredRoot, "skills"),
+				"configured-historical",
+				"Configured duplicate",
+				"Configured duplicate body.",
+			);
+			await makeRuntimeSkill(
+				path.join(home, ".gjc", "skills"),
+				"configured-historical",
+				"Historical duplicate",
+				"Historical duplicate body.",
+			);
+			const gjcDecoyPath = await makeRuntimeSkill(
+				path.join(gjcAgentDecoyDir, "skills"),
+				"gjc-direct-decoy",
+				"GJC direct decoy",
+				"Decoy.",
+			);
+			const piDecoyPath = await makeRuntimeSkill(
+				path.join(piAgentDecoyDir, "skills"),
+				"pi-direct-decoy",
+				"PI direct decoy",
+				"Decoy.",
+			);
+			const xdgDecoyPath = await makeRuntimeSkill(
+				path.join(xdgConfigHome, "gjc", "agent", "skills"),
+				"xdg-decoy",
+				"XDG decoy",
+				"Decoy.",
+			);
+			for (const [name, expectedPath, body] of [
+				["canonical-only", canonicalPath, "Canonical body."],
+				["configured-only", configuredPath, "Configured legacy body."],
+				["historical-only", historicalPath, "Historical body."],
+				["winner", projectPath, "Project body."],
+				["canonical-configured-historical", canonicalDuplicatePath, "Canonical duplicate body."],
+				["configured-historical", configuredDuplicatePath, "Configured duplicate body."],
+			] as const) {
+				const result = await tool.execute(`call-${name}`, { name });
+				expect(captured.at(-1)?.message.content).toContain(body);
+				expect(result.details?.path).toBe(expectedPath);
+			}
+			delete process.env.GJC_CONFIG_DIR;
+			const piCanonicalPath = await makeRuntimeSkill(
+				path.join(home, ".configured-pi", "agent", "skills"),
+				"pi-canonical",
+				"PI canonical",
+				"PI canonical body.",
+			);
+			const piResult = await tool.execute("call-pi", { name: "pi-canonical" });
+			expect(captured.at(-1)?.message.content).toContain("PI canonical body.");
+			expect(piResult.details?.path).toBe(piCanonicalPath);
+			const capturedBeforeDecoys = captured.length;
+			for (const name of ["gjc-direct-decoy", "pi-direct-decoy", "xdg-decoy"]) {
+				await expect(tool.execute(`call-${name}`, { name })).rejects.toThrow(/unknown skill/);
+			}
+			expect(captured).toHaveLength(capturedBeforeDecoys);
+			expect([gjcDecoyPath, piDecoyPath, xdgDecoyPath]).not.toContain(piResult.details?.path);
+		} finally {
+			if (originalGjcConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
+			else process.env.GJC_CONFIG_DIR = originalGjcConfigDir;
+			if (originalPiConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
+			else process.env.PI_CONFIG_DIR = originalPiConfigDir;
+			if (originalCodingAgentDir === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+			else process.env.GJC_CODING_AGENT_DIR = originalCodingAgentDir;
+			if (originalPiCodingAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = originalPiCodingAgentDir;
+			if (originalXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+			else process.env.XDG_CONFIG_HOME = originalXdgConfigHome;
+			if (loaded) await safeRm(loaded.baseDir, { recursive: true, force: true });
+			await safeRm(cwd, { recursive: true, force: true });
+			await safeRm(home, { recursive: true, force: true });
+		}
+	});
+
 	it("dispatches the chained skill same-turn without deliverAs nextTurn", async () => {
 		const cwd = await makeTempCwd();
 		const ultragoal = await makeSkill("ultragoal", "---\nname: ultragoal\n---\n# Ultragoal\nTrack execution.");
@@ -185,6 +462,23 @@ describe("SkillTool", () => {
 		expect(content).not.toContain("User:");
 	});
 
+	it("rejects wildcard/glob skill names immediately without dispatching", async () => {
+		const cwd = await makeTempCwd();
+		const ultragoal = await makeSkill("ultragoal", "---\nname: ultragoal\n---\nBody");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [ultragoal], captured, {
+			getActiveSkillState: () => ({ skill: "deep-interview", session_id: "s1" }),
+			getActiveSkillPhase: () => "interviewing",
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		await expect(tool.execute("call-1", { name: "*" })).rejects.toBeInstanceOf(ToolError);
+		await expect(tool.execute("call-1", { name: "*" })).rejects.toThrow(/not a valid skill name/);
+		await expect(tool.execute("call-1", { name: "git-*" })).rejects.toThrow(/glob or wildcard/);
+		// Guard runs before the phase/handoff path, so no dispatch and no state I/O.
+		expect(captured).toHaveLength(0);
+	});
+
 	it("rejects chaining into the currently active skill (recursive-self guard)", async () => {
 		const cwd = await makeTempCwd();
 		const deepInterview = await makeSkill("deep-interview", "---\nname: deep-interview\n---\nBody");
@@ -200,6 +494,43 @@ describe("SkillTool", () => {
 			/refusing to chain into currently active skill "deep-interview"/,
 		);
 		expect(captured).toHaveLength(0);
+	});
+	it("chains from an active runtime skill without native workflow state", async () => {
+		const cwd = await makeTempCwd();
+		const autopilot = await makeSkill("vc-autopilot", "---\nname: vc-autopilot\n---\nAuto");
+		const interview = await makeSkill(
+			"vc-characterchat-interview",
+			"---\nname: vc-characterchat-interview\n---\nInterview",
+		);
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [autopilot, interview], captured, {
+			getActiveSkillState: () => ({ skill: "vc-autopilot", session_id: "s1" }),
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		const result = await tool.execute("call-1", { name: "vc-characterchat-interview", args: "brief.json --brief" });
+
+		expect(result.details?.name).toBe("vc-characterchat-interview");
+		expect(result.details?.args).toBe("brief.json --brief");
+		expect(captured).toHaveLength(1);
+		expect(await readModeState(cwd, "vc-autopilot", "s1")).toBeNull();
+	});
+
+	it("chains from an active runtime skill into a native workflow skill", async () => {
+		const cwd = await makeTempCwd();
+		const customSkill = await makeSkill("project-skill", "---\nname: project-skill\n---\nCustom");
+		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [customSkill, ralplan], captured, {
+			getActiveSkillState: () => ({ skill: "project-skill", session_id: "s1" }),
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		const result = await tool.execute("call-1", { name: "ralplan" });
+
+		expect(result.details?.name).toBe("ralplan");
+		expect(captured).toHaveLength(1);
+		expect(captured[0]!.message.details).toEqual(expect.objectContaining({ name: "ralplan" }));
 	});
 
 	it("rejects chaining when caller phase is not terminal (phase guard)", async () => {
@@ -244,6 +575,30 @@ describe("SkillTool", () => {
 		const rp = await readModeState(cwd, "ralplan", "s1");
 		expect(rp?.active).toBe(true);
 		expect(rp?.handoff_from).toBe("deep-interview");
+	});
+	it("chains from a native workflow skill into a runtime skill and demotes the caller", async () => {
+		const cwd = await makeTempCwd();
+		await writeCallerModeState(cwd, "ralplan", "handoff", "s1");
+		await writeActiveEntry(cwd, "ralplan", { active: true, phase: "handoff" }, "s1");
+		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+		const runtimeSkill = await makeSkill("project-executor", "---\nname: project-executor\n---\nRun");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [ralplan, runtimeSkill], captured, {
+			getActiveSkillState: () => ({ skill: "ralplan", session_id: "s1" }),
+			getActiveSkillPhase: () => "handoff",
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		await tool.execute("call-1", { name: "project-executor" });
+
+		const rp = await readModeState(cwd, "ralplan", "s1");
+		expect(rp?.active).toBe(false);
+		expect(rp?.current_phase).toBe("handoff");
+		expect(rp?.handoff_to).toBe("project-executor");
+		expect(await readActiveEntry(cwd, "ralplan", "s1")).toBeNull();
+		expect(await readModeState(cwd, "project-executor", "s1")).toBeNull();
+		expect(await readActiveEntry(cwd, "project-executor", "s1")).toBeNull();
+		expect(captured).toHaveLength(1);
 	});
 
 	it("supports R->U handoff (ralplan in handoff phase chains to ultragoal)", async () => {
@@ -352,6 +707,81 @@ describe("SkillTool", () => {
 			const rp = await readModeState(cwd, "ralplan", "s1");
 			expect(rp?.active).toBe(true);
 			expect(rp?.handoff_from).toBe("deep-interview");
+		});
+	}
+
+	// Manifest-driven chain permissions (autoresearch handoff-ready at any live
+	// phase; ralplan "final" is a manifest terminal state the generic set misses;
+	// ralplan/ultragoal live phases stay blocked).
+	for (const [phase, callee] of [
+		["research", "deep-interview"],
+		["verdict", "ralplan"],
+		["intake", "ralplan"],
+	] as const) {
+		it(`allows autoresearch (phase=${phase}) to chain into ${callee} without a pre-write`, async () => {
+			const cwd = await makeTempCwd();
+			await writeCallerModeState(cwd, "autoresearch", phase, "s1");
+			const autoresearch = await makeSkill("autoresearch", "---\nname: autoresearch\n---\nResearch");
+			const target = await makeSkill(callee, `---\nname: ${callee}\n---\nBody`);
+			const captured: CapturedSend[] = [];
+			const session = createSession(cwd, [autoresearch, target], captured, {
+				getActiveSkillState: () => ({ skill: "autoresearch", session_id: "s1" }),
+				getActiveSkillPhase: () => phase,
+			});
+			const tool = SkillTool.createIf(session)!;
+
+			const result = await tool.execute("call-1", { name: callee });
+			expect(result.details?.name).toBe(callee);
+			expect(captured).toHaveLength(1);
+			const ar = await readModeState(cwd, "autoresearch", "s1");
+			expect(ar?.active).toBe(false);
+			expect(ar?.current_phase).toBe("handoff");
+			expect(ar?.handoff_to).toBe(callee);
+			const promoted = await readModeState(cwd, callee, "s1");
+			expect(promoted?.active).toBe(true);
+			expect(promoted?.handoff_from).toBe("autoresearch");
+		});
+	}
+
+	it("allows ralplan (phase=final, manifest terminal) to chain into ultragoal", async () => {
+		const cwd = await makeTempCwd();
+		await writeCallerModeState(cwd, "ralplan", "final", "s1");
+		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+		const ultragoal = await makeSkill("ultragoal", "---\nname: ultragoal\n---\nGo");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [ralplan, ultragoal], captured, {
+			getActiveSkillState: () => ({ skill: "ralplan", session_id: "s1" }),
+			getActiveSkillPhase: () => "final",
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		const result = await tool.execute("call-1", { name: "ultragoal" });
+		expect(result.details?.name).toBe("ultragoal");
+		const rp = await readModeState(cwd, "ralplan", "s1");
+		expect(rp?.active).toBe(false);
+		expect(rp?.handoff_to).toBe("ultragoal");
+		const ug = await readModeState(cwd, "ultragoal", "s1");
+		expect(ug?.active).toBe(true);
+	});
+
+	for (const [caller, phase, callee] of [
+		["ralplan", "planner", "ultragoal"],
+		["ultragoal", "active", "ralplan"],
+	] as const) {
+		it(`still refuses ${caller} mid-flight chaining (phase=${phase})`, async () => {
+			const cwd = await makeTempCwd();
+			await writeCallerModeState(cwd, caller, phase, "s1");
+			const callerSkill = await makeSkill(caller, `---\nname: ${caller}\n---\nBody`);
+			const target = await makeSkill(callee, `---\nname: ${callee}\n---\nBody`);
+			const captured: CapturedSend[] = [];
+			const session = createSession(cwd, [callerSkill, target], captured, {
+				getActiveSkillState: () => ({ skill: caller, session_id: "s1" }),
+				getActiveSkillPhase: () => phase,
+			});
+			const tool = SkillTool.createIf(session)!;
+
+			await expect(tool.execute("call-1", { name: callee })).rejects.toThrow(/refusing to chain/);
+			expect(captured).toHaveLength(0);
 		});
 	}
 

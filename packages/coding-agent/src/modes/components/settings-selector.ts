@@ -1,9 +1,11 @@
-import type { ThinkingLevel } from "@gajae-code/agent-core";
-import type { Effort } from "@gajae-code/ai";
+import { ThinkingLevel, type ThinkingLevel as ThinkingLevelValue } from "@gajae-code/agent-core";
+import type { Effort } from "@gajae-code/ai/core";
 import {
+	type Component,
 	Container,
 	Input,
 	matchesKey,
+	resolvePetMode,
 	type SelectItem,
 	SelectList,
 	type SettingItem,
@@ -21,15 +23,25 @@ import type {
 	StatusLineSeparatorStyle,
 } from "../../config/settings-schema";
 import { SETTING_TABS, TAB_METADATA } from "../../config/settings-schema";
+import type { GjcRuntimeSnapshotProvider } from "../../extensibility/gjc-plugins/runtime-quarantine";
 import { getCurrentThemeName, getSelectListTheme, getSettingsListTheme, theme } from "../../modes/theme/theme";
 import { matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
 import { getTabBarTheme } from "../shared";
+import { resolveUiLanguage, type UiLanguage, uiString } from "../ui-language";
 import { DynamicBorder } from "./dynamic-border";
+import { DynamicThemeText } from "./dynamic-theme-text";
+import { GjcBundleSettingsComponent } from "./gjc-bundle-settings";
+import {
+	type NotificationsEditorOperations,
+	NotificationsSettingsEditorComponent,
+} from "./notifications-settings-editor";
+import { createPetSelectItems, getPetUnavailableWarning, isPetAvailable } from "./pet-capability";
 import { handleInputOrEscape, PluginSettingsComponent } from "./plugin-settings";
+import { normalizeProviderOrder } from "./provider-order-context";
 import { getSettingsForTab, type SettingDef } from "./settings-defs";
-import type { StatusLineSegmentOptions } from "./status-line";
 import { getPreset } from "./status-line/presets";
 import { ALL_SEGMENT_IDS } from "./status-line/segments";
+import type { StatusLineSegmentOptions } from "./tool-status-header";
 
 /**
  * A submenu component for selecting from a list of options.
@@ -60,8 +72,6 @@ class TextInputSubmenu extends Container {
 		this.#input = new Input();
 		if (currentValue) {
 			this.#input.setValue(currentValue);
-			// Move cursor to end of pre-filled value (ctrl+e = cursorLineEnd).
-			this.#input.handleInput("\x05");
 		}
 		this.#input.onSubmit = value => {
 			this.onSubmit(value); // empty string clears the setting
@@ -94,18 +104,20 @@ class SelectSubmenu extends Container {
 		super();
 
 		// Title
-		this.addChild(new Text(theme.bold(theme.fg("accent", title)), 0, 0));
+		this.addChild(new DynamicThemeText(() => theme.bold(theme.fg("accent", title))));
 
 		// Description
 		if (description) {
 			this.addChild(new Spacer(1));
-			this.addChild(new Text(theme.fg("muted", description), 0, 0));
+			this.addChild(new DynamicThemeText(() => theme.fg("muted", description)));
 		}
 
 		// Preview (if provided)
 		if (getPreview) {
 			this.addChild(new Spacer(1));
-			this.addChild(new Text(theme.fg("muted", "Preview:"), 0, 0));
+			this.addChild(
+				new DynamicThemeText(() => theme.fg("muted", uiString(settings.get("ui.language"), "settings.preview"))),
+			);
 			this.#previewText = new Text(getPreview(), 0, 0);
 			this.addChild(this.#previewText);
 		}
@@ -114,7 +126,7 @@ class SelectSubmenu extends Container {
 		this.addChild(new Spacer(1));
 
 		// Select list
-		this.#selectList = new SelectList(options, Math.min(options.length, 10), getSelectListTheme());
+		this.#selectList = new SelectList(options, Math.min(options.length, 10), () => getSelectListTheme());
 
 		// Pre-select current value
 		const currentIndex = options.findIndex(o => o.value === currentValue);
@@ -150,7 +162,9 @@ class SelectSubmenu extends Container {
 
 		// Hint
 		this.addChild(new Spacer(1));
-		this.addChild(new Text(theme.fg("dim", "  Enter to select · Esc to go back"), 0, 0));
+		this.addChild(
+			new DynamicThemeText(() => theme.fg("dim", uiString(settings.get("ui.language"), "settings.selectHint"))),
+		);
 	}
 
 	#updatePreview(): void {
@@ -231,18 +245,16 @@ function getSavedUsageMode(): UsageMode {
 	return segmentOptions.usage?.mode === "remaining" ? "remaining" : "used";
 }
 
-function setSavedUsageMode(mode: string): StatusLineSegmentOptions {
+function getUsageModeSettings(mode: string): StatusLineSegmentOptions {
 	const normalizedMode: UsageMode = mode === "remaining" ? "remaining" : "used";
 	const segmentOptions = settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions;
-	const nextOptions: StatusLineSegmentOptions = {
+	return {
 		...segmentOptions,
 		usage: {
 			...(segmentOptions.usage ?? {}),
 			mode: normalizedMode,
 		},
 	};
-	settings.set("statusLine.segmentOptions", nextOptions as Record<string, unknown>);
-	return nextOptions;
 }
 
 function statusSegmentLabel(id: StatusLineSegmentId): string {
@@ -592,6 +604,8 @@ class StatusLineCustomEditor extends Container {
 			rightSegments: [...this.#draft.rightSegments],
 			separator: this.#draft.separator,
 			segmentOptions: cloneSegmentOptions(this.#draft.segmentOptions),
+			sessionAccent: settings.get("statusLine.sessionAccent"),
+			maxRows: settings.get("statusLine.maxRows"),
 			previewHighlightSegment: this.#previewHighlightSegment,
 		});
 	}
@@ -604,19 +618,23 @@ class StatusLineCustomEditor extends Container {
 			separator: settings.get("statusLine.separator"),
 			segmentOptions: cloneSegmentOptions(settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions),
 			sessionAccent: settings.get("statusLine.sessionAccent"),
+			maxRows: settings.get("statusLine.maxRows"),
 			previewHighlightSegment: undefined,
 		});
 	}
 
 	#save(): void {
-		settings.set("statusLine.preset", "custom");
-		settings.set("statusLine.leftSegments", [...this.#draft.leftSegments]);
-		settings.set("statusLine.rightSegments", [...this.#draft.rightSegments]);
-		settings.set("statusLine.separator", this.#draft.separator);
-		settings.set(
-			"statusLine.segmentOptions",
-			cloneSegmentOptions(this.#draft.segmentOptions) as Record<string, unknown>,
-		);
+		const saved = commitInteractiveSettings(this.callbacks, () => {
+			settings.set("statusLine.preset", "custom");
+			settings.set("statusLine.leftSegments", [...this.#draft.leftSegments]);
+			settings.set("statusLine.rightSegments", [...this.#draft.rightSegments]);
+			settings.set("statusLine.separator", this.#draft.separator);
+			settings.set(
+				"statusLine.segmentOptions",
+				cloneSegmentOptions(this.#draft.segmentOptions) as Record<string, unknown>,
+			);
+		});
+		if (!saved) return;
 		this.callbacks.onChange("statusLine.preset", "custom");
 		this.callbacks.onChange("statusLine.leftSegments", [...this.#draft.leftSegments]);
 		this.callbacks.onChange("statusLine.rightSegments", [...this.#draft.rightSegments]);
@@ -637,14 +655,15 @@ class StatusLineCustomEditor extends Container {
 	}
 }
 
-function getSettingsTabs(): Tab[] {
+function getSettingsTabs(language: UiLanguage): Tab[] {
 	return [
 		...SETTING_TABS.map(id => {
 			const meta = TAB_METADATA[id];
 			const icon = theme.symbol(meta.icon as Parameters<typeof theme.symbol>[0]);
-			return { id, label: `${icon} ${meta.label}` };
+			return { id, label: `${icon} ${uiString(language, `settings.tab.${id}`)}` };
 		}),
-		{ id: "plugins", label: `${theme.icon.package} Plugins` },
+		{ id: "plugins", label: `${theme.icon.package} ${uiString(language, "settings.tab.plugins")}` },
+		{ id: "gjc-bundles", label: `${theme.icon.package} ${uiString(language, "settings.tab.gjcBundles")}` },
 	];
 }
 
@@ -656,11 +675,25 @@ export interface SettingsRuntimeContext {
 	/** Available thinking levels (from session) */
 	availableThinkingLevels: Effort[];
 	/** Current thinking level (from session) */
-	thinkingLevel: ThinkingLevel | undefined;
+	thinkingLevel: ThinkingLevelValue | undefined;
 	/** Available themes */
 	availableThemes: string[];
+	/** Available model profile names (from the model registry) */
+	availableModelProfiles: string[];
 	/** Working directory for plugins tab */
 	cwd: string;
+	/** Whether this terminal can render the pet overlay. */
+	petAvailable?: boolean;
+	/** Terminal environment used to select unavailable-pet guidance. Omitted in production to use Bun.env. */
+	terminalEnv?: NodeJS.ProcessEnv;
+	/**
+	 * Runtime evidence published by the session for the current activation
+	 * generation. Omitted when no session published one, in which case the GJC
+	 * Bundles tab honestly reports runtime status as unavailable.
+	 */
+	gjcRuntimeSnapshot?: GjcRuntimeSnapshotProvider;
+	/** Activation generation the published snapshot must match to be merged. */
+	gjcActivationGeneration?: number;
 }
 
 /** Status line settings subset for preview */
@@ -672,6 +705,7 @@ export interface StatusLinePreviewSettings {
 	segmentOptions?: StatusLineSegmentOptions;
 	previewHighlightSegment?: StatusLineSegmentId;
 	sessionAccent?: boolean;
+	maxRows?: number;
 }
 
 export interface SettingsCallbacks {
@@ -681,14 +715,52 @@ export interface SettingsCallbacks {
 	onThemePreview?: (theme: string) => void | Promise<void>;
 	/** Called to restore the rendered theme when theme settings preview is cancelled */
 	onThemePreviewCancel?: (theme: string) => void | Promise<void>;
+	/**
+	 * Atomically apply and persist a theme selection. Returns false when the
+	 * candidate could not be loaded, leaving the submenu open.
+	 */
+	onThemeCommit?: (path: "theme.dark" | "theme.light", theme: string, previousTheme: string) => Promise<boolean>;
+	/** Called to live-preview the gajae pet skin while browsing the pet setting. */
+	onPetPreview?: (mode: string) => void;
+	/**
+	 * Commit a pet mode through the shared result-returning policy. The policy
+	 * rechecks capability immediately before mutation and owns persistence, so
+	 * the settings surface never persists `pet.mode` ahead of acceptance.
+	 * Returns whether the commit was accepted.
+	 */
+	onPetCommit?: (mode: string) => boolean;
 	/** Called for status line preview while configuring */
 	onStatusLinePreview?: (settings: StatusLinePreviewSettings) => void;
 	/** Get current rendered status line for inline preview */
 	getStatusLinePreview?: (width?: number) => string;
 	/** Called when plugins change */
 	onPluginsChanged?: () => void;
+	/** Called when asynchronously rebuilt settings content needs a repaint. */
+	onRenderRequested?: () => void;
+	/** Create the ordered provider-priority editor for `modelProviderOrder`. */
+	createProviderOrderEditor?: (done: () => void) => Container;
+	/** Called when an interactive setting cannot be committed. */
+	onError?: (message: string) => void;
 	/** Called when settings panel is closed */
 	onCancel: () => void;
+}
+function commitInteractiveSettings(callbacks: SettingsCallbacks, commit: () => void): boolean {
+	if (!settings.canWriteDurableConfig()) {
+		callbacks.onError?.(
+			"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+		);
+		return false;
+	}
+	try {
+		commit();
+		return true;
+	} catch (error) {
+		if (!settings.canWriteDurableConfig()) {
+			callbacks.onError?.(error instanceof Error ? error.message : String(error));
+			return false;
+		}
+		throw error;
+	}
 }
 
 /**
@@ -699,14 +771,18 @@ export class SettingsSelectorComponent extends Container {
 	#tabBar: TabBar;
 	#currentList: SettingsList | null = null;
 	#pluginComponent: PluginSettingsComponent | null = null;
+	#gjcBundleComponent: GjcBundleSettingsComponent | null = null;
+	#notificationsEditor: NotificationsSettingsEditorComponent | null = null;
 	#statusPreviewContainer: Container | null = null;
 	#statusPreviewText: Text | null = null;
-	#currentTabId: SettingTab | "plugins" = "appearance";
+	#currentTabId: SettingTab | "plugins" | "gjc-bundles" = "appearance";
 	#textInputActive = false;
+	#activeProviderOrderEditor: Container | null = null;
 
 	constructor(
 		private readonly context: SettingsRuntimeContext,
 		private readonly callbacks: SettingsCallbacks,
+		private readonly notificationsOperations?: NotificationsEditorOperations,
 	) {
 		super();
 
@@ -714,10 +790,8 @@ export class SettingsSelectorComponent extends Container {
 		this.addChild(new DynamicBorder());
 
 		// Tab bar
-		this.#tabBar = new TabBar("Settings", getSettingsTabs(), getTabBarTheme());
-		this.#tabBar.onTabChange = () => {
-			this.#switchToTab(this.#tabBar.getActiveTab().id as SettingTab | "plugins");
-		};
+		this.#tabBar = this.#createTabBar();
+
 		this.addChild(this.#tabBar);
 
 		// Spacer after tab bar
@@ -730,7 +804,40 @@ export class SettingsSelectorComponent extends Container {
 		this.addChild(new DynamicBorder());
 	}
 
-	#switchToTab(tabId: SettingTab | "plugins"): void {
+	#language(): UiLanguage {
+		return resolveUiLanguage(settings.get("ui.language"));
+	}
+
+	#createTabBar(initialIndex = 0): TabBar {
+		const language = this.#language();
+		const tabBar = new TabBar(
+			uiString(language, "settings.title"),
+			getSettingsTabs(language),
+			getTabBarTheme(),
+			initialIndex,
+			uiString(language, "settings.navigationHint"),
+		);
+		tabBar.onTabChange = () => {
+			this.#switchToTab(tabBar.getActiveTab().id as SettingTab | "plugins" | "gjc-bundles");
+		};
+		return tabBar;
+	}
+
+	#refreshTabBarLanguage(): void {
+		const previous = this.#tabBar;
+		this.#tabBar = this.#createTabBar(previous.getActiveIndex());
+		this.replaceChildren(this.children.map(child => (child === previous ? this.#tabBar : child)));
+	}
+
+	#switchToTab(tabId: SettingTab | "plugins" | "gjc-bundles"): void {
+		if (this.#currentTabId === "notifications" && tabId !== "notifications" && !this.#disposeNotificationsEditor()) {
+			return;
+		}
+		// Release an open provider-order editor (and its context subscriptions)
+		// before switching tabs; the submenu's done() never runs on tab change,
+		// so without this the abandoned editor's listeners would survive.
+		this.#activeProviderOrderEditor?.dispose();
+		this.#activeProviderOrderEditor = null;
 		this.#currentTabId = tabId;
 
 		// Remove current content
@@ -741,6 +848,11 @@ export class SettingsSelectorComponent extends Container {
 		if (this.#pluginComponent) {
 			this.removeChild(this.#pluginComponent);
 			this.#pluginComponent = null;
+		}
+		if (this.#gjcBundleComponent) {
+			this.removeChild(this.#gjcBundleComponent);
+			this.#gjcBundleComponent.dispose();
+			this.#gjcBundleComponent = null;
 		}
 		if (this.#statusPreviewContainer) {
 			this.removeChild(this.#statusPreviewContainer);
@@ -754,12 +866,26 @@ export class SettingsSelectorComponent extends Container {
 
 		if (tabId === "plugins") {
 			this.#showPluginsTab();
+		} else if (tabId === "gjc-bundles") {
+			this.#showGjcBundlesTab();
+		} else if (tabId === "notifications") {
+			this.#showNotificationsTab();
 		} else {
 			this.#showSettingsTab(tabId);
 		}
 
 		// Re-add bottom border
 		this.addChild(bottomBorder);
+	}
+
+	#disposeNotificationsEditor(): boolean {
+		const editor = this.#notificationsEditor;
+		if (!editor) return true;
+		if (editor.navigationLocked) return false;
+		editor.dispose();
+		this.removeChild(editor);
+		this.#notificationsEditor = null;
+		return true;
 	}
 
 	/**
@@ -772,13 +898,17 @@ export class SettingsSelectorComponent extends Container {
 		}
 
 		const currentValue = this.#getCurrentValue(def);
+		const language = this.#language();
+		const label = def.path === "ui.language" ? uiString(language, "settings.language.label") : def.label;
+		const description =
+			def.path === "ui.language" ? uiString(language, "settings.language.description") : def.description;
 
 		switch (def.type) {
 			case "boolean":
 				return {
 					id: def.path,
-					label: def.label,
-					description: def.description,
+					label,
+					description,
 					currentValue: currentValue ? "true" : "false",
 					values: ["true", "false"],
 				};
@@ -786,8 +916,8 @@ export class SettingsSelectorComponent extends Container {
 			case "enum":
 				return {
 					id: def.path,
-					label: def.label,
-					description: def.description,
+					label,
+					description,
 					currentValue: currentValue as string,
 					values: [...def.values],
 				};
@@ -795,17 +925,40 @@ export class SettingsSelectorComponent extends Container {
 			case "submenu":
 				return {
 					id: def.path,
-					label: def.label,
-					description: def.description,
+					label,
+					description,
 					currentValue: this.#getSubmenuCurrentValue(def.path, currentValue),
 					submenu: (cv, done) => this.#createSubmenu(def, cv, done),
 				};
 
+			case "providerOrder": {
+				const createEditor = this.callbacks.createProviderOrderEditor;
+				if (!createEditor) return null;
+				return {
+					id: def.path,
+					label,
+					description,
+					currentValue: `${normalizeProviderOrder(settings.getGlobal("modelProviderOrder") ?? []).length} configured`,
+					submenu: (_currentValue, done) => {
+						const editor = createEditor(() => {
+							this.#activeProviderOrderEditor = null;
+							// Rebuild the parent list from current settings so the
+							// `${count} configured` summary reflects the editor's
+							// persistence before the submenu closes.
+							this.#refreshCurrentTabItems();
+							done();
+						});
+						this.#activeProviderOrderEditor = editor;
+						return editor;
+					},
+				};
+			}
+
 			case "text":
 				return {
 					id: def.path,
-					label: def.label,
-					description: def.description,
+					label,
+					description,
 					currentValue: (currentValue as string) ?? "",
 					submenu: (cv, done) => this.#createTextInput(def, cv, done),
 				};
@@ -839,18 +992,39 @@ export class SettingsSelectorComponent extends Container {
 		done: (value?: string) => void,
 	): Container {
 		let options = def.options;
+		const language = this.#language();
+		const title = def.path === "ui.language" ? uiString(language, "settings.language.label") : def.label;
 
 		// Special case: inject runtime options for thinking level
 		if (def.path === "defaultThinkingLevel") {
-			options = this.context.availableThinkingLevels.map(level => {
+			options = [ThinkingLevel.Off, ...this.context.availableThinkingLevels].map(level => {
 				const baseOpt = options.find(o => o.value === level);
 				return baseOpt || { value: level, label: level };
 			});
 		} else if (def.path === "theme.dark" || def.path === "theme.light") {
 			options = this.context.availableThemes.map(t => ({ value: t, label: t }));
+		} else if (def.path === "modelProfile.default") {
+			options = this.context.availableModelProfiles.map(p => ({ value: p, label: p }));
+		} else if (def.path === "ui.language") {
+			options = [
+				{ value: "en", label: uiString(language, "settings.language.english") },
+				{ value: "ko", label: uiString(language, "settings.language.korean") },
+				{ value: "zh", label: uiString(language, "settings.language.chinese") },
+				{ value: "ja", label: uiString(language, "settings.language.japanese") },
+			];
 		}
 		if (def.path === "statusLine.preset") {
 			options = options.filter(option => option.value !== "custom");
+		}
+		let description =
+			def.path === "ui.language" ? uiString(language, "settings.language.description") : def.description;
+		if (def.path === "pet.mode") {
+			currentValue = resolvePetMode(currentValue);
+			const petAvailable = this.context.petAvailable ?? isPetAvailable();
+			options = createPetSelectItems(options, currentValue, petAvailable);
+			// Unsupported terminals must see the same actionable guidance the
+			// startup notice and /pet show, not only dimmed option descriptions.
+			if (!petAvailable) description = getPetUnavailableWarning(this.context.terminalEnv);
 		}
 		// Preview handlers
 		let onPreview: ((value: string) => void | Promise<void>) | undefined;
@@ -910,6 +1084,26 @@ export class SettingsSelectorComponent extends Container {
 				this.callbacks.onStatusLinePreview?.({ separator, previewHighlightSegment: undefined });
 				this.#updateStatusPreview();
 			};
+		} else if (def.path === "statusLine.maxRows") {
+			onPreview = value => {
+				this.callbacks.onStatusLinePreview?.({ maxRows: Number(value) });
+				this.#updateStatusPreview();
+			};
+			onPreviewCancel = () => {
+				this.callbacks.onStatusLinePreview?.({
+					maxRows: settings.get("statusLine.maxRows"),
+					previewHighlightSegment: undefined,
+				});
+				this.#updateStatusPreview();
+			};
+		} else if (def.path === "pet.mode") {
+			const savedPetMode = currentValue;
+			onPreview = value => {
+				this.callbacks.onPetPreview?.(value);
+			};
+			onPreviewCancel = () => {
+				this.callbacks.onPetPreview?.(savedPetMode);
+			};
 		}
 
 		// Provide status line preview for theme selection
@@ -917,13 +1111,50 @@ export class SettingsSelectorComponent extends Container {
 		const getPreview = isThemeSetting ? this.callbacks.getStatusLinePreview : undefined;
 
 		return new SelectSubmenu(
-			def.label,
-			def.description,
+			title,
+			description,
 			options,
 			currentValue,
 			value => {
-				this.#setSettingValue(def.path, value);
+				if (def.path === "modelProfile.default") {
+					this.callbacks.onChange(def.path, value);
+					done(value);
+					return;
+				}
+				if (def.path === "theme.dark" || def.path === "theme.light") {
+					// The theme commit persists through the controller, so it must honor
+					// the same invalid-config guard as every other durable write: report
+					// the repair error and leave the submenu open instead of no-oping.
+					if (!settings.canWriteDurableConfig()) {
+						this.callbacks.onError?.(
+							"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+						);
+						return;
+					}
+					if (!this.callbacks.onThemeCommit) return;
+					void this.callbacks.onThemeCommit(def.path, value, currentValue).then(accepted => {
+						if (accepted) done(value);
+					});
+					return;
+				}
+				if (def.path === "pet.mode") {
+					// The shared pet commit policy rechecks capability immediately
+					// before mutation and persists only on acceptance; the settings
+					// surface must not persist ahead of that result.
+					let accepted = false;
+					if (
+						!commitInteractiveSettings(this.callbacks, () => {
+							accepted = this.callbacks.onPetCommit?.(value) ?? false;
+						})
+					) {
+						return;
+					}
+					done(accepted ? value : undefined);
+					return;
+				}
+				if (!commitInteractiveSettings(this.callbacks, () => this.#setSettingValue(def.path, value))) return;
 				this.callbacks.onChange(def.path, value);
+				if (def.path === "ui.language") this.#refreshTabBarLanguage();
 				done(value);
 			},
 			() => {
@@ -955,7 +1186,7 @@ export class SettingsSelectorComponent extends Container {
 			value => {
 				// Empty string clears the setting; undefined-typed string settings
 				// store "" which the browser.ts expandPath ignores (no-op fallback).
-				this.#setSettingValue(def.path, value);
+				if (!commitInteractiveSettings(this.callbacks, () => this.#setSettingValue(def.path, value))) return;
 				this.callbacks.onChange(def.path, value);
 				wrappedDone(value);
 			},
@@ -982,6 +1213,14 @@ export class SettingsSelectorComponent extends Container {
 		}
 	}
 
+	#showNotificationsTab(): void {
+		if (!this.notificationsOperations) return;
+		this.#notificationsEditor = new NotificationsSettingsEditorComponent(this.notificationsOperations, {
+			onCancel: () => this.callbacks.onCancel(),
+		});
+		this.addChild(this.#notificationsEditor);
+	}
+
 	/**
 	 * Show a settings tab using definitions.
 	 */
@@ -992,7 +1231,9 @@ export class SettingsSelectorComponent extends Container {
 		if (tabId === "appearance") {
 			this.#statusPreviewContainer = new Container();
 			this.#statusPreviewContainer.addChild(new Spacer(1));
-			this.#statusPreviewContainer.addChild(new Text(theme.fg("muted", "Preview:"), 0, 0));
+			this.#statusPreviewContainer.addChild(
+				new DynamicThemeText(() => theme.fg("muted", uiString(settings.get("ui.language"), "settings.preview"))),
+			);
 			this.#statusPreviewText = new Text(this.#getStatusPreviewString(), 0, 0);
 			this.#statusPreviewContainer.addChild(this.#statusPreviewText);
 			this.#statusPreviewContainer.addChild(new Spacer(1));
@@ -1005,7 +1246,15 @@ export class SettingsSelectorComponent extends Container {
 			getSettingsListTheme(),
 			(id, newValue) => {
 				if (id === STATUS_LINE_USAGE_MODE_ID) {
-					const segmentOptions = setSavedUsageMode(newValue);
+					const segmentOptions = getUsageModeSettings(newValue);
+					if (
+						!commitInteractiveSettings(this.callbacks, () => {
+							settings.set("statusLine.segmentOptions", segmentOptions as Record<string, unknown>);
+						})
+					) {
+						this.#refreshCurrentTabItems(defs);
+						return;
+					}
 					this.callbacks.onChange("statusLine.segmentOptions", segmentOptions);
 					if (tabId === "appearance") {
 						this.#triggerStatusLinePreview();
@@ -1021,14 +1270,20 @@ export class SettingsSelectorComponent extends Container {
 
 				if (def.type === "boolean") {
 					const boolValue = newValue === "true";
-					settings.set(path, boolValue as never);
+					if (!commitInteractiveSettings(this.callbacks, () => settings.set(path, boolValue as never))) {
+						this.#refreshCurrentTabItems(defs);
+						return;
+					}
 					this.callbacks.onChange(path, boolValue);
 
 					if (tabId === "appearance") {
 						this.#triggerStatusLinePreview();
 					}
 				} else if (def.type === "enum") {
-					settings.set(path, newValue as never);
+					if (!commitInteractiveSettings(this.callbacks, () => settings.set(path, newValue as never))) {
+						this.#refreshCurrentTabItems(defs);
+						return;
+					}
 					this.callbacks.onChange(path, newValue);
 				}
 				// Submenu/text types already persisted the value inside their own
@@ -1055,8 +1310,26 @@ export class SettingsSelectorComponent extends Container {
 	}
 
 	#buildItemsForTab(defs: SettingDef[], tabId: SettingTab): SettingItem[] {
-		const items = this.#buildItemsForDefs(defs);
+		let items = this.#buildItemsForDefs(defs);
 		if (tabId === "appearance") {
+			// Keep the long-standing appearance navigation order stable when new
+			// appearance settings are added. The dedicated status-line editor is a
+			// sibling of the preset row, so keyboard users do not lose it behind
+			// unrelated toggles inserted before the preset.
+			const appearanceAnchorIds = [
+				"theme.dark",
+				"theme.light",
+				"ui.language",
+				"symbolPreset",
+				"colorBlindMode",
+				"statusLine.preset",
+			];
+			const anchorIds = new Set(appearanceAnchorIds);
+			const anchoredItems = appearanceAnchorIds
+				.map(id => items.find(item => item.id === id))
+				.filter((item): item is SettingItem => item !== undefined);
+			items = [...anchoredItems, ...items.filter(item => !anchorIds.has(item.id))];
+
 			const customEditorCallbacks: SettingsCallbacks = {
 				...this.callbacks,
 				onStatusLinePreview: previewSettings => {
@@ -1097,9 +1370,11 @@ export class SettingsSelectorComponent extends Container {
 	}
 
 	/** Re-evaluate condition gates against the current settings and refresh the active list. */
-	#refreshCurrentTabItems(defs: SettingDef[]): void {
-		if (this.#currentTabId === "plugins" || !this.#currentList) return;
-		this.#currentList.setItems(this.#buildItemsForTab(defs, this.#currentTabId));
+	#refreshCurrentTabItems(defs?: SettingDef[]): void {
+		if (this.#currentTabId === "plugins" || this.#currentTabId === "gjc-bundles" || !this.#currentList) return;
+		this.#currentList.setItems(
+			this.#buildItemsForTab(defs ?? getSettingsForTab(this.#currentTabId), this.#currentTabId),
+		);
 	}
 
 	/**
@@ -1142,25 +1417,77 @@ export class SettingsSelectorComponent extends Container {
 		this.#pluginComponent = new PluginSettingsComponent(this.context.cwd, {
 			onClose: () => this.callbacks.onCancel(),
 			onPluginChanged: () => this.callbacks.onPluginsChanged?.(),
+			onRenderRequested: () => this.callbacks.onRenderRequested?.(),
 		});
 		this.addChild(this.#pluginComponent);
 	}
+	#showGjcBundlesTab(): void {
+		this.#gjcBundleComponent = new GjcBundleSettingsComponent(
+			this.context.cwd,
+			{
+				onClose: () => this.callbacks.onCancel(),
+				onBundlesChanged: () => this.callbacks.onPluginsChanged?.(),
+				onRenderRequested: () => this.callbacks.onRenderRequested?.(),
+			},
+			{
+				runtimeSnapshotProvider: this.context.gjcRuntimeSnapshot,
+				activationGeneration: this.context.gjcActivationGeneration,
+			},
+		);
+		this.addChild(this.#gjcBundleComponent);
+	}
 
-	getFocusComponent(): SettingsList | PluginSettingsComponent {
-		// Return the current focusable component - one of these will always be set
-		return (this.#currentList || this.#pluginComponent)!;
+	getFocusComponent(): Component {
+		return (this.#currentList || this.#pluginComponent || this.#gjcBundleComponent || this.#notificationsEditor)!;
+	}
+
+	override dispose(): void {
+		if (this.#notificationsEditor?.navigationLocked) return;
+		// Release an open provider-order editor (and its context subscriptions)
+		// when the whole selector is torn down without a normal close.
+		this.#activeProviderOrderEditor?.dispose();
+		this.#activeProviderOrderEditor = null;
+		this.#notificationsEditor?.dispose();
+		this.#notificationsEditor = null;
+		this.#gjcBundleComponent?.dispose();
+		this.#gjcBundleComponent = null;
+		super.dispose();
 	}
 
 	handleInput(data: string): void {
+		const tabNavigation =
+			matchesKey(data, "tab") ||
+			matchesKey(data, "shift+tab") ||
+			matchesKey(data, "left") ||
+			matchesKey(data, "right");
+		if (this.#notificationsEditor && this.#currentTabId === "notifications") {
+			if (tabNavigation) {
+				if (this.#notificationsEditor.navigationLocked) {
+					this.#notificationsEditor.handleInput(data);
+					return;
+				}
+				this.#tabBar.handleInput(data);
+				return;
+			}
+			this.#notificationsEditor.handleInput(data);
+			return;
+		}
+		if (this.#gjcBundleComponent && this.#currentTabId === "gjc-bundles") {
+			if (tabNavigation) {
+				if (this.#gjcBundleComponent.navigationLocked) {
+					this.#gjcBundleComponent.handleInput(data);
+					return;
+				}
+				this.#tabBar.handleInput(data);
+				return;
+			}
+			this.#gjcBundleComponent.handleInput(data);
+			return;
+		}
+
 		// Handle tab switching — but NOT when a text input is active, since
 		// arrow keys must reach the cursor and Tab must not switch tabs.
-		if (
-			!this.#textInputActive &&
-			(matchesKey(data, "tab") ||
-				matchesKey(data, "shift+tab") ||
-				matchesKey(data, "left") ||
-				matchesKey(data, "right"))
-		) {
+		if (!this.#textInputActive && tabNavigation) {
 			this.#tabBar.handleInput(data);
 			return;
 		}
@@ -1173,6 +1500,10 @@ export class SettingsSelectorComponent extends Container {
 		}
 		if (this.#pluginComponent) {
 			this.#pluginComponent.handleInput(data);
+			return;
+		}
+		if (this.#gjcBundleComponent) {
+			this.#gjcBundleComponent.handleInput(data);
 			return;
 		}
 

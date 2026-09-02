@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import { AsyncJobManager } from "../src/async/job-manager";
 import { JobsObserver } from "../src/modes/jobs-observer";
-import { CronTool, resetCronRegistryForTests } from "../src/tools/cron";
+import { CronTool, calculateCronFireTimeMs, resetCronRegistryForTests } from "../src/tools/cron";
 import type { ToolSession } from "../src/tools/index";
 
 const OWNER = "0-Main";
@@ -27,14 +27,14 @@ function registerMonitor(manager: AsyncJobManager, label: string, ownerId = OWNE
 	});
 }
 
-function createCronSession(ownerId = OWNER): ToolSession {
+function createCronSession(ownerId = OWNER, delivery?: () => Promise<void>): ToolSession {
 	return {
 		cwd: process.cwd(),
 		hasUI: false,
 		getSessionId: () => "test-session",
 		getAgentId: () => ownerId,
 		steer: () => {},
-		sendCustomMessage: async () => {},
+		sendCustomMessage: async () => delivery?.(),
 		allocateOutputArtifact: async () => ({}),
 	} as unknown as ToolSession;
 }
@@ -42,6 +42,7 @@ function createCronSession(ownerId = OWNER): ToolSession {
 afterEach(() => {
 	resetCronRegistryForTests();
 	AsyncJobManager.setInstance(undefined);
+	vi.useRealTimers();
 });
 
 describe("JobsObserver", () => {
@@ -57,6 +58,40 @@ describe("JobsObserver", () => {
 		expect(snapshot.activeMonitorCount).toBe(1);
 		expect(snapshot.monitors.map(m => m.label)).toEqual(["tail log"]);
 		expect(snapshot.worstState).toBe("running");
+
+		observer.dispose();
+		await manager.dispose();
+	});
+
+	test("does not count a backgrounded monitor that is also surfaced as folded work", async () => {
+		const manager = makeManager();
+		const observer = new JobsObserver(manager, OWNER);
+		const backgroundedId = registerMonitor(manager, "folded monitor");
+		const backgrounded = manager.getJob(backgroundedId);
+		if (!backgrounded) throw new Error("expected backgrounded monitor job");
+		manager.markBackgrounded(backgroundedId, backgrounded.generation);
+		registerMonitor(manager, "active monitor");
+
+		const snapshot = observer.getSnapshot();
+		expect(snapshot.activeMonitorCount).toBe(1);
+		expect(snapshot.foldedJobs).toEqual(
+			expect.arrayContaining([expect.objectContaining({ id: backgroundedId, backgrounded: true })]),
+		);
+
+		observer.dispose();
+		await manager.dispose();
+	});
+
+	test("cancelMonitor rejects a foreign owner's monitor id", async () => {
+		const manager = makeManager();
+		const observer = new JobsObserver(manager, OWNER);
+		const ownedId = registerMonitor(manager, "owned", OWNER);
+		const foreignId = registerMonitor(manager, "foreign", "other-owner");
+
+		expect(observer.cancelMonitor(foreignId)).toBe(false);
+		expect(manager.getJob(foreignId)?.status).toBe("running");
+		expect(observer.cancelMonitor(ownedId)).toBe(true);
+		expect(manager.getJob(ownedId)?.status).toBe("cancelled");
 
 		observer.dispose();
 		await manager.dispose();
@@ -107,6 +142,31 @@ describe("JobsObserver", () => {
 		const snapshot = observer.getSnapshot();
 		expect(snapshot.worstState).toBe("failed");
 		expect(snapshot.failedUnacknowledged).toBe(true);
+
+		observer.dispose();
+		await manager.dispose();
+	});
+
+	test("handled foreground failures do not latch or surface as folded jobs", async () => {
+		const manager = makeManager();
+		const observer = new JobsObserver(manager, OWNER);
+
+		const jobId = manager.register(
+			"bash",
+			"handled foreground failure",
+			async () => {
+				throw new Error("foreground failure");
+			},
+			{ ownerId: OWNER },
+		);
+		await flush();
+
+		const snapshot = observer.getSnapshot();
+		expect(manager.getJob(jobId)?.status).toBe("failed");
+		expect(manager.getJob(jobId)?.metadata?.backgrounded).not.toBe(true);
+		expect(snapshot.failedUnacknowledged).toBe(false);
+		expect(snapshot.worstState).toBe("none");
+		expect(snapshot.foldedJobs).not.toEqual(expect.arrayContaining([expect.objectContaining({ id: jobId })]));
 
 		observer.dispose();
 		await manager.dispose();
@@ -169,6 +229,39 @@ describe("JobsObserver", () => {
 		expect(snapshot.worstState).toBe("running");
 		expect(fires).toBeGreaterThanOrEqual(1);
 
+		observer.dispose();
+		await manager.dispose();
+	});
+
+	test("cron firing state remains visible to observers until delivery settles", async () => {
+		const now = new Date("2026-06-02T12:00:10");
+		vi.useFakeTimers({ now });
+		const manager = makeManager();
+		AsyncJobManager.setInstance(manager);
+		const observer = new JobsObserver(manager, OWNER);
+		const delivery = Promise.withResolvers<void>();
+		const tool = new CronTool(createCronSession(OWNER, () => delivery.promise));
+		const result = await tool.execute("call", {
+			op: "create",
+			cron_expression: "1 12 * * *",
+			prompt: "pending delivery",
+			recurring: true,
+		});
+		if (!result.details?.id) throw new Error("Expected cron id");
+		const fireAt = calculateCronFireTimeMs({
+			id: result.details.id,
+			cronExpression: "1 12 * * *",
+			baseMatchMs: new Date("2026-06-02T12:01:00").getTime(),
+			recurring: true,
+			nowMs: now.getTime(),
+		});
+		vi.advanceTimersByTime(fireAt - now.getTime());
+		await Promise.resolve();
+		expect(observer.getSnapshot().crons[0]?.firing).toBe(true);
+		delivery.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(observer.getSnapshot().crons[0]?.firing).toBe(false);
 		observer.dispose();
 		await manager.dispose();
 	});

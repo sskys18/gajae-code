@@ -22,6 +22,12 @@ const message = (id: string) => ({
 
 export const EVENT_FIXTURES: Record<AgentWireEventType, AgentSessionEvent> = {
 	agent_start: ev({ type: "agent_start" }),
+	agent_failed: ev({
+		type: "agent_failed",
+		// Sanitized public wire shape: a stable classifier pair, never a raw Error
+		// (exact-head review P2).
+		error: { code: "provider_unavailable", message: "Agent run failed." },
+	}),
 	agent_end: ev({ type: "agent_end", messages: [], stopReason: "completed" }),
 	turn_start: ev({ type: "turn_start" }),
 	turn_end: ev({ type: "turn_end", message: message("m-turn"), toolResults: [] }),
@@ -68,8 +74,6 @@ export const EVENT_FIXTURES: Record<AgentWireEventType, AgentSessionEvent> = {
 		errorMessage: RAW_SECRET,
 	}),
 	auto_retry_end: ev({ type: "auto_retry_end", success: true, attempt: 1 }),
-	retry_fallback_applied: ev({ type: "retry_fallback_applied", from: "a", to: "b", role: "main" }),
-	retry_fallback_succeeded: ev({ type: "retry_fallback_succeeded", model: "b", role: "main" }),
 	ttsr_triggered: ev({ type: "ttsr_triggered", rules: [{ id: "r1" }, { id: "r2" }] }),
 	todo_reminder: ev({ type: "todo_reminder", todos: [], attempt: 1, maxAttempts: 3 }),
 	todo_auto_clear: ev({ type: "todo_auto_clear" }),
@@ -84,6 +88,18 @@ export const EVENT_FIXTURES: Record<AgentWireEventType, AgentSessionEvent> = {
 		},
 	}),
 	notice: ev({ type: "notice", level: "error", message: RAW_SECRET, source: "tool" }),
+	model_fallback_switched: ev({
+		type: "model_fallback_switched",
+		eventId: "fallback-1",
+		from: "anthropic/claude-sonnet",
+		to: "openai/gpt-5",
+		reason: "rate_limit",
+		role: "default",
+		scope: "session",
+		activeIndex: 1,
+		chainLength: 2,
+		attemptsUsed: 3,
+	}),
 	thinking_level_changed: ev({ type: "thinking_level_changed", thinkingLevel: "high" }),
 	goal_updated: ev({ type: "goal_updated", goal: { objective: RAW_SECRET } }),
 };

@@ -70,20 +70,25 @@ function parseGitignorePatterns(content: string, gitignoreDir: string, baseDir: 
 			} else {
 				patterns.push(pattern);
 			}
+		} else if (pattern.includes("/") && !pattern.startsWith("**/")) {
+			// Separator in the middle: git anchors these to the .gitignore's
+			// directory, same as rooted patterns
+			const absolutePattern = path.join(gitignoreDir, pattern);
+			const relativeToBase = path.relative(baseDir, absolutePattern);
+			if (relativeToBase.startsWith("..")) {
+				// Pattern is outside the search directory, skip
+				continue;
+			}
+			pattern = relativeToBase.replace(/\\/g, "/");
+			patterns.push(pattern);
+			if (isDirectoryOnly) {
+				patterns.push(`${pattern}/**`);
+			}
 		} else {
-			// Unrooted pattern: match anywhere in the tree
-			if (pattern.includes("/")) {
-				// Contains slash: match from any directory level
-				patterns.push(`**/${pattern}`);
-				if (isDirectoryOnly) {
-					patterns.push(`**/${pattern}/**`);
-				}
-			} else {
-				// No slash: match file/dir name anywhere
-				patterns.push(`**/${pattern}`);
-				if (isDirectoryOnly) {
-					patterns.push(`**/${pattern}/**`);
-				}
+			// No middle separator: match file/dir name anywhere in the tree
+			patterns.push(`**/${pattern}`);
+			if (isDirectoryOnly) {
+				patterns.push(`**/${pattern}/**`);
 			}
 		}
 	}
@@ -132,6 +137,10 @@ export async function loadGitignorePatterns(baseDir: string): Promise<string[]> 
  */
 export async function globPaths(patterns: string | string[], options: GlobPathsOptions = {}): Promise<string[]> {
 	const { cwd, exclude, signal, timeoutMs, dot, onlyFiles = true, gitignore } = options;
+	const timeoutSignal = timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined;
+	const combinedSignal =
+		signal && timeoutSignal ? AbortSignal.any([signal, timeoutSignal]) : (signal ?? timeoutSignal);
+	throwIfGlobAborted(combinedSignal);
 
 	// Build exclude list: always exclude .git, exclude node_modules unless pattern references it
 	const patternArray = Array.isArray(patterns) ? patterns : [patterns];
@@ -142,16 +151,17 @@ export async function globPaths(patterns: string | string[], options: GlobPathsO
 
 	if (gitignore) {
 		const gitignorePatterns = await loadGitignorePatterns(cwd ?? getProjectDir());
+		throwIfGlobAborted(combinedSignal);
 		effectiveExclude = [...effectiveExclude, ...gitignorePatterns];
 	}
 
+	const excludeGlobs = effectiveExclude.map(pattern => new Glob(pattern));
+
 	const base = cwd ?? getProjectDir();
 	const allResults: string[] = [];
-
-	// Combine timeout and abort signals
-	const timeoutSignal = timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined;
-	const combinedSignal =
-		signal && timeoutSignal ? AbortSignal.any([signal, timeoutSignal]) : (signal ?? timeoutSignal);
+	// Overlapping patterns (e.g. `["**/*.ts", "src/*.ts"]`) can both match the same
+	// file; dedupe so a path is returned at most once regardless of pattern overlap.
+	const seen = new Set<string>();
 
 	for (const pattern of patternArray) {
 		const glob = new Glob(pattern);
@@ -163,27 +173,27 @@ export async function globPaths(patterns: string | string[], options: GlobPathsO
 		};
 
 		for await (const entry of glob.scan(scanOptions)) {
-			if (combinedSignal?.aborted) {
-				const reason = combinedSignal.reason;
-				if (reason instanceof Error) throw reason;
-				throw new DOMException("Aborted", "AbortError");
-			}
+			throwIfGlobAborted(combinedSignal);
 
 			// Check exclusion patterns
 			const normalized = entry.replace(/\\/g, "/");
-			let excluded = false;
-			for (const excludePattern of effectiveExclude) {
-				const excludeGlob = new Glob(excludePattern);
-				if (excludeGlob.match(normalized)) {
-					excluded = true;
-					break;
-				}
+			if (excludeGlobs.some(excludeGlob => excludeGlob.match(normalized))) {
+				continue;
 			}
-			if (!excluded) {
-				allResults.push(normalized);
+			if (seen.has(normalized)) {
+				continue;
 			}
+			seen.add(normalized);
+			allResults.push(normalized);
 		}
+		throwIfGlobAborted(combinedSignal);
 	}
 
 	return allResults;
+}
+
+function throwIfGlobAborted(signal: AbortSignal | undefined): void {
+	if (!signal?.aborted) return;
+	if (signal.reason instanceof Error) throw signal.reason;
+	throw new DOMException("Aborted", "AbortError");
 }

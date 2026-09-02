@@ -26,12 +26,42 @@ import type {
 	ToolResultMessage,
 } from "../types";
 import { normalizeSystemPrompts } from "../utils";
+import { kCursorExecResolved } from "../utils/block-symbols";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { parseStreamingJson } from "../utils/json-parse";
+import { getStreamIdleTimeoutMs } from "../utils/idle-iterator";
+import { captureUnicodeEscapeEvidence, parseStreamingJson } from "../utils/json-parse";
+import { connectProxiedSocket, getProxyForUrl } from "../utils/proxy";
 import { formatErrorMessageWithRetryAfter } from "../utils/retry-after";
 import { flattenToolRootCombinators, toolWireSchema } from "../utils/schema";
-import { COMPOSER_EDIT_DISCIPLINE_PROMPT, isComposerHarnessModel } from "./composer-discipline";
-import type { McpToolDefinition } from "./cursor/gen/agent_pb";
+import { CURSOR_COMPOSER_EDIT_DISCIPLINE_PROMPT, isComposerHarnessModel } from "./composer-discipline";
+import { CURSOR_CLIENT_VERSION } from "./cursor/client-version";
+import {
+	buildMcpStateResult,
+	buildNeutralHookResult,
+	buildPiBashError,
+	buildPiBashResult,
+	buildPiEditError,
+	buildPiEditRejected,
+	buildPiEditResult,
+	buildPiFindError,
+	buildPiFindResult,
+	buildPiGrepError,
+	buildPiGrepResult,
+	buildPiLsError,
+	buildPiLsResult,
+	buildPiReadError,
+	buildPiReadResult,
+	buildPiWriteError,
+	buildPiWriteRejected,
+	buildPiWriteResult,
+	piEscapeRegexLiteral,
+	piJoinPath,
+	piLimit,
+	piLsPath,
+	piReadDisplayPath,
+	piTimeout,
+} from "./cursor/exec-modern";
+import type { CursorRule, McpToolDefinition, RequestedModel_ModelParameterbytes } from "./cursor/gen/agent_pb";
 import {
 	AgentClientMessageSchema,
 	AgentConversationTurnStructureSchema,
@@ -47,6 +77,10 @@ import {
 	ConversationStateStructureSchema,
 	ConversationStepSchema,
 	ConversationTurnStructureSchema,
+	CursorRuleSchema,
+	CursorRuleSource,
+	CursorRuleTypeGlobalSchema,
+	CursorRuleTypeSchema,
 	DeleteErrorSchema,
 	DeleteRejectedSchema,
 	DeleteResultSchema,
@@ -59,6 +93,7 @@ import {
 	type ExecClientMessage,
 	ExecClientMessageSchema,
 	ExecClientStreamCloseSchema,
+	ExecClientThrowSchema,
 	type ExecServerMessage,
 	FetchErrorSchema,
 	FetchResultSchema,
@@ -86,6 +121,7 @@ import {
 	LsRejectedSchema,
 	LsResultSchema,
 	LsSuccessSchema,
+	McpAllowlistPrecheckResultSchema,
 	McpErrorSchema,
 	McpImageContentSchema,
 	McpResultSchema,
@@ -104,10 +140,13 @@ import {
 	RequestContextResultSchema,
 	RequestContextSchema,
 	RequestContextSuccessSchema,
+	RequestedModel_ModelParameterbytesSchema,
+	RequestedModelSchema,
 	ResumeActionSchema,
 	SelectedContextSchema,
 	SelectedImageSchema,
 	SetBlobResultSchema,
+	ShellAllowlistPrecheckResultSchema,
 	type ShellArgs,
 	ShellFailureSchema,
 	ShellRejectedSchema,
@@ -122,6 +161,7 @@ import {
 	ShellSuccessSchema,
 	UserMessageActionSchema,
 	UserMessageSchema,
+	WebFetchAllowlistPrecheckResultSchema,
 	WriteErrorSchema,
 	WriteRejectedSchema,
 	WriteResultSchema,
@@ -131,7 +171,7 @@ import {
 } from "./cursor/gen/agent_pb";
 
 export const CURSOR_API_URL = "https://api2.cursor.sh";
-export const CURSOR_CLIENT_VERSION = "cli-2026.01.09-231024f";
+export { CURSOR_CLIENT_VERSION };
 
 const conversationStateCache = new Map<string, ConversationStateStructure>();
 const conversationBlobStores = new Map<string, Map<string, Uint8Array>>();
@@ -224,6 +264,179 @@ function parseConnectEndStream(data: Uint8Array): Error | null {
 		return null;
 	} catch {
 		return new Error("Failed to parse Connect end stream");
+	}
+}
+
+interface CursorRequestWriter {
+	enqueue(frame: Uint8Array): void;
+	isActive(): boolean;
+	registerShellGate(close: () => void): () => void;
+}
+
+class CursorRequestCoordinator implements CursorRequestWriter {
+	#state: "open" | "draining" | "failed" | "succeeded" = "open";
+	#tasks = new Set<Promise<void>>();
+	#taskChain = Promise.resolve();
+	#hasAdmittedTask = false;
+	#frames: Uint8Array[] = [];
+	#writing = false;
+	#drainWaiters: Array<() => void> = [];
+	#failure: Error | null = null;
+	#shellGates = new Set<() => void>();
+	#request: http2.ClientHttp2Stream;
+	#stopHeartbeat: () => void;
+	#onSuccess: () => void;
+	#onFailure: (error: Error) => void;
+	#drainTimer: NodeJS.Timeout | null = null;
+	#drainTimeoutMs: number | undefined;
+
+	constructor(
+		request: http2.ClientHttp2Stream,
+		stopHeartbeat: () => void,
+		onSuccess: () => void,
+		onFailure: (error: Error) => void,
+		drainTimeoutMs: number | undefined,
+	) {
+		this.#request = request;
+		this.#stopHeartbeat = stopHeartbeat;
+		this.#onSuccess = onSuccess;
+		this.#onFailure = onFailure;
+		this.#drainTimeoutMs = drainTimeoutMs;
+	}
+
+	isActive(): boolean {
+		return this.#state === "open" || this.#state === "draining";
+	}
+
+	canAdmitTask(): boolean {
+		return this.#state === "open";
+	}
+
+	hasTurnEnded(): boolean {
+		return this.#state === "draining" || this.#state === "succeeded";
+	}
+
+	failureError(): Error | null {
+		return this.#failure;
+	}
+
+	enqueue(frame: Uint8Array): void {
+		if (!this.isActive()) return;
+		this.#frames.push(Buffer.from(frame));
+		this.#writeNext();
+	}
+
+	registerShellGate(close: () => void): () => void {
+		if (!this.isActive()) {
+			close();
+			return () => {};
+		}
+		this.#shellGates.add(close);
+		return () => this.#shellGates.delete(close);
+	}
+
+	admit(taskFactory: () => Promise<void>): void {
+		if (!this.canAdmitTask()) return;
+		const orderedTask = this.#hasAdmittedTask
+			? this.#taskChain.then(() => {
+					if (this.#state === "failed" || this.#state === "succeeded") return;
+					return taskFactory();
+				})
+			: taskFactory();
+		this.#hasAdmittedTask = true;
+		this.#taskChain = orderedTask.then(
+			() => {},
+			error => {
+				this.fail(error instanceof Error ? error : new Error(String(error)));
+			},
+		);
+		this.#tasks.add(orderedTask);
+		void orderedTask.then(
+			() => this.#tasks.delete(orderedTask),
+			() => this.#tasks.delete(orderedTask),
+		);
+	}
+
+	turnEnded(): void {
+		if (this.#state !== "open") return;
+		this.#state = "draining";
+		this.#stopHeartbeat();
+		if (this.#drainTimeoutMs !== undefined && this.#drainTimeoutMs > 0) {
+			this.#drainTimer = setTimeout(() => {
+				this.fail(new Error(`Cursor admitted work drain timed out after ${this.#drainTimeoutMs}ms`));
+			}, this.#drainTimeoutMs);
+		}
+		void Promise.all([...this.#tasks]).then(
+			() => {
+				if (this.#state !== "draining") return;
+				this.#drain(() => {
+					if (this.#state !== "draining") return;
+					if (this.#drainTimer) {
+						clearTimeout(this.#drainTimer);
+						this.#drainTimer = null;
+					}
+					this.#state = "succeeded";
+					this.#onSuccess();
+				});
+			},
+			error => this.fail(error instanceof Error ? error : new Error(String(error))),
+		);
+	}
+
+	fail(error: Error): void {
+		if (this.#state === "failed" || this.#state === "succeeded") return;
+		this.#state = "failed";
+		this.#failure = error;
+		if (this.#drainTimer) {
+			clearTimeout(this.#drainTimer);
+			this.#drainTimer = null;
+		}
+		this.#stopHeartbeat();
+		for (const close of this.#shellGates) close();
+		this.#shellGates.clear();
+		this.#frames = [];
+		this.#writing = false;
+		this.#releaseDrains();
+		this.#request.close();
+		this.#onFailure(error);
+	}
+
+	#writeNext(): void {
+		if (this.#writing || !this.isActive()) return;
+		const frame = this.#frames.shift();
+		if (!frame) {
+			this.#releaseDrains();
+			return;
+		}
+		this.#writing = true;
+		try {
+			this.#request.write(frame, error => {
+				this.#writing = false;
+				if (error) {
+					this.fail(error);
+					return;
+				}
+				this.#writeNext();
+			});
+		} catch (error) {
+			this.#writing = false;
+			this.fail(error instanceof Error ? error : new Error(String(error)));
+		}
+	}
+
+	#drain(resolve: () => void): void {
+		if (!this.#writing && this.#frames.length === 0) {
+			resolve();
+			return;
+		}
+		this.#drainWaiters.push(resolve);
+	}
+
+	#releaseDrains(): void {
+		if (this.#writing || this.#frames.length > 0) return;
+		const waiters = this.#drainWaiters;
+		this.#drainWaiters = [];
+		for (const resolve of waiters) resolve();
 	}
 }
 
@@ -332,12 +545,82 @@ function omitTypeName(record: Record<string, unknown>): Record<string, unknown> 
 	return rest;
 }
 
+const CURSOR_MODEL_EFFORT_RE = /^(.*)-(minimal|low|medium|high|xhigh|max)(-fast)?$/;
+const CURSOR_GPT_MODEL_RE =
+	/^gpt-\d+(?:\.\d+){0,2}(?:-(?:codex-spark|codex-mini|codex-max|codex|luna|mini|max|nano|sol|terra))?$/;
+// `codex-max` is itself an intrinsic Cursor model, not an effort suffix. Keep
+// its canonical and canonical-fast forms intact before parsing effort aliases.
+const CURSOR_INTRINSIC_CODEX_MAX_RE = /^gpt-\d+(?:\.\d+){0,2}-codex-max(?:-fast)?$/;
+
+/** Build the ordered global USER rules Cursor expects for the current system prompt. */
+export function buildCursorRequestContextRules(systemPrompt: readonly string[] | undefined): CursorRule[] {
+	return normalizeSystemPrompts(systemPrompt).map((content, index) =>
+		create(CursorRuleSchema, {
+			fullPath: `/gjc/system-prompt/${index}.mdc`,
+			content,
+			type: create(CursorRuleTypeSchema, {
+				type: {
+					case: "global",
+					value: create(CursorRuleTypeGlobalSchema, {}),
+				},
+			}),
+			source: CursorRuleSource.USER,
+		}),
+	);
+}
+
+export interface CursorWireModelResolution {
+	modelId: string;
+	parameters: RequestedModel_ModelParameterbytes[];
+	translated: boolean;
+}
+
+/** Resolve a Cursor model's GPT effort suffix into its wire model and parameter. */
+export function resolveCursorWireModelForTest(
+	model: Pick<Model<"cursor-agent">, "id" | "wireModelId">,
+): CursorWireModelResolution {
+	const wireModelId = model.wireModelId ?? model.id;
+	if (CURSOR_INTRINSIC_CODEX_MAX_RE.test(wireModelId)) {
+		return { modelId: wireModelId, parameters: [], translated: false };
+	}
+	const match = CURSOR_MODEL_EFFORT_RE.exec(wireModelId);
+	if (!match || !CURSOR_GPT_MODEL_RE.test(match[1])) {
+		return { modelId: wireModelId, parameters: [], translated: false };
+	}
+
+	const [, baseModelId, effort, fastSuffix] = match;
+	const modelId = `${baseModelId}${fastSuffix ?? ""}`;
+	return {
+		modelId,
+		parameters: [
+			create(RequestedModel_ModelParameterbytesSchema, {
+				id: "reasoning",
+				value: effort,
+			}),
+		],
+		translated: true,
+	};
+}
+
+/** Turn Cursor's opaque HTTP/2 failure into a useful transport diagnosis. */
+export function mapH2TransportError(error: unknown, baseUrl: string): unknown {
+	if (!error || typeof error !== "object") return error;
+	const candidate = error as { code?: unknown; message?: unknown };
+	if (candidate.code !== "ERR_HTTP2_ERROR" || typeof candidate.message !== "string") return error;
+	if (!/h2 is not supported/i.test(candidate.message)) return error;
+	return new Error(
+		`Cursor HTTP/2 is not supported by ${baseUrl}. Use an HTTP/2-capable endpoint, configure a proxy tunnel that preserves ALPN h2, or set providers.cursor.baseUrl to an HTTP/2 endpoint.`,
+		{ cause: error },
+	);
+}
+
 export const streamCursor: StreamFunction<"cursor-agent"> = (
 	model: Model<"cursor-agent">,
 	context: Context,
 	options?: CursorOptions,
 ): AssistantMessageEventStream => {
 	const stream = new AssistantMessageEventStream();
+	const requestContextRules = buildCursorRequestContextRules(context.systemPrompt);
 
 	(async () => {
 		const startTime = Date.now();
@@ -363,12 +646,19 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 		let h2Client: http2.ClientHttp2Session | null = null;
 		let h2Request: http2.ClientHttp2Stream | null = null;
+		let proxiedSocket: Awaited<ReturnType<typeof connectProxiedSocket>> | null = null;
 		let heartbeatTimer: NodeJS.Timeout | null = null;
+		let onAbort: (() => void) | undefined;
+		let coordinator: CursorRequestCoordinator = undefined!;
+		const baseUrl = model.baseUrl || CURSOR_API_URL;
 
 		try {
 			const apiKey = options?.apiKey;
 			if (!apiKey) {
 				throw new Error("Cursor API key (access token) is required");
+			}
+			if (options?.signal?.aborted) {
+				throw new Error("Request was aborted");
 			}
 
 			const conversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
@@ -383,10 +673,22 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			conversationStateCache.set(conversationId, conversationState);
 			touchCursorConversation(conversationId);
 			const requestContextTools = buildMcpToolDefinitions(context.tools);
+			const targetUrl = new URL(baseUrl);
+			const proxyUrl = getProxyForUrl(model.provider, targetUrl);
+			if (options?.signal?.aborted) {
+				throw new Error("Request was aborted");
+			}
+			if (proxyUrl) {
+				proxiedSocket = await connectProxiedSocket(proxyUrl, baseUrl, {
+					signal: options?.signal,
+					timeoutMs: 30_000,
+				});
+				h2Client = http2.connect(baseUrl, { createConnection: () => proxiedSocket! });
+			} else {
+				h2Client = http2.connect(baseUrl);
+			}
 
-			const baseUrl = model.baseUrl || CURSOR_API_URL;
-			h2Client = http2.connect(baseUrl);
-
+			options?.onStreamCreated?.();
 			h2Request = h2Client.request({
 				":method": "POST",
 				":path": "/agent.v1.AgentService/Run",
@@ -399,11 +701,35 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				"x-cursor-client-type": "cli",
 				"x-request-id": crypto.randomUUID(),
 			});
+			const stopHeartbeat = () => {
+				if (heartbeatTimer) {
+					clearInterval(heartbeatTimer);
+					heartbeatTimer = null;
+				}
+			};
+			let resolveH2: (() => void) | undefined;
+			let rejectH2: ((error: Error) => void) | undefined;
+			coordinator = new CursorRequestCoordinator(
+				h2Request,
+				stopHeartbeat,
+				() => {
+					const resolve = resolveH2;
+					resolveH2 = undefined;
+					resolve?.();
+				},
+				error => {
+					const reject = rejectH2;
+					rejectH2 = undefined;
+					reject?.(error);
+				},
+				options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs(),
+			);
+			h2Client.on("error", error => coordinator.fail(error));
+			h2Request.on("error", error => coordinator.fail(error));
 
 			stream.push({ type: "start", partial: output });
 
 			let pendingBuffer = Buffer.alloc(0);
-			let endStreamError: Error | null = null;
 			let currentTextBlock: (TextContent & { index: number }) | null = null;
 			let currentThinkingBlock: (ThinkingContent & { index: number }) | null = null;
 			let currentToolCall: ToolCallState | null = null;
@@ -441,7 +767,25 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				touchCursorConversation(conversationId);
 			};
 
-			let resolveH2: (() => void) | undefined;
+			h2Request.on("trailers", trailers => {
+				const status = trailers["grpc-status"];
+				const msg = trailers["grpc-message"];
+				if (status && status !== "0") {
+					coordinator.fail(new Error(`gRPC error ${status}: ${decodeURIComponent(String(msg || ""))}`));
+				}
+			});
+			h2Request.on("end", () => {
+				if (!coordinator.hasTurnEnded()) {
+					coordinator.fail(new Error("Cursor stream ended before turnEnded"));
+				}
+			});
+			onAbort = () => {
+				coordinator.fail(new Error("Request was aborted"));
+			};
+			if (options?.signal) {
+				options.signal.addEventListener("abort", onAbort, { once: true });
+				if (options.signal.aborted) onAbort();
+			}
 
 			h2Request.on("data", (chunk: Buffer) => {
 				pendingBuffer = Buffer.concat([pendingBuffer, chunk]);
@@ -457,8 +801,9 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					if (flags & CONNECT_END_STREAM_FLAG) {
 						const endError = parseConnectEndStream(messageBytes);
 						if (endError) {
-							endStreamError = endError;
-							h2Request?.close();
+							coordinator.fail(endError);
+						} else {
+							coordinator.turnEnded();
 						}
 						continue;
 					}
@@ -468,28 +813,28 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						const isTurnEnded =
 							serverMessage.message.case === "interactionUpdate" &&
 							serverMessage.message.value.message?.case === "turnEnded";
-						void handleServerMessage(
-							serverMessage,
-							output,
-							stream,
-							state,
-							blobStore,
-							h2Request!,
-							options?.execHandlers,
-							options?.onToolResult,
-							usageState,
-							requestContextTools,
-							onConversationCheckpoint,
-						).catch(error => {
-							log("error", "handleServerMessage", { error: String(error) });
-						});
+						// Serialize handlers: exec messages can be asynchronous, and resolving the
+						// request on turnEnded before prior handlers finish loses their responses.
+						if (!coordinator.canAdmitTask()) continue;
+						coordinator.admit(() =>
+							handleServerMessage(
+								serverMessage,
+								output,
+								stream,
+								state,
+								blobStore,
+								coordinator,
+								options?.execHandlers,
+								options?.onToolResult,
+								usageState,
+								requestContextTools,
+								onConversationCheckpoint,
+								requestContextRules,
+							),
+						);
 
-						// Resolve only on explicit turnEnded. stopReason defaults to "stop"
-						// and is not a reliable signal for stream completion.
-						if (isTurnEnded && resolveH2) {
-							const r = resolveH2;
-							resolveH2 = undefined;
-							r();
+						if (isTurnEnded) {
+							coordinator.turnEnded();
 						}
 					} catch (e) {
 						log("error", "parseServerMessage", { error: String(e) });
@@ -497,48 +842,28 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				}
 			});
 
-			h2Request.write(frameConnectMessage(requestBytes));
+			coordinator.enqueue(frameConnectMessage(requestBytes));
 
 			const sendHeartbeat = () => {
-				if (!h2Request || h2Request.closed) {
-					return;
-				}
+				if (!coordinator.isActive()) return;
 				const heartbeatMessage = create(AgentClientMessageSchema, {
 					message: { case: "clientHeartbeat", value: create(ClientHeartbeatSchema, {}) },
 				});
 				const heartbeatBytes = toBinary(AgentClientMessageSchema, heartbeatMessage);
-				h2Request.write(frameConnectMessage(heartbeatBytes));
+				coordinator.enqueue(frameConnectMessage(heartbeatBytes));
 			};
 
 			heartbeatTimer = setInterval(sendHeartbeat, 5000);
-
 			await new Promise<void>((resolve, reject) => {
 				resolveH2 = resolve;
-
-				h2Request!.on("trailers", trailers => {
-					const status = trailers["grpc-status"];
-					const msg = trailers["grpc-message"];
-					if (status && status !== "0") {
-						reject(new Error(`gRPC error ${status}: ${decodeURIComponent(String(msg || ""))}`));
-					}
-				});
-
-				h2Request!.on("end", () => {
+				rejectH2 = reject;
+				const initialFailure = coordinator.failureError();
+				if (initialFailure) {
+					rejectH2 = undefined;
+					reject(initialFailure);
+				} else if (coordinator.hasTurnEnded() && !coordinator.isActive()) {
 					resolveH2 = undefined;
-					if (endStreamError) {
-						reject(endStreamError);
-						return;
-					}
 					resolve();
-				});
-
-				h2Request!.on("error", reject);
-
-				if (options?.signal) {
-					options.signal.addEventListener("abort", () => {
-						h2Request?.close();
-						reject(new Error("Request was aborted"));
-					});
 				}
 			});
 
@@ -563,6 +888,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			if (state.currentToolCall) {
 				const idx = output.content.indexOf(state.currentToolCall);
 				state.currentToolCall.arguments = parseStreamingJson(state.currentToolCall.partialJson);
+				captureUnicodeEscapeEvidence(state.currentToolCall, state.currentToolCall.partialJson ?? "");
 				delete (state.currentToolCall as any).partialJson;
 				delete (state.currentToolCall as any).index;
 				stream.push({
@@ -584,9 +910,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			});
 			stream.end();
 		} catch (error) {
+			// Keep the completion promise terminal even for synchronous setup/write
+			// failures that may not emit a separate HTTP/2 error event.
+			const mappedError = mapH2TransportError(coordinator?.failureError() ?? error, baseUrl);
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorStatus = extractHttpStatusFromError(error);
-			output.errorMessage = formatErrorMessageWithRetryAfter(error);
+			output.errorStatus = extractHttpStatusFromError(mappedError);
+			output.errorMessage = formatErrorMessageWithRetryAfter(mappedError);
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
@@ -596,15 +925,26 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				clearInterval(heartbeatTimer);
 				heartbeatTimer = null;
 			}
-			h2Request?.close();
+			if (options?.signal && onAbort) {
+				options.signal.removeEventListener("abort", onAbort);
+			}
+			if (h2Request && !h2Request.closed && !h2Request.destroyed) {
+				h2Request.end();
+			}
 			h2Client?.close();
+			proxiedSocket?.destroy();
 		}
 	})();
 
 	return stream;
 };
 
-type ToolCallState = ToolCall & { index: number; partialJson?: string; kind: "mcp" | "todo_write" | "native" };
+type ToolCallState = ToolCall & {
+	index: number;
+	partialJson?: string;
+	kind: "mcp" | "todo_write" | "native" | "cursor-exec";
+	[kCursorExecResolved]?: true;
+};
 
 interface BlockState {
 	currentTextBlock: (TextContent & { index: number }) | null;
@@ -627,12 +967,13 @@ async function handleServerMessage(
 	stream: AssistantMessageEventStream,
 	state: BlockState,
 	blobStore: Map<string, Uint8Array>,
-	h2Request: http2.ClientHttp2Stream,
+	writer: CursorRequestWriter,
 	execHandlers: CursorExecHandlers | undefined,
 	onToolResult: CursorToolResultHandler | undefined,
 	usageState: UsageState,
 	requestContextTools: McpToolDefinition[],
 	onConversationCheckpoint?: (checkpoint: ConversationStateStructure) => void,
+	requestContextRules: CursorRule[] = [],
 ): Promise<void> {
 	const msgCase = msg.message.case;
 
@@ -641,14 +982,17 @@ async function handleServerMessage(
 	if (msgCase === "interactionUpdate") {
 		processInteractionUpdate(msg.message.value, output, stream, state, usageState);
 	} else if (msgCase === "kvServerMessage") {
-		handleKvServerMessage(msg.message.value as KvServerMessage, blobStore, h2Request);
+		handleKvServerMessage(msg.message.value as KvServerMessage, blobStore, writer);
 	} else if (msgCase === "execServerMessage") {
 		await handleExecServerMessage(
 			msg.message.value as ExecServerMessage,
-			h2Request,
+			writer,
 			execHandlers,
 			onToolResult,
 			requestContextTools,
+			output,
+			stream,
+			requestContextRules,
 		);
 	} else if (msgCase === "conversationCheckpointUpdate") {
 		handleConversationCheckpointUpdate(msg.message.value, output, usageState, onConversationCheckpoint);
@@ -658,7 +1002,7 @@ async function handleServerMessage(
 function handleKvServerMessage(
 	kvMsg: KvServerMessage,
 	blobStore: Map<string, Uint8Array>,
-	h2Request: http2.ClientHttp2Stream,
+	writer: CursorRequestWriter,
 ): void {
 	const kvCase = kvMsg.message.case;
 
@@ -681,7 +1025,7 @@ function handleKvServerMessage(
 		});
 
 		const responseBytes = toBinary(AgentClientMessageSchema, kvClientMessage);
-		h2Request.write(frameConnectMessage(responseBytes));
+		writer.enqueue(frameConnectMessage(responseBytes));
 
 		log("kvClient", "getBlobResult", { blobId: blobIdKey.slice(0, 40) });
 	} else if (kvCase === "setBlobArgs") {
@@ -702,14 +1046,14 @@ function handleKvServerMessage(
 		});
 
 		const responseBytes = toBinary(AgentClientMessageSchema, kvClientMessage);
-		h2Request.write(frameConnectMessage(responseBytes));
+		writer.enqueue(frameConnectMessage(responseBytes));
 
 		log("kvClient", "setBlobResult", { blobId: blobIdKey.slice(0, 40) });
 	}
 }
 
 function sendShellStreamEvent(
-	h2Request: http2.ClientHttp2Stream,
+	h2Request: CursorRequestWriter,
 	execMsg: ExecServerMessage,
 	event: ShellStream["event"],
 ): void {
@@ -744,7 +1088,7 @@ function sanitizeShellExecResult(execResult: ShellResult): ShellResult {
 async function handleShellStreamArgs(
 	args: ShellArgs,
 	execMsg: ExecServerMessage,
-	h2Request: http2.ClientHttp2Stream,
+	h2Request: CursorRequestWriter,
 	execHandlers: CursorExecHandlers | undefined,
 	onToolResult: CursorToolResultHandler | undefined,
 ): Promise<void> {
@@ -765,6 +1109,12 @@ async function handleShellStreamArgs(
 	// Buffer for incomplete ANSI sequences across chunks
 	let stdoutBuffer = "";
 	let stderrBuffer = "";
+	let callbacksOpen = true;
+	const unregisterShellGate = h2Request.registerShellGate(() => {
+		callbacksOpen = false;
+		if (stdoutFlushTimer) clearTimeout(stdoutFlushTimer);
+		if (stderrFlushTimer) clearTimeout(stderrFlushTimer);
+	});
 
 	const incompleteEscapeRegex = /\x1b(|\[|\[\d*|\[\?|\[\?\d*|\]\d*;?)$/;
 
@@ -829,6 +1179,7 @@ async function handleShellStreamArgs(
 
 	const streamCallbacks: CursorShellStreamCallbacks = {
 		onStdout(data: string) {
+			if (!callbacksOpen || !h2Request.isActive()) return;
 			stdoutBuffer += data;
 			if (stdoutBuffer.includes("\n") || stdoutBuffer.length > 4096) {
 				if (stdoutFlushTimer) {
@@ -841,6 +1192,7 @@ async function handleShellStreamArgs(
 			}
 		},
 		onStderr(data: string) {
+			if (!callbacksOpen || !h2Request.isActive()) return;
 			stderrBuffer += data;
 			if (stderrBuffer.includes("\n") || stderrBuffer.length > 4096) {
 				if (stderrFlushTimer) {
@@ -887,12 +1239,14 @@ async function handleShellStreamArgs(
 	// Send the final structured shellResult as completion acknowledgement.
 	sendExecClientMessage(h2Request, execMsg, "shellResult", sanitizedExecResult);
 	sendExecClientStreamClose(h2Request, execMsg);
+	callbacksOpen = false;
+	unregisterShellGate();
 
 	log("shellStream", "done", { elapsed: Date.now() - startTs });
 }
 
 function sendShellStreamExitFromResult(
-	h2Request: http2.ClientHttp2Stream,
+	h2Request: CursorRequestWriter,
 	execMsg: ExecServerMessage,
 	execResult: ShellResult,
 	sendBufferedOutput: boolean,
@@ -1001,16 +1355,19 @@ function sendShellStreamExitFromResult(
 
 async function handleExecServerMessage(
 	execMsg: ExecServerMessage,
-	h2Request: http2.ClientHttp2Stream,
+	h2Request: CursorRequestWriter,
 	execHandlers: CursorExecHandlers | undefined,
 	onToolResult: CursorToolResultHandler | undefined,
 	requestContextTools: McpToolDefinition[],
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	requestContextRules: CursorRule[] = [],
 ): Promise<void> {
 	const execCase = execMsg.message.case;
 	log("exec", "dispatch", { execCase, execId: execMsg.execId, hasHandlers: !!execHandlers });
 	if (execCase === "requestContextArgs") {
 		const requestContext = create(RequestContextSchema, {
-			rules: [],
+			rules: requestContextRules,
 			repositoryInfo: [],
 			tools: requestContextTools,
 			gitRepos: [],
@@ -1220,35 +1577,212 @@ async function handleExecServerMessage(
 			sendExecClientMessage(h2Request, execMsg, "computerUseResult", execResult);
 			return;
 		}
+		case "piReadArgs": {
+			const args = execMsg.message.value;
+			const toolCallId = crypto.randomUUID();
+			synthesizeCursorExecToolCall(output, stream, toolCallId, "read", {
+				path: piReadDisplayPath(args.path, args.offset, args.limit),
+			});
+			const call = { args, toolCallId };
+			const { execResult } = await resolveExecHandler(
+				call,
+				execHandlers?.piRead?.bind(execHandlers),
+				onToolResult,
+				buildPiReadResult,
+				buildPiReadError,
+				buildPiReadError,
+			);
+			sendExecClientMessage(h2Request, execMsg, "piReadResult", execResult);
+			return;
+		}
+		case "piBashArgs": {
+			const args = execMsg.message.value;
+			const toolCallId = crypto.randomUUID();
+			synthesizeCursorExecToolCall(output, stream, toolCallId, "bash", {
+				command: args.command,
+				timeout: piTimeout(args.timeout),
+			});
+			const call = { args, toolCallId };
+			const { execResult } = await resolveExecHandler(
+				call,
+				execHandlers?.piBash?.bind(execHandlers),
+				onToolResult,
+				buildPiBashResult,
+				buildPiBashError,
+				buildPiBashError,
+			);
+			sendExecClientMessage(h2Request, execMsg, "piBashResult", execResult);
+			return;
+		}
+		case "piEditArgs": {
+			const args = execMsg.message.value;
+			const toolCallId = crypto.randomUUID();
+			synthesizeCursorExecToolCall(output, stream, toolCallId, "edit", {
+				path: args.path,
+				edits: args.edits.map(edit => ({ old_text: edit.oldText, new_text: edit.newText })),
+			});
+			const call = { args, toolCallId };
+			const { execResult } = await resolveExecHandler(
+				call,
+				execHandlers?.piEdit?.bind(execHandlers),
+				onToolResult,
+				buildPiEditResult,
+				buildPiEditRejected,
+				buildPiEditError,
+			);
+			sendExecClientMessage(h2Request, execMsg, "piEditResult", execResult);
+			return;
+		}
+		case "piWriteArgs": {
+			const args = execMsg.message.value;
+			const toolCallId = crypto.randomUUID();
+			synthesizeCursorExecToolCall(output, stream, toolCallId, "write", {
+				path: args.path,
+				content: args.content,
+			});
+			const call = { args, toolCallId };
+			const { execResult } = await resolveExecHandler(
+				call,
+				execHandlers?.piWrite?.bind(execHandlers),
+				onToolResult,
+				buildPiWriteResult,
+				buildPiWriteRejected,
+				buildPiWriteError,
+			);
+			sendExecClientMessage(h2Request, execMsg, "piWriteResult", execResult);
+			return;
+		}
+		case "piGrepArgs": {
+			const args = execMsg.message.value;
+			const toolCallId = crypto.randomUUID();
+			synthesizeCursorExecToolCall(output, stream, toolCallId, "search", {
+				pattern: args.literal === true ? piEscapeRegexLiteral(args.pattern) : args.pattern,
+				paths: [args.glob ? piJoinPath(args.path, args.glob) : args.path || "."],
+				// The model-facing search schema uses `i: true` for
+				// case-insensitive matching. Keep the field absent otherwise.
+				...(args.ignoreCase === true ? { i: true } : {}),
+				context: args.context,
+				limit: piLimit(args.limit),
+			});
+			const call = { args, toolCallId };
+			const { execResult } = await resolveExecHandler(
+				call,
+				execHandlers?.piGrep?.bind(execHandlers),
+				onToolResult,
+				buildPiGrepResult,
+				buildPiGrepError,
+				buildPiGrepError,
+			);
+			sendExecClientMessage(h2Request, execMsg, "piGrepResult", execResult);
+			return;
+		}
+		case "piFindArgs": {
+			const args = execMsg.message.value;
+			const toolCallId = crypto.randomUUID();
+			synthesizeCursorExecToolCall(output, stream, toolCallId, "find", {
+				paths: [piJoinPath(args.path, args.pattern)],
+				limit: piLimit(args.limit),
+			});
+			const call = { args, toolCallId };
+			const { execResult } = await resolveExecHandler(
+				call,
+				execHandlers?.piFind?.bind(execHandlers),
+				onToolResult,
+				buildPiFindResult,
+				buildPiFindError,
+				buildPiFindError,
+			);
+			sendExecClientMessage(h2Request, execMsg, "piFindResult", execResult);
+			return;
+		}
+		case "piLsArgs": {
+			const args = execMsg.message.value;
+			const toolCallId = crypto.randomUUID();
+			synthesizeCursorExecToolCall(output, stream, toolCallId, "read", { path: piLsPath(args.path) });
+			const call = { args, toolCallId };
+			const { execResult } = await resolveExecHandler(
+				call,
+				execHandlers?.piLs?.bind(execHandlers),
+				onToolResult,
+				buildPiLsResult,
+				buildPiLsError,
+				buildPiLsError,
+			);
+			sendExecClientMessage(h2Request, execMsg, "piLsResult", execResult);
+			return;
+		}
+		case "mcpStateExecArgs": {
+			sendExecClientMessage(
+				h2Request,
+				execMsg,
+				"mcpStateExecResult",
+				buildMcpStateResult(requestContextTools, execMsg.message.value.serverIdentifiers),
+			);
+			return;
+		}
+		case "executeHookArgs": {
+			const execResult = buildNeutralHookResult(execMsg.message.value.request);
+			if (!execResult) {
+				sendExecClientThrow(
+					h2Request,
+					execMsg,
+					`Unsupported hook request: ${execMsg.message.value.request?.request.case ?? "unset"}`,
+					"unknown_hook_request",
+				);
+				return;
+			}
+			sendExecClientMessage(h2Request, execMsg, "executeHookResult", execResult);
+			return;
+		}
+		case "shellAllowlistPrecheckArgs": {
+			sendExecClientMessage(
+				h2Request,
+				execMsg,
+				"shellAllowlistPrecheckResult",
+				create(ShellAllowlistPrecheckResultSchema, { allowlisted: false }),
+			);
+			return;
+		}
+		case "mcpAllowlistPrecheckArgs": {
+			sendExecClientMessage(
+				h2Request,
+				execMsg,
+				"mcpAllowlistPrecheckResult",
+				create(McpAllowlistPrecheckResultSchema, { allowlisted: false }),
+			);
+			return;
+		}
+		case "webFetchAllowlistPrecheckArgs": {
+			sendExecClientMessage(
+				h2Request,
+				execMsg,
+				"webFetchAllowlistPrecheckResult",
+				create(WebFetchAllowlistPrecheckResultSchema, { allowlisted: false }),
+			);
+			return;
+		}
 		default: {
 			log("warn", "unhandledExecMessage", { execCase });
-			// Send a bare ExecClientMessage (id + execId only, no typed result) so the
-			// server gets an acknowledgement and doesn't hang waiting forever.
-			const ack = create(ExecClientMessageSchema, {
-				id: execMsg.id,
-				execId: execMsg.execId,
-			});
-			const clientMessage = create(AgentClientMessageSchema, {
-				message: { case: "execClientMessage", value: ack },
-			});
-			h2Request.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+			sendExecClientThrow(
+				h2Request,
+				execMsg,
+				`No handler for exec message of type ${execCase}`,
+				"exec_variant_unsupported",
+			);
 		}
 	}
 }
 
-function sendExecClientMessage<T>(
-	h2Request: http2.ClientHttp2Stream,
+function sendExecClientMessage<TCase extends NonNullable<ExecClientMessage["message"]["case"]>>(
+	h2Request: CursorRequestWriter,
 	execMsg: ExecServerMessage,
-	messageCase: ExecClientMessage["message"]["case"],
-	value: T,
+	messageCase: TCase,
+	value: Extract<ExecClientMessage["message"], { case: TCase }>["value"],
 ): void {
 	const execClientMessage = create(ExecClientMessageSchema, {
 		id: execMsg.id,
 		execId: execMsg.execId,
-		message: {
-			case: messageCase,
-			value: value as any,
-		},
+		message: { case: messageCase, value } as ExecClientMessage["message"],
 	});
 
 	const clientMessage = create(AgentClientMessageSchema, {
@@ -1256,12 +1790,31 @@ function sendExecClientMessage<T>(
 	});
 
 	const responseBytes = toBinary(AgentClientMessageSchema, clientMessage);
-	h2Request.write(frameConnectMessage(responseBytes));
+	h2Request.enqueue(frameConnectMessage(responseBytes));
 
 	log("execClientMessage", messageCase, value);
 }
 
-function sendExecClientStreamClose(h2Request: http2.ClientHttp2Stream, execMsg: ExecServerMessage): void {
+function sendExecClientThrow(
+	h2Request: CursorRequestWriter,
+	execMsg: ExecServerMessage,
+	error: string,
+	errorCode: string,
+): void {
+	const controlMessage = create(ExecClientControlMessageSchema, {
+		message: {
+			case: "throw",
+			value: create(ExecClientThrowSchema, { id: execMsg.id, error, errorCode }),
+		},
+	});
+	const clientMessage = create(AgentClientMessageSchema, {
+		message: { case: "execClientControlMessage", value: controlMessage },
+	});
+	h2Request.enqueue(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+	sendExecClientStreamClose(h2Request, execMsg);
+}
+
+function sendExecClientStreamClose(h2Request: CursorRequestWriter, execMsg: ExecServerMessage): void {
 	const closeMessage = create(ExecClientControlMessageSchema, {
 		message: {
 			case: "streamClose",
@@ -1274,7 +1827,7 @@ function sendExecClientStreamClose(h2Request: http2.ClientHttp2Stream, execMsg: 
 		message: { case: "execClientControlMessage", value: closeMessage },
 	});
 	const responseBytes = toBinary(AgentClientMessageSchema, clientMessage);
-	h2Request.write(frameConnectMessage(responseBytes));
+	h2Request.enqueue(frameConnectMessage(responseBytes));
 	log("execClientControl", "streamClose", { id: execMsg.id, execId: execMsg.execId });
 }
 
@@ -1307,6 +1860,26 @@ export async function resolveExecHandler<TArgs, TResult>(
 		const message = error instanceof Error ? error.message : String(error);
 		return { execResult: buildError(message) };
 	}
+}
+
+/** Exported for deterministic coverage of ordered server-message handling. */
+export function createCursorMessageQueueForTest(onError?: (error: unknown) => void): {
+	enqueue(handler: () => void | Promise<void>): Promise<void>;
+	drain(): Promise<void>;
+} {
+	let chain = Promise.resolve();
+	return {
+		enqueue(handler) {
+			const result = chain.then(handler);
+			chain = result.catch(error => {
+				onError?.(error);
+			});
+			return result;
+		},
+		drain() {
+			return chain;
+		},
+	};
 }
 
 function splitExecHandlerResult<TResult>(result: CursorExecHandlerResult<TResult>): {
@@ -1862,12 +2435,15 @@ interface CursorTodoItem {
 
 interface CursorUpdateTodosToolCall {
 	updateTodosToolCall?: { args?: { todos?: CursorTodoItem[] } };
+	tool?: { case?: string; value?: { args?: { todos?: CursorTodoItem[] } } };
 }
 
 function buildTodoWriteArgs(toolCall: CursorUpdateTodosToolCall): {
 	todos: Array<{ id?: string; content: string; activeForm: string; status: "pending" | "in_progress" | "completed" }>;
 } | null {
-	const todos = toolCall.updateTodosToolCall?.args?.todos;
+	const updateCall =
+		toolCall.tool?.case === "updateTodosToolCall" ? toolCall.tool.value : toolCall.updateTodosToolCall;
+	const todos = updateCall?.args?.todos;
 	if (!todos) return null;
 	return {
 		todos: todos.map(todo => ({
@@ -1912,20 +2488,131 @@ function cursorNativeToolName(kindKey: string): string {
 // do not otherwise handle (everything except mcpToolCall / updateTodosToolCall), so
 // without this they are silently dropped and never render. Build a generic toolCall
 // block from whichever *ToolCall field is set so the call (and its result) is shown.
-function buildNativeToolCallBlock(
+
+/** Hard node budget for one native-payload conversion; bounds hostile or cyclic graphs. */
+const CURSOR_JSON_SAFE_MAX_NODES = 10_000;
+const CURSOR_JSON_SAFE_MAX_DEPTH = 100;
+
+/**
+ * Total conversion of a Cursor protobuf payload into plain JSON-safe data.
+ *
+ * protobuf-es v2 messages are plain objects, but they carry `$typeName`
+ * markers, `bigint` fields (e.g. `fileSize`, `durationMs`, `timestampMs`,
+ * `fileOutputThresholdBytes`), and `Uint8Array` blobs. None of those may leak
+ * into assistant message content: toolCall `arguments` are staged into managed
+ * snapshots, persisted to the JSONL transcript, and replayed to providers —
+ * all of which require `JSON.stringify`-safe values. Attaching the raw payload
+ * is exactly the local-snapshot producer defect class behind issue #4578.
+ *
+ * Rules: `$typeName` is stripped, safe-range bigints become numbers (decimal
+ * strings beyond `Number.MAX_SAFE_INTEGER`), byte arrays become base64
+ * strings, dates become ISO strings, functions/symbols are dropped, cycles
+ * and over-depth values collapse to null, and containers stop accepting
+ * entries once the shared node budget is exhausted.
+ */
+function cursorJsonSafeValue(value: unknown, path?: Set<object>, budget?: { remaining: number }, depth = 0): unknown {
+	const seen = path ?? new Set<object>();
+	const nodes = budget ?? { remaining: CURSOR_JSON_SAFE_MAX_NODES };
+	if (nodes.remaining-- <= 0) return null;
+	if (depth >= CURSOR_JSON_SAFE_MAX_DEPTH) return null;
+	if (typeof value === "bigint") {
+		return value <= BigInt(Number.MAX_SAFE_INTEGER) && value >= BigInt(-Number.MAX_SAFE_INTEGER)
+			? Number(value)
+			: value.toString();
+	}
+	if (typeof value === "function" || typeof value === "symbol" || value === undefined) return null;
+	if (typeof value === "number" && !Number.isFinite(value)) return null;
+	if (value === null || typeof value !== "object") return value;
+	if (seen.has(value)) return null;
+	if (value instanceof Uint8Array)
+		return Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("base64");
+	if (value instanceof Date) return Number.isFinite(value.getTime()) ? value.toISOString() : null;
+	seen.add(value);
+	try {
+		if (Array.isArray(value)) {
+			const array: unknown[] = [];
+			for (const entry of value) {
+				if (nodes.remaining <= 0) break;
+				array.push(cursorJsonSafeValue(entry, seen, nodes, depth + 1));
+			}
+			return array;
+		}
+		const record: Record<string, unknown> = {};
+		for (const [key, entry] of Object.entries(value)) {
+			if (key === "$typeName") continue;
+			if (nodes.remaining <= 0) break;
+			record[key] = cursorJsonSafeValue(entry, seen, nodes, depth + 1);
+		}
+		return record;
+	} catch {
+		return null;
+	} finally {
+		seen.delete(value);
+	}
+}
+
+/** Exported for direct regression coverage of the JSON-safety boundary. */
+export function cursorJsonSafeValueForTest(value: unknown): unknown {
+	return cursorJsonSafeValue(value);
+}
+
+function selectMcpToolCall(toolCall: any): any {
+	return toolCall?.tool?.case === "mcpToolCall" ? toolCall.tool.value : toolCall?.mcpToolCall;
+}
+
+const CURSOR_EXEC_OWNED_TOOL_CASES = new Set([
+	"piReadToolCall",
+	"piBashToolCall",
+	"piEditToolCall",
+	"piWriteToolCall",
+	"piGrepToolCall",
+	"piFindToolCall",
+	"piLsToolCall",
+]);
+
+function isExecOwnedToolCall(toolCall: any): boolean {
+	return CURSOR_EXEC_OWNED_TOOL_CASES.has(toolCall?.tool?.case);
+}
+
+export function buildNativeToolCallBlock(
 	toolCall: Record<string, unknown>,
 	callId: string,
 	index: number,
 ): ToolCallState | null {
+	const oneof = toolCall.tool as { case?: string; value?: unknown } | undefined;
+	if (oneof?.case && oneof.value && typeof oneof.value === "object") {
+		const args = (oneof.value as { args?: unknown }).args;
+		const convertedArgs = cursorJsonSafeValue(args ?? oneof.value);
+		return {
+			type: "toolCall",
+			id: callId,
+			name: cursorNativeToolName(oneof.case),
+			arguments:
+				convertedArgs && typeof convertedArgs === "object" && !Array.isArray(convertedArgs)
+					? (convertedArgs as Record<string, unknown>)
+					: { raw: convertedArgs },
+			index,
+			kind: "native",
+		};
+	}
 	for (const [key, payload] of Object.entries(toolCall)) {
 		if (!/ToolCall$/.test(key) || !payload || typeof payload !== "object") continue;
 		if (key === "mcpToolCall" || key === "updateTodosToolCall") continue;
 		const args = (payload as { args?: unknown }).args;
+		const hasObjectArgs = args !== null && typeof args === "object";
+		const convertedArgs = hasObjectArgs ? cursorJsonSafeValue(args) : undefined;
+		const safeArguments =
+			convertedArgs !== undefined &&
+			convertedArgs !== null &&
+			typeof convertedArgs === "object" &&
+			!Array.isArray(convertedArgs)
+				? (convertedArgs as Record<string, unknown>)
+				: { raw: hasObjectArgs ? convertedArgs : cursorJsonSafeValue(payload) };
 		return {
 			type: "toolCall",
 			id: callId,
 			name: cursorNativeToolName(key),
-			arguments: args && typeof args === "object" ? (args as Record<string, unknown>) : { raw: payload },
+			arguments: safeArguments,
 			index,
 			kind: "native",
 		};
@@ -1986,6 +2673,30 @@ function buildMcpErrorResult(error: string) {
 	});
 }
 
+function synthesizeCursorExecToolCall(
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	toolCallId: string,
+	name: string,
+	args: Record<string, unknown>,
+): void {
+	const block: ToolCallState = {
+		type: "toolCall",
+		id: toolCallId,
+		name,
+		arguments: cursorJsonSafeValue(args) as Record<string, unknown>,
+		index: output.content.length,
+		kind: "cursor-exec",
+		[kCursorExecResolved]: true,
+	};
+	output.content.push(block);
+	const contentIndex = output.content.length - 1;
+	stream.push({ type: "toolcall_start", contentIndex, partial: output });
+	delete (block as Partial<ToolCallState>).index;
+	delete (block as Partial<ToolCallState>).kind;
+	stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial: output });
+}
+
 function processInteractionUpdate(
 	update: any,
 	output: AssistantMessage,
@@ -2041,10 +2752,14 @@ function processInteractionUpdate(
 			});
 			state.setThinkingBlock(null);
 		}
+	} else if (updateCase === "toolCallStarted" && isExecOwnedToolCall(update.message.value.toolCall)) {
+		// Pi stream call IDs and exec IDs are distinct namespaces; without a shared
+		// correlation field, suppress the streamed variant and synthesize from exec.
+		log("exec", "streamedToolCallOwnedByExec", { case: update.message.value.toolCall?.tool?.case });
 	} else if (updateCase === "toolCallStarted") {
 		const toolCall = update.message.value.toolCall;
 		if (toolCall) {
-			const mcpCall = toolCall.mcpToolCall;
+			const mcpCall = selectMcpToolCall(toolCall);
 			if (mcpCall) {
 				const args = mcpCall.args || {};
 				const block: ToolCallState = {
@@ -2105,7 +2820,8 @@ function processInteractionUpdate(
 		if (state.currentToolCall) {
 			const toolCall = update.message.value.toolCall;
 			if (state.currentToolCall.kind === "mcp") {
-				const decodedArgs = decodeMcpArgsMap(toolCall?.mcpToolCall?.args?.args);
+				captureUnicodeEscapeEvidence(state.currentToolCall, state.currentToolCall.partialJson ?? "");
+				const decodedArgs = decodeMcpArgsMap(selectMcpToolCall(toolCall)?.args?.args);
 				if (decodedArgs) {
 					state.currentToolCall.arguments = decodedArgs;
 				}
@@ -2328,7 +3044,7 @@ export function buildCursorSystemPromptJsons(systemPrompt: readonly string[] | u
 	// Composer-harness models need anchor/edit discipline pinned ahead of any
 	// host/default prompt (see composer-discipline.ts for the observed failure modes).
 	if (modelId !== undefined && isComposerHarnessModel(modelId)) {
-		jsons.unshift(JSON.stringify({ role: "system", content: COMPOSER_EDIT_DISCIPLINE_PROMPT }));
+		jsons.unshift(JSON.stringify({ role: "system", content: CURSOR_COMPOSER_EDIT_DISCIPLINE_PROMPT }));
 	}
 	return jsons;
 }
@@ -2618,8 +3334,9 @@ function buildGrpcRequest(
 		turns,
 	});
 
+	const resolvedModel = resolveCursorWireModelForTest(model);
 	const modelDetails = create(ModelDetailsSchema, {
-		modelId: model.id,
+		modelId: resolvedModel.modelId,
 		displayModelId: model.id,
 		displayName: model.name,
 	});
@@ -2629,9 +3346,17 @@ function buildGrpcRequest(
 		action,
 		modelDetails,
 		conversationId: state.conversationId,
+		...(resolvedModel.translated
+			? {
+					requestedModel: create(RequestedModelSchema, {
+						modelId: resolvedModel.modelId,
+						parameters: resolvedModel.parameters,
+					}),
+				}
+			: {}),
 	});
 
-	options?.onPayload?.(runRequest);
+	options?.onPayload?.(runRequest, model, options?.attemptScope);
 
 	// Tools are sent later via requestContext (exec handshake)
 

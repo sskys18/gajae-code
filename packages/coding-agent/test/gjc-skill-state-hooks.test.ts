@@ -2,13 +2,23 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:te
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as activeStateModule from "@gajae-code/coding-agent/skill-state/active-state";
 import { logger } from "@gajae-code/utils";
 import { DEFAULT_DISABLED_EXTENSIONS, DEFAULT_SKILL_DISCOVERY_SETTINGS } from "../src/config/skill-settings-defaults";
-import { activeSnapshotPath, modeStatePath, sessionSpecsDir, sessionStateDir } from "../src/gjc-runtime/session-layout";
+import { runNativeRalplanCommand } from "../src/gjc-runtime/ralplan-runtime";
+import {
+	activeEntryPath,
+	activeSnapshotPath,
+	modeStatePath,
+	sessionSpecsDir,
+	sessionStateDir,
+} from "../src/gjc-runtime/session-layout";
 import { reconcileWorkflowSkillState } from "../src/gjc-runtime/state-runtime";
 import { RequiredOnWriteEnvelopeSchema } from "../src/gjc-runtime/state-schema";
 import {
 	detectWorkflowEnvelopeIntegrityMismatch,
+	readActiveEntries,
+	writeActiveEntry,
 	writeGuardedJsonAtomic,
 	writeGuardedWorkflowEnvelopeAtomic,
 } from "../src/gjc-runtime/state-writer";
@@ -25,18 +35,30 @@ import {
 import { dispatchGjcNativeSkillHook } from "../src/hooks/native-skill-hook";
 import {
 	detectSkillKeywords,
+	ensureWorkflowSkillActivationSeed,
 	ensureWorkflowSkillActivationState,
 	readVisibleSkillActiveState,
 } from "../src/hooks/skill-state";
-import { getDeepInterviewMutationDecision } from "../src/skill-state/deep-interview-mutation-guard";
+import { getWorkflowMutationDecision } from "../src/skill-state/workflow-mutation-guard";
 import { WORKFLOW_STATE_VERSION } from "../src/skill-state/workflow-state-contract";
 
 describe("GJC native skill-state hooks", () => {
 	let tempDir: string | undefined;
 	let originalGjcSessionId: string | undefined;
+	let originalCiDevChangedPaths: string | undefined;
+	let originalGithubWorkspace: string | undefined;
 
 	beforeAll(() => {
 		originalGjcSessionId = process.env.GJC_SESSION_ID;
+		originalCiDevChangedPaths = process.env.CI_DEV_CHANGED_PATHS;
+		originalGithubWorkspace = process.env.GITHUB_WORKSPACE;
+		process.env.CI_DEV_CHANGED_PATHS = "packages/coding-agent/test/gjc-skill-state-hooks.test.ts";
+		// The checkpoint change-set capture discards the pinned CI paths whenever the
+		// cwd is not the declared workspace, and these cases run in a temp cwd. Left
+		// set, every checkpoint here captures as incomplete and escalates validation
+		// to the mandatory computer red-team suite — a different subject than the hook
+		// decisions under test.
+		delete process.env.GITHUB_WORKSPACE;
 		process.env.GJC_SESSION_ID = "test-session";
 	});
 
@@ -46,6 +68,10 @@ describe("GJC native skill-state hooks", () => {
 		} else {
 			process.env.GJC_SESSION_ID = originalGjcSessionId;
 		}
+		if (originalCiDevChangedPaths === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
+		else process.env.CI_DEV_CHANGED_PATHS = originalCiDevChangedPaths;
+		if (originalGithubWorkspace === undefined) delete process.env.GITHUB_WORKSPACE;
+		else process.env.GITHUB_WORKSPACE = originalGithubWorkspace;
 	});
 
 	const testEffectiveSkillConfig = {
@@ -69,6 +95,21 @@ describe("GJC native skill-state hooks", () => {
 	async function cwd(): Promise<string> {
 		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skill-hooks-"));
 		return tempDir;
+	}
+
+	async function initGitRepo(root: string): Promise<void> {
+		const run = async (args: string[]) => {
+			const process = Bun.spawn(["git", ...args], { cwd: root, stdout: "pipe", stderr: "pipe" });
+			const status = await process.exited;
+			if (status !== 0)
+				throw new Error(`git ${args.join(" ")} failed: ${await new Response(process.stderr).text()}`);
+		};
+		await run(["init"]);
+		await run(["config", "user.email", "test@example.com"]);
+		await run(["config", "user.name", "Test"]);
+		await fs.writeFile(path.join(root, "README.md"), "test\n");
+		await run(["add", "README.md"]);
+		await run(["commit", "-m", "init"]);
 	}
 
 	async function writePersistedSessionFile(
@@ -117,7 +158,30 @@ describe("GJC native skill-state hooks", () => {
 		};
 	}
 
-	function ultragoalQualityGate(): string {
+	async function ultragoalQualityGate(root: string): Promise<string> {
+		const artifactsDir = path.join(root, "artifacts");
+		await fs.mkdir(artifactsDir, { recursive: true });
+		// Adversarial coverage is file-backed and fail-closed (#3541/#3543): inlineEvidence alone is rejected.
+		await Bun.write(
+			path.join(artifactsDir, "adversarial-report.txt"),
+			"Adversarial cases covered invalid input, missing state, and repeated operation boundaries.\n",
+		);
+		await Bun.write(
+			path.join(artifactsDir, "native-proof.png"),
+			Buffer.from(
+				"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+				"base64",
+			),
+		);
+		const computerCaseIds = [
+			"kill-switch-bypass",
+			"suspended-enforcement",
+			"permission-revoked",
+			"display-stale",
+			"out-of-bounds-drift",
+			"runaway-loop-halt",
+			"blast-radius",
+		];
 		return JSON.stringify({
 			architectReview: {
 				architectureStatus: "CLEAR",
@@ -151,9 +215,14 @@ describe("GJC native skill-state hooks", () => {
 					{
 						id: "adversarial",
 						kind: "failure-mode-test",
+						path: "artifacts/adversarial-report.txt",
 						description: "Adversarial verification report",
-						inlineEvidence:
-							"Adversarial cases covered invalid input, missing state, and repeated operation boundaries.",
+					},
+					{
+						id: "native-proof",
+						kind: "native screenshot",
+						path: "artifacts/native-proof.png",
+						description: "Live structural native proof",
 					},
 				],
 				contractCoverage: [
@@ -163,7 +232,7 @@ describe("GJC native skill-state hooks", () => {
 						obligation: "The story satisfies the approved contract",
 						status: "covered",
 						surfaceEvidenceRefs: ["surface"],
-						adversarialCaseRefs: ["case"],
+						adversarialCaseRefs: ["case", ...computerCaseIds],
 					},
 				],
 				surfaceEvidence: [
@@ -185,6 +254,14 @@ describe("GJC native skill-state hooks", () => {
 						verdict: "passed",
 						artifactRefs: ["adversarial"],
 					},
+					...computerCaseIds.map(id => ({
+						id,
+						contractRef: "approved-plan",
+						scenario: `${id} exercises the computer safety boundary`,
+						expectedBehavior: "The runtime fails closed before unsafe desktop input can continue",
+						verdict: "passed",
+						artifactRefs: ["native-proof"],
+					})),
 				],
 				blockers: [],
 			},
@@ -192,6 +269,31 @@ describe("GJC native skill-state hooks", () => {
 				status: "passed",
 				evidence: "full verification reran cleanly after the implementation pass",
 				fullRerun: true,
+				reviewCohort: {
+					reviewGeneration: 1,
+					sourceHash: "sha256:test-frozen-source",
+					joined: true,
+					lanes: {
+						cleaner: {
+							status: "passed",
+							sourceHash: "sha256:test-frozen-source",
+							evidence: "cleaner clean",
+							blockers: [],
+						},
+						architect: {
+							status: "CLEAR",
+							sourceHash: "sha256:test-frozen-source",
+							evidence: "architect clear",
+							blockers: [],
+						},
+						qa: {
+							status: "passed",
+							sourceHash: "sha256:test-frozen-source",
+							evidence: "qa passed",
+							blockers: [],
+						},
+					},
+				},
 				rerunCommands: ["bun test:e2e", "bun test:red-team"],
 				blockers: [],
 			},
@@ -199,12 +301,50 @@ describe("GJC native skill-state hooks", () => {
 	}
 
 	it("detects only the public GJC workflow skill surface", () => {
-		expect(detectSkillKeywords("$deep-interview then $team").map(match => match.skill)).toEqual([
+		expect(detectSkillKeywords("$deep-interview then $autoresearch").map(match => match.skill)).toEqual([
 			"deep-interview",
-			"team",
+			"autoresearch",
 		]);
 		expect(detectSkillKeywords("$autopilot deep interview")).toEqual([]);
-		expect(detectSkillKeywords("please run a consensus plan")[0]?.skill).toBe("ralplan");
+		expect(detectSkillKeywords("please run a consensus plan")).toEqual([]);
+		expect(detectSkillKeywords("don't assume, interview me about the coordinated setup")).toEqual([]);
+		expect(detectSkillKeywords("run a deep interview about ultragoal tracking")).toEqual([]);
+		expect(detectSkillKeywords("$ralplan this refactor")[0]?.skill).toBe("ralplan");
+	});
+
+	it("UserPromptSubmit adds advisory answer-only context for question-only prompts", async () => {
+		const root = await cwd();
+		for (const prompt of ["?", "what does /model planner mean?"]) {
+			const result = await dispatchGjcNativeSkillHook({
+				hookEventName: "UserPromptSubmit",
+				userPrompt: prompt,
+				cwd: root,
+				sessionId: `session-question-${prompt === "?" ? "bare" : "model"}`,
+			});
+			const context = String(
+				(result.outputJson?.hookSpecificOutput as { additionalContext?: unknown } | undefined)?.additionalContext ??
+					"",
+			);
+			expect(result.outputJson).not.toMatchObject({ decision: "block" });
+			expect(context).toContain("Question-only prompt advisory");
+			expect(context).toContain("answer-only/read-only");
+		}
+	});
+
+	it("UserPromptSubmit does not add question-only advisory context for explicit action prompts", async () => {
+		const root = await cwd();
+		const result = await dispatchGjcNativeSkillHook({
+			hookEventName: "UserPromptSubmit",
+			userPrompt: "fix the failing model selector test",
+			cwd: root,
+			sessionId: "session-question-action",
+		});
+		const context = String(
+			(result.outputJson?.hookSpecificOutput as { additionalContext?: unknown } | undefined)?.additionalContext ??
+				"",
+		);
+		expect(result.outputJson).not.toEqual(expect.objectContaining({ decision: "block" }));
+		expect(context).not.toContain("Question-only prompt advisory");
 	});
 
 	it("UserPromptSubmit persists session-scoped skill-active and mode state", async () => {
@@ -229,7 +369,7 @@ describe("GJC native skill-state hooks", () => {
 		);
 		expect(context).toContain("Sanitized effective skill config");
 		expect(context).toContain("filesystem/custom skill discovery");
-		expect(context).toContain("deep-interview, ralplan, ultragoal, team");
+		expect(context).toContain("deep-interview, ralplan, ultragoal, autoresearch");
 		const state = await readVisibleSkillActiveState(root, "session-1");
 		expect(state).toMatchObject({
 			active: true,
@@ -330,8 +470,8 @@ describe("GJC native skill-state hooks", () => {
 		const state = {
 			version: 1,
 			active: true,
-			skill: "team",
-			active_skills: [{ skill: "team", active: true, phase: "running", custom_field: "preserved" }],
+			skill: "autoresearch",
+			active_skills: [{ skill: "autoresearch", active: true, phase: "running", custom_field: "preserved" }],
 		};
 		await fs.writeFile(path.join(stateDir, "skill-active-state.json"), JSON.stringify(state));
 
@@ -420,10 +560,10 @@ describe("GJC native skill-state hooks", () => {
 			JSON.stringify({
 				version: 1,
 				active: true,
-				active_skills: [{ skill: "team", active: true, phase: "running", session_id: "session-corrupt" }],
+				active_skills: [{ skill: "autoresearch", active: true, phase: "running", session_id: "session-corrupt" }],
 			}),
 		);
-		await fs.writeFile(modeStatePath(root, "session-corrupt", "team"), "{");
+		await fs.writeFile(modeStatePath(root, "session-corrupt", "autoresearch"), "{");
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			const allowed = await dispatchGjcNativeSkillHook(
@@ -451,11 +591,11 @@ describe("GJC native skill-state hooks", () => {
 			JSON.stringify({
 				version: 1,
 				active: true,
-				active_skills: [{ skill: "team", active: true, phase: "running", session_id: "session-invalid" }],
+				active_skills: [{ skill: "autoresearch", active: true, phase: "running", session_id: "session-invalid" }],
 			}),
 		);
 		await fs.writeFile(
-			modeStatePath(root, "session-invalid", "team"),
+			modeStatePath(root, "session-invalid", "autoresearch"),
 			JSON.stringify({ active: true, current_phase: 7, session_id: "session-invalid" }),
 		);
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
@@ -851,7 +991,7 @@ describe("GJC native skill-state hooks", () => {
 		const state = await readVisibleSkillActiveState(root, "session-rich");
 		expect(state).toMatchObject({ active: true, skill: "deep-interview" });
 
-		const blockedProduct = await getDeepInterviewMutationDecision({
+		const blockedProduct = await getWorkflowMutationDecision({
 			cwd: root,
 			sessionId: "session-rich",
 			tool: { name: "write" } as never,
@@ -861,7 +1001,7 @@ describe("GJC native skill-state hooks", () => {
 		expect(blockedProduct.reason).toBe("phase-boundary");
 		expect(blockedProduct.message).toContain("handoff/spec before code edits");
 
-		const allowedReadOnlyBash = await getDeepInterviewMutationDecision({
+		const allowedReadOnlyBash = await getWorkflowMutationDecision({
 			cwd: root,
 			sessionId: "session-rich",
 			tool: { name: "bash" } as never,
@@ -869,7 +1009,7 @@ describe("GJC native skill-state hooks", () => {
 		});
 		expect(allowedReadOnlyBash.blocked).toBe(false);
 
-		const blockedSpec = await getDeepInterviewMutationDecision({
+		const blockedSpec = await getWorkflowMutationDecision({
 			cwd: root,
 			sessionId: "session-rich",
 			tool: { name: "write" } as never,
@@ -881,7 +1021,7 @@ describe("GJC native skill-state hooks", () => {
 
 		// Per #951 the mutation guard never blocks `bash`, even for `.gjc/**` targets;
 		// `.gjc/**` is gated only through the dedicated write/edit/ast_edit tools.
-		const allowedGjcBash = await getDeepInterviewMutationDecision({
+		const allowedGjcBash = await getWorkflowMutationDecision({
 			cwd: root,
 			sessionId: "session-rich",
 			tool: { name: "bash" } as never,
@@ -889,7 +1029,7 @@ describe("GJC native skill-state hooks", () => {
 		});
 		expect(allowedGjcBash.blocked).toBe(false);
 
-		const blocked = await getDeepInterviewMutationDecision({
+		const blocked = await getWorkflowMutationDecision({
 			cwd: root,
 			sessionId: "session-rich",
 			tool: { name: "write" } as never,
@@ -901,7 +1041,7 @@ describe("GJC native skill-state hooks", () => {
 
 	it("blocks direct workflow state JSON writes and points to gjc state", async () => {
 		const root = await cwd();
-		const blocked = await getDeepInterviewMutationDecision({
+		const blocked = await getWorkflowMutationDecision({
 			cwd: root,
 			tool: { name: "write" } as never,
 			args: { path: ".gjc/state/ralplan-state.json", content: "{}" },
@@ -910,14 +1050,14 @@ describe("GJC native skill-state hooks", () => {
 		expect(blocked.reason).toBe("workflow-state-target");
 		expect(blocked.message).toContain("gjc state ralplan");
 
-		const allowedSpec = await getDeepInterviewMutationDecision({
+		const allowedSpec = await getWorkflowMutationDecision({
 			cwd: root,
 			tool: { name: "write" } as never,
 			args: { path: ".gjc/specs/deep-interview-sample.md", content: "spec" },
 		});
 		expect(allowedSpec.blocked).toBe(true);
 
-		const allowedPlan = await getDeepInterviewMutationDecision({
+		const allowedPlan = await getWorkflowMutationDecision({
 			cwd: root,
 			tool: { name: "write" } as never,
 			args: { path: ".gjc/plans/sample.md", content: "plan" },
@@ -930,7 +1070,7 @@ describe("GJC native skill-state hooks", () => {
 		await dispatchGjcNativeSkillHook(
 			{
 				hookEventName: "UserPromptSubmit",
-				userPrompt: "$team coordinate this",
+				userPrompt: "$autoresearch investigate this",
 				cwd: root,
 				sessionId: "../../../escape",
 				threadId: "thread-safe",
@@ -939,7 +1079,7 @@ describe("GJC native skill-state hooks", () => {
 		);
 
 		const state = await readVisibleSkillActiveState(root, "../../../escape");
-		expect(state?.initialized_state_path).toBe(modeStatePath(root, "../../../escape", "team"));
+		expect(state?.initialized_state_path).toBe(modeStatePath(root, "../../../escape", "autoresearch"));
 		expect(await fs.stat(activeSnapshotPath(root, "../../../escape"))).toBeDefined();
 		await expect(fs.stat(path.join(root, ".gjc", "escape"))).rejects.toThrow();
 	});
@@ -962,7 +1102,7 @@ describe("GJC native skill-state hooks", () => {
 						enablePiUser: true,
 						enablePiProject: false,
 						customDirectories: [rawCustomDirectory],
-						includeSkills: ["ralplan", "team"],
+						includeSkills: ["ralplan", "autoresearch"],
 						ignoredSkills: ["legacy-*"],
 					},
 					disabledExtensions: ["skill:legacy", "agent:executor"],
@@ -984,7 +1124,7 @@ describe("GJC native skill-state hooks", () => {
 		expect(context).not.toContain("~/.gjc");
 		expect(context).not.toContain(".gjc/settings.json");
 		expect(context).not.toContain("SKILL.md");
-		expect(context).not.toContain("ralplan, team]");
+		expect(context).not.toContain("ralplan, autoresearch]");
 		expect(context).not.toContain("legacy-*");
 		expect(context).not.toContain("custom-skills");
 		expect(context).not.toContain("agent:executor");
@@ -996,7 +1136,7 @@ describe("GJC native skill-state hooks", () => {
 		const result = await dispatchGjcNativeSkillHook(
 			{
 				hookEventName: "UserPromptSubmit",
-				userPrompt: "$team coordinate this",
+				userPrompt: "$autoresearch investigate this",
 				cwd: root,
 				sessionId: "session-malicious-config",
 			},
@@ -1036,7 +1176,7 @@ describe("GJC native skill-state hooks", () => {
 			const result = await dispatchGjcNativeSkillHook(
 				{
 					hookEventName: "UserPromptSubmit",
-					userPrompt: "$team coordinate this",
+					userPrompt: "$autoresearch investigate this",
 					cwd: root,
 					sessionId: "session-malicious-recovery",
 				},
@@ -1128,7 +1268,7 @@ disabledExtensions:
 		const result = await dispatchGjcNativeSkillHook(
 			{
 				hookEventName: "UserPromptSubmit",
-				userPrompt: "$team coordinate this",
+				userPrompt: "$autoresearch investigate this",
 				cwd: root,
 				sessionId: "session-merged-config",
 			},
@@ -1524,7 +1664,7 @@ disabledExtensions:
 			goalId: "G001",
 			status: "complete",
 			evidence: "first stage verified",
-			qualityGateJson: ultragoalQualityGate(),
+			qualityGateJson: await ultragoalQualityGate(root),
 		});
 		await dispatchGjcNativeSkillHook(
 			{
@@ -1674,7 +1814,7 @@ disabledExtensions:
 			goalId: "G001",
 			status: "complete",
 			evidence: "first stage verified",
-			qualityGateJson: ultragoalQualityGate(),
+			qualityGateJson: await ultragoalQualityGate(root),
 		});
 		await dispatchGjcNativeSkillHook(
 			{
@@ -1757,7 +1897,7 @@ disabledExtensions:
 
 	it("ensureWorkflowSkillActivationState seeds state and engages the mutation guard", async () => {
 		const root = await cwd();
-		const before = await getDeepInterviewMutationDecision({
+		const before = await getWorkflowMutationDecision({
 			cwd: root,
 			tool: { name: "write" } as never,
 			args: { path: "src/app.ts", content: "x" },
@@ -1774,7 +1914,7 @@ disabledExtensions:
 		const state = await readVisibleSkillActiveState(root, "session-seed");
 		expect(state).toMatchObject({ active: true, skill: "deep-interview" });
 
-		const after = await getDeepInterviewMutationDecision({
+		const after = await getWorkflowMutationDecision({
 			cwd: root,
 			sessionId: "session-seed",
 			tool: { name: "write" } as never,
@@ -1818,6 +1958,260 @@ disabledExtensions:
 		// Already active → no reseed; lineage entry untouched.
 		const entry = result?.active_skills?.find(e => e.skill === "ralplan");
 		expect(entry?.handoff_from).toBe("deep-interview");
+	});
+
+	it("activation rollback preserves successor mode, entry, and rebuilt snapshot state", async () => {
+		const root = await cwd();
+		const sessionId = "session-seed-owned";
+		const activation = await ensureWorkflowSkillActivationSeed({
+			cwd: root,
+			skill: "deep-interview",
+			sessionId,
+		});
+		expect(activation.seeded).toBe(true);
+
+		const statePath = modeStatePath(root, sessionId, "deep-interview");
+		const entryPath = activeEntryPath(root, sessionId, "deep-interview");
+		const snapshotPath = activeSnapshotPath(root, sessionId);
+		const seededMode = JSON.parse(await fs.readFile(statePath, "utf8")) as Record<string, unknown>;
+		const seededEntry = JSON.parse(await fs.readFile(entryPath, "utf8")) as Record<string, unknown>;
+		const seededSnapshot = JSON.parse(await fs.readFile(snapshotPath, "utf8")) as Record<string, unknown>;
+		const seededRevision = seededMode.state_revision;
+		if (typeof seededRevision !== "number") throw new Error("Expected seeded state revision");
+
+		await writeGuardedWorkflowEnvelopeAtomic(
+			statePath,
+			{ ...seededMode, current_phase: "requirements", updated_at: "2099-01-01T00:00:00.000Z" },
+			{
+				cwd: root,
+				policy: "source",
+				expectedRevision: seededRevision,
+				receipt: {
+					cwd: root,
+					skill: "deep-interview",
+					owner: "gjc-runtime",
+					command: "state-ownership-change",
+					sessionId,
+				},
+			},
+		);
+		await writeGuardedJsonAtomic(
+			entryPath,
+			{ ...seededEntry, phase: "requirements", updated_at: "2099-01-01T00:00:00.000Z" },
+			{ cwd: root, policy: "cache", sourceRevision: seededRevision + 1 },
+		);
+		await writeGuardedJsonAtomic(
+			snapshotPath,
+			{ ...seededSnapshot, phase: "stale-snapshot", updated_at: "2099-01-01T00:00:00.000Z" },
+			{ cwd: root, policy: "cache", sourceRevision: seededRevision + 1 },
+		);
+
+		expect(await activation.rollback()).toBe(false);
+		const persistedMode = JSON.parse(await fs.readFile(statePath, "utf8")) as Record<string, unknown>;
+		const persistedEntry = JSON.parse(await fs.readFile(entryPath, "utf8")) as Record<string, unknown>;
+		const rebuiltSnapshot = JSON.parse(await fs.readFile(snapshotPath, "utf8")) as Record<string, unknown>;
+		expect(persistedMode.current_phase).toBe("requirements");
+		expect(persistedEntry.phase).toBe("requirements");
+		expect(rebuiltSnapshot.phase).toBe("requirements");
+	});
+
+	it("seeds ralplan repository binding for the first explicit-target role write", async () => {
+		const root = await cwd();
+		await initGitRepo(root);
+		const sessionId = "session-ralplan-first-use-binding";
+		const activation = await ensureWorkflowSkillActivationSeed({ cwd: root, skill: "ralplan", sessionId });
+		expect(activation.seeded).toBe(true);
+
+		const state = JSON.parse(await fs.readFile(modeStatePath(root, sessionId, "ralplan"), "utf8")) as Record<
+			string,
+			unknown
+		>;
+		expect(state.repository_binding).toMatchObject({ schema: "gjc.repository_binding.v1", worktreeRoot: root });
+
+		const result = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--worktree-root",
+				root,
+				"--session-id",
+				sessionId,
+				"--run-id",
+				"first-use-run",
+				"--stage",
+				"planner",
+				"--stage_n",
+				"1",
+				"--artifact",
+				"# planner\n",
+				"--json",
+			],
+			root,
+		);
+		expect(result.status).toBe(0);
+	});
+
+	it("rejects malformed ralplan hook bindings before an explicit-target role write", async () => {
+		const root = await cwd();
+		await initGitRepo(root);
+		const sessionId = "session-ralplan-malformed-binding";
+		await ensureWorkflowSkillActivationSeed({ cwd: root, skill: "ralplan", sessionId });
+		const statePath = modeStatePath(root, sessionId, "ralplan");
+		const state = JSON.parse(await fs.readFile(statePath, "utf8")) as Record<string, unknown>;
+		const revision = state.state_revision;
+		if (typeof revision !== "number") throw new Error("Expected seeded state revision");
+		await writeGuardedWorkflowEnvelopeAtomic(
+			statePath,
+			{ ...state, repository_binding: { schema: "gjc.repository_binding.v1", worktreeRoot: "" } },
+			{
+				cwd: root,
+				policy: "source",
+				expectedRevision: revision,
+				receipt: { cwd: root, skill: "ralplan", owner: "gjc-runtime", command: "test", sessionId },
+			},
+		);
+
+		const result = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--worktree-root",
+				root,
+				"--session-id",
+				sessionId,
+				"--stage",
+				"planner",
+				"--stage_n",
+				"1",
+				"--artifact",
+				"# planner\n",
+				"--json",
+			],
+			root,
+		);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toMatch(/repository binding rejected|requires worktreeRoot/i);
+	});
+	it("rollback restores upstream pipeline entries superseded by a later seed", async () => {
+		const root = await cwd();
+		const sessionId = "session-supersede-rollback";
+
+		const upstream = await ensureWorkflowSkillActivationSeed({
+			cwd: root,
+			skill: "deep-interview",
+			sessionId,
+		});
+		expect(upstream.seeded).toBe(true);
+
+		const successor = await ensureWorkflowSkillActivationSeed({
+			cwd: root,
+			skill: "ralplan",
+			sessionId,
+		});
+		expect(successor.seeded).toBe(true);
+
+		// Seeding ralplan removed the active deep-interview entry; rollback must
+		// restore it so a never-accepted prompt does not clear the prior workflow.
+		await expect(successor.rollback()).resolves.toBe(true);
+
+		const visible = await readVisibleSkillActiveState(root, sessionId);
+		expect(visible?.active_skills?.some(entry => entry.skill === "deep-interview" && entry.active !== false)).toBe(
+			true,
+		);
+		expect(visible?.active_skills?.some(entry => entry.skill === "ralplan" && entry.active !== false)).toBe(false);
+		expect(fs.stat(modeStatePath(root, sessionId, "ralplan"))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("cleans up the owned mode receipt when the seed's active-entry write fails", async () => {
+		const root = await cwd();
+		const sessionId = "session-mode-cleanup";
+		const statePath = modeStatePath(root, sessionId, "deep-interview");
+
+		const syncSpy = vi
+			.spyOn(activeStateModule, "syncSkillActiveState")
+			.mockRejectedValueOnce(new Error("simulated active-entry persistence failure"));
+		try {
+			await expect(
+				ensureWorkflowSkillActivationSeed({
+					cwd: root,
+					skill: "deep-interview",
+					sessionId,
+				}),
+			).rejects.toThrow("simulated active-entry persistence failure");
+		} finally {
+			syncSpy.mockRestore();
+		}
+
+		// The rejected invocation must not leave a revision-1 mode file behind,
+		// which would wedge a retry on its expectedRevision: 0 write.
+		await expect(fs.stat(statePath)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+	it("restores superseded upstream entries when seed persistence fails", async () => {
+		const root = await cwd();
+		const sessionId = "session-supersede-failure";
+
+		await ensureWorkflowSkillActivationSeed({ cwd: root, skill: "deep-interview", sessionId });
+
+		// Run the real sync (which removes the upstream deep-interview entry) and
+		// then fail, simulating a persistence error after the supersede removal.
+		const originalSync = activeStateModule.syncSkillActiveState;
+		const syncSpy = vi.spyOn(activeStateModule, "syncSkillActiveState").mockImplementationOnce(async options => {
+			await originalSync(options);
+			throw new Error("simulated post-sync persistence failure");
+		});
+		try {
+			await expect(ensureWorkflowSkillActivationSeed({ cwd: root, skill: "ralplan", sessionId })).rejects.toThrow(
+				"simulated post-sync persistence failure",
+			);
+		} finally {
+			syncSpy.mockRestore();
+		}
+
+		// The rejected ralplan seed must not leave deep-interview cleared: the
+		// seed error path restores the upstream entry sync already removed.
+		const entries = await readActiveEntries(root, { sessionId });
+		expect(entries.some(entry => entry.skill === "deep-interview")).toBe(true);
+		await expect(fs.stat(modeStatePath(root, sessionId, "ralplan"))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("rollback skips restoring an upstream skill that was re-seeded in the meantime", async () => {
+		const root = await cwd();
+		const sessionId = "session-supersede-reseed";
+
+		const upstream = await ensureWorkflowSkillActivationSeed({
+			cwd: root,
+			skill: "deep-interview",
+			sessionId,
+			nowIso: "2026-08-11T00:00:00.000Z",
+		});
+		expect(upstream.seeded).toBe(true);
+
+		const successor = await ensureWorkflowSkillActivationSeed({
+			cwd: root,
+			skill: "ralplan",
+			sessionId,
+			nowIso: "2026-08-11T00:30:00.000Z",
+		});
+		expect(successor.seeded).toBe(true);
+
+		// Simulate a concurrent re-seed of the superseded upstream skill with a
+		// fresh activation stamp.
+		await writeActiveEntry(root, { sessionId }, "deep-interview", {
+			skill: "deep-interview",
+			active: true,
+			phase: "interviewing",
+			activated_at: "2026-08-11T01:00:00.000Z",
+			updated_at: "2026-08-11T01:00:00.000Z",
+			session_id: sessionId,
+		});
+
+		await expect(successor.rollback()).resolves.toBe(true);
+
+		// The re-seeded deep-interview survives; rollback must not clobber it
+		// with the original superseded snapshot.
+		const entries = await readActiveEntries(root, { sessionId });
+		const deepInterview = entries.find(entry => entry.skill === "deep-interview");
+		expect(deepInterview).toBeDefined();
+		expect(deepInterview?.activated_at).toBe("2026-08-11T01:00:00.000Z");
+		expect(entries.some(entry => entry.skill === "ralplan")).toBe(false);
 	});
 
 	it("ensureWorkflowSkillActivationState ignores non-workflow skills", async () => {

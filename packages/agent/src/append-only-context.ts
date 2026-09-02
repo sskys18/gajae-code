@@ -65,8 +65,17 @@ export class StablePrefix {
 	}
 
 	importSnapshot(snapshot: StablePrefixSnapshot, options: BuildOptions): void {
+		// The snapshot tools were already normalized by `takeSnapshot()` at export
+		// time. Re-normalizing the cloned JSON would apply `normalizeTools` a
+		// second time, which is not idempotent: a tool whose `intent` policy is a
+		// function resolves as "omit" at export (no `_i` injected), but the
+		// function value is dropped by `cloneJson`, so a second pass resolves the
+		// missing field as "optional" and injects `_i` — changing `parameters` and
+		// diverging the recomputed fingerprint from the stored one. Verify against
+		// the stored tools as-is; the deep clone still keeps `toContext()` results
+		// isolated from later mutation.
 		const systemPrompt = cloneJson(snapshot.systemPrompt);
-		const tools = normalizeImportedTools(snapshot.tools, options);
+		const tools = cloneJson(snapshot.tools);
 		const fingerprint = computeFingerprint(systemPrompt, tools, options);
 		this.#sourceSystemPrompt = null;
 		this.#sourceTools = null;
@@ -194,6 +203,15 @@ export class AppendOnlyLog {
  * ctx = mgr.build(context);        // subsequent calls use cache
  * ```
  */
+export interface AppendOnlyContextManagerOptions {
+	/**
+	 * Invoked whenever the stable prefix fingerprint changes on `build()` (a
+	 * provider prompt-cache prefix reset). Used for per-session diagnostics; must
+	 * not throw. `from` is `<unbuilt>` on the first build.
+	 */
+	readonly onPrefixChange?: (info: { from: string; to: string; version: number }) => void;
+}
+
 export class AppendOnlyContextManager {
 	readonly prefix = new StablePrefix();
 	readonly log = new AppendOnlyLog();
@@ -203,6 +221,11 @@ export class AppendOnlyContextManager {
 	#syncedHashes: (number | bigint)[] = [];
 	/** Number of provider-normalized messages that were seeded before child-local messages. */
 	#seededPrefixCount = 0;
+	readonly #onPrefixChange: AppendOnlyContextManagerOptions["onPrefixChange"];
+
+	constructor(options: AppendOnlyContextManagerOptions = {}) {
+		this.#onPrefixChange = options.onPrefixChange;
+	}
 
 	static forkFromSeed(args: {
 		prefixSnapshot?: StablePrefixSnapshot;
@@ -220,7 +243,15 @@ export class AppendOnlyContextManager {
 	}
 
 	build(context: AgentContext, options: BuildOptions): Context {
-		this.prefix.build(context, options);
+		const previousFingerprint = this.prefix.fingerprint;
+		const changed = this.prefix.build(context, options);
+		if (changed && this.#onPrefixChange) {
+			this.#onPrefixChange({
+				from: previousFingerprint,
+				to: this.prefix.fingerprint,
+				version: this.prefix.version,
+			});
+		}
 		const { systemPrompt, tools } = this.prefix.toContext();
 		return { systemPrompt, messages: this.log.toMessages(), tools };
 	}
@@ -252,7 +283,7 @@ export class AppendOnlyContextManager {
 			if (this.#seededPrefixCount > 0) {
 				// F9: a seeded fork whose inherited prefix changed (e.g. after compaction)
 				// rebases onto the new provider context instead of throwing.
-				this.#rebaseToBaseline(normalizedMessages);
+				this.#rebaseToBaseline(messagesToSync, seededPrefixLength);
 				return;
 			}
 			this.log.clear();
@@ -265,7 +296,7 @@ export class AppendOnlyContextManager {
 		// while a seed prefix is active; a genuine seeded compaction rebases (F9).
 		if (messagesToSync.length < this.#lastSyncCount) {
 			if (this.#seededPrefixCount > 0) {
-				this.#rebaseToBaseline(normalizedMessages);
+				this.#rebaseToBaseline(messagesToSync, seededPrefixLength);
 				return;
 			}
 			this.log.clear();
@@ -275,7 +306,7 @@ export class AppendOnlyContextManager {
 
 		const newMsgs = messagesToSync.slice(this.#lastSyncCount);
 		for (const msg of newMsgs) {
-			this.log.append(msg);
+			this.log.append(cloneJson(msg));
 		}
 
 		this.#lastSyncCount = messagesToSync.length;
@@ -319,6 +350,17 @@ export class AppendOnlyContextManager {
 		this.log.replaceTail(message);
 	}
 
+	/** Release provider-normalized retainers as one history-rewrite transaction. */
+	releaseAfterHistoryRewrite(options: { preserveSeededPrefix?: boolean } = {}): void {
+		const seeded = options.preserveSeededPrefix === true ? this.#seededPrefixCount : 0;
+		const prefix = seeded > 0 ? this.log.entries().slice(0, seeded) : [];
+		this.log.clear();
+		if (prefix.length > 0) this.log.extend(prefix);
+		this.#lastSyncCount = prefix.length;
+		this.#seededPrefixCount = prefix.length;
+		this.#syncedHashes = this.#hashRange(prefix, 0, prefix.length);
+		this.invalidate();
+	}
 	invalidate(): void {
 		this.prefix.invalidate();
 	}
@@ -359,12 +401,12 @@ export class AppendOnlyContextManager {
 		return false;
 	}
 
-	/** F9: reset the seeded log to a new provider-visible baseline (seeded compaction/rebase). */
-	#rebaseToBaseline(messages: readonly unknown[]): void {
+	/** F9: reset the log to a new provider-visible baseline after seeded compaction/rebase. */
+	#rebaseToBaseline(messages: readonly unknown[], seededPrefixCount = 0): void {
 		this.log.clear();
-		this.log.extend([...messages]);
+		this.log.extend(messages.map(message => cloneJson(message)));
 		this.#lastSyncCount = messages.length;
-		this.#seededPrefixCount = 0;
+		this.#seededPrefixCount = seededPrefixCount;
 		this.#syncedHashes = this.#hashRange(messages, 0, messages.length);
 	}
 }
@@ -393,12 +435,6 @@ function takeSnapshot(context: AgentContext, options: BuildOptions): StablePrefi
 		tools,
 		fingerprint: computeFingerprint(systemPrompt, tools, options),
 	};
-}
-
-function normalizeImportedTools(tools: readonly Tool[], options: BuildOptions): Tool[] {
-	const clonedTools = cloneJson(tools);
-	const normalizedTools = normalizeTools(clonedTools as AgentContext["tools"], options.intentTracing) ?? [];
-	return cloneJson(normalizedTools);
 }
 
 export function cloneJson<T>(value: T): T {

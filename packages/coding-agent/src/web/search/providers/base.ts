@@ -1,10 +1,29 @@
-import type { AuthStorage } from "@gajae-code/ai";
+import type { AuthStorage } from "@gajae-code/ai/core";
 import type { ActiveSearchModelContext, SearchProviderId, SearchResponse } from "../types";
+
+/** Non-sensitive provider policy passed to search implementations. */
+export interface SearchProviderSettings {
+	exa?: {
+		enabled?: boolean;
+		enableSearch?: boolean;
+	};
+	searxng?: {
+		endpoint?: string;
+		categories?: string;
+		language?: string;
+	};
+}
+
+export const SEARXNG_BASIC_CREDENTIAL_PREFIX = "gjc-searxng-basic:";
+export const SEARXNG_BEARER_CREDENTIAL_PREFIX = "gjc-searxng-bearer:";
 
 /**
  * Shared web search parameters passed to providers.
  *
- * `authStorage` is the **only** credential source providers may consult.
+ * `authStorage` is the credential source for canonical providers. Native
+ * active-model search may instead use `activeModelContext.resolveCredentials`,
+ * which is supplied by ModelRegistry so rotating config credentials and
+ * generated headers are refreshed before the request.
  * Opening a sibling SQLite handle or calling provider-direct refresh helpers
  * (e.g. `refreshOpenAIOpenAI code backendToken`, `refreshGoogleCloudToken`) is prohibited:
  * it races the broker's per-credential refresh and POSTs the broker sentinel
@@ -59,8 +78,8 @@ export interface SearchParams {
 	codeExecution?: Record<string, unknown>;
 	urlContext?: Record<string, unknown>;
 	/**
-	 * The single source of truth for credentials. Providers MUST consult this
-	 * handle exclusively (`getApiKey` for bearer-style auth, `getOAuthAccess`
+	 * The canonical source of truth for credentials. Providers MUST consult this
+	 * handle (`getApiKey` for bearer-style auth, `getOAuthAccess`
 	 * when identity metadata is required). Do not open `AgentStorage` or any
 	 * `AuthCredentialStore` directly — that bypasses the broker pipeline and
 	 * the per-credential single-flight refresh.
@@ -73,6 +92,10 @@ export interface SearchParams {
 	 */
 	sessionId?: string;
 	activeModelContext?: ActiveSearchModelContext;
+	/** Session-scoped web-search timeout override in milliseconds. */
+	hardTimeoutMs?: number;
+	/** Narrow provider-local policy; credentials remain available only through authStorage. */
+	settings?: SearchProviderSettings;
 }
 
 /** Base class for web search providers. */
@@ -85,10 +108,12 @@ export abstract class SearchProvider {
 	 * service a request right now. Implementations consult the passed
 	 * {@link AuthStorage} — never a sibling store.
 	 */
-	abstract isAvailable(authStorage: AuthStorage): Promise<boolean> | boolean;
+	abstract isAvailable(authStorage: AuthStorage, settings?: SearchProviderSettings): Promise<boolean> | boolean;
 
 	/**
-	 * Execute a search. Credentials MUST be resolved through `params.authStorage`.
+	 * Execute a search. Canonical credentials MUST be resolved through
+	 * `params.authStorage`; active-model credentials MUST use the injected
+	 * resolver when one is present.
 	 */
 	abstract search(params: SearchParams): Promise<SearchResponse>;
 }

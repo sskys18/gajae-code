@@ -27,6 +27,14 @@ describe("renderInlineMarkdown", () => {
 
 		expect(plain).toBe("1. Review against a base branch (PR Style)");
 	});
+	it("omits HTML comments from inline markdown", () => {
+		const rendered = renderInlineMarkdown("alpha<!-- -->beta", defaultMarkdownTheme);
+		const plain = rendered.replace(/\x1b\[[0-9;]*m/g, "");
+
+		expect(plain).toBe("alphabeta");
+		const commentOnly = renderInlineMarkdown("<!-- -->", defaultMarkdownTheme).replace(/\x1b\[[0-9;]*m/g, "");
+		expect(commentOnly).toBe("");
+	});
 
 	it("returns empty string for undefined input (streaming guard)", () => {
 		// During streaming, partial JSON can leave option label fields as undefined.
@@ -1082,7 +1090,7 @@ bar`,
 			expect(output.includes("\x1b]8;;\x07")).toBeTruthy();
 		});
 
-		it("should keep wrapped URLs inside a single OSC 8 hyperlink span", () => {
+		it("should keep every wrapped URL fragment clickable with the same OSC 8 target (#4711)", () => {
 			const markdown = new Markdown(
 				"Visit https://example.com/really/long/path/that/will/wrap/on/narrow/width for more",
 				0,
@@ -1092,14 +1100,46 @@ bar`,
 
 			const lines = markdown.render(32);
 			expect(lines.length).toBeGreaterThan(1);
-			const output = lines.join("\n");
-			const openMatches =
-				output.match(
-					/\x1b\]8;;https:\/\/example\.com\/really\/long\/path\/that\/will\/wrap\/on\/narrow\/width\x07/g,
-				) || [];
-			const closeMatches = output.match(/\x1b\]8;;\x07/g) || [];
-			expect(openMatches.length).toBe(1);
-			expect(closeMatches.length).toBeGreaterThan(0);
+			const url = "https://example.com/really/long/path/that/will/wrap/on/narrow/width";
+			const open = `\x1b]8;;${url}\x07`;
+			// Each wrapped row that renders URL text carries its own open with
+			// the identical target and self-closes, so the TUI per-line
+			// terminator cannot strand continuation rows as plain text.
+			const urlRows = lines.filter(line => line.includes(open));
+			// Every row that renders any URL characters carries the open; rows
+			// without URL characters ("Visit", "for more") never do.
+			const plainRows = lines.map(line =>
+				line
+					.replaceAll(/\x1b\]8;;[^\x07]*\x07/g, "")
+					.replaceAll(/\x1b\[[0-9;]*m/g, "")
+					.trim(),
+			);
+			for (const [index, plain] of plainRows.entries()) {
+				const hasUrlChars = /[a-z]/iu.test(plain.replace(/^visit\s*/iu, "").replace(/\s*for more$/iu, ""));
+				expect(lines[index].includes(open)).toBe(hasUrlChars);
+			}
+			expect(urlRows.length).toBeGreaterThanOrEqual(2);
+			for (const line of urlRows) {
+				const opens = line.match(new RegExp(open.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&"), "g")) ?? [];
+				expect(opens.length).toBe(1);
+				expect(line.includes("\x1b]8;;\x07")).toBe(true);
+			}
+			// Reassembling the URL rows' non-plain text reconstructs the URL.
+			const reassembled = lines
+				.map(line =>
+					line
+						.replaceAll(/\x1b\]8;;[^\x07]*\x07/g, "")
+						.replaceAll(/\x1b\[[0-9;]*m/g, "")
+						.trim(),
+				)
+				.map(plain =>
+					plain
+						.replace(/^visit\s*/iu, "")
+						.replace(/\s*for more$/iu, "")
+						.trim(),
+				)
+				.join("");
+			expect(reassembled).toBe(url);
 		});
 
 		it("should show URL for explicit markdown links with different text", () => {
@@ -1150,6 +1190,40 @@ bar`,
 				joinedPlain.includes("hidden content") || joinedPlain.includes("<thinking>"),
 				"Should render HTML-like tags or their content as text, not hide them",
 			).toBeTruthy();
+		});
+
+		it("should omit HTML comments while preserving non-comment HTML-like text", () => {
+			const markdown = new Markdown(
+				"Before\n\n<!-- react text separator -->\n\nAfter <thinking>visible</thinking><!-- -->tail",
+				0,
+				0,
+				defaultMarkdownTheme,
+			);
+
+			const lines = markdown.render(80);
+			const plainLines = lines.map(stripTerminalSequences);
+			const joinedPlain = plainLines.join(" ");
+
+			expect(joinedPlain).not.toContain("<!--");
+			expect(joinedPlain).not.toContain("-->");
+			expect(joinedPlain).toContain("Before");
+			expect(joinedPlain).toContain("After");
+			expect(joinedPlain).toContain("visible");
+			expect(joinedPlain).toContain("tail");
+			expect(joinedPlain).toContain("<thinking>");
+			expect(joinedPlain).toContain("</thinking>");
+
+			const mixedMarkdown = new Markdown(
+				"<!-- leading --> <div>html stays visible</div>",
+				0,
+				0,
+				defaultMarkdownTheme,
+			);
+			const mixedPlain = mixedMarkdown.render(80).map(stripTerminalSequences).join(" ");
+
+			expect(mixedPlain).not.toContain("<!--");
+			expect(mixedPlain).not.toContain("-->");
+			expect(mixedPlain).toContain("<div>html stays visible</div>");
 		});
 
 		it("should render HTML tags in code blocks correctly", () => {

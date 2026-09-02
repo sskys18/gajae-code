@@ -2,17 +2,14 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { appendOrMergeDeepInterviewRound } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
 import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
-import { auditPath, modeStatePath, sessionStateDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { auditPath, modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { migrateAndPersistLegacyState } from "@gajae-code/coding-agent/gjc-runtime/state-migrations";
 import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import { RequiredOnWriteEnvelopeSchema } from "@gajae-code/coding-agent/gjc-runtime/state-schema";
 import { writeWorkflowEnvelopeAtomic } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
-import {
-	type GjcTeamSnapshot,
-	persistGjcTeamModeStateSummary,
-} from "@gajae-code/coding-agent/gjc-runtime/team-runtime";
 import { WORKFLOW_STATE_VERSION } from "@gajae-code/coding-agent/skill-state/workflow-state-contract";
 
 const TEST_SESSION_ID = "test-session";
@@ -224,38 +221,36 @@ describe("workflow state writer drift guard", () => {
 		expect(seed.status).toBe(0);
 		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
 		await expectPersistedEnvelope(statePath);
+		const blockedWrite = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "drift", "--spec", "# Spec", "--json"],
+			root,
+		);
+		expect(blockedWrite.status).toBe(2);
+		expect(blockedWrite.stderr).toContain("missing Round 0 intent contract");
+		await appendOrMergeDeepInterviewRound(
+			root,
+			statePath,
+			{
+				round: 0,
+				questionId: "intent-confirmation",
+				questionText: "Confirm locked intent",
+				component: "review-topology",
+				dimension: "topology",
+				selectedOptions: ["Confirm"],
+				intent_contract: {
+					items: [{ id: "artifact:drift", category: "artifact", statement: "Persist the writer envelope" }],
+					confirmation_options: ["Confirm"],
+				},
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
 
 		const write = await runNativeDeepInterviewCommand(
-			["--write", "--stage", "final", "--slug", "drift", "--spec", "# Spec", "--json"],
+			["--write", "--stage", "final", "--slug", "drift", "--spec", "# Spec\n\nartifact:drift", "--json"],
 			root,
 		);
 		expect(write.status).toBe(0);
 		await expectPersistedEnvelope(statePath);
-	});
-
-	it("persists required-on-write envelope for team summary without starting tmux", async () => {
-		const root = await tempDir();
-		const snapshot: GjcTeamSnapshot = {
-			team_name: "drift-team",
-			display_name: "Drift Team",
-			phase: "running",
-			state_dir: path.join(sessionStateDir(root, TEST_SESSION_ID), "team", "drift-team"),
-			tmux_session: "drift-team",
-			tmux_session_name: "drift-team",
-			tmux_target: "drift-team:",
-			task_total: 0,
-			task_counts: { pending: 0, blocked: 0, in_progress: 0, completed: 0, failed: 0 },
-			workers: [],
-			worker_lifecycle_by_id: {},
-			notification_summary: {
-				total: 0,
-				replay_eligible: 0,
-				by_state: { pending: 0, sent: 0, queued: 0, deferred: 0, failed: 0, delivered: 0, acknowledged: 0 },
-			},
-			updated_at: new Date().toISOString(),
-		};
-		await persistGjcTeamModeStateSummary(snapshot, root);
-		await expectPersistedEnvelope(modeStatePath(root, TEST_SESSION_ID, "team"));
 	});
 
 	it("persists required-on-write envelope for explicit legacy migration", async () => {

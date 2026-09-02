@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import { type GrepMatch, GrepOutputMode, type GrepResult, grep } from "@gajae-code/natives";
+import type { GrepMatch, GrepResult, grep as grepFn } from "@gajae-code/natives";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import { prompt, untilAborted } from "@gajae-code/utils";
@@ -38,13 +38,33 @@ import {
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
+let searchNativesLoad:
+	| Promise<{ GrepOutputMode: typeof import("@gajae-code/natives")["GrepOutputMode"]; grep: typeof grepFn }>
+	| undefined;
+
+async function searchNatives(): Promise<{
+	GrepOutputMode: typeof import("@gajae-code/natives")["GrepOutputMode"];
+	grep: typeof grepFn;
+}> {
+	searchNativesLoad ??= Promise.resolve(
+		require("@gajae-code/natives") as {
+			GrepOutputMode: typeof import("@gajae-code/natives")["GrepOutputMode"];
+			grep: typeof grepFn;
+		},
+	);
+	return await searchNativesLoad;
+}
+
 const searchSchema = z
 	.object({
 		pattern: z.string().describe("regex pattern"),
 		paths: z
 			.array(z.string().describe("file, directory, glob, or internal URL to search"))
 			.min(1)
-			.describe("files, directories, globs, or internal URLs to search"),
+			.optional()
+			.describe(
+				"files, directories, globs, or internal URLs to search (defaults to the working directory when omitted)",
+			),
 		i: z.boolean().optional().describe("case-insensitive search"),
 		gitignore: z.boolean().optional().describe("respect gitignore"),
 		skip: z
@@ -210,6 +230,13 @@ export interface SearchToolDetails {
 	missingPaths?: string[];
 }
 
+export interface SearchToolOptions {
+	/** Per-call symmetric context width used by Cursor's native Pi grep frame. */
+	context?: number;
+	/** Per-call total match cap used by Cursor's native Pi grep frame. */
+	totalMatchLimit?: number;
+}
+
 type SearchParams = z.infer<typeof searchSchema>;
 
 export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDetails> {
@@ -217,17 +244,20 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 	readonly label = "Search";
 	readonly loadMode = "discoverable";
 	readonly summary = "Search file contents using ripgrep (fast text search)";
-	readonly description: string;
-	readonly parameters = searchSchema;
-	readonly strict = true;
-
-	constructor(private readonly session: ToolSession) {
-		const displayMode = resolveFileDisplayMode(session);
-		this.description = prompt.render(searchDescription, {
+	get description(): string {
+		const displayMode = resolveFileDisplayMode(this.session);
+		return prompt.render(searchDescription, {
 			IS_HL_MODE: displayMode.hashLines,
 			IS_LINE_NUMBER_MODE: !displayMode.hashLines && displayMode.lineNumbers,
 		});
 	}
+	readonly parameters = searchSchema;
+	readonly strict = true;
+
+	constructor(
+		private readonly session: ToolSession,
+		private readonly options: SearchToolOptions = {},
+	) {}
 
 	async execute(
 		_toolCallId: string,
@@ -236,7 +266,10 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 		_onUpdate?: AgentToolUpdateCallback<SearchToolDetails>,
 		_toolContext?: AgentToolContext,
 	): Promise<AgentToolResult<SearchToolDetails>> {
-		const { pattern, paths, i, gitignore, skip } = params;
+		const { pattern, i, gitignore, skip } = params;
+		// Recurring real-world failure mode: models omit `paths` for repo-wide
+		// searches. Default to the working directory instead of failing the call.
+		const paths = params.paths ?? ["."];
 
 		return untilAborted(signal, async () => {
 			const normalizedPattern = pattern.trim();
@@ -270,8 +303,12 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 							`or pass a UTF-8 text member.`,
 					);
 				}
-				const normalizedContextBefore = this.session.settings.get("search.contextBefore");
-				const normalizedContextAfter = this.session.settings.get("search.contextAfter");
+				const normalizedContextBefore = this.options.context ?? this.session.settings.get("search.contextBefore");
+				const normalizedContextAfter = this.options.context ?? this.session.settings.get("search.contextAfter");
+				const nativeMatchCap =
+					this.options.totalMatchLimit === undefined
+						? INTERNAL_TOTAL_CAP
+						: Math.min(INTERNAL_TOTAL_CAP, this.options.totalMatchLimit + 1);
 				const ignoreCase = i ?? false;
 				const useGitignore = gitignore ?? true;
 				const patternHasNewline = normalizedPattern.includes("\n") || normalizedPattern.includes("\\n");
@@ -281,6 +318,8 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 					rawPaths: resolvedPaths,
 					cwd: this.session.cwd,
 					getArtifactsDir: this.session.getArtifactsDir,
+					mcpManager: this.session.getMcpManager?.(),
+					getAuthorizedArtifactsDirs: this.session.getAuthorizedArtifactsDirs,
 					internalUrlAction: "search",
 					trackImmutableSources: true,
 					surfaceExactFilePaths: true,
@@ -306,6 +345,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				const baseDisplayMode = resolveFileDisplayMode(this.session);
 				const immutableDisplayMode = resolveFileDisplayMode(this.session, { immutable: true });
 
+				const { GrepOutputMode, grep } = await searchNatives();
 				const effectiveOutputMode = GrepOutputMode.Content;
 				// Multi-scope = more than one file may match. We fetch up to
 				// INTERNAL_TOTAL_CAP matches from native grep, then in JS group by
@@ -336,7 +376,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 									hidden: true,
 									gitignore: useGitignore,
 									cache: false,
-									maxCount: INTERNAL_TOTAL_CAP,
+									maxCount: nativeMatchCap,
 									contextBefore: normalizedContextBefore,
 									contextAfter: normalizedContextAfter,
 									maxColumns: DEFAULT_MAX_COLUMN,
@@ -371,7 +411,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 								hidden: true,
 								gitignore: useGitignore,
 								cache: false,
-								maxCount: INTERNAL_TOTAL_CAP,
+								maxCount: nativeMatchCap,
 								contextBefore: normalizedContextBefore,
 								contextAfter: normalizedContextAfter,
 								maxColumns: DEFAULT_MAX_COLUMN,
@@ -442,6 +482,12 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 							}
 						}
 					}
+				}
+				const explicitMatchLimitReached =
+					this.options.totalMatchLimit !== undefined &&
+					(selectedMatches.length > this.options.totalMatchLimit || result.limitReached);
+				if (this.options.totalMatchLimit !== undefined && selectedMatches.length > this.options.totalMatchLimit) {
+					selectedMatches.length = this.options.totalMatchLimit;
 				}
 				const nextSkip = skipFiles + windowFiles.length;
 				const limitMessage = fileLimitReached
@@ -582,7 +628,11 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 					})),
 					truncated,
 					fileLimitReached: fileLimitReached ? DEFAULT_FILE_LIMIT : undefined,
-					perFileLimitReached: perFileLimitReached ? perFileMatchCap : undefined,
+					perFileLimitReached: explicitMatchLimitReached
+						? this.options.totalMatchLimit
+						: perFileLimitReached
+							? perFileMatchCap
+							: undefined,
 					displayContent: displayText,
 					missingPaths: missingPaths.length > 0 ? missingPaths : undefined,
 				};

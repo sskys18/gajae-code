@@ -2,9 +2,9 @@
  * Hook runner - executes hooks and manages their lifecycle.
  */
 import type { AgentMessage } from "@gajae-code/agent-core";
-import type { Model } from "@gajae-code/ai";
+import type { Model } from "@gajae-code/ai/core";
 import type { ModelRegistry } from "../../config/model-registry";
-import type { SessionManager } from "../../session/session-manager";
+import { createReadonlySessionManager, type SessionManager } from "../../session/session-manager";
 import { createNoOpUIContext } from "../utils";
 import type {
 	AppendEntryHandler,
@@ -226,7 +226,7 @@ export class HookRunner {
 			ui: this.#uiContext,
 			hasUI: this.#hasUI,
 			cwd: this.cwd,
-			sessionManager: this.sessionManager,
+			sessionManager: createReadonlySessionManager(this.sessionManager),
 			modelRegistry: this.modelRegistry,
 			model: this.#getModel(),
 			isIdle: () => this.#isIdleFn(),
@@ -391,7 +391,7 @@ export class HookRunner {
 	 */
 	async emitBeforeAgentStart(
 		prompt: string,
-		images?: import("@gajae-code/ai").ImageContent[],
+		images?: import("@gajae-code/ai/core").ImageContent[],
 	): Promise<BeforeAgentStartEventResult | undefined> {
 		const ctx = this.#createContext();
 		let result: BeforeAgentStartEventResult | undefined;

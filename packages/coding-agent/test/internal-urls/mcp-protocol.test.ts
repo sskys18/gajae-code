@@ -1,9 +1,17 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { InternalUrlRouter } from "../../src/internal-urls";
 import { McpProtocolHandler } from "../../src/internal-urls/mcp-protocol";
+import { parseInternalUrl } from "../../src/internal-urls/parse";
 import { MCPManager } from "../../src/runtime-mcp/manager";
 import type { MCPResource, MCPResourceReadResult, MCPResourceTemplate } from "../../src/runtime-mcp/types";
 
+let scopedManager: MCPManager | undefined;
+function scopedRouter(manager: MCPManager | undefined = scopedManager): Pick<InternalUrlRouter, "resolve"> {
+	const router = InternalUrlRouter.instance();
+	return {
+		resolve: (input, context) => router.resolve(input, { ...context, mcpManager: context?.mcpManager ?? manager }),
+	};
+}
 function createMockManager(opts: {
 	servers?: string[];
 	resources?: Map<string, { resources: MCPResource[]; templates: MCPResourceTemplate[] }>;
@@ -20,9 +28,24 @@ function createMockManager(opts: {
 	} as unknown as MCPManager;
 }
 
+function setTemplateManager(templates: string[], text = "matched"): Pick<InternalUrlRouter, "resolve"> {
+	const resources = new Map<string, { resources: MCPResource[]; templates: MCPResourceTemplate[] }>();
+	resources.set("template-server", {
+		resources: [],
+		templates: templates.map((uriTemplate, index) => ({ uriTemplate, name: `template-${index}` })),
+	});
+	const manager = createMockManager({
+		servers: ["template-server"],
+		resources,
+		readResult: { contents: [{ uri: "test://result", text }] },
+	});
+	return scopedRouter(manager);
+}
+
 describe("McpProtocolHandler", () => {
 	beforeEach(() => {
 		MCPManager.resetForTests();
+		scopedManager = undefined;
 		InternalUrlRouter.resetForTests();
 		InternalUrlRouter.instance().register(new McpProtocolHandler());
 	});
@@ -30,17 +53,42 @@ describe("McpProtocolHandler", () => {
 	afterEach(() => {
 		MCPManager.resetForTests();
 		InternalUrlRouter.resetForTests();
+		vi.restoreAllMocks();
 	});
 
 	it("returns error when no MCP manager is available", async () => {
-		const router = InternalUrlRouter.instance();
+		const router = scopedRouter();
 		await expect(router.resolve("mcp://test://resource")).rejects.toThrow("No MCP manager");
+	});
+
+	it("uses the scope-held manager without consulting MCPManager.instance()", async () => {
+		const resources = new Map<string, { resources: MCPResource[]; templates: MCPResourceTemplate[] }>();
+		resources.set("scoped", { resources: [{ uri: "test://scoped", name: "scoped" }], templates: [] });
+		const manager = createMockManager({
+			servers: ["scoped"],
+			resources,
+			readResult: { contents: [{ uri: "test://scoped", text: "scope" }] },
+		});
+		const instanceSpy = vi.spyOn(MCPManager, "instance").mockImplementation(() => {
+			throw new Error("process-global MCPManager.instance() must not route mcp://");
+		});
+		try {
+			const resource = await InternalUrlRouter.instance().resolve("mcp://test://scoped", { mcpManager: manager });
+			expect(resource.content).toBe("scope");
+		} finally {
+			instanceSpy.mockRestore();
+		}
+	});
+
+	it("rejects omitted context even when a process-global manager is populated", async () => {
+		MCPManager.setInstance(createMockManager({ servers: ["populated"] }));
+		const handler = new McpProtocolHandler();
+		await expect(handler.resolve(parseInternalUrl("mcp://test://resource"))).rejects.toThrow("No MCP manager");
 	});
 
 	it("requires resource URI in mcp URL", async () => {
 		const manager = createMockManager({ servers: ["server-a"] });
-		MCPManager.setInstance(manager);
-		const router = InternalUrlRouter.instance();
+		const router = scopedRouter(manager);
 		await expect(router.resolve("mcp://")).rejects.toThrow("mcp:// URL requires a resource URI");
 	});
 
@@ -51,8 +99,7 @@ describe("McpProtocolHandler", () => {
 			templates: [],
 		});
 		const manager = createMockManager({ servers: ["server-a"], resources });
-		MCPManager.setInstance(manager);
-		const router = InternalUrlRouter.instance();
+		const router = scopedRouter(manager);
 
 		await expect(router.resolve("mcp://test://missing")).rejects.toThrow("No MCP server has resource");
 		await expect(router.resolve("mcp://test://missing")).rejects.toThrow("file://known");
@@ -70,8 +117,7 @@ describe("McpProtocolHandler", () => {
 			resources,
 			readResult: { contents: [{ uri: "test://doc", text: "hello world" }] },
 		});
-		MCPManager.setInstance(manager);
-		const router = InternalUrlRouter.instance();
+		const router = scopedRouter(manager);
 
 		const resource = await router.resolve("mcp://test://doc");
 		expect(resource.content).toBe("hello world");
@@ -89,8 +135,7 @@ describe("McpProtocolHandler", () => {
 			resources,
 			readResult: { contents: [{ uri: "test://doc?q=1", text: "query resource" }] },
 		});
-		MCPManager.setInstance(manager);
-		const router = InternalUrlRouter.instance();
+		const router = scopedRouter(manager);
 
 		const resource = await router.resolve("mcp://test://doc?q=1");
 		expect(resource.content).toBe("query resource");
@@ -107,8 +152,7 @@ describe("McpProtocolHandler", () => {
 			resources,
 			readResult: { contents: [{ uri: "test://docs/foo/raw", text: "from template" }] },
 		});
-		MCPManager.setInstance(manager);
-		const router = InternalUrlRouter.instance();
+		const router = scopedRouter(manager);
 
 		const resource = await router.resolve("mcp://test://docs/foo/raw");
 		expect(resource.content).toBe("from template");
@@ -125,12 +169,99 @@ describe("McpProtocolHandler", () => {
 			resources,
 			readResult: { contents: [{ uri: "test://docs", text: "empty expansion" }] },
 		});
-		MCPManager.setInstance(manager);
-		const router = InternalUrlRouter.instance();
+		const router = scopedRouter(manager);
 
 		const resource = await router.resolve("mcp://test://docs");
 		expect(resource.content).toBe("empty expansion");
 	});
+
+	it("accepts resource URIs at the limit and rejects larger URIs without echoing them", async () => {
+		const exactUri = `test://${"a".repeat(16_384 - 7)}`;
+		const router = setTemplateManager(["test://{id}"]);
+		expect((await router.resolve(`mcp://${exactUri}`)).content).toBe("matched");
+
+		const oversizedUri = `${exactUri}z`;
+		try {
+			await router.resolve(`mcp://${oversizedUri}`);
+			expect.unreachable();
+		} catch (error) {
+			expect(error).toBeInstanceOf(Error);
+			expect((error as Error).message).toBe("MCP resource URI exceeds the 16384-character limit.");
+			expect((error as Error).message).not.toContain(oversizedUri);
+		}
+	});
+
+	it("applies the resource URI limit before trimming edge whitespace", async () => {
+		const normalizedUri = "test://doc";
+		const oversizedRawUri = `${normalizedUri}${" ".repeat(16_384 - normalizedUri.length + 1)}`;
+		const router = setTemplateManager(["test://{id}"]);
+
+		await expect(router.resolve(`mcp://${oversizedRawUri}`)).rejects.toThrow(
+			"MCP resource URI exceeds the 16384-character limit.",
+		);
+	});
+
+	it.each([
+		["LF", "\n"],
+		["CR", "\r"],
+		["LINE SEPARATOR", "\u2028"],
+		["PARAGRAPH SEPARATOR", "\u2029"],
+	])("rejects %s inside a template expression expansion", async (_name, lineTerminator) => {
+		const router = setTemplateManager(["test://{id}"]);
+		await expect(router.resolve(`mcp://test://a${lineTerminator}b`)).rejects.toThrow("No MCP server has resource");
+	});
+
+	it("skips templates beyond the length limit while accepting the exact boundary", async () => {
+		const exactTemplate = `test://${"a".repeat(8_192 - 11)}{id}`;
+		const exactUri = `${exactTemplate.slice(0, -4)}x`;
+		expect((await setTemplateManager([exactTemplate]).resolve(`mcp://${exactUri}`)).content).toBe("matched");
+
+		const oversizedTemplate = `${exactTemplate}z`;
+		const resource = await setTemplateManager([oversizedTemplate, "test://{id}"]).resolve("mcp://test://ok");
+		expect(resource.content).toBe("matched");
+	});
+
+	it("skips templates beyond the expression limit while accepting the exact boundary", async () => {
+		const exactTemplate = `test://${"{id}".repeat(32)}`;
+		expect((await setTemplateManager([exactTemplate]).resolve("mcp://test://")).content).toBe("matched");
+
+		const oversizedTemplate = `${exactTemplate}{extra}`;
+		const resource = await setTemplateManager([oversizedTemplate, "test://{id}"]).resolve("mcp://test://ok");
+		expect(resource.content).toBe("matched");
+	});
+
+	it("matches ordered literal segments with overlapping prefix and suffix text", async () => {
+		const router = setTemplateManager(["test://aba{first}aba{second}bab"]);
+		expect((await router.resolve("mcp://test://abaxabaxybab")).content).toBe("matched");
+		await expect(router.resolve("mcp://test://ababaxaba")).rejects.toThrow("No MCP server has resource");
+	});
+
+	it("treats empty and unclosed braces as literal template text", async () => {
+		const router = setTemplateManager(["test://literal/{}", "test://literal/{unclosed", "test://literal/{}{id}"]);
+		expect((await router.resolve("mcp://test://literal/{}")).content).toBe("matched");
+		expect((await router.resolve("mcp://test://literal/{unclosed")).content).toBe("matched");
+		expect((await router.resolve("mcp://test://literal/{}value")).content).toBe("matched");
+	});
+
+	it("rejects adversarial adjacent-expression nonmatches within a bounded timeout", async () => {
+		const template = `test://${"{id}".repeat(32)}suffix`;
+		const uri = `test://${"a".repeat(16_000)}not-ending`;
+		await expect(setTemplateManager([template]).resolve(`mcp://${uri}`)).rejects.toThrow(
+			"No MCP server has resource",
+		);
+	}, 1_000);
+
+	it("bounds scanning across multiple max-length unmatched-brace templates", async () => {
+		const attackerTemplate = `test://${"{".repeat(8_192 - 7)}`;
+		try {
+			await setTemplateManager(Array.from({ length: 32 }, () => attackerTemplate)).resolve("mcp://test://miss");
+			expect.unreachable();
+		} catch (error) {
+			expect(error).toBeInstanceOf(Error);
+			expect((error as Error).message).toContain("No MCP server has resource");
+			expect((error as Error).message).not.toContain(attackerTemplate);
+		}
+	}, 500);
 
 	it("picks the most specific matching template across overlapping schemes", async () => {
 		const resources = new Map<string, { resources: MCPResource[]; templates: MCPResourceTemplate[] }>();
@@ -147,8 +278,7 @@ describe("McpProtocolHandler", () => {
 			resources,
 			readResult: { contents: [{ uri: "test://foo/123", text: "from specific" }] },
 		});
-		MCPManager.setInstance(manager);
-		const router = InternalUrlRouter.instance();
+		const router = scopedRouter(manager);
 
 		const resource = await router.resolve("mcp://test://foo/123");
 		expect(resource.notes).toEqual(["MCP server: specific-server"]);
@@ -169,8 +299,7 @@ describe("McpProtocolHandler", () => {
 			resources,
 			readResult: { contents: [{ uri: "test://foo", text: "from first" }] },
 		});
-		MCPManager.setInstance(manager);
-		const router = InternalUrlRouter.instance();
+		const router = scopedRouter(manager);
 
 		const resource = await router.resolve("mcp://test://foo");
 		expect(resource.notes).toEqual(["MCP server: first"]);
@@ -183,8 +312,7 @@ describe("McpProtocolHandler", () => {
 			templates: [{ uriTemplate: "testing://{id}", name: "testing-template" }],
 		});
 		const manager = createMockManager({ servers: ["tmpl-server"], resources });
-		MCPManager.setInstance(manager);
-		const router = InternalUrlRouter.instance();
+		const router = scopedRouter(manager);
 
 		await expect(router.resolve("mcp://test://foo")).rejects.toThrow("No MCP server has resource");
 	});
@@ -200,8 +328,7 @@ describe("McpProtocolHandler", () => {
 			resources,
 			readResult: undefined,
 		});
-		MCPManager.setInstance(manager);
-		const router = InternalUrlRouter.instance();
+		const router = scopedRouter(manager);
 
 		await expect(router.resolve("mcp://test://empty")).rejects.toThrow("returned no content");
 		await expect(router.resolve("mcp://test://empty")).rejects.toThrow("null-server");
@@ -221,8 +348,7 @@ describe("McpProtocolHandler", () => {
 				contents: [{ uri: "test://image", mimeType: "image/png", blob: blobData }],
 			},
 		});
-		MCPManager.setInstance(manager);
-		const router = InternalUrlRouter.instance();
+		const router = scopedRouter(manager);
 
 		const resource = await router.resolve("mcp://test://image");
 		expect(resource.content).toContain("[Binary content:");
@@ -246,8 +372,7 @@ describe("McpProtocolHandler", () => {
 				],
 			},
 		});
-		MCPManager.setInstance(manager);
-		const router = InternalUrlRouter.instance();
+		const router = scopedRouter(manager);
 
 		const resource = await router.resolve("mcp://test://mixed");
 		expect(resource.content).toContain("part one");
@@ -268,8 +393,7 @@ describe("McpProtocolHandler", () => {
 				contents: [{ uri: "test://blank" }],
 			},
 		});
-		MCPManager.setInstance(manager);
-		const router = InternalUrlRouter.instance();
+		const router = scopedRouter(manager);
 
 		const resource = await router.resolve("mcp://test://blank");
 		expect(resource.content).toBe("(empty resource)");
@@ -286,8 +410,7 @@ describe("McpProtocolHandler", () => {
 			resources,
 			readError: new Error("connection refused"),
 		});
-		MCPManager.setInstance(manager);
-		const router = InternalUrlRouter.instance();
+		const router = scopedRouter(manager);
 
 		await expect(router.resolve("mcp://test://fail")).rejects.toThrow("MCP resource read error:");
 		await expect(router.resolve("mcp://test://fail")).rejects.toThrow("connection refused");
@@ -308,8 +431,7 @@ describe("McpProtocolHandler", () => {
 			resources,
 			readResult: { contents: [{ uri: "test://shared", text: "from first" }] },
 		});
-		MCPManager.setInstance(manager);
-		const router = InternalUrlRouter.instance();
+		const router = scopedRouter(manager);
 
 		const resource = await router.resolve("mcp://test://shared");
 		expect(resource.notes).toEqual(["MCP server: first"]);
@@ -317,8 +439,7 @@ describe("McpProtocolHandler", () => {
 
 	it("shows (none) when no servers have any resources", async () => {
 		const manager = createMockManager({ servers: ["lonely-server"] });
-		MCPManager.setInstance(manager);
-		const router = InternalUrlRouter.instance();
+		const router = scopedRouter(manager);
 
 		await expect(router.resolve("mcp://test://anything")).rejects.toThrow("(none)");
 	});
@@ -336,8 +457,7 @@ describe("McpProtocolHandler", () => {
 				contents: [{ uri: "test://bin", blob: "data" }],
 			},
 		});
-		MCPManager.setInstance(manager);
-		const router = InternalUrlRouter.instance();
+		const router = scopedRouter(manager);
 
 		const resource = await router.resolve("mcp://test://bin");
 		expect(resource.content).toContain("[Binary content: unknown,");

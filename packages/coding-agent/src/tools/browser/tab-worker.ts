@@ -2,10 +2,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { Snowflake, untilAborted } from "@gajae-code/utils";
+import { untilAborted } from "@gajae-code/utils/abortable";
+import { Snowflake } from "@gajae-code/utils/snowflake";
 import type { HTMLElement } from "linkedom";
 import type {
 	Browser,
+	CDPSession,
 	Dialog,
 	ElementHandle,
 	HTTPResponse,
@@ -17,8 +19,6 @@ import type {
 import { JsRuntime, type RuntimeHooks } from "../../eval/js/shared/runtime";
 import type { JsDisplayOutput } from "../../eval/js/shared/types";
 import { resizeImage } from "../../utils/image-resize";
-import { resolveToCwd } from "../path-utils";
-import { formatScreenshot } from "../render-utils";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tool-errors";
 import {
 	applyStealthPatches,
@@ -28,6 +28,12 @@ import {
 	loadPuppeteerInWorker,
 } from "./launch";
 import { extractReadableFromHtml, type ReadableFormat, type ReadableResult } from "./readable";
+import {
+	BrowserRuntimeDiagnosticsMailbox,
+	instrumentBrowserRuntimeDiagnostics,
+	serializeRuntimeDiagnostics,
+} from "./runtime-diagnostics";
+import { formatScreenshot } from "./screenshot-format";
 import type {
 	Observation,
 	ObservationEntry,
@@ -41,6 +47,7 @@ import type {
 	WorkerInbound,
 	WorkerInitPayload,
 } from "./tab-protocol";
+import { resolveTabWorkerPath } from "./tab-worker-path-resolver";
 
 declare global {
 	interface Element extends HTMLElement {}
@@ -73,6 +80,16 @@ const INTERACTIVE_AX_ROLES = new Set([
 ]);
 
 const LEGACY_SELECTOR_PREFIXES = ["p-aria/", "p-text/", "p-xpath/", "p-pierce/"] as const;
+
+/**
+ * Test seam: override the worker's puppeteer loader so WorkerCore-level tests can
+ * inject a fake browser/page without a live Chromium. Mirrors the supervisor's
+ * `__setAcquireTabWorkerDepsForTest` pattern.
+ */
+let loadPuppeteerInWorkerForTest: typeof loadPuppeteerInWorker | undefined;
+export function __setLoadPuppeteerInWorkerForTest(loader: typeof loadPuppeteerInWorker | undefined): void {
+	loadPuppeteerInWorkerForTest = loader;
+}
 
 type DialogPolicy = "accept" | "dismiss";
 type DragTarget = string | { readonly x: number; readonly y: number };
@@ -397,6 +414,8 @@ export class WorkerCore {
 	#transport: Transport;
 	#browser?: Browser;
 	#page?: Page;
+	#runtimeDiagnostics = new BrowserRuntimeDiagnosticsMailbox();
+	#runtimeDiagnosticsSession?: CDPSession;
 	#targetId?: string;
 	#elementCache = new Map<number, ElementHandle>();
 	#elementCounter = 0;
@@ -446,7 +465,7 @@ export class WorkerCore {
 	async #init(payload: WorkerInitPayload): Promise<void> {
 		try {
 			this.#mode = payload.mode;
-			const puppeteer = await loadPuppeteerInWorker(payload.safeDir);
+			const puppeteer = await (loadPuppeteerInWorkerForTest ?? loadPuppeteerInWorker)(payload.safeDir);
 			this.#browser = await puppeteer.connect({
 				browserWSEndpoint: payload.browserWSEndpoint,
 				defaultViewport: null,
@@ -454,8 +473,9 @@ export class WorkerCore {
 			});
 			if (payload.mode === "headless") {
 				this.#page = await this.#browser.newPage();
-				await applyStealthPatches(this.#browser, this.#page, { browserSession: null, override: null });
+				await applyStealthPatches(this.#browser, this.#page, { browserSession: null, override: null }, payload.geo);
 				await applyViewport(this.#page, payload.viewport);
+				if (payload.runtimeDiagnostics) await this.#instrumentRuntimeDiagnostics(this.#page);
 				if (payload.dialogs) this.#applyDialogPolicy(payload.dialogs);
 				if (payload.url) {
 					await this.#page.goto(payload.url, {
@@ -466,6 +486,7 @@ export class WorkerCore {
 				}
 			} else {
 				this.#page = await this.#findAttachedPage(payload.targetId);
+				if (payload.runtimeDiagnostics) await this.#instrumentRuntimeDiagnostics(this.#page);
 				if (payload.dialogs) this.#applyDialogPolicy(payload.dialogs);
 			}
 			this.#targetId = await targetIdForPage(this.#page);
@@ -514,6 +535,16 @@ export class WorkerCore {
 		page.on("dialog", handler);
 		this.#dialogPolicy = policy;
 		this.#dialogHandler = handler;
+	}
+
+	async #instrumentRuntimeDiagnostics(page: Page): Promise<void> {
+		try {
+			this.#runtimeDiagnosticsSession = await instrumentBrowserRuntimeDiagnostics(page, this.#runtimeDiagnostics);
+		} catch (error) {
+			this.#log("debug", "Failed to instrument browser runtime diagnostics", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	}
 
 	async #postReadyInfo(): Promise<void> {
@@ -580,6 +611,10 @@ export class WorkerCore {
 					cancelRejection,
 				]);
 				await this.#postReadyInfo();
+				const drained = this.#runtimeDiagnostics.drain();
+				if (drained.runtimeDiagnostics.length || drained.runtimeDiagnosticsDropped) {
+					displays.push({ type: "text", text: serializeRuntimeDiagnostics(drained) });
+				}
 				this.#transport.send({
 					type: "result",
 					id: msg.id,
@@ -813,7 +848,8 @@ export class WorkerCore {
 			{ type: "image", data: buffer.toBase64(), mimeType: "image/png" },
 			{ maxWidth: 1024, maxHeight: 1024, maxBytes: 150 * 1024, jpegQuality: 70 },
 		);
-		const explicitPath = opts.save ? resolveToCwd(opts.save, session.cwd) : undefined;
+		const explicitPath = opts.save ? resolveTabWorkerPath(opts.save, session.cwd) : undefined;
+
 		const dest =
 			explicitPath ??
 			(session.browserScreenshotDir
@@ -950,7 +986,7 @@ export class WorkerCore {
 			page.locator(normalizeSelector(selector)).setTimeout(timeoutMs).waitHandle(),
 		)) as ElementHandle;
 		try {
-			const absolute = filePaths.map(filePath => resolveToCwd(filePath, session.cwd));
+			const absolute = filePaths.map(filePath => resolveTabWorkerPath(filePath, session.cwd));
 			const upload = handle as unknown as { uploadFile: (...paths: string[]) => Promise<void> };
 			const tagName = (await untilAborted(signal, () =>
 				handle.evaluate(el => (el as unknown as { tagName: string }).tagName),
@@ -1032,6 +1068,7 @@ export class WorkerCore {
 		this.#clearElementCache();
 		const page = this.#page;
 		if (this.#dialogHandler && page && !page.isClosed()) page.off("dialog", this.#dialogHandler);
+		await this.#runtimeDiagnosticsSession?.detach().catch(() => undefined);
 		if (this.#mode === "headless" && page && !page.isClosed()) await page.close().catch(() => undefined);
 		if (this.#browser?.connected) this.#browser.disconnect();
 		this.#transport.send({ type: "closed" });

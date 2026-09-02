@@ -13,6 +13,8 @@ target/
 *.node
 *.node.build.json
 *.b64.js
+# `bun build --compile` leaves these next to the entrypoint when it is interrupted.
+*.bun-build
 
 # Environment
 .env
@@ -56,15 +58,21 @@ packages/ai/test/.temp-images/
 .gjc/verification/
 .gjc/logs/
 .gjc/rlm/
-.gjc/state/
+**/.gjc/state/
 .gjc/_session-*/
+.gjc/rss-checkpoints/
 .gjc/metrics.json
+**/.gjc/settings.json.fallback-invalid
+**/.gjc/settings.json.config-root.fallback-invalid
+**/.gjc/settings.json.strict-invalid
 .pi_config/
 .opencode/
 .worktrees/
 compaction-results/
 changes/
 __pycache__/
+*.egg-info/
+.pytest_cache/
 
 # Scratch files
 syntax.jsonl
@@ -75,16 +83,17 @@ pi-*.html
 # Generated files
 packages/coding-agent/src/internal-urls/docs-index.generated.ts
 /runs/
-python/gjc-rpc/src/gjc_rpc.egg-info/
 # parallel-agent worktrees
 .wt/
 CPU*.md
 packages/coding-agent/binaries/
 
-# robogjc runtime state
-python/robogjc/data/
-python/robogjc/.cache/
-python/robogjc/src/robogjc/static/
-python/robogjc/web/dist/
-python/robogjc/.env
+# Root artifacts/ is untracked test working space (issue #4420).
+# Tests write evidence there and read it back within the same run;
+# test fixtures belong in packages/*/test/fixtures/ instead.
+/artifacts/
 .release-040-artifacts/
+
+# Python SDK build output
+python/gjc-sdk/build/
+*.py[cod]

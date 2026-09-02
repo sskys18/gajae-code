@@ -1,9 +1,16 @@
 /**
  * Bordered output container with optional header and sections.
  */
-import { ImageProtocol, padding, TERMINAL, visibleWidth, wrapTextWithAnsi } from "@gajae-code/tui";
+import {
+	ImageProtocol,
+	isTerminalGraphicsFallbackActive,
+	padding,
+	TERMINAL,
+	visibleWidth,
+	wrapTextWithAnsi,
+} from "@gajae-code/tui";
 import type { Theme } from "../modes/theme/theme";
-import { getSixelLineMask } from "../utils/sixel";
+import { containsSixelSequence, getSixelLineMask } from "../utils/sixel";
 import type { State } from "./types";
 import type { RenderCache } from "./utils";
 import { getStateBgColor, Hasher, padToWidth, truncateToWidth } from "./utils";
@@ -15,6 +22,16 @@ export interface OutputBlockOptions {
 	sections?: Array<{ label?: string; lines: string[] }>;
 	width: number;
 	applyBg?: boolean;
+}
+/**
+ * Return the width available to section content after the output block's
+ * visible left and right borders. Keep callers on the same layout contract as
+ * renderOutputBlock so width-aware projections are not wrapped a second time.
+ */
+export function getOutputBlockContentWidth(width: number, theme: Theme): number {
+	const lineWidth = Math.max(0, width);
+	const borderWidth = visibleWidth(`${theme.boxSharp.vertical} `) + visibleWidth(theme.boxSharp.vertical);
+	return Math.max(0, lineWidth - borderWidth);
 }
 
 export function renderOutputBlock(options: OutputBlockOptions, theme: Theme): string[] {
@@ -63,7 +80,7 @@ export function renderOutputBlock(options: OutputBlockOptions, theme: Theme): st
 
 	const contentPrefix = border(`${v} `);
 	const contentSuffix = border(v);
-	const contentWidth = Math.max(0, lineWidth - visibleWidth(contentPrefix) - visibleWidth(contentSuffix));
+	const contentWidth = getOutputBlockContentWidth(lineWidth, theme);
 	const lines: string[] = [];
 
 	lines.push(
@@ -81,13 +98,17 @@ export function renderOutputBlock(options: OutputBlockOptions, theme: Theme): st
 			);
 		}
 		const allLines = section.lines.flatMap(l => l.split("\n"));
-		const sixelLineMask = TERMINAL.imageProtocol === ImageProtocol.Sixel ? getSixelLineMask(allLines) : undefined;
+		const fallbackActive = isTerminalGraphicsFallbackActive();
+		const sixelLineMask =
+			fallbackActive || TERMINAL.imageProtocol === ImageProtocol.Sixel ? getSixelLineMask(allLines) : undefined;
 		for (let lineIndex = 0; lineIndex < allLines.length; lineIndex++) {
-			const line = allLines[lineIndex]!;
-			if (sixelLineMask?.[lineIndex]) {
-				lines.push(line);
+			const sixelLine = sixelLineMask?.[lineIndex] ?? false;
+			if (sixelLine && !fallbackActive) {
+				lines.push(allLines[lineIndex]!);
 				continue;
 			}
+			if (sixelLine && sixelLineMask?.[lineIndex - 1] && !containsSixelSequence(allLines[lineIndex]!)) continue;
+			const line = sixelLine ? "[SIXEL image hidden while IRC sidebar is visible]" : allLines[lineIndex]!;
 			const wrappedLines = wrapTextWithAnsi(line.trimEnd(), contentWidth);
 			for (const wrappedLine of wrappedLines) {
 				const innerPadding = padding(Math.max(0, contentWidth - visibleWidth(wrappedLine)));
@@ -137,6 +158,7 @@ export class CachedOutputBlock {
 		h.optional(options.headerMeta);
 		h.optional(options.state);
 		h.bool(options.applyBg ?? true);
+		h.bool(isTerminalGraphicsFallbackActive());
 		if (options.sections) {
 			for (const s of options.sections) {
 				h.optional(s.label);

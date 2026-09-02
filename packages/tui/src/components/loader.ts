@@ -1,31 +1,51 @@
+import { type AnimationRegistration, registerAnimationCallback } from "../animation-scheduler";
+import { isRemoteTerminalSession, isUnderTerminalMultiplexer } from "../terminal-capabilities";
 import type { TUI } from "../tui";
 import { sliceByColumn, visibleWidth } from "../utils";
 import { Text } from "./text";
 
-/**
- * Loader component that drives display refresh at ~60fps so callers whose
- * message colorizer is time-dependent (e.g. shimmer/KITT) animate smoothly.
- *
- * Two cadences are interleaved on a single timer:
- *   - **Recompute tick** (every `RENDER_INTERVAL_MS`) → recomposes the spinner +
- *     colorized message every 16ms. A redraw is requested only when that composed
- *     text actually changed since the last tick (`#lastDisplayed`), so animated
- *     colorizers (shimmer/KITT) and spinner-frame advances still repaint, while
- *     static loaders skip the redundant no-op render requests between advances.
- *   - **Spinner advance** (every `SPINNER_ADVANCE_MS`) → bumps the spinner
- *     frame index. Decoupled from the recompute cadence so the spinner keeps
- *     its classic ~12.5fps step pace regardless of shimmer state.
- *
- * The animation timer is `unref`'d so an active loader never keeps the event
- * loop alive on its own.
- */
-const RENDER_INTERVAL_MS = 16;
 const SPINNER_ADVANCE_MS = 80;
+
+/**
+ * Compatibility options for existing loader call sites.
+ *
+ * @deprecated `timeDependentColor` preserves the historical smooth-animation
+ * contract: direct local terminals reevaluate colorizers at 60 fps, while
+ * remote or multiplexed terminals stay on the shared 80 ms cadence to avoid
+ * output churn. The field remains accepted for downstream callers while they
+ * migrate to an explicit animation policy.
+ */
+export interface LoaderOptions {
+	timeDependentColor?: boolean;
+	/** Request a layout-only repaint when the loader is outside the transcript anchor. */
+	renderScope?: "full" | "layout";
+}
+
+const SMOOTH_ANIMATION_MS = 16;
+
+function resolveAnimationCadence(options: LoaderOptions): 16 | 80 {
+	if (options.timeDependentColor !== true) return SPINNER_ADVANCE_MS;
+	return isRemoteTerminalSession() || isUnderTerminalMultiplexer() ? SPINNER_ADVANCE_MS : SMOOTH_ANIMATION_MS;
+}
+
+/** Test-only performance counters for advisory baseline tests. */
+export const __loaderPerfCounters = {
+	liveIntervals: 0,
+	startedIntervals: 0,
+	callbackInvocations: 0,
+	renderRequests: 0,
+	reset(): void {
+		this.liveIntervals = 0;
+		this.startedIntervals = 0;
+		this.callbackInvocations = 0;
+		this.renderRequests = 0;
+	},
+};
 
 export class Loader extends Text {
 	#frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 	#currentFrame = 0;
-	#intervalId?: NodeJS.Timeout;
+	#animation?: AnimationRegistration;
 	#ui: TUI | null = null;
 	#lastSpinnerTick = 0;
 	#lastDisplayed?: string;
@@ -36,6 +56,7 @@ export class Loader extends Text {
 		private messageColorFn: (str: string) => string,
 		private message: string = "Loading...",
 		spinnerFrames?: string[],
+		private options: LoaderOptions = {},
 	) {
 		super("", 1, 0);
 		this.#ui = ui;
@@ -57,24 +78,26 @@ export class Loader extends Text {
 	}
 
 	start() {
+		if (this.#animation) return;
 		this.#lastSpinnerTick = performance.now();
 		this.#updateDisplay();
-		this.#intervalId = setInterval(() => {
-			const now = performance.now();
+		__loaderPerfCounters.liveIntervals += 1;
+		__loaderPerfCounters.startedIntervals += 1;
+		this.#animation = registerAnimationCallback(now => {
+			__loaderPerfCounters.callbackInvocations += 1;
 			if (now - this.#lastSpinnerTick >= SPINNER_ADVANCE_MS) {
 				this.#currentFrame = (this.#currentFrame + 1) % this.#frames.length;
 				this.#lastSpinnerTick = now;
 			}
 			this.#updateDisplay();
-		}, RENDER_INTERVAL_MS);
-		// Don't let the animation timer keep the event loop alive on its own.
-		this.#intervalId?.unref?.();
+		}, resolveAnimationCadence(this.options));
 	}
 
 	stop() {
-		if (this.#intervalId) {
-			clearInterval(this.#intervalId);
-			this.#intervalId = undefined;
+		if (this.#animation) {
+			this.#animation.unregister();
+			__loaderPerfCounters.liveIntervals = Math.max(0, __loaderPerfCounters.liveIntervals - 1);
+			this.#animation = undefined;
 		}
 	}
 
@@ -90,14 +113,11 @@ export class Loader extends Text {
 	#updateDisplay() {
 		const frame = this.#frames[this.#currentFrame];
 		const next = `${this.spinnerColorFn(frame)} ${this.messageColorFn(this.message)}`;
-		// Only touch the component and ask the TUI to repaint when the rendered
-		// text actually changed. Time-dependent colorizers (shimmer/KITT) produce
-		// new text every tick and still animate; static loaders skip the ~16ms
-		// no-op render requests between 80ms spinner advances. Output is unchanged
-		// because a suppressed frame would have produced a no-op write anyway.
 		if (next === this.#lastDisplayed) return;
 		this.#lastDisplayed = next;
 		this.setText(next);
-		this.#ui?.requestRender(false, "loader");
+		__loaderPerfCounters.renderRequests += 1;
+		if (this.options.renderScope === "layout") this.#ui?.requestLayoutRender("loader");
+		else this.#ui?.requestRender(false, "loader");
 	}
 }

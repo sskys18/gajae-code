@@ -7,26 +7,31 @@ export function getExtraHelpText(): string {
   ${APP_NAME} setup                - Install GJC defaults or optional dependencies
   ${APP_NAME} session              - List, inspect, create, remove, or attach sessions
   ${APP_NAME} state                - Inspect or manage persisted GJC state
+  ${APP_NAME} auth-broker         - Manage the auth-broker (credential vault)
+  ${APP_NAME} accounts             - List, check, pin, and remove stored OAuth accounts
+  ${APP_NAME} models presets       - Inspect, refresh, pin, rollback, or disable the signed model preset registry
+  ${APP_NAME} auth-gateway        - Run an auth-gateway forward proxy
   ${APP_NAME} harness              - Run harness control-plane commands
   ${APP_NAME} coordinator          - Manage coordinator/runtime coordination helpers
-  ${APP_NAME} team                 - Run tmux-backed coordinated execution
   ${APP_NAME} ultragoal            - Run durable goal execution workflow
   ${APP_NAME} ralplan              - Run consensus planning workflow
+  ${APP_NAME} autoresearch         - Run autonomous research workflow
   ${APP_NAME} deep-interview       - Run requirements interview workflow
   ${APP_NAME} skills               - List/read embedded workflow skills
   ${APP_NAME} config               - List, get, and set configuration values
+  ${APP_NAME} stats                - View AI usage statistics (tokens, cost, requests)
   ${APP_NAME} notify               - Send or test notifications
   ${APP_NAME} daemon               - Manage background daemon helpers
   ${APP_NAME} mcp                  - Manage MCP server registrations
   ${APP_NAME} mcp-serve            - Serve the MCP integration endpoint
   ${APP_NAME} contribute-pr        - Prepare contribution/PR workflow artifacts
   ${APP_NAME} migrate              - Run migration helpers
-  ${APP_NAME} rlm                  - Run RLM helpers
   ${APP_NAME} update               - Update GJC installation artifacts
   ${APP_NAME} plugin               - Install, remove, and list plugins
   ${APP_NAME} web-search           - Search the web from the CLI (alias: q)
   ${APP_NAME} codex-native-hook    - Run Codex native hook integration
   ${APP_NAME} gc                   - Run garbage-collection/cleanup helpers
+  ${APP_NAME} quick-lane         - Classify a task into quick lane or deep path
   ${APP_NAME} <command> --help     - Show command-specific help
 
 Environment Variables:
@@ -53,6 +58,7 @@ Environment Variables:
   KILO_API_KEY               - Kilo Gateway models
   MISTRAL_API_KEY            - Mistral models
   ZAI_API_KEY                - z.ai models (ZhipuAI/GLM)
+  JUNIE_API_KEY              - JetBrains AI models (Junie; Claude via JetBrains AI)
   MINIMAX_API_KEY            - MiniMax models
   OPENCODE_API_KEY           - OpenCode Zen/OpenCode Go models
   CURSOR_ACCESS_TOKEN        - Cursor AI models
@@ -73,17 +79,20 @@ Environment Variables:
 
   # Configuration
   GJC_CODING_AGENT_DIR       - Session storage directory (default: ~/${CONFIG_DIR_NAME}/agent)
+  GJC_UI_LANGUAGE            - Explicit first-use onboarding language (en, ko, zh, or ja); invalid values use English without prompting
   GJC_PACKAGE_DIR            - Override package directory (for Nix/Guix store paths)
   GJC_SMOL_MODEL              - Override smol/fast model (see --smol)
   GJC_SLOW_MODEL              - Override slow/reasoning model (see --slow)
   GJC_PLAN_MODEL              - Override planning model (see --plan)
+  GJC_MODEL_PRESET_REGISTRY_URL - HTTPS latest.json override for the signed preset registry
+  GJC_MODEL_PRESET_REGISTRY_DISABLED - Disable registry fetch/use (1/true/yes/on)
   GJC_NO_PTY                  - Disable PTY-based interactive bash execution
   --tmux                       - Launch interactive startup inside a fresh tmux session
   gjc session                  - List, inspect, create, remove, or attach tagged GJC-managed tmux sessions
   GJC_LAUNCH_POLICY           - Launch policy for --tmux startup: tmux or direct
   GJC_TMUX_SESSION            - Explicit tmux session name override for --tmux startup
   GJC_TMUX_PROFILE            - Apply GJC tmux scroll/mouse/clipboard profile to --tmux sessions (set 0/off to skip)
-  GJC_MOUSE                   - Mouse-wheel scroll in --tmux sessions (set 0/off to let the host terminal scroll)
+  GJC_MOUSE                   - Apply tmux copy-mode mouse capture in --tmux sessions (set 0/off to skip)
 
   For complete environment variable reference, see:
   docs/environment-variables.md
@@ -92,7 +101,7 @@ Available Tools (default-enabled unless noted):
   bash          - Execute bash commands
   edit          - Edit files with find/replace
   write         - Write files (creates/overwrites)
-  grep          - Search file contents
+  search        - Search file contents
   find          - Find files by glob pattern
   lsp           - Language server protocol (code intelligence)
   python        - Execute Python code (requires: ${APP_NAME} setup python)
@@ -105,5 +114,6 @@ Available Tools (default-enabled unless noted):
 
 Useful Commands:
   ${APP_NAME} --list-models        - List configured provider models
+  ${APP_NAME} models               - Alias for --list-models (never starts an agent)
   ${APP_NAME} --help               - Show this help`;
 }

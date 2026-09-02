@@ -1,5 +1,12 @@
-import { getProjectDir, logger } from "@gajae-code/utils";
-import type { AutocompleteProvider, CombinedAutocompleteProvider } from "../autocomplete";
+import { getProjectDir, logger, onDefaultTabWidthChange } from "@gajae-code/utils";
+import {
+	type AutocompleteProvider,
+	type AutocompleteSuggestionKind,
+	type CombinedAutocompleteProvider,
+	extractSlashCommandTokenPrefix,
+	isInsideInlineCodeSpan,
+	isSlashCommandPromptStart,
+} from "../autocomplete";
 import { BracketedPasteHandler } from "../bracketed-paste";
 import { getKeybindings, type KeybindingsManager } from "../keybindings";
 import { extractPrintableText, matchesKey } from "../keys";
@@ -340,8 +347,25 @@ interface EditorState {
 
 interface LayoutLine {
 	text: string;
+	visibleWidth: number;
+	logicalLine: number;
 	hasCursor: boolean;
 	cursorPos?: number;
+}
+
+interface LayoutCacheKey {
+	docVersion: number;
+	contentWidth: number;
+	optionsKey: string;
+}
+
+interface LayoutCache {
+	key: LayoutCacheKey;
+	cursorLine: number;
+	cursorCol: number;
+	lines: LayoutLine[];
+	lineStarts: number[];
+	lineCounts: number[];
 }
 
 export interface EditorTheme {
@@ -373,6 +397,18 @@ interface HistoryStorage {
 
 type HistoryCursorAnchor = "start" | "end";
 
+/** Test-only performance counters for advisory baseline tests. */
+export const __editorPerfCounters = {
+	layoutTextInvocations: 0,
+	layoutLogicalLinesProcessed: 0,
+	visibleWidthMeasurements: 0,
+	reset(): void {
+		this.layoutTextInvocations = 0;
+		this.layoutLogicalLinesProcessed = 0;
+		this.visibleWidthMeasurements = 0;
+	},
+};
+
 export class Editor implements Component, Focusable {
 	#state: EditorState = {
 		lines: [""],
@@ -400,9 +436,12 @@ export class Editor implements Component, Focusable {
 	// Store last layout width for cursor navigation
 	#lastLayoutWidth: number = 80;
 	#paddingXOverride: number | undefined;
+	#rightGutterWidth = 0;
 	#maxHeight?: number;
 	#scrollOffset: number = 0;
 	#wrappedLineCache: CachedWrappedLine[] = [];
+	#docVersion = 0;
+	#layoutCache: LayoutCache | undefined;
 
 	// Emacs-style kill ring
 	#killRing = new KillRing();
@@ -423,6 +462,7 @@ export class Editor implements Component, Focusable {
 	#autocompleteState: "regular" | "force" | null = null;
 	#autocompletePrefix: string = "";
 	#autocompleteRequestId: number = 0;
+	#autocompleteOrigin?: { docVersion: number; cursorLine: number; cursorCol: number };
 	#autocompleteMaxVisible: number = 5;
 	onAutocompleteUpdate?: () => void;
 
@@ -437,6 +477,8 @@ export class Editor implements Component, Focusable {
 	#history: string[] = [];
 	#historyIndex: number = -1; // -1 = not browsing, 0 = most recent, 1 = older, etc.
 	#historyStorage?: HistoryStorage;
+	#historyStorageLoader?: () => Promise<HistoryStorage | undefined>;
+	#historyStorageLoad?: Promise<HistoryStorage | undefined>;
 
 	// Undo stack for editor state changes
 	#undoStack: EditorState[] = [];
@@ -448,8 +490,14 @@ export class Editor implements Component, Focusable {
 	onSubmit?: (text: string) => void;
 	onAltEnter?: (text: string) => void;
 	onChange?: (text: string) => void;
+	onUndo?: (text: string) => void;
 	onAutocompleteCancel?: () => void;
 	onTabDeclined?: (text: string) => void;
+	/**
+	 * Called before Tab opens/applies autocomplete. Return true to consume Tab
+	 * for app-level behavior (for example, queueing a draft while a turn runs).
+	 */
+	onTab?: (text: string) => boolean | undefined;
 	disableSubmit: boolean = false;
 
 	// Custom top border (for status line integration)
@@ -458,13 +506,34 @@ export class Editor implements Component, Focusable {
 	#borderStyle: EditorBorderStyle = "round";
 	#closedBorderBox = false;
 
+	#disposeTabWidthListener?: () => void;
+
 	constructor(theme: EditorTheme) {
 		this.#theme = theme;
 		this.borderColor = theme.borderColor;
+		// Raw tabs can reach editor state via insertText()/autocomplete results
+		// (setText expands tabs by contract). visibleWidth + wrapping depend on the
+		// default tab width, so a runtime tab-width change must drop both caches.
+		this.#disposeTabWidthListener = onDefaultTabWidthChange(() => {
+			this.invalidate();
+			if (this.#inputPrefix !== undefined) {
+				this.#inputPrefixWidth = visibleWidth(this.#inputPrefix);
+			}
+		});
 	}
 
-	setAutocompleteProvider(provider: AutocompleteProvider): void {
+	dispose(): void {
+		this.#disposeTabWidthListener?.();
+		this.#disposeTabWidthListener = undefined;
+	}
+
+	setAutocompleteProvider(provider: AutocompleteProvider | undefined): void {
 		this.#autocompleteProvider = provider;
+		if (provider === undefined) {
+			this.#cancelAutocomplete();
+			this.onAutocompleteUpdate?.();
+		}
+		this.invalidate();
 	}
 
 	getAutocompleteProvider(): AutocompleteProvider | undefined {
@@ -482,6 +551,7 @@ export class Editor implements Component, Focusable {
 	 */
 	setTopBorder(content: EditorTopBorder | undefined): void {
 		this.#topBorderContent = content;
+		this.#invalidateLayoutCache();
 	}
 
 	/**
@@ -489,38 +559,46 @@ export class Editor implements Component, Focusable {
 	 */
 	setBorderVisible(borderVisible: boolean): void {
 		this.#borderVisible = borderVisible;
+		this.#invalidateLayoutCache();
 	}
 
 	setBorderStyle(borderStyle: EditorBorderStyle): void {
 		this.#borderStyle = borderStyle;
+		this.#invalidateLayoutCache();
 	}
 
 	setClosedBorderBox(closedBorderBox: boolean): void {
 		this.#closedBorderBox = closedBorderBox;
+		this.#invalidateLayoutCache();
 	}
 
 	setPromptGutter(promptGutter: string | undefined): void {
 		this.#promptGutter = promptGutter;
+		this.#invalidateLayoutCache();
 	}
 
 	setInputPrefix(inputPrefix: string | undefined): void {
 		this.#inputPrefix = inputPrefix;
 		this.#inputPrefixWidth = inputPrefix ? visibleWidth(inputPrefix) : 0;
+		this.#invalidateLayoutCache();
 	}
 
 	setPlaceholder(placeholder: string | undefined): void {
 		const trimmed = placeholder?.trim();
 		this.#placeholder = trimmed ? trimmed : undefined;
+		this.#invalidateLayoutCache();
 	}
 
 	/**
 	 * Get the available width for top border content given a total terminal width.
-	 * Accounts for the border characters and horizontal padding when visible.
+	 * Accounts for right gutter, border characters, and horizontal padding when visible.
 	 */
 	getTopBorderAvailableWidth(terminalWidth: number): number {
+		const rightGutterWidth = Math.min(this.#rightGutterWidth, Math.max(0, terminalWidth - 1));
+		const renderWidth = Math.max(1, terminalWidth - rightGutterWidth);
 		const paddingX = this.#getEditorPaddingX();
 		const borderWidth = this.#getHorizontalChromeWidth(paddingX);
-		return Math.max(0, terminalWidth - borderWidth * 2);
+		return Math.max(0, renderWidth - borderWidth * 2);
 	}
 
 	/**
@@ -528,6 +606,7 @@ export class Editor implements Component, Focusable {
 	 */
 	setUseTerminalCursor(useTerminalCursor: boolean): void {
 		this.#useTerminalCursor = useTerminalCursor;
+		this.#invalidateLayoutCache();
 	}
 
 	getUseTerminalCursor(): boolean {
@@ -542,6 +621,11 @@ export class Editor implements Component, Focusable {
 
 	setPaddingX(paddingX: number): void {
 		this.#paddingXOverride = Math.max(0, paddingX);
+		this.#invalidateLayoutCache();
+	}
+
+	setRightGutterWidth(width: number): void {
+		this.#rightGutterWidth = Number.isFinite(width) ? Math.max(0, Math.floor(width)) : 0;
 	}
 
 	getAutocompleteMaxVisible(): number {
@@ -557,9 +641,30 @@ export class Editor implements Component, Focusable {
 
 	setHistoryStorage(storage: HistoryStorage): void {
 		this.#historyStorage = storage;
-		const recent = storage.getRecent(100, getProjectDir());
-		this.#history = recent.map(entry => entry.prompt);
+		const recent = storage.getRecent(100, getProjectDir()).map(entry => entry.prompt);
+		const merged: string[] = [];
+		for (const prompt of [...this.#history, ...recent]) {
+			if (merged.includes(prompt)) continue;
+			merged.push(prompt);
+			if (merged.length >= 100) break;
+		}
+		this.#history = merged;
 		this.#historyIndex = -1;
+	}
+
+	setHistoryStorageLoader(loader: (() => Promise<HistoryStorage | undefined>) | undefined): void {
+		this.#historyStorageLoader = loader;
+		this.#historyStorageLoad = undefined;
+	}
+
+	#ensureHistoryStorage(): Promise<HistoryStorage | undefined> {
+		if (this.#historyStorage) return Promise.resolve(this.#historyStorage);
+		if (!this.#historyStorageLoader) return Promise.resolve(undefined);
+		this.#historyStorageLoad ??= this.#historyStorageLoader().then(storage => {
+			if (storage) this.setHistoryStorage(storage);
+			return storage;
+		});
+		return this.#historyStorageLoad;
 	}
 
 	/**
@@ -582,6 +687,13 @@ export class Editor implements Component, Focusable {
 			stor.add(trimmed, getProjectDir()).catch(error => {
 				logger.error("HistoryStorage add failed", { error: String(error) });
 			});
+		} else {
+			void this.#ensureHistoryStorage().then(storage => {
+				if (!storage) return;
+				return storage.add(trimmed, getProjectDir()).catch(error => {
+					logger.error("HistoryStorage add failed", { error: String(error) });
+				});
+			});
 		}
 	}
 
@@ -603,7 +715,13 @@ export class Editor implements Component, Focusable {
 
 	#navigateHistory(direction: 1 | -1): void {
 		this.#resetKillSequence();
-		if (this.#history.length === 0) return;
+		if (this.#history.length === 0) {
+			void this.#ensureHistoryStorage().then(storage => {
+				if (storage && this.#history.length > 0) this.#navigateHistory(direction);
+				this.invalidate();
+			});
+			return;
+		}
 		const newIndex = this.#historyIndex - direction; // Up(-1) increases index, Down(1) decreases
 		if (newIndex < -1 || newIndex >= this.#history.length) return;
 		this.#historyIndex = newIndex;
@@ -631,10 +749,21 @@ export class Editor implements Component, Focusable {
 			this.onChange(this.getText());
 		}
 		this.#wrappedLineCache.length = 0;
+		this.#bumpDocumentVersion();
 	}
 
 	invalidate(): void {
 		this.#wrappedLineCache.length = 0;
+		this.#layoutCache = undefined;
+	}
+
+	#bumpDocumentVersion(): void {
+		this.#docVersion += 1;
+		this.#layoutCache = undefined;
+	}
+
+	#invalidateLayoutCache(): void {
+		this.#layoutCache = undefined;
 	}
 
 	#getEditorPaddingX(): number {
@@ -780,12 +909,14 @@ export class Editor implements Component, Focusable {
 	}
 
 	render(width: number): string[] {
+		const rightGutterWidth = Math.min(this.#rightGutterWidth, Math.max(0, width - 1));
+		const renderWidth = Math.max(1, width - rightGutterWidth);
 		const paddingX = this.#getEditorPaddingX();
 		const borderVisible = this.#borderVisible;
-		const promptGutter = this.#getPromptGutter(width, paddingX);
-		const contentAreaWidth = this.#getContentWidth(width, paddingX);
+		const promptGutter = this.#getPromptGutter(renderWidth, paddingX);
+		const contentAreaWidth = this.#getContentWidth(renderWidth, paddingX);
 		const inputPrefixWidth = this.#inputPrefixWidth;
-		const layoutWidth = Math.max(1, this.#getLayoutWidth(width, paddingX) - inputPrefixWidth);
+		const layoutWidth = Math.max(1, this.#getLayoutWidth(renderWidth, paddingX) - inputPrefixWidth);
 		this.#lastLayoutWidth = layoutWidth;
 
 		// Box-drawing characters for the configured input box shape.
@@ -806,7 +937,7 @@ export class Editor implements Component, Focusable {
 
 		if (borderVisible) {
 			// Render top border: ╭─ [status content] ────────────────╮
-			const topFillWidth = Math.max(0, width - borderWidth * 2);
+			const topFillWidth = Math.max(0, renderWidth - borderWidth * 2);
 			if (this.#topBorderContent) {
 				const { content, width: statusWidth } = this.#topBorderContent;
 				if (statusWidth <= topFillWidth) {
@@ -838,7 +969,7 @@ export class Editor implements Component, Focusable {
 		for (let visibleIndex = 0; visibleIndex < visibleLayoutLines.length; visibleIndex++) {
 			const layoutLine = visibleLayoutLines[visibleIndex]!;
 			let displayText = layoutLine.text;
-			let displayWidth = visibleWidth(layoutLine.text);
+			let displayWidth = layoutLine.visibleWidth;
 			let cursorInPadding = false;
 			const absoluteVisibleIndex = this.#scrollOffset + visibleIndex;
 			const showPromptGutter = promptGutter !== undefined && visibleIndex === 0;
@@ -1011,7 +1142,7 @@ export class Editor implements Component, Focusable {
 		}
 
 		if (borderVisible && this.#closedBorderBox) {
-			const bottomFillWidth = Math.max(0, width - borderWidth * 2);
+			const bottomFillWidth = Math.max(0, renderWidth - borderWidth * 2);
 			const bottomLeftClosed = this.borderColor(`${box.bottomLeft}${box.horizontal.repeat(paddingX)}`);
 			const bottomRightClosed = this.borderColor(`${box.horizontal.repeat(paddingX)}${box.bottomRight}`);
 			result.push(bottomLeftClosed + horizontal.repeat(bottomFillWidth) + bottomRightClosed);
@@ -1019,8 +1150,13 @@ export class Editor implements Component, Focusable {
 
 		// Add autocomplete list if active
 		if (this.#autocompleteState && this.#autocompleteList) {
-			const autocompleteResult = this.#autocompleteList.render(width);
+			const autocompleteResult = this.#autocompleteList.render(renderWidth);
 			result.push(...autocompleteResult);
+		}
+
+		if (rightGutterWidth > 0) {
+			const rightGutter = padding(rightGutterWidth);
+			return result.map(line => line + rightGutter);
 		}
 
 		return result;
@@ -1050,8 +1186,12 @@ export class Editor implements Component, Focusable {
 		}
 
 		// Handle bracketed paste mode
-		const paste = this.#pasteHandler.process(data);
+		const paste =
+			data === "\x1b" && !this.#pasteHandler.hasPendingFrame
+				? ({ handled: false } as const)
+				: this.#pasteHandler.process(data);
 		if (paste.handled) {
+			if (paste.leading.length > 0) this.handleInput(paste.leading);
 			if (paste.pasteContent !== undefined) {
 				this.#handlePaste(paste.pasteContent);
 				if (paste.remaining.length > 0) {
@@ -1073,6 +1213,10 @@ export class Editor implements Component, Focusable {
 		// Undo
 		if (kb.matches(data, "tui.editor.undo")) {
 			this.#applyUndo();
+			return;
+		}
+
+		if (kb.matches(data, "tui.input.tab") && this.onTab?.(this.getText())) {
 			return;
 		}
 
@@ -1107,6 +1251,11 @@ export class Editor implements Component, Focusable {
 
 				// If Tab was pressed, always apply the selection
 				if (kb.matches(data, "tui.input.tab")) {
+					if (!this.#isAutocompleteSelectionCurrent()) {
+						this.#cancelAutocomplete();
+						this.#handleTabCompletion();
+						return;
+					}
 					const selected = this.#autocompleteList.getSelectedItem();
 					if (selected && this.#autocompleteProvider) {
 						const shouldChainSlashCommandAutocomplete = this.#isSlashCommandNameAutocompleteSelection();
@@ -1119,6 +1268,7 @@ export class Editor implements Component, Focusable {
 						);
 
 						this.#state.lines = result.lines;
+						this.#bumpDocumentVersion();
 						this.#state.cursorLine = result.cursorLine;
 						this.#setCursorCol(result.cursorCol);
 
@@ -1139,35 +1289,38 @@ export class Editor implements Component, Focusable {
 				}
 
 				// If Enter was pressed on a slash command, apply completion and submit
-				if ((kb.matches(data, "tui.input.submit") || data === "\n") && this.#autocompletePrefix.startsWith("/")) {
-					// Check for stale autocomplete state due to debounce
-					const currentLine = this.#state.lines[this.#state.cursorLine] ?? "";
-					const currentTextBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
-					if (currentTextBeforeCursor !== this.#autocompletePrefix) {
-						// Autocomplete is stale - cancel and fall through to normal submission
+				if (
+					(kb.matches(data, "tui.input.submit") || data === "\n") &&
+					this.#autocompleteState === "regular" &&
+					this.#autocompletePrefix.startsWith("/")
+				) {
+					const selected = this.#autocompleteList.getSelectedItem();
+					if (!this.#isAutocompleteSelectionCurrent()) {
 						this.#cancelAutocomplete();
-					} else {
-						const selected = this.#autocompleteList.getSelectedItem();
-						if (selected && this.#autocompleteProvider) {
-							const result = this.#autocompleteProvider.applyCompletion(
-								this.#state.lines,
-								this.#state.cursorLine,
-								this.#state.cursorCol,
-								selected,
-								this.#autocompletePrefix,
-							);
+					} else if (selected && this.#autocompleteProvider) {
+						const result = this.#autocompleteProvider.applyCompletion(
+							this.#state.lines,
+							this.#state.cursorLine,
+							this.#state.cursorCol,
+							selected,
+							this.#autocompletePrefix,
+						);
 
-							this.#state.lines = result.lines;
-							this.#state.cursorLine = result.cursorLine;
-							this.#setCursorCol(result.cursorCol);
-							result.onApplied?.();
-						}
+						this.#state.lines = result.lines;
+						this.#bumpDocumentVersion();
+						this.#state.cursorLine = result.cursorLine;
+						this.#setCursorCol(result.cursorCol);
+						result.onApplied?.();
 						this.#cancelAutocomplete();
 					}
 					// Don't return - fall through to submission logic
 				}
 				// If Enter was pressed on a file path, apply completion
 				else if (kb.matches(data, "tui.input.submit") || data === "\n") {
+					if (!this.#isAutocompleteSelectionCurrent()) {
+						this.#cancelAutocomplete();
+						return;
+					}
 					const selected = this.#autocompleteList.getSelectedItem();
 					if (selected && this.#autocompleteProvider) {
 						const result = this.#autocompleteProvider.applyCompletion(
@@ -1179,6 +1332,7 @@ export class Editor implements Component, Focusable {
 						);
 
 						this.#state.lines = result.lines;
+						this.#bumpDocumentVersion();
 						this.#state.cursorLine = result.cursorLine;
 						this.#setCursorCol(result.cursorCol);
 
@@ -1205,32 +1359,34 @@ export class Editor implements Component, Focusable {
 		}
 
 		// Continue with rest of input handling
-		// Ctrl+K - Delete to end of line
-		if (matchesKey(data, "ctrl+k")) {
+		// Kill/yank/word-delete actions resolve through the keybinding registry so a
+		// user remap actually moves them, matching `Input` and `SecretInput`. The
+		// five parity ids below declare exactly the chords the previous literals
+		// implemented, so default behavior is unchanged.
+		if (kb.matches(data, "tui.editor.deleteToLineEnd")) {
 			this.#deleteToEndOfLine();
 		}
 		// Ctrl+U - Delete to start of line
-		else if (matchesKey(data, "ctrl+u")) {
+		else if (kb.matches(data, "tui.editor.deleteToLineStart")) {
 			this.#deleteToStartOfLine();
 		}
-		// Ctrl+W - Delete word backwards
-		else if (matchesKey(data, "ctrl+w")) {
-			this.#deleteWordBackwards();
-		}
-		// Option/Alt+Backspace - Delete word backwards
-		else if (matchesKey(data, "alt+backspace")) {
+		// Deliberate repair, not parity: `tui.editor.deleteWordBackward` declares
+		// ctrl+w, alt+backspace AND ctrl+backspace, but the previous literal chain
+		// implemented only the first two, so the declared ctrl+backspace never
+		// worked in the composer.
+		else if (kb.matches(data, "tui.editor.deleteWordBackward")) {
 			this.#deleteWordBackwards();
 		}
 		// Option/Alt+D - Delete word forwards
-		else if (matchesKey(data, "alt+d") || matchesKey(data, "alt+delete")) {
+		else if (kb.matches(data, "tui.editor.deleteWordForward")) {
 			this.#deleteWordForwards();
 		}
 		// Ctrl+Y - Yank from kill ring
-		else if (matchesKey(data, "ctrl+y")) {
+		else if (kb.matches(data, "tui.editor.yank")) {
 			this.#yankFromKillRing();
 		}
 		// Alt+Y - Yank-pop (cycle kill ring)
-		else if (matchesKey(data, "alt+y")) {
+		else if (kb.matches(data, "tui.editor.yankPop")) {
 			this.#yankPop();
 		}
 		// Ctrl+A - Move to start of line
@@ -1251,6 +1407,7 @@ export class Editor implements Component, Focusable {
 		}
 		// New line
 		else if (
+			matchesKey(data, "ctrl+j") || // Ctrl+J (Kitty/modifyOtherKeys)
 			(data.charCodeAt(0) === 10 && data.length > 1) || // Ctrl+Enter with modifiers
 			matchesKey(data, "ctrl+enter") || // Ctrl+Enter (Kitty/modifyOtherKeys, including lock bits/keypad Enter)
 			matchesKey(data, "ctrl+shift+enter") || // Ctrl+Shift+Enter (Kitty/modifyOtherKeys combined modifier)
@@ -1281,8 +1438,8 @@ export class Editor implements Component, Focusable {
 				const currentLine = this.#state.lines[this.#state.cursorLine] ?? "";
 				const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
 				if (
-					textBeforeCursor.startsWith("/") &&
-					this.#isInSubmittedSlashCommandContext() &&
+					(this.#isInSubmittedSlashCommandContext() ||
+						this.#getSlashTokenBeforeCursor()?.startsWith("/skill") === true) &&
 					this.#autocompleteProvider?.trySyncSlashCompletion
 				) {
 					const syncResult = this.#autocompleteProvider.trySyncSlashCompletion(textBeforeCursor);
@@ -1299,6 +1456,7 @@ export class Editor implements Component, Focusable {
 							syncResult.prefix,
 						);
 						this.#state.lines = result.lines;
+						this.#bumpDocumentVersion();
 						this.#state.cursorLine = result.cursorLine;
 						this.#setCursorCol(result.cursorCol);
 						result.onApplied?.();
@@ -1432,95 +1590,175 @@ export class Editor implements Component, Focusable {
 		return this.#wrappedLineCache.length;
 	}
 
-	#layoutText(contentWidth: number): LayoutLine[] {
+	#makeLayoutCacheKey(contentWidth: number): LayoutCacheKey {
+		return {
+			docVersion: this.#docVersion,
+			contentWidth,
+			optionsKey: JSON.stringify({
+				borderVisible: this.#borderVisible,
+				borderStyle: this.#borderStyle,
+				closedBorderBox: this.#closedBorderBox,
+				inputPrefix: this.#inputPrefix,
+				inputPrefixWidth: this.#inputPrefixWidth,
+				placeholder: this.#placeholder,
+				promptGutter: this.#promptGutter,
+				useTerminalCursor: this.#useTerminalCursor,
+				cursorOverride: this.cursorOverride,
+				cursorOverrideWidth: this.cursorOverrideWidth,
+				autocompleteState: this.#autocompleteState,
+				autocompletePrefix: this.#autocompletePrefix,
+				autocompleteHint: this.#autocompleteList?.getSelectedItem()?.hint,
+			}),
+		};
+	}
+
+	#layoutLine(text: string, logicalLine: number, hasCursor: boolean, cursorPos?: number): LayoutLine {
+		__editorPerfCounters.visibleWidthMeasurements += 1;
+		return {
+			text,
+			visibleWidth: visibleWidth(text),
+			logicalLine,
+			hasCursor,
+			cursorPos,
+		};
+	}
+
+	#layoutLogicalLine(lineIndex: number, contentWidth: number): LayoutLine[] {
+		__editorPerfCounters.layoutLogicalLinesProcessed += 1;
+		const line = this.#state.lines[lineIndex] || "";
+		const isCurrentLine = lineIndex === this.#state.cursorLine;
+		const wrappedLine = this.#getWrappedLine(lineIndex, contentWidth);
 		const layoutLines: LayoutLine[] = [];
 
-		if (this.#state.lines.length === 0 || (this.#state.lines.length === 1 && this.#state.lines[0] === "")) {
-			// Empty editor — keep the wrap cache bounded by document size like
-			// the non-empty path below (stale entries from a previously large
-			// buffer must not be retained).
-			this.#wrappedLineCache.length = this.#state.lines.length;
-			layoutLines.push({
-				text: "",
-				hasCursor: true,
-				cursorPos: 0,
-			});
+		if (wrappedLine.width <= contentWidth) {
+			layoutLines.push(
+				this.#layoutLine(line, lineIndex, isCurrentLine, isCurrentLine ? this.#state.cursorCol : undefined),
+			);
 			return layoutLines;
 		}
 
-		// Process each logical line
-		for (let i = 0; i < this.#state.lines.length; i++) {
-			const line = this.#state.lines[i] || "";
-			const isCurrentLine = i === this.#state.cursorLine;
-			const wrappedLine = this.#getWrappedLine(i, contentWidth);
+		const chunks = wrappedLine.chunks;
+		for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+			const chunk = chunks[chunkIndex];
+			if (!chunk) continue;
 
-			if (wrappedLine.width <= contentWidth) {
-				// Line fits in one layout line
-				if (isCurrentLine) {
-					layoutLines.push({
-						text: line,
-						hasCursor: true,
-						cursorPos: this.#state.cursorCol,
-					});
+			const cursorPos = this.#state.cursorCol;
+			const isLastChunk = chunkIndex === chunks.length - 1;
+			let hasCursorInChunk = false;
+			let adjustedCursorPos = 0;
+
+			if (isCurrentLine) {
+				if (isLastChunk) {
+					hasCursorInChunk = cursorPos >= chunk.startIndex;
+					adjustedCursorPos = cursorPos - chunk.startIndex;
 				} else {
-					layoutLines.push({
-						text: line,
-						hasCursor: false,
-					});
-				}
-			} else {
-				// Line needs wrapping - use word-aware wrapping
-				const chunks = wrappedLine.chunks;
-
-				for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
-					const chunk = chunks[chunkIndex];
-					if (!chunk) continue;
-
-					const cursorPos = this.#state.cursorCol;
-					const isLastChunk = chunkIndex === chunks.length - 1;
-
-					// Determine if cursor is in this chunk
-					// For word-wrapped chunks, we need to handle the case where
-					// cursor might be in trimmed whitespace at end of chunk
-					let hasCursorInChunk = false;
-					let adjustedCursorPos = 0;
-
-					if (isCurrentLine) {
-						if (isLastChunk) {
-							// Last chunk: cursor belongs here if >= startIndex
-							hasCursorInChunk = cursorPos >= chunk.startIndex;
-							adjustedCursorPos = cursorPos - chunk.startIndex;
-						} else {
-							// Non-last chunk: cursor belongs here if in range [startIndex, endIndex)
-							// But we need to handle the visual position in the trimmed text
-							hasCursorInChunk = cursorPos >= chunk.startIndex && cursorPos < chunk.endIndex;
-							if (hasCursorInChunk) {
-								adjustedCursorPos = cursorPos - chunk.startIndex;
-								// Clamp to text length (in case cursor was in trimmed whitespace)
-								if (adjustedCursorPos > chunk.text.length) {
-									adjustedCursorPos = chunk.text.length;
-								}
-							}
+					hasCursorInChunk = cursorPos >= chunk.startIndex && cursorPos < chunk.endIndex;
+					if (hasCursorInChunk) {
+						adjustedCursorPos = cursorPos - chunk.startIndex;
+						if (adjustedCursorPos > chunk.text.length) {
+							adjustedCursorPos = chunk.text.length;
 						}
 					}
+				}
+			}
 
-					if (hasCursorInChunk) {
-						layoutLines.push({
-							text: chunk.text,
-							hasCursor: true,
-							cursorPos: adjustedCursorPos,
-						});
+			if (hasCursorInChunk) {
+				let displayChunkText = chunk.text;
+				let displayCursorPos = adjustedCursorPos;
+				if (displayCursorPos > displayChunkText.length) {
+					let hiddenWhitespaceWidth = displayCursorPos - displayChunkText.length;
+					const displayChunkWidth = visibleWidth(displayChunkText);
+					__editorPerfCounters.visibleWidthMeasurements += 1;
+					if (displayChunkWidth + hiddenWhitespaceWidth <= contentWidth) {
+						displayChunkText += padding(hiddenWhitespaceWidth);
 					} else {
-						layoutLines.push({
-							text: chunk.text,
-							hasCursor: false,
-						});
+						layoutLines.push(this.#layoutLine(displayChunkText, lineIndex, false));
+						hiddenWhitespaceWidth -= Math.max(0, contentWidth - displayChunkWidth);
+						while (hiddenWhitespaceWidth > contentWidth) {
+							layoutLines.push(this.#layoutLine(padding(contentWidth), lineIndex, false));
+							hiddenWhitespaceWidth -= contentWidth;
+						}
+						displayChunkText = padding(hiddenWhitespaceWidth);
+						displayCursorPos = hiddenWhitespaceWidth;
 					}
 				}
+				layoutLines.push(this.#layoutLine(displayChunkText, lineIndex, true, displayCursorPos));
+			} else {
+				layoutLines.push(this.#layoutLine(chunk.text, lineIndex, false));
+			}
+		}
+
+		return layoutLines;
+	}
+
+	#sameLayoutCacheKey(a: LayoutCacheKey, b: LayoutCacheKey): boolean {
+		return a.docVersion === b.docVersion && a.contentWidth === b.contentWidth && a.optionsKey === b.optionsKey;
+	}
+
+	#replaceCachedLogicalLine(cache: LayoutCache, lineIndex: number, contentWidth: number): void {
+		const start = cache.lineStarts[lineIndex] ?? cache.lines.length;
+		const oldCount = cache.lineCounts[lineIndex] ?? 0;
+		const replacement = this.#layoutLogicalLine(lineIndex, contentWidth);
+		cache.lines.splice(start, oldCount, ...replacement);
+		cache.lineCounts[lineIndex] = replacement.length;
+		const delta = replacement.length - oldCount;
+		if (delta !== 0) {
+			for (let i = lineIndex + 1; i < cache.lineStarts.length; i++) {
+				cache.lineStarts[i] = (cache.lineStarts[i] ?? 0) + delta;
+			}
+		}
+	}
+
+	#patchCursorInCachedLayout(cache: LayoutCache, contentWidth: number): LayoutLine[] {
+		const previousLine = cache.cursorLine;
+		const currentLine = this.#state.cursorLine;
+		this.#replaceCachedLogicalLine(cache, previousLine, contentWidth);
+		if (currentLine !== previousLine) {
+			this.#replaceCachedLogicalLine(cache, currentLine, contentWidth);
+		}
+		cache.cursorLine = currentLine;
+		cache.cursorCol = this.#state.cursorCol;
+		return cache.lines;
+	}
+
+	#layoutText(contentWidth: number): LayoutLine[] {
+		__editorPerfCounters.layoutTextInvocations += 1;
+		const key = this.#makeLayoutCacheKey(contentWidth);
+		const cached = this.#layoutCache;
+		if (cached && this.#sameLayoutCacheKey(cached.key, key)) {
+			if (cached.cursorLine === this.#state.cursorLine && cached.cursorCol === this.#state.cursorCol) {
+				return cached.lines;
+			}
+			return this.#patchCursorInCachedLayout(cached, contentWidth);
+		}
+
+		const layoutLines: LayoutLine[] = [];
+		const lineStarts: number[] = [];
+		const lineCounts: number[] = [];
+
+		if (this.#state.lines.length === 0 || (this.#state.lines.length === 1 && this.#state.lines[0] === "")) {
+			this.#wrappedLineCache.length = this.#state.lines.length;
+			lineStarts[0] = 0;
+			lineCounts[0] = 1;
+			layoutLines.push(this.#layoutLine("", 0, true, 0));
+		} else {
+			for (let i = 0; i < this.#state.lines.length; i++) {
+				lineStarts[i] = layoutLines.length;
+				const logicalLayout = this.#layoutLogicalLine(i, contentWidth);
+				lineCounts[i] = logicalLayout.length;
+				layoutLines.push(...logicalLayout);
 			}
 		}
 
 		this.#wrappedLineCache.length = this.#state.lines.length;
+		this.#layoutCache = {
+			key,
+			cursorLine: this.#state.cursorLine,
+			cursorCol: this.#state.cursorCol,
+			lines: layoutLines,
+			lineStarts,
+			lineCounts,
+		};
 		return layoutLines;
 	}
 
@@ -1592,6 +1830,7 @@ export class Editor implements Component, Focusable {
 		this.#resetKillSequence();
 		this.#preferredVisualCol = null;
 		this.#state.lines[this.#state.cursorLine] = beforeTransient + afterTransient;
+		this.#bumpDocumentVersion();
 		this.#setCursorCol(transientStartCol);
 
 		while (true) {
@@ -1640,18 +1879,51 @@ export class Editor implements Component, Focusable {
 	/** Insert text at the current cursor position */
 	insertText(text: string): void {
 		this.#exitHistoryForEditing();
-		this.#resetKillSequence();
-		this.#recordUndoState();
+		this.#insertTextAtCursor(text);
+	}
+	/**
+	 * Delete an exact text run immediately before the cursor as one edit.
+	 * Returns false without changing the document when the text is not present.
+	 */
+	deleteTextBeforeCursor(text: string): boolean {
+		if (text.length === 0 || this.#state.cursorCol < text.length) return false;
 
 		const line = this.#state.lines[this.#state.cursorLine] || "";
-		const inserted = insertTextNfcAt(line, this.#state.cursorCol, text);
+		const startCol = this.#state.cursorCol - text.length;
+		if (line.slice(startCol, this.#state.cursorCol) !== text) return false;
 
-		this.#state.lines[this.#state.cursorLine] = inserted.line;
-		this.#setCursorCol(inserted.cursorCol);
+		this.#exitHistoryForEditing();
+		this.#resetKillSequence();
+		this.#recordUndoState();
+		this.#state.lines[this.#state.cursorLine] = line.slice(0, startCol) + line.slice(this.#state.cursorCol);
+		this.#setCursorCol(startCol);
+		this.#notifyBackwardDelete();
+		return true;
+	}
+	/**
+	 * Delete a same-line text range containing the cursor as one edit.
+	 * Returns false without changing the document when the range is invalid.
+	 */
+	deleteTextRangeAroundCursor(startCol: number, endCol: number): boolean {
+		const line = this.#state.lines[this.#state.cursorLine] || "";
+		if (
+			!Number.isInteger(startCol) ||
+			!Number.isInteger(endCol) ||
+			startCol < 0 ||
+			startCol >= endCol ||
+			endCol > line.length ||
+			startCol > this.#state.cursorCol ||
+			endCol < this.#state.cursorCol
+		)
+			return false;
 
-		if (this.onChange) {
-			this.onChange(this.getText());
-		}
+		this.#exitHistoryForEditing();
+		this.#resetKillSequence();
+		this.#recordUndoState();
+		this.#state.lines[this.#state.cursorLine] = line.slice(0, startCol) + line.slice(endCol);
+		this.#setCursorCol(startCol);
+		this.#notifyBackwardDelete();
+		return true;
 	}
 
 	// All the editor methods from before...
@@ -1695,9 +1967,17 @@ export class Editor implements Component, Focusable {
 
 		// Check if we should trigger or update autocomplete
 		if (!this.#autocompleteState) {
-			// Auto-trigger for "/" at the start of a line (slash commands)
-			if (char === "/" && this.#isAtStartOfSubmittedMessage()) {
-				this.#tryTriggerAutocomplete();
+			// Auto-trigger slash commands, or path-only completion inside inline code.
+			if (char === "/") {
+				const currentLine = this.#state.lines[this.#state.cursorLine] || "";
+				const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
+				if (this.#isInSubmittedSlashCommandContext()) {
+					this.#tryTriggerAutocomplete();
+				} else if (isInsideInlineCodeSpan(textBeforeCursor)) {
+					this.#forceFileAutocomplete();
+				} else if (this.#isInSlashTokenContext()) {
+					this.#tryTriggerAutocomplete();
+				}
 			}
 			// Auto-trigger for "@" file reference (fuzzy search)
 			else if (char === "@") {
@@ -1714,11 +1994,11 @@ export class Editor implements Component, Focusable {
 				this.#tryTriggerAutocomplete();
 			}
 			// Also auto-trigger when typing letters/path chars in a completable context
-			else if (/[a-zA-Z0-9.\-_/]/.test(char)) {
+			else if (/[\p{L}0-9.\-_/]/u.test(char)) {
 				const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 				const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
-				// Check if we're in a slash command (with or without space for arguments)
-				if (this.#isInSubmittedSlashCommandContext()) {
+				// Check if we're in a slash command or inline slash token
+				if (this.#isInSubmittedSlashCommandContext() || this.#isInSlashTokenContext()) {
 					this.#tryTriggerAutocomplete();
 				}
 				// Check if we're in an @ file reference context
@@ -1742,49 +2022,48 @@ export class Editor implements Component, Focusable {
 	#handlePaste(pastedText: string): void {
 		this.#historyIndex = -1; // Exit history browsing mode
 		this.#resetKillSequence();
+		const hadAutocomplete = this.#autocompleteState !== null;
+		this.#cancelAutocomplete();
+		if (hadAutocomplete) {
+			this.onAutocompleteUpdate?.();
+		}
+
+		// Some terminals (e.g. tmux popups with extended-keys-format=csi-u) re-encode
+		// control bytes inside bracketed paste as CSI-u Ctrl+<letter> sequences
+		// (ESC [ <codepoint> ; 5 u). Decode those back to their literal byte so the
+		// per-char filter below preserves newlines instead of stripping ESC and
+		// leaking the printable tail (e.g. "[106;5u") into the editor.
+		const decodedText = pastedText.replace(/\x1b\[(\d+);5u/g, (match, code) => {
+			const cp = Number(code);
+			if (cp >= 97 && cp <= 122) return String.fromCharCode(cp - 96);
+			if (cp >= 65 && cp <= 90) return String.fromCharCode(cp - 64);
+			return match;
+		});
+
+		// Clean the pasted text. NFC-normalize so macOS Finder drag-drops of
+		// Korean filenames (which arrive as NFD: e.g. `ᄒ`+`ᅪ` instead of `화`)
+		// land in the buffer as the same precomposed syllables a terminal
+		// renders — without this, cursor column accounting drifts by
+		// `(NFD cells − NFC cells)` and the visible glyph desyncs from the
+		// hardware cursor. Matches the `Input` component's prior fix; this
+		// is the same fix on the real GJC prompt component (`Editor`).
+		const cleanText = decodedText.replace(/\r\n?/g, "\n").normalize("NFC");
+
+		// Convert tabs to spaces (4 spaces per tab)
+		const tabExpandedText = cleanText.replace(/\t/g, "    ");
+
+		// Filter out non-printable characters except newlines
+		const filteredText = tabExpandedText
+			.split("")
+			.filter(char => char === "\n" || char.charCodeAt(0) >= 32)
+			.join("");
+
+		// Nothing survived filtering: the buffer is untouched, so don't record
+		// an undo snapshot — a no-op entry would make the next undo appear dead.
+		if (filteredText.length === 0) return;
+
 		this.#recordUndoState();
-
 		this.#withUndoSuspended(() => {
-			// Some terminals (e.g. tmux popups with extended-keys-format=csi-u) re-encode
-			// control bytes inside bracketed paste as CSI-u Ctrl+<letter> sequences
-			// (ESC [ <codepoint> ; 5 u). Decode those back to their literal byte so the
-			// per-char filter below preserves newlines instead of stripping ESC and
-			// leaking the printable tail (e.g. "[106;5u") into the editor.
-			const decodedText = pastedText.replace(/\x1b\[(\d+);5u/g, (match, code) => {
-				const cp = Number(code);
-				if (cp >= 97 && cp <= 122) return String.fromCharCode(cp - 96);
-				if (cp >= 65 && cp <= 90) return String.fromCharCode(cp - 64);
-				return match;
-			});
-
-			// Clean the pasted text. NFC-normalize so macOS Finder drag-drops of
-			// Korean filenames (which arrive as NFD: e.g. `ᄒ`+`ᅪ` instead of `화`)
-			// land in the buffer as the same precomposed syllables a terminal
-			// renders — without this, cursor column accounting drifts by
-			// `(NFD cells − NFC cells)` and the visible glyph desyncs from the
-			// hardware cursor. Matches the `Input` component's prior fix; this
-			// is the same fix on the real GJC prompt component (`Editor`).
-			const cleanText = decodedText.replace(/\r\n?/g, "\n").normalize("NFC");
-
-			// Convert tabs to spaces (4 spaces per tab)
-			const tabExpandedText = cleanText.replace(/\t/g, "    ");
-
-			// Filter out non-printable characters except newlines
-			let filteredText = tabExpandedText
-				.split("")
-				.filter(char => char === "\n" || char.charCodeAt(0) >= 32)
-				.join("");
-
-			// If pasting a file path (starts with /, ~, or .) and the character before
-			// the cursor is a word character, prepend a space for better readability
-			if (/^[/~.]/.test(filteredText)) {
-				const currentLine = this.#state.lines[this.#state.cursorLine] || "";
-				const charBeforeCursor = this.#state.cursorCol > 0 ? currentLine[this.#state.cursorCol - 1] : "";
-				if (charBeforeCursor && /\w/.test(charBeforeCursor)) {
-					filteredText = ` ${filteredText}`;
-				}
-			}
-
 			// Split into lines
 			const pastedLines = filteredText.split("\n");
 
@@ -1806,15 +2085,10 @@ export class Editor implements Component, Focusable {
 				return;
 			}
 
-			if (pastedLines.length === 1) {
-				// Single line - insert character by character to trigger autocomplete
-				for (const char of filteredText) {
-					this.#insertCharacter(char);
-				}
-				return;
-			}
-
-			// Multi-line paste - use insertTextAtCursor for proper handling
+			// Paste is literal input, not typed input. Insert atomically so leading
+			// trigger characters such as "/", "#", "@", ":", or path-like text do
+			// not open or update autocomplete lists while preserving normal typed
+			// trigger behavior.
 			this.#insertTextAtCursor(filteredText);
 		});
 	}
@@ -1859,6 +2133,7 @@ export class Editor implements Component, Focusable {
 		const result = this.#expandPasteMarkers(this.#state.lines.join("\n")).trim();
 
 		this.#state = { lines: [""], cursorLine: 0, cursorCol: 0 };
+		this.#bumpDocumentVersion();
 		this.#pastes.clear();
 		this.#pasteCounter = 0;
 		this.#historyIndex = -1;
@@ -1866,8 +2141,8 @@ export class Editor implements Component, Focusable {
 		this.#undoStack.length = 0;
 		this.#wrappedLineCache.length = 0;
 
-		if (this.onChange) this.onChange("");
 		if (this.onSubmit) this.onSubmit(result);
+		if (this.onChange) this.onChange("");
 	}
 
 	#handleBackspace(): void {
@@ -1902,6 +2177,10 @@ export class Editor implements Component, Focusable {
 			this.#setCursorCol(previousLine.length);
 		}
 
+		this.#notifyBackwardDelete();
+	}
+
+	#notifyBackwardDelete(): void {
 		if (this.onChange) {
 			this.onChange(this.getText());
 		}
@@ -1913,8 +2192,8 @@ export class Editor implements Component, Focusable {
 			// If autocomplete was cancelled (no matches), re-trigger if we're in a completable context
 			const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 			const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
-			// Slash command context
-			if (this.#isInSubmittedSlashCommandContext()) {
+			// Slash command or inline slash token context
+			if (this.#isInSubmittedSlashCommandContext() || this.#isInSlashTokenContext()) {
 				this.#tryTriggerAutocomplete();
 			}
 			// @ file reference context
@@ -2050,6 +2329,7 @@ export class Editor implements Component, Focusable {
 	#recordUndoState(): void {
 		if (this.#suspendUndo) return;
 		this.#undoStack.push(structuredClone(this.#state));
+		this.#bumpDocumentVersion();
 	}
 
 	#applyUndo(): void {
@@ -2060,6 +2340,8 @@ export class Editor implements Component, Focusable {
 		this.#resetKillSequence();
 		this.#preferredVisualCol = null;
 		Object.assign(this.#state, snapshot);
+		this.#bumpDocumentVersion();
+		this.onUndo?.(this.getText());
 
 		if (this.onChange) {
 			this.onChange(this.getText());
@@ -2070,7 +2352,7 @@ export class Editor implements Component, Focusable {
 		} else {
 			const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 			const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
-			if (this.#isInSubmittedSlashCommandContext()) {
+			if (this.#isInSubmittedSlashCommandContext() || this.#isInSlashTokenContext()) {
 				this.#tryTriggerAutocomplete();
 			} else if (textBeforeCursor.match(/(?:^|[\s])@[^\s]*$/)) {
 				this.#tryTriggerAutocomplete();
@@ -2384,8 +2666,8 @@ export class Editor implements Component, Focusable {
 		} else {
 			const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 			const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
-			// Slash command context
-			if (this.#isInSubmittedSlashCommandContext()) {
+			// Slash command or inline slash token context
+			if (this.#isInSubmittedSlashCommandContext() || this.#isInSlashTokenContext()) {
 				this.#tryTriggerAutocomplete();
 			}
 			// @ file reference context
@@ -2565,6 +2847,12 @@ export class Editor implements Component, Focusable {
 					: this.#state.cursorCol - 1
 				: undefined;
 
+			// Backward from column 0: lastIndexOf clamps a negative position to 0,
+			// which would match the character under the cursor instead of skipping it
+			if (!isForward && searchFrom !== undefined && searchFrom < 0) {
+				continue;
+			}
+
 			const idx = isForward ? line.indexOf(char, searchFrom) : line.lastIndexOf(char, searchFrom);
 
 			if (idx !== -1) {
@@ -2600,18 +2888,53 @@ export class Editor implements Component, Focusable {
 		return true;
 	}
 
-	// Slash commands execute only when the submitted prompt starts with the command.
-	#isAtStartOfSubmittedMessage(): boolean {
-		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
-		const beforeCursor = currentLine.slice(0, this.#state.cursorCol);
-
-		return this.#hasOnlyWhitespaceBeforeCursorLine() && (beforeCursor.trim() === "" || beforeCursor.trim() === "/");
-	}
-
 	#isInSubmittedSlashCommandContext(): boolean {
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 		const beforeCursor = currentLine.slice(0, this.#state.cursorCol);
-		return this.#hasOnlyWhitespaceBeforeCursorLine() && beforeCursor.trimStart().startsWith("/");
+		return isSlashCommandPromptStart(this.#state.lines, this.#state.cursorLine, beforeCursor);
+	}
+
+	#getSlashTokenBeforeCursor(): string | null {
+		if (!this.#hasOnlyWhitespaceBeforeCursorLine()) return null;
+		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
+		const beforeCursor = currentLine.slice(0, this.#state.cursorCol);
+		return extractSlashCommandTokenPrefix(beforeCursor.trimStart());
+	}
+
+	#isInSlashTokenContext(): boolean {
+		return this.#getSlashTokenBeforeCursor() !== null;
+	}
+	#isAutocompleteSelectionCurrent(): boolean {
+		if (!this.#isAutocompleteOriginCurrent()) return false;
+		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
+		const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
+		if (!textBeforeCursor.endsWith(this.#autocompletePrefix)) return false;
+		if (this.#autocompleteState !== "regular" || !this.#autocompletePrefix.startsWith("/")) return true;
+		return this.#getSlashTokenBeforeCursor() === this.#autocompletePrefix;
+	}
+	#captureAutocompleteOrigin(): { docVersion: number; cursorLine: number; cursorCol: number } {
+		return {
+			docVersion: this.#docVersion,
+			cursorLine: this.#state.cursorLine,
+			cursorCol: this.#state.cursorCol,
+		};
+	}
+
+	#isAutocompleteOriginCurrent(origin = this.#autocompleteOrigin): boolean {
+		return (
+			origin !== undefined &&
+			origin.docVersion === this.#docVersion &&
+			origin.cursorLine === this.#state.cursorLine &&
+			origin.cursorCol === this.#state.cursorCol
+		);
+	}
+
+	#isSlashCommandNameAutocompleteContext(): boolean {
+		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
+		const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol).trimStart();
+		return (
+			this.#isInSubmittedSlashCommandContext() && textBeforeCursor.startsWith("/") && !textBeforeCursor.includes(" ")
+		);
 	}
 
 	#isSlashCommandNameAutocompleteSelection(): boolean {
@@ -2619,11 +2942,7 @@ export class Editor implements Component, Focusable {
 			return false;
 		}
 
-		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
-		const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol).trimStart();
-		return (
-			this.#isInSubmittedSlashCommandContext() && textBeforeCursor.startsWith("/") && !textBeforeCursor.includes(" ")
-		);
+		return this.#isSlashCommandNameAutocompleteContext();
 	}
 
 	#isCompletedSlashCommandAtCursor(): boolean {
@@ -2654,6 +2973,7 @@ export class Editor implements Component, Focusable {
 			}
 		}
 
+		const origin = this.#captureAutocompleteOrigin();
 		const requestId = ++this.#autocompleteRequestId;
 
 		const suggestions = await this.#autocompleteProvider.getSuggestions(
@@ -2661,12 +2981,13 @@ export class Editor implements Component, Focusable {
 			this.#state.cursorLine,
 			this.#state.cursorCol,
 		);
-		if (requestId !== this.#autocompleteRequestId) return;
+		if (requestId !== this.#autocompleteRequestId || !this.#isAutocompleteOriginCurrent(origin)) return;
 
 		if (suggestions && Array.isArray(suggestions.items) && suggestions.items.length > 0) {
 			this.#autocompletePrefix = suggestions.prefix;
-			this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
+			this.#autocompleteList = this.#createAutocompleteList(suggestions.items, suggestions.kind ?? "default");
 			this.#autocompleteState = "regular";
+			this.#autocompleteOrigin = origin;
 			this.onAutocompleteUpdate?.();
 		} else {
 			this.#cancelAutocomplete();
@@ -2675,14 +2996,11 @@ export class Editor implements Component, Focusable {
 		}
 	}
 	#createAutocompleteList(
-		prefix: string,
 		items: Array<{ value: string; label: string; description?: string }>,
+		kind: AutocompleteSuggestionKind,
 	): SelectList {
-		// Layout options prepared for future SelectList enhancements (e.g., for slash commands)
-		const layout = prefix.startsWith("/") ? SLASH_COMMAND_SELECT_LIST_LAYOUT : undefined;
-		// TODO: Pass layout to SelectList when constructor is updated to support it
-		void layout; // Use layout variable to avoid lint warnings
-		return new SelectList(items, this.#autocompleteMaxVisible, this.#theme.selectList);
+		const layout = kind === "slash-command" ? SLASH_COMMAND_SELECT_LIST_LAYOUT : undefined;
+		return new SelectList(items, this.#autocompleteMaxVisible, this.#theme.selectList, layout);
 	}
 
 	#handleTabCompletion(): void {
@@ -2695,7 +3013,10 @@ export class Editor implements Component, Focusable {
 		const beforeCursor = currentLine.slice(0, this.#state.cursorCol);
 
 		// Check if we're in a slash command context
-		if (this.#isInSubmittedSlashCommandContext() && !beforeCursor.trimStart().includes(" ")) {
+		if (
+			(this.#isInSubmittedSlashCommandContext() && !beforeCursor.trimStart().includes(" ")) ||
+			this.#isInSlashTokenContext()
+		) {
 			this.#handleSlashCommandCompletion();
 		} else {
 			this.#forceFileAutocomplete(true);
@@ -2723,13 +3044,14 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 			return;
 		}
 
+		const origin = this.#captureAutocompleteOrigin();
 		const requestId = ++this.#autocompleteRequestId;
 		const suggestions = await provider.getForceFileSuggestions(
 			this.#state.lines,
 			this.#state.cursorLine,
 			this.#state.cursorCol,
 		);
-		if (requestId !== this.#autocompleteRequestId) return;
+		if (requestId !== this.#autocompleteRequestId || !this.#isAutocompleteOriginCurrent(origin)) return;
 
 		if (suggestions && Array.isArray(suggestions.items) && suggestions.items.length > 0) {
 			// If there's exactly one suggestion and this was an explicit Tab press, apply it immediately
@@ -2744,6 +3066,7 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 				);
 
 				this.#state.lines = result.lines;
+				this.#bumpDocumentVersion();
 				this.#state.cursorLine = result.cursorLine;
 				this.#setCursorCol(result.cursorCol);
 
@@ -2754,8 +3077,9 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 			}
 
 			this.#autocompletePrefix = suggestions.prefix;
-			this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
+			this.#autocompleteList = this.#createAutocompleteList(suggestions.items, "default");
 			this.#autocompleteState = "force";
+			this.#autocompleteOrigin = origin;
 			this.onAutocompleteUpdate?.();
 		} else {
 			this.#cancelAutocomplete();
@@ -2770,6 +3094,7 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 		this.#autocompleteRequestId += 1;
 		this.#autocompleteState = null;
 		this.#autocompleteList = undefined;
+		this.#autocompleteOrigin = undefined;
 		this.#autocompletePrefix = "";
 		if (notifyCancel && wasAutocompleting) {
 			this.onAutocompleteCancel?.();
@@ -2789,6 +3114,7 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 			return;
 		}
 
+		const origin = this.#captureAutocompleteOrigin();
 		const requestId = ++this.#autocompleteRequestId;
 
 		const suggestions = await this.#autocompleteProvider.getSuggestions(
@@ -2796,12 +3122,13 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 			this.#state.cursorLine,
 			this.#state.cursorCol,
 		);
-		if (requestId !== this.#autocompleteRequestId) return;
+		if (requestId !== this.#autocompleteRequestId || !this.#isAutocompleteOriginCurrent(origin)) return;
 
 		if (suggestions && Array.isArray(suggestions.items) && suggestions.items.length > 0) {
 			this.#autocompletePrefix = suggestions.prefix;
 			// Always create new SelectList to ensure update
-			this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
+			this.#autocompleteList = this.#createAutocompleteList(suggestions.items, suggestions.kind ?? "default");
+			this.#autocompleteOrigin = origin;
 			this.onAutocompleteUpdate?.();
 		} else {
 			this.#cancelAutocomplete();

@@ -10,6 +10,7 @@ import {
 	isUltragoalAskBlocked,
 	isUltragoalBypassPrompt,
 	isUltragoalPauseBlocked,
+	readUltragoalVerificationState,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
 import {
 	countUltragoalNudges,
@@ -18,12 +19,14 @@ import {
 	readUltragoalLedger,
 	readUltragoalPlan,
 	recordUltragoalBlockerClassification,
+	recordUltragoalCriticVerdict,
 	recordUltragoalNudgeIfBudgetRemaining,
 	resolveUltragoalNudgeBudget,
 	selectUltragoalNudgeTarget,
 	type UltragoalNudgeSurface,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 import { assertUltragoalAskAllowed } from "@gajae-code/coding-agent/tools/ultragoal-ask-guard";
+import { YAML } from "bun";
 
 const TEST_SESSION_ID = "ultragoal-nudge-guard-test-session";
 const ORIGINAL_GJC_SESSION_ID = process.env.GJC_SESSION_ID;
@@ -39,7 +42,10 @@ async function tempDir(): Promise<string> {
 async function setProjectBudget(cwd: string, budget: number): Promise<void> {
 	const gjcDir = path.join(cwd, ".gjc");
 	await fs.mkdir(gjcDir, { recursive: true });
-	await fs.writeFile(path.join(gjcDir, "settings.json"), JSON.stringify({ "gjc.ultragoal.nudgeBudget": budget }));
+	await fs.writeFile(
+		path.join(gjcDir, "config.yml"),
+		YAML.stringify({ gjc: { ultragoal: { nudgeBudget: budget } } }, null, 2),
+	);
 }
 
 const SINGLE_BRIEF = "Implement the story";
@@ -59,6 +65,36 @@ afterEach(async () => {
 });
 
 describe("ultragoal nudge guard", () => {
+	it("links a reworded goal to its ultragoal run through provenance", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: SINGLE_BRIEF });
+
+		const diagnostic = await readUltragoalVerificationState({
+			cwd,
+			sessionId: TEST_SESSION_ID,
+			currentGoal: {
+				objective: "Reworded after plan creation",
+				provenance: { source: "ultragoal", runId: TEST_SESSION_ID, goalId: "G001" },
+			},
+		});
+
+		expect(diagnostic.state).toBe("active_missing_final_receipt");
+	});
+
+	it("preserves legacy objective matching when goal provenance is absent", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: SINGLE_BRIEF });
+
+		const diagnostic = await readUltragoalVerificationState({
+			cwd,
+			sessionId: TEST_SESSION_ID,
+			currentGoal: { objective: "Unrelated reworded objective" },
+		});
+
+		expect(diagnostic.state).toBe("unrelated_goal");
+	});
 	// AC5: the escalating refusal text must never trip the bypass detector.
 	it("AC5: formatted nudge text never trips isUltragoalBypassPrompt for any surface", () => {
 		const surfaces: UltragoalNudgeSurface[] = ["pause", "drop", "ask", "premature_complete"];
@@ -91,19 +127,21 @@ describe("ultragoal nudge guard", () => {
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await setProjectBudget(cwd, 1);
 		await createUltragoalPlan({ cwd, brief: SINGLE_BRIEF });
-		await recordUltragoalBlockerClassification({
-			cwd,
-			classification: "human_blocked",
-			evidence: "User must provide production API credentials",
-		});
-		// Budget 1: first pause attempt is nudged even though the blocker is human_blocked.
+		// Budget 1: the first pause attempt is nudged before the human-only blocker is classified.
 		await expect(assertUltragoalPauseAllowed(cwd)).rejects.toThrow(/try-harder nudge \(1\/1\)/);
-		// Re-record human_blocked as the latest event, then exhausted budget falls back to today's allowance.
-		await recordUltragoalBlockerClassification({
+		const classification = await recordUltragoalBlockerClassification({
 			cwd,
 			classification: "human_blocked",
 			evidence: "User must provide production API credentials",
 		});
+		await recordUltragoalCriticVerdict({
+			cwd,
+			terminus: "pause",
+			verdict: "OKAY",
+			evidence: "critic confirms the remaining blocker requires human action",
+			classificationEventId: classification.eventId,
+		});
+		// The exhausted budget now falls back to the bound clean human-blocked allowance.
 		await expect(assertUltragoalPauseAllowed(cwd)).resolves.toBeUndefined();
 	});
 
@@ -160,6 +198,25 @@ describe("ultragoal nudge guard", () => {
 		const ledger = await readUltragoalLedger(cwd, TEST_SESSION_ID);
 		const askNudges = ledger.filter(event => event.event === "nudge" && event.surface === "ask");
 		expect(askNudges.length).toBe(1);
+	});
+
+	// Session profile: the ask guard resolves the nudge budget from the
+	// session agent directory (a tenant profile with nudgeBudget 0 is never
+	// nudged) instead of the process-default profile.
+	it("AC1: the session agent directory selects the nudge budget profile", async () => {
+		const cwd = await tempDir();
+		const tenantAgentDir = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: SINGLE_BRIEF });
+		await fs.writeFile(
+			path.join(tenantAgentDir, "config.yml"),
+			YAML.stringify({ gjc: { ultragoal: { nudgeBudget: 0 } } }, null, 2),
+		);
+		// The tenant forbids nudges: the ask assert falls straight to the
+		// block message and appends no nudge row.
+		await expect(assertUltragoalAskAllowed(cwd, { sessionId: TEST_SESSION_ID }, tenantAgentDir)).rejects.toThrow();
+		const ledger = await readUltragoalLedger(cwd, TEST_SESSION_ID);
+		expect(ledger.filter(event => event.event === "nudge" && event.surface === "ask").length).toBe(0);
 	});
 
 	// AC1 (drop): a real give-up drop is nudged while budget remains.
@@ -280,20 +337,57 @@ describe("ultragoal nudge guard", () => {
 	});
 
 	// AC4: default budget is 10 and a project setting takes precedence over the user setting.
+	//
+	// The user-settings half runs in a child process. `GJC_CONFIG_DIR` is a config
+	// root *dirname under home* (PR #3327), not a full path, and `getConfigRootDir()`
+	// joins it onto `os.homedir()` — which an in-process test cannot redirect. Setting
+	// it to an absolute path here silently resolved nothing and the assertion only
+	// passed while the reader still treated the value as a full path.
 	it("AC4: nudge budget default is 10 and project overrides user", async () => {
 		const cwd = await tempDir();
 		const defaultResolved = await resolveUltragoalNudgeBudget(cwd);
 		expect(defaultResolved.budget).toBe(10);
-		const userDir = await tempDir();
-		await fs.mkdir(path.join(userDir, ".gjc"), { recursive: true });
+
+		const home = await tempDir();
+		await fs.mkdir(path.join(home, ".gjc", "agent"), { recursive: true });
 		await fs.writeFile(
-			path.join(userDir, ".gjc", "settings.json"),
-			JSON.stringify({ "gjc.ultragoal.nudgeBudget": 3 }),
+			path.join(home, ".gjc", "agent", "config.yml"),
+			YAML.stringify({ gjc: { ultragoal: { nudgeBudget: 3 } } }, null, 2),
 		);
-		process.env.GJC_CONFIG_DIR = path.join(userDir, ".gjc");
-		expect((await resolveUltragoalNudgeBudget(cwd)).budget).toBe(3);
+		const probe = path.join(import.meta.dir, "..", "fixtures", "config-root-settings-probe.ts");
+		const userOnly = Bun.spawn([process.execPath, probe], {
+			cwd,
+			env: {
+				...process.env,
+				HOME: home,
+				GJC_CONFIG_DIR: ".gjc",
+				GJC_CODING_AGENT_DIR: path.join(home, ".gjc", "agent"),
+				PI_CODING_AGENT_DIR: path.join(home, ".gjc", "agent"),
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const userOut = await new Response(userOnly.stdout).text();
+		expect(await userOnly.exited).toBe(0);
+		expect(JSON.parse(userOut.trim()).ultragoal.budget).toBe(3);
+
+		// A project setting still wins over that user setting.
 		await setProjectBudget(cwd, 7);
-		expect((await resolveUltragoalNudgeBudget(cwd)).budget).toBe(7);
+		const projectWins = Bun.spawn([process.execPath, probe], {
+			cwd,
+			env: {
+				...process.env,
+				HOME: home,
+				GJC_CONFIG_DIR: ".gjc",
+				GJC_CODING_AGENT_DIR: path.join(home, ".gjc", "agent"),
+				PI_CODING_AGENT_DIR: path.join(home, ".gjc", "agent"),
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const projectOut = await new Response(projectWins.stdout).text();
+		expect(await projectWins.exited).toBe(0);
+		expect(JSON.parse(projectOut.trim()).ultragoal.budget).toBe(7);
 	});
 
 	// AC4: budget 0 is an opt-out — the writer never appends and reports exhausted.

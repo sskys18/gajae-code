@@ -1,203 +1,387 @@
+<p align="right">
+  <strong>English</strong> | <a href="README.ko.md">한국어</a> | <a href="README.zh-CN.md">中文</a> | <a href="README.ja.md">日本語</a>
+</p>
+
 <p align="center">
   <img src="assets/hero.png" alt="Gajae-Code autonomous coding-agent hero illustration" width="100%" />
 </p>
 
-<h1 align="center">Gajae-Code</h1>
+<h1 align="center">G A J A E - C O D E</h1>
 
 <p align="center">
-  <strong>Encode intention. Decode software.</strong><br />
-  A focused coding-agent runner for interviews, reviewed plans, tmux-native execution, and durable verification.
+  <strong>Encode intention. Decode software.</strong>
+  <br/>
+  <sub>The coding agent that runs on the <strong>plan you already pay for</strong> — and answers to your phone.</sub>
 </p>
 
 <p align="center">
   <a href="https://gajae-code.com"><img alt="Website" src="https://img.shields.io/badge/website-gajae--code.com-ff4d4f?style=flat-square"></a>
   <a href="https://www.npmjs.com/package/gajae-code"><img alt="npm package" src="https://img.shields.io/npm/v/gajae-code?style=flat-square"></a>
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green?style=flat-square"></a>
-  <a href="https://discord.gg/8vPXmxSt9"><img alt="Discord" src="https://img.shields.io/badge/Discord-join-5865F2?style=flat-square&logo=discord&logoColor=white"></a>
+  <a href="https://discord.gg/wSyUQYfhAw"><img alt="Discord" src="https://img.shields.io/badge/Discord-join-5865F2?style=flat-square&logo=discord&logoColor=white"></a>
 </p>
 
 <p align="center">
-  <img src="assets/character.png" alt="Gajae-Code character mascot" width="320" />
+  <a href="https://github.com/devswha/gajae-code-app"><strong>🖥️ Desktop app (experimental, community-built)</strong></a> — a third-party, community-built desktop interface for Gajae-Code. Not an official first-party app; use at your own discretion.
 </p>
+
+<p align="center">
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#why-gajae-code">Why</a> ·
+  <a href="#bring-your-coding-plan">Coding Plans</a> ·
+  <a href="#answer-from-your-phone">Phone</a> ·
+  <a href="#plan-before-mutation">Workflow</a> ·
+  <a href="#spend-fewer-tokens">Token Diet</a> ·
+  <a href="#let-openclaw--hermes--grokbot--your-own-bot-drive-gjc">Controllers</a> ·
+  <a href="#run-gjc-inside-paseo-orca-or-t3-code">Agent Shells</a> ·
+  <a href="#documentation">Docs</a>
+</p>
+
+**Log in with the subscription you already have, plan before a single file mutates, execute with evidence — and answer the agent's questions from your terminal, your phone, or your own bot.**
+
+Gajae-Code (`gjc`) is an external coding-agent harness: drop it into any repository or worktree. No separate API billing. No per-token anxiety. No terminal babysitting.
 
 > Gajae-Code is an experimental, beta-stage project. Expect rough edges and verify outputs before relying on it for important work.
 
-## New in 0.7.0
+---
+
+## Why Gajae-Code?
+
+Most coding agents fail on three fronts: they bill you twice, they mutate before they understand, and they go silent the moment you step away from the keyboard.
+
+| Problem | What Happens | Gajae-Code Fix |
+| :--- | :--- | :--- |
+| Separate API billing | You pay for a plan *and* per-token API costs | `/login` with the coding plan you already pay for — Claude, Codex, Cursor, Copilot, OpenCode Go, GOAT, ClinePass, and more |
+| Code-first agents | The agent edits before it understands; you rework | Plan-gated workflow: interview → plan → critique → *then* mutate, with approval gates |
+| Terminal-bound sessions | Agent asks a question at 2 AM; work stalls until morning | Questions route to Telegram/Discord/Slack; you answer from anywhere |
+| Context bloat | Whole-file reads and log floods burn the window | Structural summaries, artifact spill, cache-aware routing, compaction |
+
+---
+
+## Quick Start
+
+**Install** — prebuilt binaries for Linux (x64/arm64), macOS (arm64/x64), and Windows (x64). Bun is not required:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/v0.15.3/scripts/install.sh -o gjc-install.sh
+sh gjc-install.sh
+gjc
+```
+
+Piping `main` executes mutable content; use it only if you explicitly want the latest installer:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh
+```
+
+Windows (PowerShell), tagged:
+
+```powershell
+Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/v0.15.3/scripts/install.ps1 -OutFile gjc-install.ps1
+powershell -File gjc-install.ps1
+```
+
+**First use** — pick your plan and go:
+
+```text
+/login                       pick a provider / coding plan
+/skill:deep-interview        clarify ambiguous requirements
+/skill:ralplan               build and critique the plan
+gjc ultragoal create-goals --brief-file <approved-plan>
+```
+
+**Run modes:**
+
+```sh
+gjc                                # run in the current checkout
+gjc --tmux                         # tmux-backed leader session
+gjc --tmux --worktree my-task      # isolated worktree for risky work
+gjc @screenshot.png "What should I change?"   # image input
+```
+
+Nightly channel: `sh gjc-install.sh --channel nightly` (use the tagged installer downloaded above). Full install matrix, Windows setup, update channels, and shell completion: [docs/install.md](docs/install.md). Bun is only needed to build from source.
+
+---
+
+## Bring your coding plan
 
 <p align="center">
-  <img src="assets/telegram-mobile-hero.png" alt="Gajae Code 0.7.0 mobile answers for coding agents hero illustration" width="100%" />
+  <img src="assets/coding-plans-banner.png" alt="Coding plans and providers GJC runs on: Claude, ChatGPT/Codex, Cursor, GitHub Copilot, OpenCode Go, Kimi, GLM/Z.AI, MiniMax, Grok, Qwen, Command Code GOAT, ClinePass" width="100%" />
 </p>
 
-**Mobile answers for coding agents** — Gajae-Code now ships a configure-once notifications SDK and managed Telegram reference daemon. Each session exposes a loopback WebSocket discovery file and a generic `action_needed`/`reply` protocol so Telegram, Discord, Slack, mobile apps, or local tools can surface pending asks and route answers back without terminal scraping.
+Log in once and run GJC on the subscription you already pay for. Run `/login` inside a session and pick your plan:
 
-The bundled Telegram flow adds a threaded per-session surface with context updates, live/finalized output, image attachments, inline buttons, free-text replies, typing indicators, and double-check acknowledgements. `gjc daemon` keeps one safe long-poll owner per bot token so new sessions attach cleanly instead of tripping Telegram 409 conflicts.
+| Plan / subscription | OAuth login |
+| :--- | :--- |
+| Claude Pro / Max | `anthropic` |
+| ChatGPT Plus / Pro (Codex) | `openai-codex` (browser) · `openai-codex-device` (headless) |
+| Cursor | `cursor` |
+| GitHub Copilot | `github-copilot` |
+| OpenCode Zen / OpenCode Go | `opencode-zen` · `opencode-go` |
+| Kimi Code / Coding Plan / Moonshot | `kimi-code` · `moonshot` |
+| Z.AI GLM Coding Plan | `zai` |
+| MiniMax Coding Plan (Intl / CN) | `minimax-code` · `minimax-code-cn` |
+| xAI (Grok) | `xai` |
+| Alibaba Token Plan / Qwen Portal | `alibaba-token-plan` · `qwen-portal` |
 
-## Also new in 0.6.0
+More OAuth plans — Google Gemini CLI, GitLab Duo, Perplexity Pro/Max, Fire Pass, Xiaomi Token Plan — are covered in [docs/models.md](docs/models.md).
+
+### New: coding-plan presets
+
+Key-based coding plans onboard with one command — the preset writes the API type, base URL, env var, compatibility flags, and a **live model catalog** together, so new models show up without a GJC update:
+
+```sh
+gjc setup provider --preset commandcode-goat   # Command Code GOAT plan (CMD_API_KEY)
+gjc setup provider --preset cline-pass         # ClinePass (CLINE_API_KEY)
+```
+
+- **Command Code GOAT** — discovers the provider's live `/provider/v1/models` catalog and keeps every discovered model, including Claude-named IDs, on the provider's OpenAI-compatible `/chat/completions` transport. Login verifies entitlement with a fixed harmless inference probe before persisting credentials. Aliases: `commandcode`, `goat`.
+- **ClinePass** — no hardcoded models; GJC fetches Cline's live catalog the same way Cline generates its own. Aliases: `clinepass`, `cline`.
+- Also available as presets: `minimax`, `minimax-cn`, `glm`, `alibaba-token-plan` — or `/provider add --preset <name>` inside the TUI.
+
+<details>
+<summary><strong>Beyond coding plans: 50+ providers, gateways, local runtimes</strong></summary>
+
+API-key providers, local runtimes (Ollama, LM Studio, vLLM), and gateways (Cloudflare AI Gateway, Vercel AI Gateway, LiteLLM, and more) all work. Register your own endpoints in `models.yml`, pool multiple accounts per provider with usage-aware routing, mix vendors per agent role with model presets and profiles, or centralize team credentials with the auth broker/gateway.
+
+- [Models, providers, and auth resolution](docs/models.md)
+- [Custom providers & multi-account routing](docs/custom-providers-and-multi-account.md)
+- [Multi-vendor role profiles](docs/multi-vendor-profiles.md)
+- [Auth broker & gateway (shared team credentials)](docs/auth-broker-gateway.md)
+
+</details>
+
+---
+
+## Answer from your phone
 
 <p align="center">
-  <img src="assets/rlm.png" alt="rlm research/REPL mode — Research. Experiment. Iterate." width="100%" />
+  <img src="assets/telegram-mobile-hero.png" alt="Gajae Code mobile answers for coding agents hero illustration" width="100%" />
 </p>
 
-**`rlm`** — an opt-in research/REPL mode. A Jupyter-notebook-style research session over the agent loop, backed by the shared persistent Python kernel with a hard-gated `python` + `read` + `web_search` toolset. Runs aggregate into `.gjc/rlm/<session>/notebook.ipynb` and synthesize a `report.md` on exit. Start it with `gjc rlm`.
+When the agent needs a decision, it pings you on Telegram — and you answer from anywhere:
 
-<p align="center">
-  <img src="assets/computer-use.png" alt="computer-use desktop control — See. Click. Type. Control." width="100%" />
-</p>
+- **Coordinator/lifecycle session forum topics** with live/finalized output, context updates, image attachments, inline buttons, free-text replies, and typing indicators.
+- **Configure once** from `/settings` → Notifications in a running session, or headless via `gjc notify setup|status|health|test|recovery`. Tokens are masked on entry and never displayed again.
+- **`gjc daemon`** keeps one safe long-poll owner per bot token, so new sessions attach cleanly without Telegram 409 conflicts.
+- Discord and Slack delivery ship alongside; the generic `action_needed`/`reply` protocol lets any bot or mobile app route answers back without terminal scraping.
 
-**`computer-use`** — an experimental, opt-in desktop-control tool surface. Backed by native screenshot/input bindings and gated through settings/tool registration, it lets the agent see the screen and drive mouse/keyboard for local desktop coordination.
+[Telegram onboarding](docs/telegram-onboarding.md) · [Discord](docs/discord-onboarding.md) · [Slack](docs/slack-onboarding.md)
 
-## Website
+---
 
-Visit **[gajae-code.com](https://gajae-code.com)** for the Gajae Code landing page, quick-start guide, architecture overview, harness notes, bridge/RPC docs, skills, receipts, remote-control design, and troubleshooting.
+## Plan before mutation
 
-## What is Gajae-Code?
-
-Gajae-Code (`gjc`) is an external coding-agent harness. It runs from the repository or worktree you choose, then gives the agent a small, explicit workflow surface:
+A deliberately small workflow surface — four skills, four role agents, nothing else:
 
 ```text
 deep-interview -> ralplan -> ultragoal
-                         └─ optional team execution when parallel tmux workers help
+               └─ optional autoresearch mission when research must ground the plan
 ```
 
-<p align="center">
-  <img src="assets/character.png" alt="Gajae-Code mascot guiding the deep-interview to ralplan to ultragoal workflow loop" width="240" />
-</p>
+| Surface | What it does |
+| :--- | :--- |
+| `deep-interview` | Turns vague requests into concrete requirements. |
+| `ralplan` | Builds and critiques the implementation plan before code changes. |
+| `ultragoal` | Tracks goals through execution, revision, verification, and evidence. |
+| `autoresearch` | Runs goal-directed research missions and ends on a structured verdict. |
+| `executor` / `architect` / `planner` / `critic` | Bundled role agents for implementation and read-only review lanes. |
 
-It is intentionally not a hidden plugin for Codex CLI, Claude Code, OpenCode, or Claw Code. Start `gjc` beside those tools when you want structured planning, persistent evidence, tmux-backed workers, or an isolated worktree.
+Also included, opt-in: **`computer-use`** (experimental desktop control). See [Python REPL](docs/python-repl.md) and [docs/tools/computer.md](docs/tools/computer.md).
 
-## Install
+## Custom skills
+
+GJC uses the Claude Code / Codex `SKILL.md` file convention, but loads runtime skills directly only from canonical GJC locations — no configuration required:
 
 ```sh
-bun install -g gajae-code
+# project-local, per repository:
+mkdir -p .gjc/skills && cp -r my-skill .gjc/skills/
+
+# user-wide, available in every project:
+mkdir -p ~/.gjc/agent/skills && cp -r my-skill ~/.gjc/agent/skills/
 ```
 
-The scoped package is also available as `@gajae-code/coding-agent`.
+Claude Code and Codex skill directories are import sources only. `gjc skills discover` reports them with the exact copy command; copy a skill into a canonical `.gjc` location before invoking it with `/skill:my-skill`. Scope trust is explicit via `skills.trustProjectSkills` / `skills.trustUserSkills` (both default on), with `skills.enabled` as the master switch. The four bundled workflow skills above can never be replaced by disk skills. See [docs/skills.md](docs/skills.md) for locations, precedence, and diagnostics.
+## Theme defaults
 
-### Supported platforms
+The default dark TUI identity is the GJC red-claw theme; light-appearance terminals default to the bundled blue-crab theme. Explicit theme settings still take precedence.
 
-Prebuilt standalone release binaries are published only for:
+---
 
-- **Linux** — x64 and arm64
-- **Windows** — x64
-- **macOS** — Apple Silicon (arm64) and Intel (x64)
+## Spend fewer tokens
 
-The npm/Bun package path and build-from-source also remain available on every platform.
+GJC optimizes both sides of the token bill:
 
-### macOS Intel install
+- **Cache hits** — per-provider `cacheRetention` control; Anthropic defaults to long (1h) cache retention because short caches are fragile for long agent runs; provider ranking prefers cheap `cacheRead` paths; opt-in session-affinity headers let OpenAI-compatible relays reuse server-side prompt caches.
+- **Context savings** — file reads return structural summaries instead of whole files; oversized shell output is minimized and spilled to retrievable `artifact://` references instead of flooding the context; compaction and branch summaries keep long sessions inside the window without losing prior work.
 
-Standalone release binaries are published for both Apple Silicon (`gjc-darwin-arm64`) and Intel (`gjc-darwin-x64`) macOS. You can also install through the npm/Bun package path or build from source:
+[Cache retention & provider compat](docs/models.md) · [Compaction & branch summaries](docs/compaction.md)
 
-```sh
-bun install -g gajae-code
-# or
-curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --source
-```
+---
 
-### Windows (native install)
+The default dark TUI identity is the GJC red-claw theme; light-appearance terminals default to the bundled blue-crab theme. See [docs/theme.md](docs/theme.md) for the full catalog and `theme.dark` / `theme.light` settings.
 
-On a clean Windows 11 machine, install Bun first, then install `gjc` with Bun's
-global installer:
+## Let OpenClaw / Hermes / Grokbot / your own bot drive GJC
 
-```powershell
-# 1. Install Bun
-powershell -c "irm bun.sh/install.ps1|iex"
+Any external controller — OpenClaw, Hermes, Grokbot, a Discord bot, a cron script — drives real GJC
+sessions through the broker-bound **SDK session CLI** and the bundled
+[`sdk-skills/`](https://github.com/Yeachan-Heo/gajae-code/tree/main/sdk-skills) procedures
+(`gjc-sdk-discover` · `gjc-sdk-operate` · `gjc-sdk-author`). Durable
+turns and credential-free JSON, never terminal scraping.
 
-# 2. Restart the terminal so PATH and the Bun runtime refresh, then confirm Bun
-bun --version
+Don't read a guide — paste this prompt into your controller and let it wire itself up:
 
-# 3. Install and verify gjc
-bun install -g gajae-code
-gjc --version
-gjc --smoke-test
-```
-
-`bun install -g` places the `gjc` launcher in `%USERPROFILE%\.bun\bin`. That
-directory must be on `PATH` for `gjc` to resolve as a command. Bun's installer
-adds it automatically, but the change only applies to terminals started after
-installation — restart PowerShell (or sign out/in) if `gjc` is "not recognized".
-
-Troubleshooting:
-
-- **`gjc` reports an old Bun runtime.** Re-run the Bun installer above, restart
-  the terminal, and confirm `bun --version` matches what `gjc --version`
-  expects. If an older Bun still wins, make sure `%USERPROFILE%\.bun\bin` is
-  first on `PATH` and remove any stale Bun installs shadowing it.
-- **`gjc.exe` exists but `gjc` is "not recognized".** The launcher is installed
-  but not on `PATH`. Confirm `%USERPROFILE%\.bun\bin` is listed in
-  `echo $env:Path`, then restart the terminal.
-- **`gjc --tmux` starts without a tmux-backed session.** Native Windows needs a
-  tmux-compatible executable on `PATH`. For GJC-managed session/team guarantees,
-  use WSL with real tmux, or another provider that round-trips tmux user options
-  such as `@gjc-profile`. Native psmux can provide `tmux`/`pmux`/`psmux`
-  commands, but that path is not fully supported for GJC ownership tags and team
-  guarantees yet; see `docs/environment-variables.md#interactive---tmux-startup-and-scrollmouse-profile`.
-
-## Quick start
-
-```sh
-# Run directly in the current checkout
-gjc
-
-# Use a tmux-backed leader session
-gjc --tmux
-
-# Use an isolated worktree for risky or reviewable work
-# --worktree takes an optional branch-like name, not a filesystem path.
-gjc --tmux --worktree my-task-branch
-
-# If you already created a worktree directory, launch from that directory instead.
-cd ../my-task-worktree && gjc --tmux
-```
-
-### Image input
-
-GJC accepts images in two ways:
-
-- **CLI startup**: prefix a local image path with `@`, for example `gjc @screenshot.png "What should I change?"`.
-- **Interactive TUI**: copy an image to the system clipboard and use the configured **Paste image from clipboard** key (Ctrl+V on Linux/macOS, Alt+V on Windows), or type `#paste-image` and choose the prompt action. When the clipboard is unavailable, paste or pass the image file path with `@path/to/image.png` instead.
-
-Type `#` in the interactive editor to open prompt actions. In a tmux-backed session, choose **Scroll to previous user input** (for example via `#prev`) to enter tmux copy-mode at the previous rendered user message.
-
-Inside a GJC session, use the public workflow surface:
+<details>
+<summary><strong>Copy-paste controller setup prompt</strong></summary>
 
 ```text
-/skill:deep-interview clarify ambiguous requirements
-/skill:ralplan build and critique the implementation plan
-gjc ultragoal create-goals --brief-file <approved-plan>
-gjc ultragoal complete-goals
+Use Gajae-Code (gjc) as your coding-agent backend on this machine. gjc is already installed.
+Your interface is the broker-bound SDK session CLI. Never scrape terminal output, never read
+endpoint records or credentials under .gjc/state/sdk, never open a raw session WebSocket.
+
+1. Load the shipped procedures before acting. Read these skill files from the gjc checkout or
+   from https://github.com/Yeachan-Heo/gajae-code/tree/main/sdk-skills (bundle root
+   `sdk-skills/`, manifest.json formatVersion 1 — if it is missing, malformed, or a different
+   version, stop and report instead of guessing):
+     sdk-skills/gjc-sdk-discover/SKILL.md   -- find and inspect sessions
+     sdk-skills/gjc-sdk-operate/SKILL.md    -- the allowlisted control/lifecycle operations
+     sdk-skills/gjc-sdk-author/SKILL.md     -- TypeScript/Python templates for scripted flows
+   Follow their allowlists exactly. Pass every value as an argv item, never as a shell string.
+
+2. Prove the surface works (read-only). Run from inside the target repository:
+     gjc --version
+     gjc sdk session list
+   `list` returns a credential-free JSON DTO of indexed sessions. Fail closed on missing,
+   unavailable, stale, dead, unknown, or ambiguous rows. Exit 2 = usage error, exit 1 =
+   operational failure (broker unavailable, session unavailable, retention gap, wait timeout).
+
+3. Understand a session before touching it:
+     gjc sdk session inspect <sessionId>
+     gjc sdk session raw query <sessionId> --query session.metadata
+     ... then context.get, goal.list, todo.list, workflow.gates.list, session.stats
+   These reads are not an atomic snapshot: label every reported field confirmed / inferred /
+   stale / unavailable / unknown. Never invent a missing value.
+
+4. Start work in an isolated session:
+     gjc sdk session raw global --op session.create \
+       --idempotency-key <fresh-uuid> --json-input '{"cwd":"/abs/path/to/repo"}'
+   Lifecycle ops allowed: session.create, session.fork, session.resume, session.close.
+   session.delete is NOT allowed. session.get_endpoint is refused unconditionally.
+
+5. Drive a turn and reconcile it:
+     gjc sdk session send <sessionId> --text "<task>" --op-ref <fresh-ulid>
+     gjc sdk session status <sessionId> <opRef>        # lossless turn.result lookup
+     gjc sdk session tail <sessionId> --until-idle     # replay + live follow
+   Use `send --wait --timeout-ms <ms>` for a bounded wait; a wait window that elapses reports
+   wait_timeout and never cancels the running turn. One fresh op-ref per logical prompt --
+   `unknown` means uncertainty, never proof of non-execution, so reconcile with `status`
+   instead of replaying a prompt.
+
+6. Answer what the agent asks you:
+     gjc sdk session raw control <sessionId> --op ask.answer --json-input '{...}'
+     gjc sdk session raw control <sessionId> --op workflow.gate_answer --json-input '{...}'
+   For gate answers use the durable workflow gate ID plus expectedSessionId; a transient
+   action_needed.id is never durable authority. Other allowed per-session controls:
+   turn.prompt, turn.steer, turn.follow_up, todo.replace, session.switch, session.rename.
+
+7. Show the human the exact operation and target before any mutating call, and treat the
+   approval as single-use: if the operation, input, or target changes, ask again.
 ```
 
-Add `gjc team ...` only when coordinated tmux workers materially help.
+</details>
 
-## Core capabilities
+Long prompts are safe to leave running: the SDK prompt deadline is a progress-aware inactivity lease
+(`sdk.promptDeadlineMs`, 30 min default) bounded by `sdk.promptMaxRuntimeMs` (6 h default), renewed only
+by attributable tool execution for the accepted turn — not by heartbeats or streaming text.
 
-- **Interview before guessing**: `deep-interview` turns vague requests into concrete requirements.
-- **Plan before mutation**: `ralplan` reviews the approach before code changes.
-- **Execute with evidence**: `ultragoal` tracks goals, revisions, checks, and completion evidence.
-- **Parallelize when useful**: `team` coordinates tmux-backed workers for larger tasks.
-- **Stay external and reviewable**: run from a chosen repo or worktree without patching another agent runtime.
+Need event-driven fan-out across many worktrees instead of one session at a time? The native
+[Coordinator MCP bridge](docs/hermes-mcp-bridge.md) (`gjc mcp-serve coordinator`, installed by
+`gjc setup hermes`) exposes the delegation tools for that shape.
 
-## Workflow surface
+- [External controller / bot integration guide](docs/bot-integration.md) — provider-independent smokes; [`docs/aside-integration.md`](docs/aside-integration.md) covers the opt-in search/context sidecar and the `/aside` composer command
+- [SDK session CLI](docs/sdk-session-cli.md) · [SDK & wire protocol](docs/sdk.md) · [SDK app guide](docs/sdk-app-guide.md) · [External-control readiness](docs/external-control-readiness.md)
 
-Gajae-Code ships four default workflow skills:
+---
 
-| Skill            | What it does                                                          |
-| ---------------- | --------------------------------------------------------------------- |
-| `deep-interview` | Clarifies ambiguous requirements before planning or code changes.     |
-| `ralplan`        | Builds and critiques an implementation plan before mutation.          |
-| `ultragoal`      | Tracks goals through execution, revision, verification, and evidence. |
-| `team`           | Coordinates tmux-backed workers when parallel execution is worth it.  |
+## Run GJC inside Paseo, Orca, or T3 Code
 
-And four bundled role agents:
+Prefer a desktop/mobile agent shell over a bare terminal? GJC plugs into the three popular ones — at
+three honestly different levels of support.
 
-| Agent       | What it does                                       |
-| ----------- | -------------------------------------------------- |
-| `executor`  | Bounded implementation, fixes, and refactors.      |
-| `architect` | Read-only architecture and code-review assessment. |
-| `planner`   | Read-only sequencing and acceptance criteria.      |
-| `critic`    | Read-only plan critique and actionability review.  |
+<table>
+<tr>
+<th width="120">Host</th><th width="110">Support</th><th>What you get</th><th>Setup</th>
+</tr>
+<tr>
+<td align="center">
+  <a href="https://paseo.sh"><img src="https://www.google.com/s2/favicons?domain=paseo.sh&sz=64" width="28" alt="Paseo logo" /><br/><strong>Paseo</strong></a><br/>
+  <sub><a href="https://github.com/getpaseo/paseo">repo</a></sub>
+</td>
+<td align="center">★★★★★<br/><sub>first-class</sub></td>
+<td>Native ACP provider installed by GJC itself. Model catalog, Default/Plan modes, thinking levels, real permission prompts, cancel that can terminate owned subagents, mobile control.</td>
+<td><code>gjc setup paseo</code><br/><sub>then <code>paseo daemon restart</code></sub></td>
+</tr>
+<tr>
+<td align="center">
+  <a href="https://onorca.dev"><img src="https://www.google.com/s2/favicons?domain=onorca.dev&sz=64" width="28" alt="Orca logo" /><br/><strong>Orca</strong></a><br/>
+  <sub><a href="https://github.com/stablyai/orca">repo</a></sub>
+</td>
+<td align="center">★★★★☆<br/><sub>works, one field</sub></td>
+<td>GJC runs as a custom CLI agent, one worktree per session, with Orca's diff review, terminal splits, SSH worktrees, and mobile companion. No usage tracking or account hot-swap yet.</td>
+<td><strong>Settings → Agents</strong><br/>add command <code>gjc</code></td>
+</tr>
+<tr>
+<td align="center">
+  <a href="https://t3.codes"><img src="https://www.google.com/s2/favicons?domain=t3.codes&sz=64" width="28" alt="T3 Code logo" /><br/><strong>T3 Code</strong></a><br/>
+  <sub><a href="https://github.com/pingdotgg/t3code">repo</a></sub>
+</td>
+<td align="center">★★★☆☆<br/><sub>experimental</sub></td>
+<td>T3 Code ships harnesses for Codex, Claude, Cursor, Grok and OpenCode only — there is no GJC harness upstream yet. Run GJC beside it; the native provider is <a href="https://github.com/pingdotgg/t3code/discussions/7290">proposed upstream</a>.</td>
+<td><sub>not one-command yet — see the guide</sub></td>
+</tr>
+</table>
 
-No sprawling default skill zoo: GJC improves by making this small method better.
+Paseo, in one paste:
+
+```sh
+gjc setup paseo            # writes the ACP provider entry, backs up, never restarts your daemon
+paseo daemon restart
+paseo provider ls          # gjc must read `available`
+paseo run --provider gjc --cwd /path/to/repo "your prompt"
+
+gjc setup paseo --check    # pass / stale / drift, with a machine-readable --json
+gjc setup paseo --remove   # rolls back only the keys GJC itself created
+```
+
+Orca, in one field: install GJC (see [docs/install.md](docs/install.md)), then add a custom agent
+with command `gjc` and no arguments. Orca pre-fills a permission-bypass flag for agents that expose
+one — GJC has none by design, so leave the arguments empty and keep GJC's own approval gates.
+
+**[Full integration guide → docs/terminal-app-integrations.md](docs/terminal-app-integrations.md)** —
+per-host setup, verification, cancel semantics, troubleshooting tables, and what each host cannot reach yet.
+
+---
+
+## Documentation
+
+Start at **[gajae-code.com](https://gajae-code.com)** or `docs/`:
+
+- [Install & updates](docs/install.md) · [Environment variables](docs/environment-variables.md) · [Keybindings](docs/keybindings.md) · [Themes](docs/theme.md) · [UI language](docs/ui-language.md)
+- [Models & providers](docs/models.md) · [Custom providers & multi-account routing](docs/custom-providers-and-multi-account.md) · [Multi-vendor profiles](docs/multi-vendor-profiles.md) · [Auth broker](docs/auth-broker-gateway.md)
+- [Customization authority, import, and trust](docs/customization.md) · [Skills](docs/skills.md) · [Hooks](docs/hooks.md) · [Standalone MCP](docs/standalone-mcp.md) · [Plugin bundles](docs/gjc-plugins.md)
+- [Terminal app integrations: Paseo · Orca · T3 Code](docs/terminal-app-integrations.md)
+- [Telegram](docs/telegram-onboarding.md) · [Bot integration](docs/bot-integration.md) · [SDK](docs/sdk.md) · [SDK session CLI](docs/sdk-session-cli.md)
+- [Sessions](docs/session.md) · [Compaction](docs/compaction.md) · [Memory](docs/memory.md) · [Secrets](docs/secrets.md)
+- [Codebase overview](docs/codebase-overview.md) · [Contributing / dev setup](CONTRIBUTING.md)
+- [macOS Option/Alt key setup (iTerm2)](docs/macos-option-key.md) · [GEO visibility benchmark](docs/geobench.md)
+
+The default dark TUI identity is the GJC red-claw theme; light-appearance terminals default to the bundled blue-crab theme. See [Themes](docs/theme.md) to swap or build your own.
+
+## SDK extensions
+
+### Local customization: `/extensions`
+
+In an interactive session, `/extensions` is the primary customization setup surface — it configures skills, hooks, and MCPs across the project (`<project>/.gjc/`) and user-global (`~/.gjc/agent/`) scopes, with status/provenance diagnostics, enable/disable/remove, and a guided Import-from-Claude-Code/Codex flow (normalized preview, explicit confirmation, skip/rename/overwrite collision policy, atomic writes with rollback). Non-interactive setups use `gjc mcp` for MCP servers and `gjc migrate` for Claude Code/Codex imports.
 
 ### Skill migration and bundled skill inspection
 
@@ -219,9 +403,19 @@ gjc setup defaults --check
 | Claude Code | `gjc --tmux` or `gjc --tmux --worktree <name>` | GJC does not become a Claude Code extension. |
 | OpenCode | `gjc` or `gjc --tmux` | External-runner workflow only today. |
 | Claw Code | `gjc --tmux --worktree <name>` | GJC does not install into or replace Claw Code. |
-| External controller / bot | `gjc --mode rpc` for a subprocess worker, or Bridge/HTTPS surfaces where configured | External controllers drive GJC through generic RPC/bridge contracts, not scrollback scraping. |
+| [Paseo](https://paseo.sh) | `gjc setup paseo` | GJC registers itself as an ACP provider and rolls itself back with `--remove`; Paseo owns its own config files. |
+| [Orca](https://onorca.dev) | `gjc` as a custom agent command | Orca launches GJC in its own worktree terminal; GJC keeps its own approval gates. |
+| [T3 Code](https://t3.codes) | none yet — experimental | No GJC harness upstream ([proposal](https://github.com/pingdotgg/t3code/discussions/7290)); run GJC beside it until a driver lands. |
+| External controller / bot | Coordinator MCP, `gjc sdk session`, or a configured managed adapter | External controllers use broker-bound, credential-free surfaces rather than scrollback or direct endpoint transports. The host-neutral `gjc-sdk-*` skills compose `gjc sdk session` and install no coordinator integration. |
 
-For standalone MCP support boundaries, see [`docs/standalone-mcp.md`](docs/standalone-mcp.md). For evaluating Aside as an opt-in search/context retrieval sidecar, see [`docs/aside-integration.md`](docs/aside-integration.md). For generic third-party bot setup and provider-independent smokes, see [`docs/bot-integration.md`](docs/bot-integration.md). For the readiness classification across RPC, ACP, and Bridge/HTTPS surfaces, see [`docs/external-control-readiness.md`](docs/external-control-readiness.md). For lower-level protocol details, see [`docs/hermes-mcp-bridge.md`](docs/hermes-mcp-bridge.md), [`docs/rpc.md`](docs/rpc.md), and [`docs/bridge.md`](docs/bridge.md).
+For evaluating Aside as an opt-in search/context retrieval sidecar, see [`docs/aside-integration.md`](docs/aside-integration.md). For generic third-party bot setup and provider-independent smokes, see [`docs/bot-integration.md`](docs/bot-integration.md). For external-control readiness, see [`docs/external-control-readiness.md`](docs/external-control-readiness.md). For the wire protocol and machine interfaces, see [`docs/sdk.md`](docs/sdk.md).
+
+## SDK Extensions
+
+- [gjc-remote](https://github.com/kogangdon/gjc-remote) — a real-world SDK extension for controlling allowlisted GJC sessions on remote hosts from Discord.
+- [oh-my-gajae-code](https://github.com/devswha/oh-my-gajae-code) — a community plugin marketplace for installing additional workflow skills and slash commands.
+- [gjc-agy-skill](https://github.com/jkf87/gjc-agy-skill) — a third-party community GJC skill integrating Antigravity CLI for vision/OCR, image generation, and Gemini print-mode one-shot workflows.
+- [GJC multivendor setup guide](https://github.com/project820/gjc-multivendor-setup-guide) — role-based provider profiles and installable model bundles for multivendor GJC setups.
 
 ## Configuration
 
@@ -236,6 +430,12 @@ retry:
 ```
 
 `requestMaxRetries` applies before a stream is established. `streamMaxRetries` applies only to replay-safe transient stream failures. Invalid auth, unsupported models/providers, malformed requests, context overflow, user aborts, and permanent quota failures remain fail-fast.
+
+### Launch-time updates
+
+Interactive startup checks GitHub releases for a newer GJC version in the background by default. This check is notify-only and non-mutating: GJC never installs or replaces itself during launch. On a supported platform, `gjc update` downloads and atomically replaces the matching GitHub release binary (package-manager shims are not overwritten). Source checkouts and `dev:link` executables must be updated through that checkout; `gjc update` refuses to self-overwrite them. Unsupported platforms should rerun the documented installer.
+
+Run `gjc config set startup.checkUpdate false` to disable the launch-time check. Network failures are ignored so they do not block startup.
 
 ### Good to read together
 
@@ -257,78 +457,40 @@ Pick from Settings (`Appearance -> Dark theme` / `Light theme`) or `/theme`.
 | `codex` | Crisp dark blue-gray palette with sharper coding-session contrast. | A Codex-like dark workspace. |
 | `opencode` | OpenCode-inspired dark palette with punchier terminal accents. | OpenCode muscle memory in the bundled picker. |
 
-## Development
+## Troubleshooting
 
-Install dependencies, build native bindings, and set up local defaults:
+When a tool, skill, hook, extension, slash command, MCP server, or plugin bundle does not appear as expected, start here:
+
+```sh
+gjc customize doctor         # human-readable provenance and remediation
+gjc customize doctor --json # stable JSON for CI/setup tooling
+```
+
+`gjc customize doctor` is the single read-only troubleshooting surface. It reports every discovered customization, its source convention and scope (`gjc`, Claude project, Codex project, plugin, explicit config), effective precedence and shadowing, loaded/enabled/disabled/quarantined/rejected/stored-only status, bounded reason codes, remediation commands, trust requirements, and whether a restart/new session is required. Credentials, endpoint tokens, auth headers, and unsafe raw config dumps are never printed.
+
+## Development
 
 ```sh
 bun install
 bun run build:native
-bun run install:defaults
+bun run dev:link       # global `gjc` runs this checkout's source
+bun run dev:doctor     # verify the link
 ```
 
-The `.node` binary for `@gajae-code/natives` is gitignored and required before any CLI invocation (`install:defaults`, `dev:link`, tests).
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/codebase-overview.md](docs/codebase-overview.md) for the package map and gates.
 
-### Canonical: build and link the dev `gjc`
+## Contributors & lineage
 
-To make the global `gjc` command run **this checkout's TypeScript source** (hot to every edit, with skills/natives working), link it onto your `PATH`:
-
-```sh
-bun install
-bun run dev:link
-```
-
-`dev:link` symlinks `gjc` → `packages/coding-agent/src/cli.ts` into `~/.local/bin` (override with `GJC_DEV_LINK_DIR`), replaces that managed target, warns and fails if another `gjc` still shadows it earlier on `PATH`, and runs `--smoke-test` to confirm `@gajae-code/natives` loads. Use `bun run install:dev` for the full bootstrap (install + link + `setup defaults`).
-
-Check at any time whether your `gjc` has drifted (wrong source, or a compiled binary that can't load skills):
-
-```sh
-bun run dev:doctor
-```
-
-> Do **not** use the compiled binary for day-to-day development. `bun --cwd=packages/coding-agent run build` produces a standalone `dist/gjc`, but a `bun build --compile` binary cannot dynamically load `@gajae-code/natives`, so skills fail with `Cannot find module '@gajae-code/natives' from '/$bunfs/root/gjc'`. Running from source via `dev:link` avoids this. Build the binary only when validating a release.
-
-Run the CLI from source directly without linking:
-
-```sh
-bun packages/coding-agent/src/cli.ts --help
-```
-
-Default workflow definitions live in source, not committed `.gjc` copies:
-
-```text
-packages/coding-agent/src/defaults/gjc/skills/<name>/SKILL.md
-packages/coding-agent/src/prompts/agents/<role>.md
-```
-
-For workflow-definition or rebrand-surface changes, run the project gates:
-
-```sh
-bun scripts/check-visible-definitions.ts
-bun scripts/verify-g002-gates.ts
-bun scripts/rebrand-inventory.ts --strict
-bun test packages/coding-agent/test/default-gjc-definitions.test.ts
-```
-
-For future UI, dashboard, terminal, and TUI visual work, follow the repo-owned [UI design and visual QA workflow](docs/ui-design-visual-qa.md) before broad product-screen implementation.
-
-For a package-by-package map, see [`docs/codebase-overview.md`](docs/codebase-overview.md).
-
-## Contributors
-
-Thanks to the people and agents helping shape the early Gajae-Code releases, including [Yeachan-Heo](https://github.com/Yeachan-Heo), [IYENTeam](https://github.com/IYENTeam), and [HaD0Yun](https://github.com/HaD0Yun). Contributions, bug reports, and release validation are welcome through GitHub and the Discord community.
-
-## Inspirations and lineage
-
-Gajae-Code's default TUI identity is the crustacean pair: red-claw for dark appearance and blue-crab for light appearance. It also bundles `claude-code`, `codex`, and `opencode` migration themes whose palettes are inspired by those tools so users moving from them get a familiar look. It builds on lessons from a small family of agent harnesses while keeping the public GJC surface intentionally focused. Historical attribution is kept in [`NOTICE.md`](NOTICE.md).
+Thanks to [Yeachan-Heo](https://github.com/Yeachan-Heo), [IYENTeam](https://github.com/IYENTeam), [HaD0Yun](https://github.com/HaD0Yun), [probepark](https://github.com/probepark), and [snowykr](https://github.com/snowykr). Repository maintainers and their GitHub access are listed in [MAINTAINERS.md](MAINTAINERS.md). GJC builds on lessons from a small family of agent harnesses; historical attribution lives in [NOTICE.md](NOTICE.md).
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+MIT. See [LICENSE](LICENSE).
 
-## GEO visibility benchmark
+---
 
-Gajae-Code includes a [`geobench`](https://github.com/NomaDamas/geobench) product spec for measuring LLM hit rate, MRR, share of voice, and citations.
-
-- Spec: [`geobench/gajae-code.yaml`](geobench/gajae-code.yaml)
-- Runbook: [`docs/geobench.md`](docs/geobench.md)
+<p align="center">
+  <em>"Encode intention. Decode software."</em>
+  <br/><br/>
+  <strong>The plan comes first. The mutation earns its place.</strong>
+</p>

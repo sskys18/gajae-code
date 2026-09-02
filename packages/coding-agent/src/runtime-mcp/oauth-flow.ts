@@ -12,7 +12,6 @@ import type { OAuthController, OAuthCredentials } from "@gajae-code/ai/utils/oau
 const DEFAULT_PORT = 3000;
 const CALLBACK_PATH = "/callback";
 const CALLBACK_BIND_HOSTNAME = "127.0.0.1";
-
 function isLoopbackHostname(hostname: string): boolean {
 	return hostname === "localhost" || hostname === "127.0.0.1";
 }
@@ -96,7 +95,26 @@ function resolveCallbackOptions(config: MCPOAuthConfig): OAuthCallbackFlowOption
 		callbackHostname: resolveCallbackHostname(redirectUri),
 		callbackBindHostname: CALLBACK_BIND_HOSTNAME,
 		redirectUri,
+		...(config.issuer ? { expectedIssuer: config.issuer } : {}),
+		...(config.issuerResponseIssSupported !== undefined
+			? { issuerResponseIssSupported: config.issuerResponseIssSupported }
+			: {}),
 	};
+}
+
+/**
+ * Canonical MCP server resource URI per RFC 8707 §2: absolute URI, lowercase
+ * scheme/host, no fragment, no trailing slash on an empty path.
+ */
+export function canonicalMCPResourceUri(raw: string): string | undefined {
+	try {
+		const url = new URL(raw);
+		if (url.hash) url.hash = "";
+		const serialized = url.toString();
+		return url.pathname === "/" && serialized.endsWith("/") ? serialized.slice(0, -1) : serialized;
+	} catch {
+		return undefined;
+	}
 }
 
 export interface MCPOAuthConfig {
@@ -104,7 +122,12 @@ export interface MCPOAuthConfig {
 	authorizationUrl: string;
 	/** Token endpoint URL */
 	tokenUrl: string;
-	/** Client ID (optional when already embedded in authorization URL) */
+	/**
+	 * Client ID (optional when already embedded in authorization URL). An
+	 * HTTPS URL here is a Client ID Metadata Document (CIMD) reference per
+	 * MCP 2026-07-28 and is used as-is; Dynamic Client Registration is only a
+	 * deprecated backwards-compatibility fallback when no client id exists.
+	 */
 	clientId?: string;
 	/** Client secret (optional for PKCE flows) */
 	clientSecret?: string;
@@ -116,6 +139,19 @@ export interface MCPOAuthConfig {
 	callbackPort?: number;
 	/** Custom callback path (default: /callback or redirectUri pathname) */
 	callbackPath?: string;
+	/**
+	 * Canonical URI of the target MCP server (RFC 8707). Sent as the `resource`
+	 * parameter on BOTH the authorization and token requests, regardless of
+	 * authorization-server support.
+	 */
+	resource?: string;
+	/**
+	 * Expected authorization-server issuer recorded from validated discovery
+	 * metadata (RFC 9207 / MCP 2026-07-28). Validation fails closed on mismatch.
+	 */
+	issuer?: string;
+	/** `authorization_response_iss_parameter_supported` from the same metadata. */
+	issuerResponseIssSupported?: boolean;
 }
 
 /**
@@ -156,9 +192,11 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 	}
 
 	async generateAuthUrl(state: string, redirectUri: string): Promise<{ url: string; instructions?: string }> {
+		this.ctrl.signal?.throwIfAborted();
 		if (!this.#resolvedClientId) {
-			await this.#tryRegisterClient(redirectUri);
+			await this.#tryRegisterClient(redirectUri, this.ctrl.signal);
 		}
+		this.ctrl.signal?.throwIfAborted();
 
 		const authUrl = new URL(this.config.authorizationUrl);
 		const params = authUrl.searchParams;
@@ -175,6 +213,10 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 		}
 		params.set("redirect_uri", redirectUri);
 		params.set("state", state);
+		// RFC 8707: the canonical MCP server resource MUST be on the authorization request.
+		if (this.config.resource && !params.get("resource")) {
+			params.set("resource", this.config.resource);
+		}
 
 		// Add PKCE challenge (some providers require it)
 		const codeVerifier = this.#generateCodeVerifier();
@@ -186,13 +228,14 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 		this.#codeVerifier = codeVerifier;
 
 		if (!params.get("client_id")) {
-			await this.#assertClientIdNotRequired(authUrl.toString());
+			await this.#assertClientIdNotRequired(authUrl.toString(), this.ctrl.signal);
 		}
 
 		return { url: authUrl.toString() };
 	}
 
 	async exchangeToken(code: string, _state: string, redirectUri: string): Promise<OAuthCredentials> {
+		this.ctrl.signal?.throwIfAborted();
 		const params = new URLSearchParams({
 			grant_type: "authorization_code",
 			code,
@@ -200,6 +243,10 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 		});
 		if (this.#resolvedClientId) {
 			params.set("client_id", this.#resolvedClientId);
+		}
+		// RFC 8707: the canonical MCP server resource MUST be on the token request.
+		if (this.config.resource) {
+			params.set("resource", this.config.resource);
 		}
 
 		// Add code verifier for PKCE
@@ -220,7 +267,9 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 				"Content-Type": "application/x-www-form-urlencoded",
 			},
 			body: params.toString(),
+			signal: this.ctrl.signal,
 		});
+		this.ctrl.signal?.throwIfAborted();
 
 		if (!response.ok) {
 			const errorText = await response.text();
@@ -286,8 +335,8 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 	/**
 	 * Try OAuth dynamic client registration when provider requires a client_id.
 	 */
-	async #tryRegisterClient(redirectUri: string): Promise<void> {
-		const registrationEndpoint = await this.#resolveRegistrationEndpoint();
+	async #tryRegisterClient(redirectUri: string, signal?: AbortSignal): Promise<void> {
+		const registrationEndpoint = await this.#resolveRegistrationEndpoint(signal);
 		if (!registrationEndpoint) return;
 
 		try {
@@ -305,6 +354,7 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 					token_endpoint_auth_method: "none",
 					application_type: "native",
 				}),
+				signal,
 			});
 
 			if (!response.ok) return;
@@ -320,18 +370,20 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 			if (data.client_secret && data.client_secret.trim() !== "") {
 				this.#registeredClientSecret = data.client_secret;
 			}
-		} catch {
+		} catch (error) {
+			if (signal?.aborted) throw error;
 			// Ignore registration failures and continue without client registration.
 		}
 	}
 
-	async #resolveRegistrationEndpoint(): Promise<string | null> {
+	async #resolveRegistrationEndpoint(signal?: AbortSignal): Promise<string | null> {
 		try {
 			const authorizationEndpoint = new URL(this.config.authorizationUrl);
 			const metadataUrl = new URL("/.well-known/oauth-authorization-server", authorizationEndpoint.origin);
 			const response = await fetch(metadataUrl.toString(), {
 				method: "GET",
 				headers: { Accept: "application/json" },
+				signal,
 			});
 
 			if (!response.ok) return null;
@@ -339,19 +391,21 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 			if (metadata.registration_endpoint && metadata.registration_endpoint.trim() !== "") {
 				return metadata.registration_endpoint;
 			}
-		} catch {
+		} catch (error) {
+			if (signal?.aborted) throw error;
 			// Ignore metadata discovery failures.
 		}
 
 		return null;
 	}
 
-	async #assertClientIdNotRequired(authorizationUrl: string): Promise<void> {
+	async #assertClientIdNotRequired(authorizationUrl: string, signal?: AbortSignal): Promise<void> {
 		try {
 			const response = await fetch(authorizationUrl, {
 				method: "GET",
 				redirect: "manual",
 				headers: { Accept: "text/plain,text/html,application/json" },
+				signal,
 			});
 			if (response.status < 400) return;
 			const body = await response.text();
@@ -359,51 +413,11 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 				throw new Error("OAuth provider requires client_id");
 			}
 		} catch (error) {
+			if (signal?.aborted) throw error;
 			if (error instanceof Error && /client[_-]?id/i.test(error.message)) {
 				throw error;
 			}
 			// Ignore network/probe failures to avoid blocking flows that still work.
 		}
 	}
-}
-
-/**
- * Refresh an MCP OAuth token using the standard refresh_token grant.
- * Returns updated credentials; preserves the old refresh token if the server doesn't rotate it.
- */
-export async function refreshMCPOAuthToken(
-	tokenUrl: string,
-	refreshToken: string,
-	clientId?: string,
-	clientSecret?: string,
-): Promise<OAuthCredentials> {
-	const params = new URLSearchParams({
-		grant_type: "refresh_token",
-		refresh_token: refreshToken,
-	});
-	if (clientId) params.set("client_id", clientId);
-	if (clientSecret) params.set("client_secret", clientSecret);
-
-	const response = await fetch(tokenUrl, {
-		method: "POST",
-		headers: { "Content-Type": "application/x-www-form-urlencoded" },
-		body: params.toString(),
-	});
-
-	if (!response.ok) {
-		const text = await response.text();
-		throw new Error(`MCP OAuth refresh failed: ${response.status} ${text}`);
-	}
-
-	const data = (await response.json()) as {
-		access_token: string;
-		refresh_token?: string;
-		expires_in?: number;
-	};
-	const expiresIn = data.expires_in ?? 3600;
-	return {
-		access: data.access_token,
-		refresh: data.refresh_token ?? refreshToken,
-		expires: Date.now() + expiresIn * 1000,
-	};
 }

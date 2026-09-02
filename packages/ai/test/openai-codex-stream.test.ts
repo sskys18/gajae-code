@@ -8,6 +8,10 @@ import {
 } from "@gajae-code/ai/providers/openai-codex-responses";
 import type { Context, Model, ProviderSessionState } from "@gajae-code/ai/types";
 import { getAgentDir, setAgentDir, TempDir } from "@gajae-code/utils";
+import { classifyFallbackTrigger } from "../src/utils/fallback-transport";
+
+const RAW_SENTINEL = "RAW_SENTINEL_DO_NOT_SURFACE";
+const SUMMARY_SENTINEL = "SUMMARY_SENTINEL_SAFE_TO_SURFACE";
 
 const originalFetch = global.fetch;
 const originalAgentDir = getAgentDir();
@@ -15,7 +19,6 @@ const originalWebSocket = global.WebSocket;
 const originalCodexWebSocketRetryBudget = Bun.env.PI_CODEX_WEBSOCKET_RETRY_BUDGET;
 const originalCodexWebSocketRetryDelayMs = Bun.env.PI_CODEX_WEBSOCKET_RETRY_DELAY_MS;
 const originalCodexWebSocketIdleTimeoutMs = Bun.env.PI_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS;
-const originalCodexWebSocketFirstEventTimeoutMs = Bun.env.PI_CODEX_WEBSOCKET_FIRST_EVENT_TIMEOUT_MS;
 const originalCodexWebSocketV2 = Bun.env.PI_CODEX_WEBSOCKET_V2;
 
 function restoreEnv(name: string, value: string | undefined): void {
@@ -33,7 +36,6 @@ afterEach(() => {
 	restoreEnv("PI_CODEX_WEBSOCKET_RETRY_BUDGET", originalCodexWebSocketRetryBudget);
 	restoreEnv("PI_CODEX_WEBSOCKET_RETRY_DELAY_MS", originalCodexWebSocketRetryDelayMs);
 	restoreEnv("PI_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS", originalCodexWebSocketIdleTimeoutMs);
-	restoreEnv("PI_CODEX_WEBSOCKET_FIRST_EVENT_TIMEOUT_MS", originalCodexWebSocketFirstEventTimeoutMs);
 	restoreEnv("PI_CODEX_WEBSOCKET_V2", originalCodexWebSocketV2);
 	vi.restoreAllMocks();
 });
@@ -84,7 +86,7 @@ function getRequestSignal(input: string | URL | Request, init: RequestInit | und
 	return undefined;
 }
 
-function createNoProgressCodexSse(signal: AbortSignal | undefined): Response {
+function createMalformedDeltaCodexSse(signal: AbortSignal | undefined): Response {
 	const encoder = new TextEncoder();
 	let interval: NodeJS.Timeout | undefined;
 	let abortListener: (() => void) | undefined;
@@ -95,19 +97,24 @@ function createNoProgressCodexSse(signal: AbortSignal | undefined): Response {
 				encode({
 					type: "response.output_item.added",
 					item: {
-						type: "function_call",
-						id: "fc_stalled",
-						call_id: "call_stalled",
-						name: "todo_write",
-						arguments: "",
+						type: "message",
+						id: "msg_stalled",
+						role: "assistant",
+						status: "in_progress",
+						content: [],
 					},
 				}),
 			);
+			controller.enqueue(encode({ type: "response.content_part.added", part: { type: "output_text", text: "" } }));
+			const malformedDeltas: unknown[] = [42, undefined, ""];
+			let malformedDeltaIndex = 0;
 			interval = setInterval(() => {
 				controller.enqueue(
 					encode({
-						type: "response.in_progress",
-						response: { id: "resp_stalled", status: "in_progress" },
+						type: "response.output_text.delta",
+						item_id: "msg_stalled",
+						output_index: 0,
+						delta: malformedDeltas[malformedDeltaIndex++ % malformedDeltas.length],
 					}),
 				);
 			}, 2);
@@ -272,13 +279,141 @@ describe("openai-codex streaming", () => {
 		]);
 	});
 
-	it("times out SSE streams that only emit no-progress status events", async () => {
+	it("maps reserved tool wire names back to canonical tool names", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sse = `${[
+			`data: ${JSON.stringify({
+				type: "response.output_item.added",
+				item: {
+					type: "function_call",
+					id: "fc_1",
+					call_id: "call_1",
+					name: "computer_tool",
+					arguments: "",
+				},
+			})}`,
+			`data: ${JSON.stringify({
+				type: "response.function_call_arguments.done",
+				item_id: "fc_1",
+				arguments: '{"action":"screenshot"}',
+			})}`,
+			`data: ${JSON.stringify({
+				type: "response.output_item.done",
+				item: {
+					type: "function_call",
+					id: "fc_1",
+					call_id: "call_1",
+					name: "computer_tool",
+					arguments: '{"action":"screenshot"}',
+				},
+			})}`,
+			`data: ${JSON.stringify({ type: "response.completed", response: { status: "completed" } })}`,
+		].join("\n\n")}\n\n`;
+		global.fetch = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		) as unknown as typeof fetch;
+
+		const model = { ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false };
+		const result = await streamOpenAICodexResponses(model, createCodexTestContext(), { apiKey: token }).result();
+
+		const toolCalls = result.content.filter(block => block.type === "toolCall");
+		expect(toolCalls).toHaveLength(1);
+		expect(toolCalls[0]).toMatchObject({ name: "computer", arguments: { action: "screenshot" } });
+	});
+
+	it.each([
+		[false, 2],
+		[true, 1],
+	])("uses one websocket request per managed connection-limit failure", async (fallbackManaged, expectedRequests) => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		let requests = 0;
+		class ConnectionLimitWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+			send(): void {
+				requests += 1;
+				if (requests === 1) {
+					this.sendJson({
+						type: "error",
+						error: { code: "websocket_connection_limit_reached", message: "connection limit" },
+					});
+					return;
+				}
+				this.emitCodexResponse({
+					messageId: "msg_reconnected",
+					responseId: "resp_reconnected",
+					text: "reconnected",
+				});
+			}
+		}
+		global.WebSocket = ConnectionLimitWebSocket as unknown as typeof WebSocket;
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: true },
+			createCodexTestContext(),
+			{
+				apiKey: createCodexTestToken(),
+				sessionId: `connection-limit-${fallbackManaged}`,
+				preferWebsockets: true,
+				fallbackManaged,
+				providerSessionState: new Map<string, ProviderSessionState>(),
+			},
+		).result();
+		expect(requests).toBe(expectedRequests);
+		expect(result.stopReason).toBe(fallbackManaged ? "error" : "stop");
+	});
+
+	it("does not replay a managed websocket failure over SSE", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		let websocketRequests = 0;
+		const fetchMock = vi.fn(async () => new Response(createCompletedCodexSse("unexpected replay"), { status: 200 }));
+		global.fetch = fetchMock as unknown as typeof fetch;
+		class BufferedCloseWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+			send(): void {
+				websocketRequests += 1;
+				this.sendJson({
+					type: "response.output_item.added",
+					item: { type: "message", id: "partial", role: "assistant", status: "in_progress", content: [] },
+				});
+				this.sendJson({ type: "response.content_part.added", part: { type: "output_text", text: "" } });
+				this.sendJson({ type: "response.output_text.delta", delta: "partial" });
+				this.readyState = MockWebSocket.CLOSED;
+				this.emit("close", { code: 1006 } as unknown as Event);
+			}
+		}
+		global.WebSocket = BufferedCloseWebSocket as unknown as typeof WebSocket;
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: true },
+			createCodexTestContext(),
+			{
+				apiKey: createCodexTestToken(),
+				sessionId: "managed-sse-replay",
+				preferWebsockets: true,
+				fallbackManaged: true,
+				providerSessionState: new Map<string, ProviderSessionState>(),
+			},
+		).result();
+		expect(websocketRequests).toBe(1);
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(result.stopReason).toBe("error");
+	});
+
+	it("times out SSE streams whose repeated malformed deltas are not semantic progress", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
 		const token = createCodexTestToken();
 		const context = createCodexTestContext();
 		global.fetch = ((input: string | URL | Request, init?: RequestInit) =>
-			Promise.resolve(createNoProgressCodexSse(getRequestSignal(input, init)))) as typeof fetch;
+			Promise.resolve(createMalformedDeltaCodexSse(getRequestSignal(input, init)))) as typeof fetch;
 
 		const model = { ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false };
 		const result = await streamOpenAICodexResponses(model, context, {
@@ -288,15 +423,7 @@ describe("openai-codex streaming", () => {
 
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("OpenAI Codex SSE stream stalled while waiting for the next event");
-		expect(result.content as unknown[]).toEqual([
-			{
-				type: "toolCall",
-				id: "call_stalled|fc_stalled",
-				name: "todo_write",
-				arguments: {},
-				partialJson: "",
-			},
-		]);
+		expect(result.content as unknown[]).toEqual([{ type: "text", text: "", textSignature: undefined }]);
 	});
 
 	it("parses websocket JSON from non-string payloads", async () => {
@@ -546,7 +673,221 @@ describe("openai-codex streaming", () => {
 		expect(sawDone).toBe(true);
 	});
 
-	it("includes service_tier in SSE payloads when requested", async () => {
+	describe("Codex reasoning summary fallback", () => {
+		const token = createCodexTestToken();
+		const run = async (streamedDelta: string | undefined) => {
+			const events = [
+				{
+					type: "response.output_item.added",
+					output_index: 0,
+					item: { type: "reasoning", id: "reasoning_1", summary: [] },
+				},
+				{
+					type: "response.reasoning_summary_part.added",
+					item_id: "reasoning_1",
+					output_index: 0,
+					part: { type: "summary_text", text: "" },
+				},
+				...(streamedDelta
+					? [
+							{
+								type: "response.reasoning_summary_text.delta",
+								item_id: "reasoning_1",
+								output_index: 0,
+								delta: streamedDelta,
+							},
+						]
+					: []),
+				{ type: "response.reasoning_summary_part.done", item_id: "reasoning_1", output_index: 0 },
+				{
+					type: "response.output_item.done",
+					output_index: 0,
+					item: {
+						type: "reasoning",
+						id: "reasoning_1",
+						summary: [{ type: "summary_text", text: "FINAL CODEX SUMMARY" }],
+						content: [],
+					},
+				},
+				{
+					type: "response.completed",
+					response: {
+						status: "completed",
+						usage: {
+							input_tokens: 0,
+							output_tokens: 0,
+							total_tokens: 0,
+							input_tokens_details: { cached_tokens: 0 },
+						},
+					},
+				},
+			];
+			const sse = `${events.map(event => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\n`;
+			global.fetch = vi.fn(async (input: string | URL) => {
+				if (String(input) === "https://chatgpt.com/backend-api/codex/responses") {
+					return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+				}
+				return new Response("not found", { status: 404 });
+			}) as unknown as typeof fetch;
+
+			const streamResult = streamOpenAICodexResponses(
+				{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+				createCodexTestContext(),
+				{ apiKey: token },
+			);
+			const emitted: Array<Record<string, unknown>> = [];
+			for await (const event of streamResult) emitted.push(event as Record<string, unknown>);
+			return emitted;
+		};
+
+		it("emits a summary start before the canonical summary end when no summary text delta streams", async () => {
+			const fallbackEvents = await run(undefined);
+			const summaryEvents = fallbackEvents.filter(
+				event => event.type === "reasoning_summary_start" || event.type === "reasoning_summary_end",
+			);
+			expect(summaryEvents).toEqual([
+				expect.objectContaining({ type: "reasoning_summary_start", contentIndex: 0 }),
+				expect.objectContaining({ type: "reasoning_summary_end", contentIndex: 0, content: "FINAL CODEX SUMMARY" }),
+			]);
+			const fallbackDone = fallbackEvents.find(event => event.type === "done");
+			expect(
+				(fallbackDone?.message as { content: Array<{ type: string; summaryText?: string; provenance?: string }> })
+					.content,
+			).toContainEqual(
+				expect.objectContaining({ type: "thinking", summaryText: "FINAL CODEX SUMMARY", provenance: "summary" }),
+			);
+		});
+
+		it("emits one summary start and keeps streamed summary text when a summary text delta streams", async () => {
+			const streamedEvents = await run("STREAMED CODEX SUMMARY");
+			expect(streamedEvents.filter(event => event.type === "reasoning_summary_start")).toHaveLength(1);
+			const summaryEnd = streamedEvents.find(event => event.type === "reasoning_summary_end");
+			expect(summaryEnd).toEqual(
+				expect.objectContaining({ contentIndex: 0, content: expect.stringContaining("STREAMED CODEX SUMMARY") }),
+			);
+			expect(summaryEnd?.content).not.toContain("FINAL CODEX SUMMARY");
+		});
+		it("keeps finalized thinking monotonic across reasoning finalization permutations", async () => {
+			const run = async (events: Array<Record<string, unknown>>) => {
+				const sse = `${[
+					...events,
+					{
+						type: "response.completed",
+						response: {
+							status: "completed",
+							usage: {
+								input_tokens: 0,
+								output_tokens: 0,
+								total_tokens: 0,
+								input_tokens_details: { cached_tokens: 0 },
+							},
+						},
+					},
+				]
+					.map(event => `data: ${JSON.stringify(event)}`)
+					.join("\n\n")}\n\n`;
+				global.fetch = vi.fn(
+					async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+				) as unknown as typeof fetch;
+				return streamOpenAICodexResponses(
+					{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+					createCodexTestContext(),
+					{ apiKey: token },
+				).result();
+			};
+			const added = {
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "reasoning", id: "reasoning_monotonic", summary: [] },
+			};
+			const summaryPart = {
+				type: "response.reasoning_summary_part.added",
+				item_id: "reasoning_monotonic",
+				output_index: 0,
+				part: { type: "summary_text", text: "" },
+			};
+			const summaryDelta = {
+				type: "response.reasoning_summary_text.delta",
+				item_id: "reasoning_monotonic",
+				output_index: 0,
+				delta: SUMMARY_SENTINEL,
+			};
+			const rawDelta = {
+				type: "response.reasoning_text.delta",
+				item_id: "reasoning_monotonic",
+				output_index: 0,
+				delta: RAW_SENTINEL,
+			};
+			const done = (summary: string[] = [], raw = "") => ({
+				type: "response.output_item.done",
+				output_index: 0,
+				item: {
+					type: "reasoning",
+					id: "reasoning_monotonic",
+					summary: summary.map(text => ({ type: "summary_text", text })),
+					content: raw ? [{ type: "reasoning_text", text: raw }] : [],
+				},
+			});
+			const cases = [
+				{
+					name: "summary-first then raw duplicate output_item.done",
+					events: [added, summaryPart, summaryDelta, done([SUMMARY_SENTINEL]), done([], RAW_SENTINEL)],
+					provenance: "summary",
+					summaryText: SUMMARY_SENTINEL,
+					rawText: undefined,
+				},
+				{
+					name: "raw-first then summary",
+					events: [added, rawDelta, summaryPart, summaryDelta, done([SUMMARY_SENTINEL], RAW_SENTINEL)],
+					provenance: "mixed",
+					summaryText: SUMMARY_SENTINEL,
+					rawText: RAW_SENTINEL,
+				},
+				{
+					name: "duplicate summary finalizations",
+					events: [added, summaryPart, summaryDelta, done([SUMMARY_SENTINEL]), done([SUMMARY_SENTINEL])],
+					provenance: "summary",
+					summaryText: SUMMARY_SENTINEL,
+					rawText: undefined,
+				},
+				{
+					name: "final-only summary",
+					events: [added, done([SUMMARY_SENTINEL])],
+					provenance: "summary",
+					summaryText: SUMMARY_SENTINEL,
+					rawText: undefined,
+				},
+				{
+					name: "raw-only control",
+					events: [added, rawDelta, done([], RAW_SENTINEL)],
+					provenance: "raw",
+					summaryText: undefined,
+					rawText: RAW_SENTINEL,
+				},
+			] as const;
+
+			for (const scenario of cases) {
+				const result = await run([...scenario.events]);
+				const block = result.content[0] as {
+					thinking: string;
+					provenance?: string;
+					summaryText?: string;
+					rawText?: string;
+				};
+				expect(block, scenario.name).toMatchObject({ provenance: scenario.provenance });
+				expect(block.summaryText, scenario.name).toBe(scenario.summaryText);
+				expect(block.rawText, scenario.name).toBe(scenario.rawText);
+				if (scenario.provenance === "raw") {
+					expect(block.thinking, scenario.name).toBe(RAW_SENTINEL);
+				} else {
+					expect(block.thinking, scenario.name).toBe(SUMMARY_SENTINEL);
+					expect(block.thinking, scenario.name).not.toContain(RAW_SENTINEL);
+				}
+			}
+		});
+	});
+
+	it("uses the explicit response service tier before the requested-tier fallback", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
 
@@ -555,17 +896,18 @@ describe("openai-codex streaming", () => {
 			"utf8",
 		).toBase64();
 		const token = `aaa.${payload}.bbb`;
-		let capturedBody: Record<string, unknown> | undefined;
+		const capturedBodies: Record<string, unknown>[] = [];
+		let responseServiceTier: "default" | undefined = "default";
 
-		const sse = `${[
-			`data: ${JSON.stringify({ type: "response.output_item.added", item: { type: "message", id: "msg_1", role: "assistant", status: "in_progress", content: [] } })}`,
-			`data: ${JSON.stringify({ type: "response.content_part.added", part: { type: "output_text", text: "" } })}`,
-			`data: ${JSON.stringify({ type: "response.output_text.delta", delta: "Hello" })}`,
-			`data: ${JSON.stringify({ type: "response.output_item.done", item: { type: "message", id: "msg_1", role: "assistant", status: "completed", content: [{ type: "output_text", text: "Hello" }] } })}`,
-			`data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", service_tier: "default", usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8, input_tokens_details: { cached_tokens: 0 } } } })}`,
-		].join("\n\n")}\n\n`;
 		const fetchMock = vi.fn(async (_input: string | URL, init?: RequestInit) => {
-			capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			capturedBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+			const sse = `${[
+				`data: ${JSON.stringify({ type: "response.output_item.added", item: { type: "message", id: "msg_1", role: "assistant", status: "in_progress", content: [] } })}`,
+				`data: ${JSON.stringify({ type: "response.content_part.added", part: { type: "output_text", text: "" } })}`,
+				`data: ${JSON.stringify({ type: "response.output_text.delta", delta: "Hello" })}`,
+				`data: ${JSON.stringify({ type: "response.output_item.done", item: { type: "message", id: "msg_1", role: "assistant", status: "completed", content: [{ type: "output_text", text: "Hello" }] } })}`,
+				`data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", ...(responseServiceTier ? { service_tier: responseServiceTier } : {}), usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8, input_tokens_details: { cached_tokens: 0 } } } })}`,
+			].join("\n\n")}\n\n`;
 			return new Response(sse, {
 				status: 200,
 				headers: { "content-type": "text/event-stream" },
@@ -591,15 +933,27 @@ describe("openai-codex streaming", () => {
 			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
 		};
 
-		const result = await streamOpenAICodexResponses(model, context, {
+		const explicitDefaultResult = await streamOpenAICodexResponses(model, context, {
 			apiKey: token,
 			serviceTier: "priority",
 		}).result();
-		expect(result.stopReason).toBe("stop");
-		expect(capturedBody?.service_tier).toBe("priority");
-		expect(result.usage.cost.input).toBeCloseTo(0.00001);
-		expect(result.usage.cost.output).toBeCloseTo(0.000012);
-		expect(result.usage.cost.total).toBeCloseTo(0.000022);
+		responseServiceTier = undefined;
+		const missingTierResult = await streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			serviceTier: "priority",
+		}).result();
+
+		expect(explicitDefaultResult.stopReason).toBe("stop");
+		expect(missingTierResult.stopReason).toBe("stop");
+		expect(capturedBodies).toHaveLength(2);
+		expect(capturedBodies[0]?.service_tier).toBe("priority");
+		expect(capturedBodies[1]?.service_tier).toBe("priority");
+		expect(explicitDefaultResult.usage.cost.input).toBeCloseTo(0.000005, 10);
+		expect(explicitDefaultResult.usage.cost.output).toBeCloseTo(0.000006, 10);
+		expect(explicitDefaultResult.usage.cost.total).toBeCloseTo(0.000011, 10);
+		expect(missingTierResult.usage.cost.input).toBeCloseTo(0.00001, 10);
+		expect(missingTierResult.usage.cost.output).toBeCloseTo(0.000012, 10);
+		expect(missingTierResult.usage.cost.total).toBeCloseTo(0.000022, 10);
 	});
 
 	it("fails truncated SSE streams that never emit a terminal response event", async () => {
@@ -766,6 +1120,13 @@ describe("openai-codex streaming", () => {
 		expect(result.stopReason).toBe("error");
 		expect((result.errorMessage ?? "").toLowerCase()).toContain("rate limit");
 		expect(result.errorMessage).not.toContain("Body already used");
+		expect(result.transportFailure).toMatchObject({
+			kind: "transport",
+			status: 429,
+			providerCode: "rate_limit_exceeded",
+		});
+		expect(result.transportFailure?.headers).toEqual({ "retry-after": "600" });
+		expect(classifyFallbackTrigger(result.transportFailure)).toEqual({ class: "rate_limit", retryAfterMs: 600_000 });
 	});
 
 	it("honors requestMaxRetries before a Codex SSE stream is established", async () => {
@@ -1849,6 +2210,624 @@ describe("openai-codex streaming", () => {
 		expect(JSON.stringify(retryInput)).toContain("Second question");
 	});
 
+	it("retries websocket continuations when Codex rejects the anchor as a generic invalid_request_error", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-invalid-anchor-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		class InvalidPreviousResponseIdWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			send(data: string): void {
+				const request = JSON.parse(data) as Record<string, unknown>;
+				sentRequests.push(request);
+				const requestIndex = sentRequests.length;
+
+				if (requestIndex === 1) {
+					this.emitCodexResponse({
+						messageId: "msg_1",
+						responseId: "resp_1",
+						text: "First answer",
+						terminalType: "response.completed",
+						includeCreated: true,
+					});
+					return;
+				}
+
+				if (requestIndex === 2) {
+					expect(request.previous_response_id).toBe("resp_1");
+					this.sendJson({
+						type: "error",
+						error: {
+							type: "invalid_request_error",
+							code: "invalid_request_error",
+							message: "Invalid `previous_response_id`.",
+						},
+					});
+					return;
+				}
+
+				if (requestIndex === 3) {
+					expect(request.previous_response_id).toBeUndefined();
+					this.emitCodexResponse({
+						messageId: "msg_3",
+						responseId: "resp_3",
+						text: "Second answer",
+						terminalType: "response.completed",
+						includeCreated: true,
+					});
+					return;
+				}
+
+				throw new Error(`Unexpected websocket request index: ${requestIndex}`);
+			}
+		}
+
+		global.WebSocket = InvalidPreviousResponseIdWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const firstContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "First question", timestamp: Date.now() }],
+		};
+		const firstResponse = await streamOpenAICodexResponses(model, firstContext, {
+			apiKey: token,
+			sessionId: "ws-invalid-previous-response-session",
+			providerSessionState,
+		}).result();
+		const secondContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [
+				...firstContext.messages,
+				firstResponse,
+				{ role: "user", content: "Second question", timestamp: Date.now() + 1 },
+			],
+		};
+
+		const secondResponse = await streamOpenAICodexResponses(model, secondContext, {
+			apiKey: token,
+			sessionId: "ws-invalid-previous-response-session",
+			providerSessionState,
+		}).result();
+
+		expect(secondResponse.stopReason).toBe("stop");
+		expect(JSON.stringify(secondResponse.content)).toContain("Second answer");
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(sentRequests).toHaveLength(3);
+		const retryInput = sentRequests[2]?.input;
+		expect(Array.isArray(retryInput)).toBe(true);
+		expect(JSON.stringify(retryInput)).toContain("First question");
+		expect(JSON.stringify(retryInput)).toContain("First answer");
+		expect(JSON.stringify(retryInput)).toContain("Second question");
+
+		const stats = getOpenAICodexWebSocketDebugStats(model, {
+			sessionId: "ws-invalid-previous-response-session",
+			providerSessionState,
+		});
+		expect(stats?.lastPreviousResponseId).toBeUndefined();
+	});
+
+	it.each([
+		["tool call id fault", "Previous response's tool call ID is malformed."],
+		["missing call id", "Invalid tool call in previous response; call ID is missing."],
+		["unknown message id", "Previous response's message ID is unknown."],
+		// No stale qualifier in the RAW message. Only display formatting appends
+		// `(code=invalid_request_error)`; classifying the formatted string would
+		// manufacture the "invalid" the provider never sent next to the token.
+		["schema fault naming the anchor field", "The previous_response_id field is required."],
+	])("keeps a deterministic %s fatal instead of replaying full context", async (_label, providerMessage) => {
+		const tempDir = TempDir.createSync("@pi-codex-anchor-nearmiss-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		class NearMissWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			send(data: string): void {
+				const request = JSON.parse(data) as Record<string, unknown>;
+				sentRequests.push(request);
+				if (sentRequests.length === 1) {
+					this.emitCodexResponse({
+						messageId: "msg_1",
+						responseId: "resp_1",
+						text: "First answer",
+						terminalType: "response.completed",
+						includeCreated: true,
+					});
+					return;
+				}
+				expect(request.previous_response_id).toBe("resp_1");
+				this.sendJson({
+					type: "error",
+					error: { type: "invalid_request_error", code: "invalid_request_error", message: providerMessage },
+				});
+			}
+		}
+
+		global.WebSocket = NearMissWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const sessionId = "ws-anchor-near-miss-session";
+		const firstContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "First question", timestamp: Date.now() }],
+		};
+		const firstResponse = await streamOpenAICodexResponses(model, firstContext, {
+			apiKey: token,
+			sessionId,
+			providerSessionState,
+		}).result();
+		const secondResponse = await streamOpenAICodexResponses(
+			model,
+			{
+				systemPrompt: ["You are a helpful assistant."],
+				messages: [
+					...firstContext.messages,
+					firstResponse,
+					{ role: "user", content: "Second question", timestamp: Date.now() + 1 },
+				],
+			},
+			{ apiKey: token, sessionId, providerSessionState },
+		).result();
+
+		expect(secondResponse.stopReason).toBe("error");
+		// Exactly one continuation attempt: no anchor-clearing full-context replay.
+		expect(sentRequests).toHaveLength(2);
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("keeps an anchor-naming rejection fatal when the request sent no anchor", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-no-anchor-sent-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		class RequiresAnchorWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			send(data: string): void {
+				sentRequests.push(JSON.parse(data) as Record<string, unknown>);
+				// The very first turn never carries an anchor. A rejection naming the
+				// field is a real validation fault, not a stale continuation.
+				this.sendJson({
+					type: "error",
+					error: {
+						type: "invalid_request_error",
+						code: "invalid_request_error",
+						message: "Invalid request: previous_response_id is required",
+					},
+				});
+			}
+		}
+
+		global.WebSocket = RequiresAnchorWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const response = await streamOpenAICodexResponses(
+			model,
+			{
+				systemPrompt: ["You are a helpful assistant."],
+				messages: [{ role: "user", content: "First question", timestamp: Date.now() }],
+			},
+			{
+				apiKey: token,
+				sessionId: "ws-no-anchor-sent-session",
+				providerSessionState: new Map<string, ProviderSessionState>(),
+			},
+		).result();
+
+		expect(response.stopReason).toBe("error");
+		// No anchor was sent, so no state-clearing replay may be attempted.
+		expect(sentRequests).toHaveLength(1);
+		expect(sentRequests[0]?.previous_response_id).toBeUndefined();
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("bounds Codex anchor recovery to a single full-context replay", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-anchor-oneshot-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		class AlwaysRejectsAnchorWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			send(data: string): void {
+				sentRequests.push(JSON.parse(data) as Record<string, unknown>);
+				if (sentRequests.length === 1) {
+					this.emitCodexResponse({
+						messageId: "msg_1",
+						responseId: "resp_1",
+						text: "First answer",
+						terminalType: "response.completed",
+						includeCreated: true,
+					});
+					return;
+				}
+				this.sendJson({
+					type: "error",
+					error: {
+						type: "invalid_request_error",
+						code: "invalid_request_error",
+						message: "Invalid `previous_response_id`.",
+					},
+				});
+			}
+		}
+
+		global.WebSocket = AlwaysRejectsAnchorWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const sessionId = "ws-anchor-one-shot-session";
+		const firstContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "First question", timestamp: Date.now() }],
+		};
+		const firstResponse = await streamOpenAICodexResponses(model, firstContext, {
+			apiKey: token,
+			sessionId,
+			providerSessionState,
+		}).result();
+		const secondResponse = await streamOpenAICodexResponses(
+			model,
+			{
+				systemPrompt: ["You are a helpful assistant."],
+				messages: [
+					...firstContext.messages,
+					firstResponse,
+					{ role: "user", content: "Second question", timestamp: Date.now() + 1 },
+				],
+			},
+			{ apiKey: token, sessionId, providerSessionState },
+		).result();
+
+		expect(secondResponse.stopReason).toBe("error");
+		// Anchored attempt + exactly one anchor-free replay, then the error surfaces.
+		expect(sentRequests).toHaveLength(3);
+		expect(sentRequests[1]?.previous_response_id).toBe("resp_1");
+		expect(sentRequests[2]?.previous_response_id).toBeUndefined();
+	});
+
+	it.each([
+		["backticked identifier", "Invalid `previous_response_id`."],
+		["prose wording", "Invalid previous response ID provided."],
+		["hyphenated identifier", "previous-response-id expired"],
+		["trailing predicate", "previous_response_id is no longer valid"],
+	])("recovers a Codex anchor rejection worded as %s", async (_label, providerMessage) => {
+		const tempDir = TempDir.createSync("@pi-codex-anchor-wording-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sentRequests: Array<Record<string, unknown>> = [];
+		global.fetch = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		}) as unknown as typeof fetch;
+
+		class AnchorWordingWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			send(data: string): void {
+				const request = JSON.parse(data) as Record<string, unknown>;
+				sentRequests.push(request);
+				const requestIndex = sentRequests.length;
+				if (requestIndex === 2) {
+					expect(request.previous_response_id).toBe("resp_1");
+					this.sendJson({
+						type: "error",
+						error: { type: "invalid_request_error", code: "invalid_request_error", message: providerMessage },
+					});
+					return;
+				}
+				if (requestIndex === 3) expect(request.previous_response_id).toBeUndefined();
+				this.emitCodexResponse({
+					messageId: `msg_${requestIndex}`,
+					responseId: `resp_${requestIndex}`,
+					text: requestIndex === 1 ? "First answer" : "Second answer",
+					terminalType: "response.completed",
+					includeCreated: true,
+				});
+			}
+		}
+
+		global.WebSocket = AnchorWordingWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const sessionId = "ws-anchor-wording-session";
+		const firstContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "First question", timestamp: Date.now() }],
+		};
+		const firstResponse = await streamOpenAICodexResponses(model, firstContext, {
+			apiKey: token,
+			sessionId,
+			providerSessionState,
+		}).result();
+		const secondResponse = await streamOpenAICodexResponses(
+			model,
+			{
+				systemPrompt: ["You are a helpful assistant."],
+				messages: [
+					...firstContext.messages,
+					firstResponse,
+					{ role: "user", content: "Second question", timestamp: Date.now() + 1 },
+				],
+			},
+			{ apiKey: token, sessionId, providerSessionState },
+		).result();
+
+		expect(secondResponse.stopReason).toBe("stop");
+		expect(sentRequests).toHaveLength(3);
+		expect(JSON.stringify(sentRequests[2]?.input)).toContain("First question");
+	});
+	it.each([
+		// codex-lb masks the anchor fault's specific code to invalid_request_error
+		// and keeps only the canonical not-found/expired prose; the same masking it
+		// already applies to codex_previous_response_stale. The third element
+		// controls whether the event carries the masked code at all.
+		["canonical not-found prose with masked code", "Previous response with id 'resp_1' not found.", true],
+		["canonical not-found prose without a code", "Previous response with id 'resp_1' not found.", false],
+		["expired prose with masked code", "The previous response 'resp_1' has expired.", true],
+		["unknown-anchor prose", "Unknown previous response 'resp_1'.", true],
+		// Cross-sentence coincidence inside the 48-char window is a deliberate
+		// trade-off: the anchor-sent + one-shot + zero-content gates bound the
+		// worst case to one extra full-context request, so ambiguity resolves
+		// toward recovery instead of killing the turn.
+		[
+			"cross-sentence stale qualifier",
+			"The requested resource was not found in the archive. Please inspect the previous response.",
+			true,
+		],
+	])("recovers a Codex stale anchor worded as %s", async (_label, providerMessage, includeCode) => {
+		const tempDir = TempDir.createSync("@pi-codex-anchor-prose-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		class AnchorProseWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			send(data: string): void {
+				const request = JSON.parse(data) as Record<string, unknown>;
+				sentRequests.push(request);
+				const requestIndex = sentRequests.length;
+				if (requestIndex === 2) {
+					expect(request.previous_response_id).toBe("resp_1");
+					this.sendJson({
+						type: "error",
+						error: includeCode
+							? { type: "invalid_request_error", code: "invalid_request_error", message: providerMessage }
+							: { message: providerMessage },
+					});
+					return;
+				}
+				if (requestIndex === 3) expect(request.previous_response_id).toBeUndefined();
+				this.emitCodexResponse({
+					messageId: `msg_${requestIndex}`,
+					responseId: `resp_${requestIndex}`,
+					text: requestIndex === 1 ? "First answer" : "Second answer",
+					terminalType: "response.completed",
+					includeCreated: true,
+				});
+			}
+		}
+
+		global.WebSocket = AnchorProseWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const sessionId = "ws-anchor-prose-session";
+		const firstContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "First question", timestamp: Date.now() }],
+		};
+		const firstResponse = await streamOpenAICodexResponses(model, firstContext, {
+			apiKey: token,
+			sessionId,
+			providerSessionState,
+		}).result();
+		const secondResponse = await streamOpenAICodexResponses(
+			model,
+			{
+				systemPrompt: ["You are a helpful assistant."],
+				messages: [
+					...firstContext.messages,
+					firstResponse,
+					{ role: "user", content: "Second question", timestamp: Date.now() + 1 },
+				],
+			},
+			{ apiKey: token, sessionId, providerSessionState },
+		).result();
+
+		expect(secondResponse.stopReason).toBe("stop");
+		expect(JSON.stringify(secondResponse.content)).toContain("Second answer");
+		expect(fetchMock).not.toHaveBeenCalled();
+		// Anchored attempt, one anchor-free full-context replay, nothing more.
+		expect(sentRequests).toHaveLength(3);
+		expect(sentRequests[1]?.previous_response_id).toBe("resp_1");
+		expect(sentRequests[2]?.previous_response_id).toBeUndefined();
+		const retryInput = sentRequests[2]?.input;
+		expect(Array.isArray(retryInput)).toBe(true);
+		expect(JSON.stringify(retryInput)).toContain("First question");
+		expect(JSON.stringify(retryInput)).toContain("First answer");
+		expect(JSON.stringify(retryInput)).toContain("Second question");
+	});
+
+	it.each([
+		// Sub-field faults INSIDE the previous response are deterministic history
+		// faults; replaying full context would re-send the same offending item.
+		["tool call fault in prose", "Unknown tool call in previous response."],
+		["message id fault in prose", "Unknown message ID in previous response."],
+		["item fault in prose", "Unknown item in previous response."],
+		["function call fault in prose", "Previous response's function call is invalid."],
+		// The fault noun may FOLLOW the anchor phrase as well: the sub-field guard
+		// applies on both sides of the reference.
+		["tool call fault after the anchor phrase", "Unknown previous response tool call."],
+		["output item fault after the anchor phrase", "Unknown previous response output item."],
+		["call id fault after the anchor phrase", "Unknown previous response call id fc_1."],
+		// ... and after the QUALIFIER in the token-first ordering.
+		["sub-field fault after the qualifier", "Previous response includes an unknown tool call."],
+		["output item fault after the qualifier", "Previous response contains an invalid output item."],
+		// Span bound and line bound: a stale qualifier more than 48 chars from the
+		// reference, or across a line break, is not an anchor-stale message.
+		[
+			"stale qualifier beyond the span bound",
+			"Previous response 'resp_1' referenced by this very long request identifier string is no longer available.",
+		],
+		["stale qualifier across a line break", "The previous response\nwith id 'resp_1' was not found."],
+	])("keeps a %s fatal instead of replaying full context", async (_label, providerMessage) => {
+		const tempDir = TempDir.createSync("@pi-codex-anchor-prose-nearmiss-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		class AnchorProseNearMissWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			send(data: string): void {
+				const request = JSON.parse(data) as Record<string, unknown>;
+				sentRequests.push(request);
+				if (sentRequests.length === 1) {
+					this.emitCodexResponse({
+						messageId: "msg_1",
+						responseId: "resp_1",
+						text: "First answer",
+						terminalType: "response.completed",
+						includeCreated: true,
+					});
+					return;
+				}
+				expect(request.previous_response_id).toBe("resp_1");
+				this.sendJson({
+					type: "error",
+					error: { type: "invalid_request_error", code: "invalid_request_error", message: providerMessage },
+				});
+			}
+		}
+
+		global.WebSocket = AnchorProseNearMissWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const sessionId = "ws-anchor-prose-near-miss-session";
+		const firstContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "First question", timestamp: Date.now() }],
+		};
+		const firstResponse = await streamOpenAICodexResponses(model, firstContext, {
+			apiKey: token,
+			sessionId,
+			providerSessionState,
+		}).result();
+		const secondResponse = await streamOpenAICodexResponses(
+			model,
+			{
+				systemPrompt: ["You are a helpful assistant."],
+				messages: [
+					...firstContext.messages,
+					firstResponse,
+					{ role: "user", content: "Second question", timestamp: Date.now() + 1 },
+				],
+			},
+			{ apiKey: token, sessionId, providerSessionState },
+		).result();
+
+		expect(secondResponse.stopReason).toBe("error");
+		// Exactly one continuation attempt: no anchor-clearing full-context replay.
+		expect(sentRequests).toHaveLength(2);
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("keeps a genuine invalid_request_error fatal when no continuation anchor is implicated", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-invalid-request-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		class InvalidRequestWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			send(data: string): void {
+				sentRequests.push(JSON.parse(data) as Record<string, unknown>);
+				this.sendJson({
+					type: "error",
+					error: {
+						type: "invalid_request_error",
+						code: "invalid_request_error",
+						message: "Invalid value for 'model'.",
+					},
+				});
+			}
+		}
+
+		global.WebSocket = InvalidRequestWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const response = await streamOpenAICodexResponses(
+			model,
+			{
+				systemPrompt: ["You are a helpful assistant."],
+				messages: [{ role: "user", content: "First question", timestamp: Date.now() }],
+			},
+			{
+				apiKey: token,
+				sessionId: "ws-invalid-request-session",
+				providerSessionState: new Map<string, ProviderSessionState>(),
+			},
+		).result();
+
+		expect(response.stopReason).toBe("error");
+		expect(sentRequests).toHaveLength(1);
+	});
+
 	it("uses low Codex text verbosity by default while preserving explicit overrides", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-verbosity-");
 		setAgentDir(tempDir.path());
@@ -1952,10 +2931,9 @@ describe("openai-codex streaming", () => {
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
-	it("falls back to SSE when a prewarmed websocket never produces a first event", async () => {
+	it("discards a timed-out prewarmed websocket before the outer retry", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
-		Bun.env.PI_CODEX_WEBSOCKET_FIRST_EVENT_TIMEOUT_MS = "10";
 		Bun.env.PI_CODEX_WEBSOCKET_RETRY_BUDGET = "0";
 
 		const payload = Buffer.from(
@@ -1964,27 +2942,43 @@ describe("openai-codex streaming", () => {
 		).toBase64();
 		const token = `aaa.${payload}.bbb`;
 
-		const sse = `${[
-			`data: ${JSON.stringify({ type: "response.output_item.added", item: { type: "message", id: "msg_sse_first_event", role: "assistant", status: "in_progress", content: [] } })}`,
-			`data: ${JSON.stringify({ type: "response.content_part.added", part: { type: "output_text", text: "" } })}`,
-			`data: ${JSON.stringify({ type: "response.output_text.delta", delta: "Hello fallback" })}`,
-			`data: ${JSON.stringify({ type: "response.output_item.done", item: { type: "message", id: "msg_sse_first_event", role: "assistant", status: "completed", content: [{ type: "output_text", text: "Hello fallback" }] } })}`,
-			`data: ${JSON.stringify({ type: "response.done", response: { id: "resp_sse_first_event", status: "completed", usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8, input_tokens_details: { cached_tokens: 0 } } } })}`,
-		].join("\n\n")}\n\n`;
 		const fetchMock = vi.fn(async () => {
-			return new Response(sse, { headers: { "content-type": "text/event-stream" } });
+			throw new Error("SSE fallback must not run for a typed first-event timeout");
 		});
 		global.fetch = fetchMock as unknown as typeof fetch;
 
 		let sendCount = 0;
+		const sockets: IdleWebSocket[] = [];
 		class IdleWebSocket extends MockWebSocket {
 			constructor(url: string, options?: { headers?: WsHeaders }) {
 				super(url, options);
+				sockets.push(this);
 				this.scheduleOpen();
 			}
 
 			send(): void {
 				sendCount += 1;
+				if (sendCount === 1) {
+					setTimeout(() => {
+						this.emitCodexResponse({
+							messageId: "msg_stale",
+							responseId: "resp_stale",
+							text: "Stale response",
+						});
+					}, 25);
+					return;
+				}
+				if (sendCount === 2) {
+					setTimeout(() => {
+						this.emitCodexResponse({
+							messageId: "msg_fresh",
+							responseId: "resp_fresh",
+							text: "Fresh response",
+						});
+					}, 30);
+					return;
+				}
+				throw new Error(`Unexpected websocket send ${sendCount}`);
 			}
 		}
 
@@ -2013,22 +3007,49 @@ describe("openai-codex streaming", () => {
 			sessionId: "ws-idle-timeout-session",
 			providerSessionState,
 		});
-		const result = await streamOpenAICodexResponses(model, context, {
+
+		const first = await streamOpenAICodexResponses(model, context, {
 			apiKey: token,
 			sessionId: "ws-idle-timeout-session",
 			providerSessionState,
+			streamFirstEventTimeoutMs: 10,
 		}).result();
-		expect(sendCount).toBeGreaterThanOrEqual(1);
-		expect(result.stopReason).toBe("stop");
-		expect(result.errorMessage).toBeUndefined();
-		expect(fetchMock).toHaveBeenCalledTimes(1);
-		const transportDetails = getOpenAICodexTransportDetails(model, {
+		expect(first.stopReason).toBe("error");
+		expect(first.errorMessage).toBe("Codex websocket transport error: timeout waiting for first websocket event");
+		expect(first.transportFailure).toMatchObject({
+			kind: "transport",
+			providerCode: "stream_first_event_timeout",
+		});
+		expect(sockets).toHaveLength(1);
+		expect(sockets[0]?.readyState).toBe(MockWebSocket.CLOSED);
+		const afterTimeout = getOpenAICodexTransportDetails(model, {
 			sessionId: "ws-idle-timeout-session",
 			providerSessionState,
 		});
-		expect(transportDetails.lastTransport).toBe("sse");
-		expect(transportDetails.websocketDisabled).toBe(true);
-		expect(transportDetails.fallbackCount).toBe(1);
+		expect(afterTimeout.websocketConnected).toBe(false);
+		expect(afterTimeout.websocketDisabled).toBe(false);
+		expect(afterTimeout.fallbackCount).toBe(0);
+
+		const second = await streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			sessionId: "ws-idle-timeout-session",
+			providerSessionState,
+			streamFirstEventTimeoutMs: 100,
+		}).result();
+		expect(sendCount).toBe(2);
+		expect(sockets).toHaveLength(2);
+		expect(second.stopReason).toBe("stop");
+		expect(second.content.find(block => block.type === "text")?.text).toBe("Fresh response");
+		expect(second.content.find(block => block.type === "text")?.text).not.toContain("Stale response");
+		expect(fetchMock).not.toHaveBeenCalled();
+		const afterRetry = getOpenAICodexTransportDetails(model, {
+			sessionId: "ws-idle-timeout-session",
+			providerSessionState,
+		});
+		expect(afterRetry.lastTransport).toBe("websocket");
+		expect(afterRetry.websocketConnected).toBe(true);
+		expect(afterRetry.websocketDisabled).toBe(false);
+		expect(afterRetry.fallbackCount).toBe(0);
 	});
 
 	it("falls back to SSE when websocket status events do not make semantic progress", async () => {
@@ -2043,9 +3064,11 @@ describe("openai-codex streaming", () => {
 
 		let sendCount = 0;
 		let interval: NodeJS.Timeout | undefined;
+		const sockets: NoProgressWebSocket[] = [];
 		class NoProgressWebSocket extends MockWebSocket {
 			constructor(url: string, options?: { headers?: WsHeaders }) {
 				super(url, options);
+				sockets.push(this);
 				this.scheduleOpen();
 			}
 
@@ -2089,12 +3112,48 @@ describe("openai-codex streaming", () => {
 		expect(result.stopReason).toBe("stop");
 		expect(result.errorMessage).toBeUndefined();
 		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(sockets[0]?.readyState).toBe(MockWebSocket.CLOSED);
 		const transportDetails = getOpenAICodexTransportDetails(model, {
 			sessionId: "ws-no-progress-session",
 			providerSessionState,
 		});
 		expect(transportDetails.lastTransport).toBe("sse");
 		expect(transportDetails.websocketDisabled).toBe(true);
+	});
+
+	it("bounds the websocket first-progress window across repeated no-op deltas", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		let interval: NodeJS.Timeout | undefined;
+		class NoFirstProgressWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+			send(): void {
+				interval = setInterval(() => {
+					this.sendJson({ type: "response.output_text.delta", delta: 42 });
+				}, 2);
+			}
+			close(): void {
+				if (interval) clearInterval(interval);
+				super.close();
+			}
+		}
+		global.WebSocket = NoFirstProgressWebSocket as unknown as typeof WebSocket;
+		const result = await streamOpenAICodexResponses(
+			createCodexTestModel("https://chatgpt.com/backend-api"),
+			createCodexTestContext(),
+			{
+				apiKey: createCodexTestToken(),
+				sessionId: "ws-first-progress-noop",
+				providerSessionState: new Map<string, ProviderSessionState>(),
+				streamFirstEventTimeoutMs: 20,
+				streamIdleTimeoutMs: 500,
+			},
+		).result();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("timeout waiting for first websocket event");
 	});
 
 	it("retries websocket stream closes before surfacing transport errors", async () => {
@@ -2250,6 +3309,70 @@ describe("openai-codex streaming", () => {
 		expect(transportDetails.lastTransport).toBe("sse");
 		expect(transportDetails.websocketDisabled).toBe(true);
 		expect(transportDetails.fallbackCount).toBe(1);
+	});
+
+	it("releases an in-flight websocket request when the stream consumer returns early", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const sentTypesByConnection: string[][] = [];
+		let constructorCount = 0;
+
+		class ConsumerReturnWebSocket extends MockWebSocket {
+			#connectionIndex: number;
+
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.#connectionIndex = constructorCount++;
+				sentTypesByConnection[this.#connectionIndex] = [];
+				this.scheduleOpen();
+			}
+
+			send(data: string): void {
+				const request = JSON.parse(data) as { type?: string };
+				const requestType = typeof request.type === "string" ? request.type : "";
+				sentTypesByConnection[this.#connectionIndex]?.push(requestType);
+				if (this.#connectionIndex === 0) {
+					this.sendJson({
+						type: "response.output_item.added",
+						item: { type: "message", id: "msg_1", role: "assistant", status: "in_progress", content: [] },
+					});
+					this.sendJson({ type: "response.content_part.added", part: { type: "output_text", text: "" } });
+					this.sendJson({ type: "response.output_text.delta", delta: "oversized provisional payload" });
+					return;
+				}
+				this.emitCodexResponse({ messageId: "msg_2", responseId: "resp_2", text: "clean successor" });
+			}
+		}
+
+		global.WebSocket = ConsumerReturnWebSocket as unknown as typeof WebSocket;
+		global.fetch = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		}) as unknown as typeof fetch;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const first = streamOpenAICodexResponses(model, createCodexTestContext(), {
+			apiKey: token,
+			sessionId: "ws-consumer-return-session",
+			providerSessionState,
+		});
+		const iterator = first[Symbol.asyncIterator]();
+		for (let i = 0; i < 3; i++) {
+			const event = await iterator.next();
+			expect(event.done).toBe(false);
+		}
+		await iterator.return?.();
+
+		const successor = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+			apiKey: token,
+			sessionId: "ws-consumer-return-session",
+			providerSessionState,
+		}).result();
+
+		expect(successor.stopReason).toBe("stop");
+		expect(successor.content).toEqual([expect.objectContaining({ type: "text", text: "clean successor" })]);
+		expect(constructorCount).toBe(2);
+		expect(sentTypesByConnection).toEqual([["response.create"], ["response.create"]]);
 	});
 
 	it("resets websocket append state after an aborted request closes the connection", async () => {
@@ -2830,6 +3953,42 @@ describe("openai-codex streaming", () => {
 		expect(transportDetails.websocketConnected).toBe(true);
 		expect(transportDetails.prewarmed).toBe(true);
 		expect(transportDetails.canAppend).toBe(true);
+	});
+
+	it("applies each reused websocket request's idle timeout", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		let sendCount = 0;
+		class RequestScopedIdleWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+			send(): void {
+				sendCount += 1;
+				if (sendCount === 1) {
+					this.emitCodexResponse({ messageId: "msg_first", responseId: "resp_first", text: "first" });
+					return;
+				}
+				this.sendJson({ type: "response.created", response: { id: "resp_stalled", status: "in_progress" } });
+			}
+		}
+		global.WebSocket = RequestScopedIdleWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = { apiKey: createCodexTestToken(), sessionId: "ws-request-idle", providerSessionState };
+		await streamOpenAICodexResponses(model, createCodexTestContext(), {
+			...options,
+			streamIdleTimeoutMs: 1_000,
+		}).result();
+		const startedAt = Date.now();
+		const stalled = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+			...options,
+			streamIdleTimeoutMs: 20,
+			streamMaxRetries: 0,
+		}).result();
+		expect(stalled.stopReason).toBe("error");
+		expect(Date.now() - startedAt).toBeLessThan(600);
 	});
 
 	it("replays x-codex-turn-state on subsequent SSE requests", async () => {

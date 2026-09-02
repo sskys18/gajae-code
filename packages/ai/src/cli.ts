@@ -104,6 +104,7 @@ Providers:
   google-gemini-cli Google Gemini CLI
   google-antigravity Antigravity (Gemini 3, Anthropic, GPT-OSS)
   openai-codex      OpenAI code provider (ChatGPT Plus/Pro)
+  commandcode-goat    Command Code GOAT (API key)
   kimi-code         Kimi Code
   kilo              Kilo Gateway
   kagi              Kagi
@@ -118,6 +119,9 @@ Providers:
   minimax-code-cn   MiniMax Coding Plan (China)
   cursor            Cursor (Anthropic, GPT, etc.)
   zenmux            ZenMux
+  opengateway       OpenGateway by Sionic AI
+  bizrouter         BizRouter
+  mara              Mara Cloud
   ollama-cloud      Ollama Cloud
 
 Examples:

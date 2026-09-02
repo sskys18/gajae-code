@@ -32,7 +32,7 @@ The tool is `concurrency = "exclusive"` for a session, so calls do not overlap.
 
 ## Kernel lifecycle
 
-Each kernel is a single Python subprocess: `python -u <runner.py>`. The runner is bundled with the host binary (Bun text import), written to `~/.gjc/python-env`-adjacent tmp cache once per script-hash, and reused by every subsequent spawn.
+Each kernel is a single Python subprocess: `python -u <runner.py>`. The bundled runner is materialized once per GJC process in a process-private temporary directory and file, then reused only by subsequent spawns within that process.
 
 Kernel startup sequence:
 
@@ -113,6 +113,25 @@ Unknown magic names raise `NameError: UsageError: ...` inside the cell.
   - Spawns a fresh subprocess for each request.
   - Shuts the subprocess down after the request.
   - No cross-call state persistence.
+
+### Kernel ownership
+
+Retained kernels are keyed by an **owner id**, and there are two kinds of owner:
+
+- **Session-owned** (the `eval` tool) — derived from the session file plus cwd as described above. Reaped when the session disposes.
+- **Explicitly-owned** (the `python` tool) — the caller supplies `kernelOwnerId`, which is `python:<session-id>`. This is deliberately distinct from the session's eval owner id so the two never alias and a Python REPL kernel is never reaped as collateral of eval cleanup.
+
+`disposeKernelSessionsByOwner(ownerId)` disposes every retained kernel for one owner and is idempotent, so disposing an owner twice is not a double free.
+
+Owner-scoped kernels are reaped on all three exits:
+
+- the owning tool's own teardown action (for `python`, `action: "clear"`),
+- session cleanup, which also handles session identity transitions,
+- signal exit (Ctrl-C), via `disposeChildSubprocesses`, which also drains both registries inside a single bounded budget.
+
+`gjc autoresearch clear` clears autoresearch state only; it does not dispose a Python kernel.
+
+A tool registering through the SDK's `registerSessionCleanup` lands in the **transition** cleanup registry, not the session one. Draining only the session registry on signal exit left explicitly-owned kernels running after Ctrl-C while graceful dispose looked correct.
 
 ### Multi-cell behavior in a single tool call
 

@@ -12,7 +12,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 const repoRoot = path.join(import.meta.dir, "..");
-const EXPECTED_DEFINITIONS = ["deep-interview", "ralplan", "team", "ultragoal"] as const;
+const EXPECTED_DEFINITIONS = ["autoresearch", "deep-interview", "ralplan", "ultragoal"] as const;
 const EXPECTED_ROLE_AGENTS = ["architect", "critic", "executor", "planner"] as const;
 const EXPECTED_PUBLIC_PACKAGE_VERSION_CATALOG_KEY = "@gajae-code/coding-agent";
 const ALLOWED_PUBLIC_PACKAGE_VERSIONS = new Map<string, string>();
@@ -23,8 +23,8 @@ const ALLOWED_PRIVATE_PACKAGE_VERSIONS = new Map<string, string>([
 const ALLOWED_UNSCOPED_PACKAGE_NAMES = new Set<string>(["gajae-code"]);
 const ALLOWED_PACKAGE_BINARIES = new Map<string, readonly string[]>([
 	["@gajae-code/ai", ["pi-ai"]],
-	["@gajae-code/coding-agent", ["gjc"]],
-	["gajae-code", ["gjc"]],
+	["@gajae-code/coding-agent", ["gjc", "가재씨"]],
+	["gajae-code", ["gjc", "가재씨"]],
 	["@gajae-code/stats", ["gjc-stats"]],
 	["@gajae-code/typescript-edit-benchmark", ["typescript-edit-benchmark"]],
 ]);
@@ -37,12 +37,12 @@ const LEGACY_NAME_PATTERNS: readonly RegExp[] = [
 	new RegExp("qa\." + ("om" + "p") + String.raw`\.sh`, "u"),
 ];
 const FORBIDDEN_PUBLIC_DOC_PATTERNS: readonly RegExp[] = [
+	// MCP is a public product surface since #4283/#4284 (`gjc mcp`, `/extensions`,
+	// docs/standalone-mcp.md); only removed-doc names stay forbidden in public docs.
 	...LEGACY_NAME_PATTERNS,
-	/MCP/u,
-	/\/mcp/u,
 	/mcp-config/u,
-	/mcp-server/u,
-];
+	/mcp-server\.md/u,
+]
 const FORBIDDEN_EXA_MCP_DOC_PATTERNS: readonly RegExp[] = [
 	/Exa MCP/u,
 	/web_search_exa/u,
@@ -66,10 +66,6 @@ const FORBIDDEN_SKILL_PATTERNS: readonly RegExp[] = [
 	/\/mcp/u,
 ];
 const FORBIDDEN_PUBLIC_WORKFLOW_EXPORT_BLOCKS = [
-	"./autoresearch",
-	"./autoresearch/*",
-	"./autoresearch/tools/*",
-	"./commands/autoresearch",
 	"./commands/ralph",
 	"./commands/ultraqa",
 	"./commands/ultrawork",
@@ -77,7 +73,6 @@ const FORBIDDEN_PUBLIC_WORKFLOW_EXPORT_BLOCKS = [
 ] as const;
 const FORBIDDEN_WORKFLOW_SURFACE_TOKENS = [
 	"autopilot",
-	"autoresearch",
 	"autoresearch-goal",
 	"performance-goal",
 	"ralph",
@@ -399,7 +394,9 @@ async function verifyMcpQuarantine(): Promise<GateResult> {
 	const missingPrivateBlocks = REQUIRED_PRIVATE_EXPORT_BLOCKS.filter(key => exportsRecord[key] !== null);
 	const builtinRegistry = await readText("packages/coding-agent/src/slash-commands/builtin-registry.ts");
 	const acpBuiltins = await readText("packages/coding-agent/src/slash-commands/acp-builtins.ts");
-	const exposesMcpBuiltin = /name:\s*["']mcp["']/.test(builtinRegistry);
+	// Only a root-level slash-command entry is public. Nested subcommands such as
+	// `/aside mcp` are intentionally allowed and must not trip the quarantine gate.
+	const exposesMcpBuiltin = /^\t\tname:\s*["']mcp["']/m.test(builtinRegistry);
 	const importsMcpBuiltinHandler = builtinRegistry.includes("handleMcpAcp");
 	const acpReferencesMcpHandler = acpBuiltins.includes("handleMcpAcp");
 	const acpAdvertisesMcpCommand = /name:\s*["']mcp["']/.test(acpBuiltins);
@@ -532,9 +529,9 @@ async function probeForbiddenPackageSymbols(): Promise<string[]> {
 
 async function verifyLocalToolsPreserved(): Promise<GateResult> {
 	const missing = REQUIRED_LOCAL_TOOL_FILES.filter(relativePath => !fs.existsSync(path.join(repoRoot, relativePath)));
-	const toolIndex = await readText("packages/coding-agent/src/tools/index.ts");
+	const toolRegistry = `${await readText("packages/coding-agent/src/tools/index.ts")}\n${await readText("packages/coding-agent/src/tools/descriptors.ts")}`;
 	const requiredRegistryNames = ["read", "write", "edit", "bash", "find", "search", "ast_grep", "ast_edit"];
-	const missingRegistryNames = requiredRegistryNames.filter(name => !toolIndex.includes(`${name}:`));
+	const missingRegistryNames = requiredRegistryNames.filter(name => !toolRegistry.includes(`${name}:`));
 
 	return {
 		name: "inline/local tools preserved",

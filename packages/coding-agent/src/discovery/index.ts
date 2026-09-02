@@ -22,15 +22,21 @@ import "../capability/tool";
 // Import providers (each registers itself on import)
 import "./agents-md";
 import "./builtin";
+import "./claude-hooks";
+import "./claude-plugins";
 import "./cline";
 import "./agents";
 import "./cursor";
+import "./codex-hooks";
 import "./gemini";
 import "./opencode";
 import "./github";
 import "./mcp-json";
 import "./ssh";
-import "./vscode";
+// NOTE: There is deliberately no VS Code provider and no MCP registration in
+// the cursor/gemini/opencode/windsurf providers: GJC does not inherit MCP
+// servers live from other hosts. MCP comes from GJC's own config (builtin,
+// mcp-json), validated plugin bundles, or an explicit `gjc mcp import <host>`.
 import "./windsurf";
 
 // Re-export the main API from capability registry
@@ -53,6 +59,7 @@ export {
 	listCapabilities,
 	// Loading API
 	loadCapability,
+	releaseSettingsScope,
 	// Cache management
 	reset,
 	setDisabledProviders,

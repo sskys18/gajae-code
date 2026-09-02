@@ -1,10 +1,18 @@
 import { afterEach, beforeAll, describe, expect, it, spyOn, vi } from "bun:test";
 import type { AgentToolContext } from "@gajae-code/agent-core";
+import { validateToolArguments } from "@gajae-code/ai/utils/validation";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { AppendOrMergeResult } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
 import * as deepInterviewRecorder from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
+import { deepInterviewCharacterCount } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
 import { getThemeByName, initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
-import type { ToolSession } from "@gajae-code/coding-agent/tools";
+import type {
+	AskAnswerRequest,
+	AskAnswerSource,
+	AskRemoteReceipt,
+	AskSettlement,
+	ToolSession,
+} from "@gajae-code/coding-agent/tools";
 import { AskTool, askSchema, askToolRenderer } from "@gajae-code/coding-agent/tools/ask";
 import { ToolAbortError } from "@gajae-code/coding-agent/tools/tool-errors";
 import { logger } from "@gajae-code/utils";
@@ -458,6 +466,149 @@ describe("AskTool cancellation", () => {
 		expect(abort).not.toHaveBeenCalled();
 	});
 
+	it("rejects oversized deep-interview custom input before recorder persistence", async () => {
+		const appendSpy = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound");
+		const tool = new AskTool(createSession());
+		const oversized = "😀".repeat(10_001);
+		const context = createContext({
+			select: async (_prompt, options, dialogOptions) => {
+				dialogOptions?.customInput?.onSubmit(oversized);
+				return options[2];
+			},
+		});
+
+		await expect(
+			tool.execute(
+				"call-oversized-deep-input",
+				{ questions: [singleDeepInterviewQuestion()] },
+				undefined,
+				undefined,
+				context,
+			),
+		).rejects.toThrow("user_response exceeds max length 10000");
+		expect(appendSpy).not.toHaveBeenCalled();
+	});
+
+	it("accepts exactly 10000 emoji custom-input characters and invalidates a 10001-character remote reply", async () => {
+		const appendSpy = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
+			action: "created",
+			record: {} as AppendOrMergeResult["record"],
+		});
+		const exact = "😀".repeat(10_000);
+		const local = new AskTool(createSession({ getSessionId: () => "test-session" }));
+		const localContext = createContext({
+			select: async (_prompt, options, dialogOptions) => {
+				dialogOptions?.customInput?.onSubmit(exact);
+				return options[2];
+			},
+		});
+		await expect(
+			local.execute(
+				"call-exact-emoji-deep-input",
+				{ questions: [singleDeepInterviewQuestion()] },
+				undefined,
+				undefined,
+				localContext,
+			),
+		).resolves.toBeDefined();
+		appendSpy.mockClear();
+
+		const settlements: unknown[] = [];
+		const remote = new AskTool(
+			createSession({
+				getAskAnswerSource: () => ({
+					awaitAnswer: async () => undefined,
+					awaitAnswerRequest: async () => ({
+						source: "remote" as const,
+						interaction: { kind: "value" as const, value: "😀".repeat(10_001) },
+						settle: async settlement => {
+							settlements.push(settlement);
+							return { kind: "resolved_without_commit" as const };
+						},
+					}),
+				}),
+			}),
+		);
+		await expect(
+			remote.execute(
+				"call-remote-oversized-emoji-deep-input",
+				{ questions: [singleDeepInterviewQuestion()] },
+				undefined,
+				undefined,
+				createContext({ select: () => new Promise<string | undefined>(() => {}) }),
+			),
+		).rejects.toThrow("user_response exceeds max length 10000");
+		expect(settlements).toEqual([{ kind: "invalid", reason: "invalid_structured_answer" }]);
+		expect(appendSpy).not.toHaveBeenCalled();
+	});
+
+	it("rejects oversized legacy formatted deep-interview input before tool output", async () => {
+		const appendSpy = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound");
+		const oversized = "한".repeat(10_001);
+		const tool = new AskTool(createSession());
+		const context = createContext({
+			select: async (_prompt, options, dialogOptions) => {
+				dialogOptions?.customInput?.onSubmit(oversized);
+				return options.find(option => option === dialogOptions?.customInput?.optionLabel);
+			},
+		});
+
+		await expect(
+			tool.execute(
+				"call-oversized-legacy-deep-input",
+				{
+					questions: [
+						{
+							id: "legacy-deep",
+							question:
+								"Round 1 | Component: Scope | Targeting: Constraints | Why now: unresolved boundary | Ambiguity: 42%\n\nWhat is the boundary?",
+							options: [{ label: "Known" }],
+						},
+					],
+				},
+				undefined,
+				undefined,
+				context,
+			),
+		).rejects.toThrow("user_response exceeds max length 10000");
+		const settlements: unknown[] = [];
+		const remote = new AskTool(
+			createSession({
+				getAskAnswerSource: () => ({
+					awaitAnswer: async () => undefined,
+					awaitAnswerRequest: async () => ({
+						source: "remote" as const,
+						interaction: { kind: "value" as const, value: oversized },
+						settle: async settlement => {
+							settlements.push(settlement);
+							return { kind: "resolved_without_commit" as const };
+						},
+					}),
+				}),
+			}),
+		);
+		await expect(
+			remote.execute(
+				"call-remote-oversized-legacy-deep-input",
+				{
+					questions: [
+						{
+							id: "legacy-deep",
+							question:
+								"Round 1 | Component: Scope | Targeting: Constraints | Why now: unresolved boundary | Ambiguity: 42%\n\nWhat is the boundary?",
+							options: [{ label: "Known" }],
+						},
+					],
+				},
+				undefined,
+				undefined,
+				createContext({ select: () => new Promise<string | undefined>(() => {}) }),
+			),
+		).rejects.toThrow("user_response exceeds max length 10000");
+		expect(settlements).toEqual([{ kind: "invalid", reason: "invalid_structured_answer" }]);
+		expect(appendSpy).not.toHaveBeenCalled();
+	});
+
 	it("does not enter custom input when timeout resolves to Other in multi-select", async () => {
 		const tool = new AskTool(
 			createSession({
@@ -542,6 +693,585 @@ describe("AskTool cancellation", () => {
 	});
 });
 
+describe("AskTool remote semantic settlements", () => {
+	const abortableUi = (abort?: () => void) =>
+		createContext({
+			select: (_prompt, _options, dialogOptions) =>
+				new Promise<string | undefined>(resolve => {
+					dialogOptions?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+				}),
+			editor: (_title, _prefill, dialogOptions) =>
+				new Promise<string | undefined>(resolve => {
+					dialogOptions?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+				}),
+			abort,
+		});
+
+	it("bounds repeated remote whitespace custom answers and explains the retry", async () => {
+		const requests: AskAnswerRequest[] = [];
+		const settlements: AskSettlement[] = [];
+		let remoteCalls = 0;
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: request => {
+				requests.push(request);
+				remoteCalls++;
+				return Promise.resolve({
+					source: "remote" as const,
+					interaction: { kind: "value" as const, value: " \t" },
+					settle: async (settlement: AskSettlement) => {
+						settlements.push(settlement);
+						return { kind: "invalid_closed" as const };
+					},
+				});
+			},
+		};
+		const abort = vi.fn();
+		const tool = new AskTool(createSession({ getAskAnswerSource: () => source }));
+
+		await expect(
+			tool.execute(
+				"remote-whitespace-loop",
+				{ questions: [{ id: "choice", question: "Choose", options: [{ label: "yes" }] }] },
+				undefined,
+				undefined,
+				abortableUi(abort),
+			),
+		).rejects.toThrow("Ask tool was cancelled by the user");
+
+		expect(remoteCalls).toBe(3);
+		expect(settlements).toHaveLength(3);
+		expect(settlements).toEqual([
+			{ kind: "invalid", reason: "empty_custom" },
+			{ kind: "invalid", reason: "empty_custom" },
+			{ kind: "invalid", reason: "empty_custom" },
+		]);
+		expect(requests.slice(1).every(request => request.question.includes("Custom input cannot be empty"))).toBe(true);
+	});
+
+	it("yields between synchronous invalid remote answers so timers are not starved", async () => {
+		let timerRan = false;
+		const timer = setTimeout(() => {
+			timerRan = true;
+		}, 0);
+		let remoteCalls = 0;
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: () => {
+				remoteCalls++;
+				return Promise.resolve({
+					source: "remote" as const,
+					interaction: { kind: "value" as const, value: "   " },
+					settle: async () => ({ kind: "invalid_closed" as const }),
+				});
+			},
+		};
+
+		await expect(
+			new AskTool(createSession({ getAskAnswerSource: () => source })).execute(
+				"remote-whitespace-yield",
+				{ questions: [{ id: "choice", question: "Choose", options: [{ label: "yes" }] }] },
+				undefined,
+				undefined,
+				abortableUi(),
+			),
+		).rejects.toThrow("Ask tool was cancelled by the user");
+		clearTimeout(timer);
+		expect(timerRan).toBe(true);
+		expect(remoteCalls).toBe(3);
+	});
+
+	it("awaits a committed visible acknowledgement before returning the answer", async () => {
+		const settlementStarted = Promise.withResolvers<void>();
+		const releaseSettlement = Promise.withResolvers<void>();
+		let completed = false;
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: () =>
+				Promise.resolve({
+					source: "remote" as const,
+					interaction: { kind: "value" as const, value: "yes" },
+					settle: async settlement => {
+						expect(settlement).toEqual({ kind: "commit" });
+						settlementStarted.resolve();
+						await releaseSettlement.promise;
+						return { kind: "committed" as const, ack: { status: "delivered" as const, messageId: 42 } };
+					},
+				}),
+		};
+		const tool = new AskTool(createSession({ getAskAnswerSource: () => source }));
+		const execution = tool
+			.execute(
+				"remote-commit-order",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "yes" }, { label: "no" }] }] },
+				undefined,
+				undefined,
+				abortableUi(),
+			)
+			.then(result => {
+				completed = true;
+				return result;
+			});
+		await settlementStarted.promise;
+		expect(completed).toBe(false);
+		releaseSettlement.resolve();
+		const result = await execution;
+		expect(result.content[0]?.type === "text" ? result.content[0].text : "").toContain("yes");
+	});
+
+	for (const ack of [
+		{ status: "failed" as const, reason: "telegram_rejected" as const },
+		{ status: "unknown" as const, reason: "host_timeout" as const },
+	]) {
+		it(`preserves the accepted answer when visible acknowledgement is ${ack.status}`, async () => {
+			let settlements = 0;
+			const source: AskAnswerSource = {
+				awaitAnswer: async () => undefined,
+				awaitAnswerRequest: () =>
+					Promise.resolve({
+						source: "remote" as const,
+						interaction: { kind: "value" as const, value: "yes" },
+						settle: async settlement => {
+							settlements++;
+							expect(settlement).toEqual({ kind: "commit" });
+							return { kind: "committed" as const, ack };
+						},
+					}),
+			};
+			const tool = new AskTool(createSession({ getAskAnswerSource: () => source }));
+			const result = await tool.execute(
+				`remote-commit-${ack.status}`,
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "yes" }, { label: "no" }] }] },
+				undefined,
+				undefined,
+				abortableUi(),
+			);
+			expect(result.content[0]?.type === "text" ? result.content[0].text : "").toContain("yes");
+			expect(settlements).toBe(1);
+		});
+	}
+
+	it("atomically selects a same-microtask remote selector receipt over the local value", async () => {
+		const settlements: unknown[] = [];
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: () =>
+				Promise.resolve({
+					source: "remote" as const,
+					interaction: { kind: "value" as const, value: "remote" },
+					settle: async settlement => {
+						settlements.push(settlement);
+						return { kind: "committed" as const, ack: { status: "delivered" as const, messageId: 51 } };
+					},
+				}),
+		};
+		const result = await new AskTool(createSession({ getAskAnswerSource: () => source })).execute(
+			"same-microtask-selector",
+			{ questions: [{ id: "choice", question: "Choose", options: [{ label: "remote" }, { label: "local" }] }] },
+			undefined,
+			undefined,
+			createContext({ select: () => Promise.resolve("local") }),
+		);
+		expect(result.details?.selectedOptions).toEqual(["remote"]);
+		expect(settlements).toEqual([{ kind: "commit" }]);
+	});
+	it("does not leak an aborted remote selector rejection into the next ask", async () => {
+		let remoteCalls = 0;
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: (_request, signal) => {
+				remoteCalls++;
+				return new Promise<AskRemoteReceipt | undefined>((_resolve, reject) => {
+					signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), {
+						once: true,
+					});
+				});
+			},
+		};
+		const tool = new AskTool(createSession({ getAskAnswerSource: () => source }));
+
+		for (const id of ["first", "second"]) {
+			const result = await tool.execute(
+				`local-wins-${id}`,
+				{ questions: [{ id, question: `Choose ${id}`, options: [{ label: "local" }, { label: "remote" }] }] },
+				undefined,
+				undefined,
+				createContext({ select: () => Promise.resolve("local") }),
+			);
+			expect(result.details?.selectedOptions).toEqual(["local"]);
+		}
+		await Promise.resolve();
+		expect(remoteCalls).toBe(2);
+	});
+
+	it("atomically selects a same-microtask remote editor receipt over local text", async () => {
+		const settlements: unknown[] = [];
+		let requestCount = 0;
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: () => {
+				if (requestCount++ === 0) return new Promise<AskRemoteReceipt | undefined>(() => {});
+				return Promise.resolve({
+					source: "remote" as const,
+					interaction: { kind: "value" as const, value: "remote editor text" },
+					settle: async settlement => {
+						settlements.push(settlement);
+						return { kind: "committed" as const, ack: { status: "delivered" as const, messageId: 52 } };
+					},
+				});
+			},
+		};
+		const result = await new AskTool(createSession({ getAskAnswerSource: () => source })).execute(
+			"same-microtask-editor",
+			{ questions: [{ id: "choice", question: "Choose", options: [{ label: "yes" }, { label: "no" }] }] },
+			undefined,
+			undefined,
+			createContext({
+				select: (_prompt, options) => Promise.resolve(options[options.length - 1]),
+				editor: () => Promise.resolve("local editor text"),
+			}),
+		);
+		expect(result.details?.customInput).toBe("remote editor text");
+		expect(settlements).toEqual([{ kind: "commit" }]);
+	});
+
+	it("settles a same-microtask remote toggle only after it wins the selector race", async () => {
+		const settlements: unknown[] = [];
+		let remoteCall = 0;
+		let localCall = 0;
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: () => {
+				const interaction =
+					remoteCall++ === 0
+						? { kind: "value" as const, value: "alpha" }
+						: { kind: "control" as const, controlId: "navigation_forward" as const };
+				return Promise.resolve({
+					source: "remote" as const,
+					interaction,
+					settle: async settlement => {
+						settlements.push(settlement);
+						return settlement.kind === "commit"
+							? { kind: "committed" as const, ack: { status: "delivered" as const, messageId: 53 } }
+							: { kind: "resolved_without_commit" as const };
+					},
+				});
+			},
+		};
+		const result = await new AskTool(createSession({ getAskAnswerSource: () => source })).execute(
+			"same-microtask-toggle",
+			{
+				questions: [
+					{ id: "choice", question: "Choose", multi: true, options: [{ label: "alpha" }, { label: "beta" }] },
+				],
+			},
+			undefined,
+			undefined,
+			createContext({
+				select: () => (localCall++ === 0 ? Promise.resolve("beta") : new Promise<string | undefined>(() => {})),
+			}),
+		);
+		expect(result.details?.selectedOptions).toEqual(["alpha"]);
+		expect(settlements).toEqual([{ kind: "resolve_without_commit", reason: "toggle" }, { kind: "commit" }]);
+	});
+
+	it("settles a same-microtask remote Other transition only after it wins", async () => {
+		const settlements: unknown[] = [];
+		let remoteCall = 0;
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: request => {
+				const value =
+					remoteCall++ === 0 ? request.options.find(option => option.includes("Other"))! : "remote custom text";
+				return Promise.resolve({
+					source: "remote" as const,
+					interaction: { kind: "value" as const, value },
+					settle: async settlement => {
+						settlements.push(settlement);
+						return settlement.kind === "commit"
+							? { kind: "committed" as const, ack: { status: "delivered" as const, messageId: 54 } }
+							: { kind: "resolved_without_commit" as const };
+					},
+				});
+			},
+		};
+		const result = await new AskTool(createSession({ getAskAnswerSource: () => source })).execute(
+			"same-microtask-other",
+			{ questions: [{ id: "choice", question: "Choose", options: [{ label: "alpha" }, { label: "beta" }] }] },
+			undefined,
+			undefined,
+			createContext({
+				select: () => Promise.resolve("alpha"),
+				editor: () => new Promise<string | undefined>(() => {}),
+			}),
+		);
+		expect(result.details?.customInput).toBe("remote custom text");
+		expect(settlements).toEqual([{ kind: "resolve_without_commit", reason: "other_transition" }, { kind: "commit" }]);
+	});
+
+	it("commits a real option whose label ends with the synthetic Other text", async () => {
+		const label = "Deploy Other (type your own)";
+		const settlements: unknown[] = [];
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: () =>
+				Promise.resolve({
+					source: "remote" as const,
+					interaction: { kind: "value" as const, value: label },
+					settle: async settlement => {
+						settlements.push(settlement);
+						return { kind: "committed" as const, ack: { status: "delivered" as const, messageId: 42 } };
+					},
+				}),
+		};
+		const result = await new AskTool(createSession({ getAskAnswerSource: () => source })).execute(
+			"remote-sentinel-suffix",
+			{ questions: [{ id: "choice", question: "Choose", options: [{ label }, { label: "Skip" }] }] },
+			undefined,
+			undefined,
+			abortableUi(),
+		);
+		expect(settlements).toEqual([{ kind: "commit" }]);
+		expect(result.content[0]?.type === "text" ? result.content[0].text : "").toContain(label);
+	});
+
+	it("aborts the remote leg and settles a late receipt after tool cancellation", async () => {
+		const late = Promise.withResolvers<AskRemoteReceipt>();
+		const settlement = vi.fn(async () => ({ kind: "resolved_without_commit" as const }));
+		let remoteSignal: AbortSignal | undefined;
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: (_request, signal) => {
+				remoteSignal = signal;
+				return late.promise;
+			},
+		};
+		const controller = new AbortController();
+		const context = createContext({
+			select: (_prompt, _options, dialogOptions) =>
+				new Promise<string | undefined>((_resolve, reject) => {
+					dialogOptions?.signal?.addEventListener(
+						"abort",
+						() => reject(new DOMException("Aborted", "AbortError")),
+						{ once: true },
+					);
+					queueMicrotask(() => controller.abort());
+				}),
+		});
+		const execution = new AskTool(createSession({ getAskAnswerSource: () => source })).execute(
+			"remote-tool-abort",
+			{ questions: [{ id: "choice", question: "Choose", options: [{ label: "yes" }] }] },
+			controller.signal,
+			undefined,
+			context,
+		);
+		await expect(execution).rejects.toBeInstanceOf(ToolAbortError);
+		expect(remoteSignal?.aborted).toBe(true);
+		late.resolve({ source: "remote", interaction: { kind: "value", value: "yes" }, settle: settlement });
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(settlement).toHaveBeenCalledWith({ kind: "resolve_without_commit", reason: "aborted" });
+	});
+
+	it("settles multi-select toggles without acknowledgement and commits only Done", async () => {
+		const requests: AskAnswerRequest[] = [];
+		const settlements: unknown[] = [];
+		let call = 0;
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: request => {
+				requests.push(request);
+				const interaction =
+					call++ === 0
+						? { kind: "value" as const, value: "alpha" }
+						: { kind: "control" as const, controlId: "navigation_forward" as const };
+				return Promise.resolve({
+					source: "remote" as const,
+					interaction,
+					settle: async (settlement: unknown) => {
+						settlements.push(settlement);
+						return (settlement as { kind: string }).kind === "commit"
+							? { kind: "committed" as const, ack: { status: "delivered" as const, messageId: 7 } }
+							: { kind: "resolved_without_commit" as const };
+					},
+				});
+			},
+		};
+		const tool = new AskTool(createSession({ getAskAnswerSource: () => source }));
+		const result = await tool.execute(
+			"remote-multi",
+			{
+				questions: [
+					{
+						id: "choices",
+						question: "Choose",
+						multi: true,
+						recommended: 1,
+						options: [{ label: "alpha" }, { label: "beta" }],
+					},
+				],
+			},
+			undefined,
+			undefined,
+			abortableUi(),
+		);
+		expect(requests[0]?.controls).toEqual([
+			{ id: "navigation_forward", kind: "navigation", label: "Done", enabled: false },
+		]);
+		expect(requests[1]?.controls).toEqual([
+			{ id: "navigation_forward", kind: "navigation", label: "Done", enabled: true },
+		]);
+		expect(requests.map(request => request.recommendedIndex)).toEqual([1, 1]);
+		// The toggle must be visible remotely: the second request carries the
+		// selection made by the first, not an identical repeated prompt.
+		expect(requests.map(request => request.multi)).toEqual([true, true]);
+		expect(requests[0]?.selectedOptions).toEqual([]);
+		expect(requests[1]?.selectedOptions).toEqual(["alpha"]);
+		expect(settlements).toEqual([{ kind: "resolve_without_commit", reason: "toggle" }, { kind: "commit" }]);
+		expect(result.content[0]?.type === "text" ? result.content[0].text : "").toContain("alpha");
+	});
+	it("omits invalid source recommendations from remote selector requests", async () => {
+		for (const recommended of [-1, 0.5, 2]) {
+			const requests: AskAnswerRequest[] = [];
+			const source: AskAnswerSource = {
+				awaitAnswer: async () => undefined,
+				awaitAnswerRequest: request => {
+					requests.push(request);
+					return Promise.resolve({
+						source: "remote" as const,
+						interaction: { kind: "value" as const, value: "beta" },
+						settle: async () => ({
+							kind: "committed" as const,
+							ack: { status: "delivered" as const, messageId: 7 },
+						}),
+					});
+				},
+			};
+			const result = await new AskTool(createSession({ getAskAnswerSource: () => source })).execute(
+				`remote-invalid-recommendation-${recommended}`,
+				{
+					questions: [
+						{
+							id: "choice",
+							question: "Choose",
+							recommended,
+							options: [{ label: "alpha" }, { label: "beta" }],
+						},
+					],
+				},
+				undefined,
+				undefined,
+				abortableUi(),
+			);
+			expect(requests).toHaveLength(1);
+			expect(requests[0]).not.toHaveProperty("recommendedIndex");
+			expect(result.content[0]?.type === "text" ? result.content[0].text : "").toContain("beta");
+		}
+	});
+
+	it("uses fresh receipts for Other and clarification transitions without acknowledgement", async () => {
+		for (const mode of ["other", "clarification"] as const) {
+			const requests: AskAnswerRequest[] = [];
+			const settlements: unknown[] = [];
+			let call = 0;
+			const source: AskAnswerSource = {
+				awaitAnswer: async () => undefined,
+				awaitAnswerRequest: request => {
+					requests.push(request);
+					const first =
+						mode === "other"
+							? request.options.find(option => option.includes("Other"))!
+							: request.options.find(option => option.includes("Ask about"))!;
+					const interaction = {
+						kind: "value" as const,
+						value: call++ === 0 ? first : mode === "other" ? "custom text" : "what does this mean?",
+					};
+					return Promise.resolve({
+						source: "remote" as const,
+						interaction,
+						settle: async (settlement: unknown) => {
+							settlements.push(settlement);
+							return (settlement as { kind: string }).kind === "commit"
+								? { kind: "committed" as const, ack: { status: "delivered" as const, messageId: 9 } }
+								: { kind: "resolved_without_commit" as const };
+						},
+					});
+				},
+			};
+			const tool = new AskTool(createSession({ getAskAnswerSource: () => source }));
+			await tool.execute(
+				`remote-${mode}`,
+				{
+					questions: [
+						{
+							id: "q",
+							question: mode === "clarification" ? "Round 1 | Scope | Ambiguity: 50%" : "Choose",
+							options: [{ label: "alpha" }, { label: "beta" }],
+							recommended: 1,
+							deepInterview: mode === "clarification" ? deepInterviewMeta() : undefined,
+						},
+					],
+				},
+				undefined,
+				undefined,
+				abortableUi(),
+			);
+			expect(requests[1]?.interaction).toBe(mode === "other" ? "custom_editor" : "clarification_editor");
+			expect(requests[0]?.recommendedIndex).toBe(1);
+			expect(requests[1]).not.toHaveProperty("recommendedIndex");
+			expect(settlements).toEqual(
+				mode === "other"
+					? [{ kind: "resolve_without_commit", reason: "other_transition" }, { kind: "commit" }]
+					: [
+							{ kind: "resolve_without_commit", reason: "clarification_transition" },
+							{ kind: "resolve_without_commit", reason: "clarification_submitted" },
+						],
+			);
+		}
+	});
+
+	it("advances an empty intermediate multi-question selection without acknowledgement", async () => {
+		const settlements: unknown[] = [];
+		let call = 0;
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: request => {
+				if (call === 0)
+					expect(request.controls).toEqual([
+						{ id: "navigation_forward", kind: "navigation", label: "Next", enabled: true },
+					]);
+				const interaction =
+					call++ === 0
+						? { kind: "control" as const, controlId: "navigation_forward" as const }
+						: { kind: "value" as const, value: "yes" };
+				return Promise.resolve({
+					source: "remote" as const,
+					interaction,
+					settle: async (settlement: unknown) => {
+						settlements.push(settlement);
+						return (settlement as { kind: string }).kind === "commit"
+							? { kind: "committed" as const, ack: { status: "delivered" as const, messageId: 11 } }
+							: { kind: "resolved_without_commit" as const };
+					},
+				});
+			},
+		};
+		const tool = new AskTool(createSession({ getAskAnswerSource: () => source }));
+		await tool.execute(
+			"remote-empty-next",
+			{
+				questions: [
+					{ id: "first", question: "Choose", multi: true, options: [{ label: "alpha" }] },
+					{ id: "second", question: "Proceed?", options: [{ label: "yes" }, { label: "no" }] },
+				],
+			},
+			undefined,
+			undefined,
+			abortableUi(),
+		);
+		expect(settlements).toEqual([{ kind: "resolve_without_commit", reason: "empty_navigation" }, { kind: "commit" }]);
+	});
+});
 describe("AskTool custom input", () => {
 	it("routes custom input through editor and preserves raw multiline strings", async () => {
 		const tool = new AskTool(createSession());
@@ -729,7 +1459,7 @@ describe("AskTool custom input", () => {
 		expect(abort).not.toHaveBeenCalled();
 	});
 
-	it("treats explicit empty-string custom input as submitted input", async () => {
+	it("cancels when the editor submits empty custom input", async () => {
 		const tool = new AskTool(createSession());
 		const abort = vi.fn();
 		const editor = vi.fn(async () => "");
@@ -739,31 +1469,51 @@ describe("AskTool custom input", () => {
 			abort,
 		});
 
-		const result = await tool.execute(
-			"call-empty-custom",
-			{
-				questions: [
-					{
-						id: "details",
-						question: "Share details",
-						options: [{ label: "yes" }, { label: "no" }],
-					},
-				],
-			},
-			undefined,
-			undefined,
-			context,
-		);
-
-		expect(result.content[0]?.type).toBe("text");
-		if (result.content[0]?.type !== "text") {
-			throw new Error("Expected text result");
-		}
-		expect(result.content[0].text).toContain("User provided custom input:");
-		expect(result.details?.customInput).toBe("");
-		expect(result.details?.selectedOptions).toEqual([]);
+		await expect(
+			tool.execute(
+				"call-empty-custom",
+				{
+					questions: [
+						{
+							id: "details",
+							question: "Share details",
+							options: [{ label: "yes" }, { label: "no" }],
+						},
+					],
+				},
+				undefined,
+				undefined,
+				context,
+			),
+		).rejects.toBeInstanceOf(ToolAbortError);
 		expect(editor).toHaveBeenCalledTimes(1);
-		expect(abort).not.toHaveBeenCalled();
+		expect(abort).toHaveBeenCalledTimes(1);
+	});
+
+	it("cancels when inline Other input is only whitespace", async () => {
+		const tool = new AskTool(createSession());
+		const abort = vi.fn();
+		const editor = vi.fn(async () => "editor fallback");
+		const context = createContext({
+			select: async (_prompt, _options, dialogOptions) => {
+				dialogOptions?.customInput?.onSubmit(" \t\n ");
+				return "Other (type your own)";
+			},
+			editor,
+			abort,
+		});
+
+		await expect(
+			tool.execute(
+				"call-inline-empty-custom",
+				{ questions: [{ id: "details", question: "Share details", options: [{ label: "yes" }] }] },
+				undefined,
+				undefined,
+				context,
+			),
+		).rejects.toBeInstanceOf(ToolAbortError);
+		expect(editor).not.toHaveBeenCalled();
+		expect(abort).toHaveBeenCalledTimes(1);
 	});
 
 	it("renders checked options together with custom text in multi-select answers", async () => {
@@ -1738,11 +2488,14 @@ describe("AskTool deep-interview rendering middleware", () => {
 		expect(recorder).not.toHaveBeenCalled();
 	});
 
-	it("leaves non-deep-interview selector prompts without scroll-title opt-in", async () => {
+	it("opts ordinary selector prompts into local prompt scrolling", async () => {
 		const tool = new AskTool(createSession());
 		const select = vi.fn(
-			async (_prompt: string, options: string[], _dialogOptions?: { scrollTitleRows?: number; helpText?: string }) =>
-				options[0],
+			async (
+				_prompt: string,
+				options: string[],
+				_dialogOptions?: { scrollTitleRows?: number; helpText?: string; outline?: boolean; wrapFocused?: boolean },
+			) => options[0],
 		);
 		const context = createContext({ select });
 
@@ -1763,8 +2516,11 @@ describe("AskTool deep-interview rendering middleware", () => {
 		);
 
 		const dialogOptions = select.mock.calls[0]?.[2];
-		expect(dialogOptions?.scrollTitleRows).toBeUndefined();
-		expect(dialogOptions?.helpText).not.toContain("scroll question");
+		expect(dialogOptions?.scrollTitleRows).toBe(Number.MAX_SAFE_INTEGER);
+		expect(dialogOptions?.helpText).toContain("PgUp/PgDn/Ctrl+u/d: question");
+		expect(dialogOptions?.helpText).toContain("Wheel: transcript");
+		expect(dialogOptions?.outline).toBe(true);
+		expect(dialogOptions?.wrapFocused).toBe(true);
 	});
 
 	it("recognizes topology questions even when the agent prepends an intro", async () => {
@@ -1850,7 +2606,9 @@ describe("AskTool deep-interview recorder persistence", () => {
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockRejectedValue(
 			new Error("recorder boom"),
 		);
-		const tool = new AskTool(createSession({ getSessionId: () => "session-ask" }));
+		const tool = new AskTool(
+			createSession({ getSessionId: () => "session-ask", getDeepInterviewAskStage: () => "post-topology" }),
+		);
 		const context = createContext({ select: async (_prompt, options) => options[1] });
 
 		const result = await tool.execute(
@@ -1885,12 +2643,260 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(warn).toHaveBeenCalledWith(expect.stringContaining("deep-interview round recording failed"));
 	});
 
+	it("preserves a foreign workflow answer without writing its deep-interview metadata", async () => {
+		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound");
+		const tool = new AskTool(
+			createSession({ getSessionId: () => "session-ask", getDeepInterviewAskStage: () => "post-topology" }),
+		);
+		const context = createContext({ select: async (_prompt, options) => options[0] });
+
+		const result = await tool.execute(
+			"call-foreign-workflow-metadata",
+			{
+				questions: [
+					{
+						id: "ralplan-approval",
+						question: "Approve the plan?",
+						options: [{ label: "Approve" }, { label: "Revise" }],
+						workflowGate: { stage: "ralplan", kind: "approval" },
+						deepInterview: {
+							round: 0,
+							component: "review-topology",
+							dimension: "topology",
+							ambiguity: 0,
+							intent_contract: {
+								items: [
+									{ id: "artifact:foreign-plan", category: "artifact", statement: "Execute foreign plan" },
+								],
+								confirmation_options: ["Approve"],
+							},
+						},
+					},
+				],
+			},
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(result.content[0]).toMatchObject({ type: "text", text: "User selected: Approve" });
+		expect(recorder).not.toHaveBeenCalled();
+	});
+
+	it("preserves an inactive workflow answer without writing its deep-interview metadata", async () => {
+		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound");
+		const tool = new AskTool(createSession({ getSessionId: () => "session-ask" }));
+		const context = createContext({ select: async (_prompt, options) => options[0] });
+
+		const result = await tool.execute(
+			"call-inactive-workflow-metadata",
+			{ questions: [singleDeepInterviewQuestion()] },
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(result.content[0]).toMatchObject({ type: "text", text: "User selected: Budget" });
+		expect(recorder).not.toHaveBeenCalled();
+	});
+
+	it("does not synthesize or record intent authorization on ask timeout", async () => {
+		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
+			action: "created",
+			record: {} as AppendOrMergeResult["record"],
+		});
+		const tool = new AskTool(
+			createSession({
+				settings: Settings.isolated({ "ask.timeout": 0.001 }),
+				getSessionId: () => "session-ask",
+				getDeepInterviewAskStage: () => "post-topology",
+			}),
+		);
+		const context = createContext({
+			select: async (_prompt, _options, dialogOptions) => {
+				const timeout = dialogOptions?.timeout ?? 1;
+				await Bun.sleep(timeout + 5);
+				dialogOptions?.onTimeout?.();
+				return _options[0];
+			},
+		});
+		const contractQuestion = {
+			id: "intent-contract-timeout",
+			question: "Confirm locked intent",
+			options: [{ label: "Looks right" }, { label: "Revise" }],
+			deepInterview: {
+				round: 0,
+				component: "review-topology",
+				dimension: "topology",
+				ambiguity: 1,
+				intent_contract: {
+					items: [{ id: "artifact:report", category: "artifact" as const, statement: "Produce report" }],
+					confirmation_options: ["Looks right"],
+				},
+			},
+		};
+		const contractResult = await tool.execute(
+			"intent-contract-timeout",
+			{ questions: [contractQuestion] },
+			undefined,
+			undefined,
+			context,
+		);
+		expect(contractResult.details?.selectedOptions).toEqual([]);
+		const reviewQuestion = {
+			id: "intent-review-timeout",
+			question: "Approve reduction",
+			options: [{ label: "Approve reduction" }, { label: "Revise" }],
+			deepInterview: {
+				round: 2,
+				component: "locked-intent",
+				dimension: "constraints",
+				ambiguity: 0.2,
+				intent_review: {
+					observed_items: [{ id: "artifact:report", category: "artifact" as const, statement: "Produce report" }],
+					supporting_substitutions: [
+						{
+							removed_id: "surface:review",
+							replacement_ids: ["artifact:report"],
+							rationale: "Report replacement",
+						},
+					],
+					approval_options: ["Approve reduction"],
+				},
+			},
+		};
+		const reviewResult = await tool.execute(
+			"intent-review-timeout",
+			{ questions: [reviewQuestion] },
+			undefined,
+			undefined,
+			context,
+		);
+		expect(reviewResult.details?.selectedOptions).toEqual([]);
+		expect(recorder).not.toHaveBeenCalled();
+	});
+	it("does not auto-select a ralplan approval gate on ask timeout", async () => {
+		const tool = new AskTool(
+			createSession({
+				settings: Settings.isolated({ "ask.timeout": 0.001 }),
+				getSessionId: () => "session-ask",
+			}),
+		);
+		const context = createContext({
+			select: async (_prompt, _options, dialogOptions) => {
+				const timeout = dialogOptions?.timeout ?? 1;
+				await Bun.sleep(timeout + 5);
+				dialogOptions?.onTimeout?.();
+				return _options[0];
+			},
+		});
+		const approvalQuestion = {
+			id: "ralplan-approval-timeout",
+			question: "Approve the plan?",
+			options: [{ label: "Approve" }, { label: "Revise" }],
+			workflowGate: { stage: "ralplan", kind: "approval" } as const,
+		};
+		const result = await tool.execute(
+			"ralplan-approval-timeout",
+			{ questions: [approvalQuestion] },
+			undefined,
+			undefined,
+			context,
+		);
+		// A timeout is not consent: the plan approval must stay unselected.
+		expect(result.details?.selectedOptions).toEqual([]);
+	});
+	it("does not auto-select an execution gate on ask timeout", async () => {
+		const tool = new AskTool(
+			createSession({
+				settings: Settings.isolated({ "ask.timeout": 0.001 }),
+				getSessionId: () => "session-ask",
+			}),
+		);
+		const context = createContext({
+			select: async (_prompt, _options, dialogOptions) => {
+				const timeout = dialogOptions?.timeout ?? 1;
+				await Bun.sleep(timeout + 5);
+				dialogOptions?.onTimeout?.();
+				return _options[0];
+			},
+		});
+		const executionQuestion = {
+			id: "ultragoal-execution-timeout",
+			question: "Approve execution?",
+			options: [{ label: "Approve" }, { label: "Hold" }],
+			workflowGate: { stage: "ultragoal", kind: "execution" } as const,
+		};
+		const result = await tool.execute(
+			"ultragoal-execution-timeout",
+			{ questions: [executionQuestion] },
+			undefined,
+			undefined,
+			context,
+		);
+		// A timeout is not execution authorization.
+		expect(result.details?.selectedOptions).toEqual([]);
+	});
+
+	it("discards focused intent choices before multi-question timeout navigation", async () => {
+		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
+			action: "created",
+			record: {} as AppendOrMergeResult["record"],
+		});
+		const tool = new AskTool(
+			createSession({ settings: Settings.isolated({ "ask.timeout": 0.001 }), getSessionId: () => "session-ask" }),
+		);
+		let visits = 0;
+		const context = createContext({
+			select: async (_prompt, options, dialogOptions) => {
+				visits += 1;
+				if (visits === 1) {
+					const timeout = dialogOptions?.timeout ?? 1;
+					await Bun.sleep(timeout + 5);
+					dialogOptions?.onTimeout?.();
+				}
+				return options[0];
+			},
+		});
+		const result = await tool.execute(
+			"intent-multi-timeout",
+			{
+				questions: [
+					{
+						id: "intent-contract-timeout",
+						question: "Confirm locked intent",
+						options: [{ label: "Looks right" }, { label: "Revise" }],
+						deepInterview: {
+							round: 0,
+							component: "review-topology",
+							dimension: "topology",
+							ambiguity: 1,
+							intent_contract: {
+								items: [{ id: "artifact:report", category: "artifact", statement: "Produce report" }],
+								confirmation_options: ["Looks right"],
+							},
+						},
+					},
+					{ id: "ordinary", question: "Continue?", options: [{ label: "Yes" }, { label: "No" }] },
+				],
+			},
+			undefined,
+			undefined,
+			context,
+		);
+		expect(result.details?.results?.[0]?.selectedOptions).toEqual([]);
+		expect(result.details?.results?.[1]?.selectedOptions).toEqual(["Yes"]);
+		expect(recorder).not.toHaveBeenCalled();
+	});
+
 	it("times out a never-resolving recorder promise within the bounded await", async () => {
 		const warn = spyOn(logger, "warn").mockImplementation(() => {});
 		spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockImplementation(
 			() => new Promise(() => {}) as ReturnType<typeof deepInterviewRecorder.appendOrMergeDeepInterviewRound>,
 		);
-		const tool = new AskTool(createSession({ getSessionId: () => "session-ask" }));
+		const tool = new AskTool(
+			createSession({ getSessionId: () => "session-ask", getDeepInterviewAskStage: () => "post-topology" }),
+		);
 		const context = createContext({ select: async (_prompt, options) => options[0] });
 		const started = performance.now();
 
@@ -1914,7 +2920,9 @@ describe("AskTool deep-interview recorder persistence", () => {
 			record: {} as Awaited<ReturnType<typeof deepInterviewRecorder.appendOrMergeDeepInterviewRound>>["record"],
 		});
 		spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockRejectedValue(new Error("hud boom"));
-		const tool = new AskTool(createSession({ getSessionId: () => "session-ask" }));
+		const tool = new AskTool(
+			createSession({ getSessionId: () => "session-ask", getDeepInterviewAskStage: () => "post-topology" }),
+		);
 		const context = createContext({ select: async (_prompt, options) => options[0] });
 
 		const result = await tool.execute(
@@ -1929,14 +2937,16 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(warn).toHaveBeenCalledWith(expect.stringContaining("deep-interview round recording failed"));
 	});
 
-	it("passes optional metadata for single, multi-question, and unattended workflow gate asks", async () => {
+	it("passes optional metadata for single, multi-question, and SDK workflow gate asks", async () => {
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
 			action: "created",
 			record: {} as Awaited<ReturnType<typeof deepInterviewRecorder.appendOrMergeDeepInterviewRound>>["record"],
 		});
 		spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockResolvedValue(undefined);
 
-		await new AskTool(createSession({ getSessionId: () => "single-session" })).execute(
+		await new AskTool(
+			createSession({ getSessionId: () => "single-session", getDeepInterviewAskStage: () => "post-topology" }),
+		).execute(
 			"call-single-meta",
 			{ questions: [singleDeepInterviewQuestion()] },
 			undefined,
@@ -1944,7 +2954,9 @@ describe("AskTool deep-interview recorder persistence", () => {
 			createContext({ select: async (_prompt, options) => options[0] }),
 		);
 
-		await new AskTool(createSession({ getSessionId: () => "multi-session" })).execute(
+		await new AskTool(
+			createSession({ getSessionId: () => "multi-session", getDeepInterviewAskStage: () => "post-topology" }),
+		).execute(
 			"call-multi-meta",
 			{
 				questions: [
@@ -1962,11 +2974,16 @@ describe("AskTool deep-interview recorder persistence", () => {
 		);
 
 		const gateEmitter = {
-			isUnattended: () => true,
+			supportsRemoteGateAnswers: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Timeline"] })),
 		};
 		await new AskTool(
-			createSession({ hasUI: false, getSessionId: () => "gate-session", getWorkflowGateEmitter: () => gateEmitter }),
+			createSession({
+				hasUI: false,
+				getSessionId: () => "gate-session",
+				getWorkflowGateEmitter: () => gateEmitter,
+				getDeepInterviewAskStage: () => "post-topology",
+			}),
 		).execute("call-gate-meta", { questions: [singleDeepInterviewQuestion()] }, undefined, undefined, undefined);
 
 		expect(recorder).toHaveBeenCalledTimes(4);
@@ -1980,7 +2997,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 
 	it("emits deep-interview question gates by default and honors ralplan approval overrides", async () => {
 		const defaultGateEmitter = {
-			isUnattended: () => true,
+			supportsRemoteGateAnswers: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Budget"] })),
 		};
 		await new AskTool(
@@ -2000,7 +3017,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		);
 
 		const ralplanGateEmitter = {
-			isUnattended: () => true,
+			supportsRemoteGateAnswers: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Approve execution via ultragoal"] })),
 		};
 		await new AskTool(
@@ -2027,6 +3044,184 @@ describe("AskTool deep-interview recorder persistence", () => {
 		);
 	});
 
+	it("prefers the local interactive UI over the workflow gate when a UI context is present", async () => {
+		// Regression: a durable workflow-gate emitter now exists for every session and
+		// its supportsRemoteGateAnswers() is always true. Attended TUI asks must still use the local
+		// selector instead of stranding on emitGate() waiting for a remote responder.
+		const gateEmitter = {
+			supportsRemoteGateAnswers: () => true,
+			emitGate: vi.fn(async () => ({ selected: ["no"] })),
+		};
+		const select = vi.fn(async () => "yes");
+		const context = createContext({ select });
+		const result = await new AskTool(
+			createSession({ getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+		).execute(
+			"call-attended-no-gate",
+			{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "yes" }, { label: "no" }] }] },
+			undefined,
+			undefined,
+			context,
+		);
+		expect(gateEmitter.emitGate).not.toHaveBeenCalled();
+		expect(select).toHaveBeenCalledTimes(1);
+		expect(result.details?.selectedOptions).toEqual(["yes"]);
+	});
+
+	function deepInterviewQuestionAtPayloadLength(length: number) {
+		const question = singleDeepInterviewQuestion();
+		question.question = "";
+		const paddingLength = length - deepInterviewCharacterCount(JSON.stringify({ questions: [question] }));
+		if (paddingLength < 0) throw new Error("deep-interview question base exceeds structured-response limit");
+		question.question = "😀".repeat(paddingLength);
+		if (deepInterviewCharacterCount(JSON.stringify({ questions: [question] })) !== length)
+			throw new Error("unable to construct structured question boundary");
+		return question;
+	}
+
+	it("accepts exactly 100000 structured question characters and rejects 100001 before gate or recorder advancement", async () => {
+		const appendSpy = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
+			action: "created",
+			record: {} as AppendOrMergeResult["record"],
+		});
+		spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockResolvedValue(undefined);
+		const gateEmitter = {
+			supportsRemoteGateAnswers: () => true,
+			emitGate: vi.fn(async () => ({ selected: ["Budget"] })),
+		};
+		const tool = new AskTool(
+			createSession({
+				hasUI: false,
+				getSessionId: () => "test-session",
+				getWorkflowGateEmitter: () => gateEmitter,
+				getDeepInterviewAskStage: () => "post-topology",
+			} as Partial<ToolSession>),
+		);
+		const exact = deepInterviewQuestionAtPayloadLength(100_000);
+		const oversized = deepInterviewQuestionAtPayloadLength(100_001);
+
+		expect(deepInterviewCharacterCount(JSON.stringify({ questions: [exact] }))).toBe(100_000);
+		await tool.execute("call-structured-limit-exact", { questions: [exact] }, undefined, undefined, undefined);
+		expect(gateEmitter.emitGate).toHaveBeenCalledTimes(1);
+		expect(appendSpy).toHaveBeenCalledTimes(1);
+
+		expect(deepInterviewCharacterCount(JSON.stringify({ questions: [oversized] }))).toBe(100_001);
+		await expect(
+			tool.execute("call-structured-limit-oversized", { questions: [oversized] }, undefined, undefined, undefined),
+		).rejects.toThrow("structured deep-interview response exceeds max length 100000");
+		expect(gateEmitter.emitGate).toHaveBeenCalledTimes(1);
+		expect(appendSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("bounds the complete legacy and multi-question ask payload before any gate emission", async () => {
+		const gateEmitter = { supportsRemoteGateAnswers: () => true, emitGate: vi.fn(async () => ({ selected: ["A"] })) };
+		const tool = new AskTool(
+			createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+		);
+		const payloadAtLength = (length: number) => {
+			const questions = [
+				{ id: "legacy", question: "", options: [{ label: "A" }] },
+				{ id: "second", question: "Continue?", options: [{ label: "A" }] },
+			];
+			const overhead = deepInterviewCharacterCount(JSON.stringify({ questions }));
+			questions[0]!.question = "한".repeat(length - overhead);
+			return { questions };
+		};
+		const exact = payloadAtLength(100_000);
+		const oversized = payloadAtLength(100_001);
+		expect(deepInterviewCharacterCount(JSON.stringify(exact))).toBe(100_000);
+		await tool.execute("call-legacy-aggregate-exact", exact, undefined, undefined, undefined);
+		expect(gateEmitter.emitGate).toHaveBeenCalledTimes(2);
+		expect(deepInterviewCharacterCount(JSON.stringify(oversized))).toBe(100_001);
+		await expect(
+			tool.execute("call-legacy-aggregate-oversized", oversized, undefined, undefined, undefined),
+		).rejects.toThrow("structured deep-interview response exceeds max length 100000");
+		expect(gateEmitter.emitGate).toHaveBeenCalledTimes(2);
+	});
+
+	it("forwards bounded inert adapter context through the canonical gate", async () => {
+		const gateEmitter = {
+			supportsRemoteGateAnswers: () => true,
+			emitGate: vi.fn(async () => ({ selected: ["Continue"] })),
+		};
+		const adapterContext = {
+			confused_terms: ["eventual consistency"],
+			references: [
+				{
+					reference_id: "architecture-note",
+					label: "Architecture note",
+					origin: "user-provided",
+					url: "https://example.test/architecture",
+					excerpt: "Compare this design against the proposal.",
+				},
+			],
+		};
+		const tool = new AskTool(
+			createSession({
+				hasUI: false,
+				getSessionId: () => "test-session",
+				getWorkflowGateEmitter: () => gateEmitter,
+			} as Partial<ToolSession>),
+		);
+
+		await tool.execute(
+			"call-adapter-context",
+			{
+				questions: [
+					{
+						id: "adapter-context",
+						question: "Which contrast should we explore?",
+						options: [{ label: "Continue" }],
+						deepInterview: { ...deepInterviewMeta(), ...adapterContext },
+					},
+				],
+			},
+			undefined,
+			undefined,
+			undefined,
+		);
+
+		const gate = (
+			gateEmitter.emitGate.mock.calls as unknown as Array<[{ context: { stage_state: unknown } }]>
+		)[0]?.[0];
+		expect(gate?.context.stage_state).toMatchObject(adapterContext);
+		expect(
+			askSchema.safeParse({
+				questions: [
+					{
+						id: "invalid-adapter-context",
+						question: "Which contrast should we explore?",
+						options: [{ label: "Continue" }],
+						deepInterview: { ...deepInterviewMeta(), confused_terms: ["x".repeat(257)] },
+					},
+				],
+			}).success,
+		).toBe(false);
+	});
+
+	it("uses code-point limits for deep-interview metadata strings", () => {
+		const metadata = { ...deepInterviewMeta(), component: "😀".repeat(128), dimension: "😀".repeat(128) };
+		expect(
+			askSchema.safeParse({
+				questions: [
+					{ id: "emoji-metadata", question: "Pick?", options: [{ label: "A" }], deepInterview: metadata },
+				],
+			}).success,
+		).toBe(true);
+		expect(
+			askSchema.safeParse({
+				questions: [
+					{
+						id: "oversized-emoji-metadata",
+						question: "Pick?",
+						options: [{ label: "A" }],
+						deepInterview: { ...metadata, component: "😀".repeat(129) },
+					},
+				],
+			}).success,
+		).toBe(false);
+	});
+
 	it("keeps deepInterview optional and rejects malformed metadata", () => {
 		expect(
 			askSchema.safeParse({ questions: [{ id: "q", question: "Pick?", options: [{ label: "A" }] }] }).success,
@@ -2043,5 +3238,544 @@ describe("AskTool deep-interview recorder persistence", () => {
 				],
 			}).success,
 		).toBe(false);
+	});
+
+	it("preserves deep-interview intent branch and strict metadata validation", () => {
+		const contract = {
+			items: [{ id: "artifact:report", category: "artifact" as const, statement: "Produce report" }],
+			confirmation_options: ["Confirm"],
+		};
+		const review = {
+			observed_items: [{ id: "artifact:report", category: "artifact" as const, statement: "Produce report" }],
+			supporting_substitutions: [],
+			approval_options: ["Approve"],
+		};
+		const question = (deepInterview: Record<string, unknown>) => ({
+			questions: [
+				{ id: "q", question: "Pick?", options: [{ label: "Confirm" }, { label: "Approve" }], deepInterview },
+			],
+		});
+
+		expect(
+			askSchema.safeParse(
+				question({
+					round: 1,
+					component: "review-topology",
+					dimension: "topology",
+					ambiguity: 0.5,
+					intent_contract: contract,
+				}),
+			).success,
+		).toBe(false);
+		expect(
+			askSchema.safeParse(
+				question({
+					round: 0,
+					component: "review-topology",
+					dimension: "topology",
+					ambiguity: 0.5,
+					intent_contract: contract,
+					intent_review: review,
+				}),
+			).success,
+		).toBe(false);
+		expect(
+			askSchema.safeParse(
+				question({ round: 1, component: "Scope", dimension: "Constraints", ambiguity: 0.5, unexpected: true }),
+			).success,
+		).toBe(false);
+	});
+	it("narrows provider-facing deep-interview metadata to the persisted workflow stage", () => {
+		const contractQuestion = {
+			questions: [
+				{
+					id: "topology",
+					question: "Confirm?",
+					options: [{ label: "Confirm" }],
+					deepInterview: {
+						round: 0,
+						component: "review-topology",
+						dimension: "topology",
+						ambiguity: 1,
+						intent_contract: {
+							items: [{ id: "artifact:report", category: "artifact", statement: "Produce report" }],
+							confirmation_options: ["Confirm"],
+						},
+					},
+				},
+			],
+		};
+		const reviewQuestion = {
+			questions: [
+				{
+					id: "review",
+					question: "Approve?",
+					options: [{ label: "Approve" }],
+					deepInterview: {
+						round: 1,
+						component: "locked-intent",
+						dimension: "constraints",
+						ambiguity: 0.2,
+						intent_review: {
+							observed_items: [{ id: "artifact:report", category: "artifact", statement: "Produce report" }],
+							supporting_substitutions: [],
+							approval_options: ["Approve"],
+						},
+					},
+				},
+			],
+		};
+
+		const topologyTool = new AskTool(createSession({ getDeepInterviewAskStage: () => "topology" }));
+		expect(topologyTool.parameters.safeParse(contractQuestion).success).toBe(true);
+		expect(topologyTool.parameters.safeParse(reviewQuestion).success).toBe(false);
+
+		const postTopologyTool = new AskTool(createSession({ getDeepInterviewAskStage: () => "post-topology" }));
+		expect(postTopologyTool.parameters.safeParse(contractQuestion).success).toBe(false);
+		expect(postTopologyTool.parameters.safeParse(reviewQuestion).success).toBe(true);
+
+		const inactiveTool = new AskTool(createSession());
+		const inactiveContract = inactiveTool.parameters.parse(contractQuestion);
+		const inactiveReview = inactiveTool.parameters.parse(reviewQuestion);
+		expect(inactiveContract.questions[0]).not.toHaveProperty("deepInterview");
+		expect(inactiveReview.questions[0]).not.toHaveProperty("deepInterview");
+	});
+});
+
+describe("AskTool Round-0 intent recovery", () => {
+	function roundZeroPair(workflowGate?: Record<string, unknown>) {
+		return {
+			questions: [
+				{
+					id: "round-0-intent",
+					question: "Confirm the locked intent",
+					options: [{ label: "Looks right" }, { label: "Approve reduction" }, { label: "Revise" }],
+					...(workflowGate === undefined ? {} : { workflowGate }),
+					deepInterview: {
+						round: 0,
+						component: "review-topology",
+						dimension: "topology",
+						ambiguity: 1,
+						intent_contract: {
+							items: [{ id: "artifact:report", category: "artifact", statement: "Produce a report" }],
+							confirmation_options: ["Looks right"],
+						},
+						intent_review: {
+							observed_items: [{ id: "artifact:report", category: "artifact", statement: "Produce a report" }],
+							supporting_substitutions: [],
+							approval_options: ["Approve reduction"],
+						},
+					},
+				},
+			],
+		};
+	}
+
+	function validateAsk(arguments_: Record<string, unknown>, stage: "topology" | "post-topology" = "topology") {
+		return validateToolArguments(new AskTool(createSession({ getDeepInterviewAskStage: () => stage })), {
+			type: "toolCall",
+			id: "ask-round-0",
+			name: "ask",
+			arguments: arguments_,
+		});
+	}
+
+	it("recovers only the canonical Round-0 pair and retains the contract", () => {
+		const result = validateAsk(roundZeroPair());
+		const deepInterview = (result.questions[0] as { deepInterview: Record<string, unknown> }).deepInterview;
+		expect(deepInterview.intent_contract).toMatchObject({ confirmation_options: ["Looks right"] });
+		expect(deepInterview.intent_review).toBeUndefined();
+	});
+
+	it("treats the explicit deep-interview question workflow gate as equivalent", () => {
+		const result = validateAsk(roundZeroPair({ stage: "deep-interview", kind: "question" }));
+		expect((result.questions[0] as { workflowGate: unknown }).workflowGate).toEqual({
+			stage: "deep-interview",
+			kind: "question",
+		});
+	});
+
+	it("normalizes strict-provider null placeholders and preserves bounded adapter context before exact Round-0 recovery", () => {
+		const pair = roundZeroPair();
+		Object.assign(pair.questions[0], { multi: null, recommended: null, workflowGate: null });
+		Object.assign(pair.questions[0].deepInterview, {
+			round_id: null,
+			confused_terms: ["eventual consistency"],
+			references: [{ reference_id: "note", label: "Note", origin: "user", url: null, excerpt: null }],
+		});
+		const question = validateAsk(pair).questions[0];
+		expect(question).toMatchObject({
+			deepInterview: {
+				intent_contract: expect.any(Object),
+				confused_terms: ["eventual consistency"],
+				references: [{ reference_id: "note" }],
+			},
+		});
+		expect(question.deepInterview.references?.[0]).not.toHaveProperty("url");
+		expect(question.deepInterview.references?.[0]).not.toHaveProperty("excerpt");
+		expect(question.deepInterview).not.toHaveProperty("intent_review");
+		expect(question.deepInterview).not.toHaveProperty("round_id");
+		expect(question).not.toHaveProperty("multi");
+		expect(question).not.toHaveProperty("recommended");
+		expect(question).not.toHaveProperty("workflowGate");
+	});
+
+	it("normalizes a null optional deepInterview field on an ordinary ask", () => {
+		const result = validateAsk({
+			questions: [
+				{
+					id: "ordinary",
+					question: "Choose one",
+					options: [{ label: "First" }, { label: "Second" }],
+					deepInterview: null,
+				},
+			],
+		});
+
+		expect(result.questions[0]).not.toHaveProperty("deepInterview");
+	});
+
+	it("returns bounded corrections for strict-wire intent constraints that local validation must enforce", () => {
+		const roundZeroReview = roundZeroPair();
+		Reflect.deleteProperty(roundZeroReview.questions[0].deepInterview, "intent_contract");
+		roundZeroReview.questions[0].deepInterview.intent_review.observed_items = [];
+		roundZeroReview.questions[0].deepInterview.intent_review.approval_options = [];
+		expect(() => validateAsk(roundZeroReview)).toThrow(
+			"deepInterview.intent_review is post-Round-0 only and requires a positive round",
+		);
+
+		const emptyContract = roundZeroPair();
+		Reflect.deleteProperty(emptyContract.questions[0].deepInterview, "intent_review");
+		emptyContract.questions[0].deepInterview.intent_contract.items = [];
+		emptyContract.questions[0].deepInterview.intent_contract.confirmation_options = [];
+		expect(() => validateAsk(emptyContract)).toThrow(
+			"deepInterview.intent_contract requires non-empty items and confirmation_options",
+		);
+
+		const foreignWorkflowContract = roundZeroPair({ stage: "ralplan", kind: "approval" });
+		Reflect.deleteProperty(foreignWorkflowContract.questions[0].deepInterview, "intent_review");
+		expect(() => validateAsk(foreignWorkflowContract)).toThrow(
+			"deepInterview metadata cannot be combined with a non-deep-interview workflowGate",
+		);
+	});
+	it("terminally rejects every recovery-shaped near-miss before coercion", () => {
+		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound");
+		const gateEmitter = { supportsRemoteGateAnswers: () => true, emitGate: vi.fn() };
+		const tool = new AskTool(
+			createSession({
+				hasUI: false,
+				getWorkflowGateEmitter: () => gateEmitter,
+				getDeepInterviewAskStage: () => "topology",
+			} as Partial<ToolSession>),
+		);
+		const execute = spyOn(tool, "execute");
+		const validateCandidate = (arguments_: Record<string, unknown>) =>
+			validateToolArguments(tool, {
+				type: "toolCall",
+				id: "ask-round-0-rejected",
+				name: "ask",
+				arguments: arguments_,
+			});
+		const prototypeRoot = Object.assign(Object.create({ inherited: true }), roundZeroPair());
+		const prototypeQuestion = roundZeroPair();
+		prototypeQuestion.questions[0] = Object.assign(
+			Object.create({ inherited: true }),
+			prototypeQuestion.questions[0],
+		);
+		const prototypeDeep = roundZeroPair();
+		prototypeDeep.questions[0].deepInterview = Object.assign(
+			Object.create({ inherited: true }),
+			prototypeDeep.questions[0].deepInterview,
+		);
+		const extraRoot = { ...roundZeroPair(), extra: true };
+		const extraQuestion = roundZeroPair();
+		Object.assign(extraQuestion.questions[0], { extra: true });
+		const extraDeep = roundZeroPair();
+		Object.assign(extraDeep.questions[0].deepInterview, { extra: true });
+		const duplicateOptions = roundZeroPair();
+		duplicateOptions.questions[0].options = [{ label: "Looks right" }, { label: "Looks right" }];
+		const ownUndefinedGate = roundZeroPair();
+		ownUndefinedGate.questions[0].workflowGate = undefined;
+		const reviewOnlyRoundZero = roundZeroPair();
+		Reflect.deleteProperty(reviewOnlyRoundZero.questions[0].deepInterview, "intent_contract");
+		const multipleQuestions = roundZeroPair();
+		multipleQuestions.questions.push(structuredClone(multipleQuestions.questions[0]));
+		const invalidLabels = roundZeroPair();
+		invalidLabels.questions[0].deepInterview.intent_contract.confirmation_options = ["Looks right", "Looks right"];
+		const encodedRoot = JSON.stringify(roundZeroPair()) as unknown as Record<string, unknown>;
+		const encodedQuestions = roundZeroPair();
+		encodedQuestions.questions = JSON.stringify(encodedQuestions.questions) as never;
+		const encodedQuestion = roundZeroPair();
+		encodedQuestion.questions[0] = JSON.stringify(encodedQuestion.questions[0]) as never;
+		const encodedDeepInterview = roundZeroPair();
+		encodedDeepInterview.questions[0].deepInterview = JSON.stringify(
+			encodedDeepInterview.questions[0].deepInterview,
+		) as never;
+		const nullQuestions = { questions: null } as unknown as Record<string, unknown>;
+		const malformedContractOnly = roundZeroPair();
+		Reflect.deleteProperty(malformedContractOnly.questions[0].deepInterview, "intent_review");
+		malformedContractOnly.questions[0].deepInterview.round = 1;
+		const malformedReviewOnly = roundZeroPair();
+		Reflect.deleteProperty(malformedReviewOnly.questions[0].deepInterview, "intent_contract");
+		malformedReviewOnly.questions[0].deepInterview.round = 1;
+		malformedReviewOnly.questions[0].deepInterview.component = "locked-intent";
+		malformedReviewOnly.questions[0].deepInterview.dimension = "constraints";
+		malformedReviewOnly.questions[0].deepInterview.intent_review.approval_options = ["Not displayed"];
+		const sparseAdapterContext = roundZeroPair();
+		Object.assign(sparseAdapterContext.questions[0].deepInterview, { confused_terms: new Array(1) });
+
+		const invalidGates: unknown[] = [
+			"deep-interview/question",
+			[],
+			{ stage: "deep-interview" },
+			{ kind: "question" },
+			{ stage: "deep-interview", kind: "question", extra: true },
+			{ stage: "Deep-Interview", kind: "question" },
+			{ stage: "deep-interview ", kind: "question" },
+			{ stage: "ralplan", kind: "question" },
+			{ stage: "ralplan", kind: "approval" },
+			{ stage: "ultragoal", kind: "question" },
+			{ stage: "ultragoal", kind: "execution" },
+		];
+		const malformedIntentMetadata: unknown[] = [null, "{}", [], { items: [] }, { items: [], extra: true }];
+
+		for (const arguments_ of [
+			prototypeRoot,
+			prototypeQuestion,
+			prototypeDeep,
+			extraRoot,
+			extraQuestion,
+			extraDeep,
+			duplicateOptions,
+			ownUndefinedGate,
+			reviewOnlyRoundZero,
+			multipleQuestions,
+			invalidLabels,
+			encodedRoot,
+			encodedQuestions,
+			encodedQuestion,
+			encodedDeepInterview,
+			nullQuestions,
+			malformedContractOnly,
+			malformedReviewOnly,
+			sparseAdapterContext,
+		]) {
+			expect(() => validateCandidate(arguments_)).toThrow("raw arguments rejected before coercion");
+		}
+		for (const workflowGate of invalidGates) {
+			const pair = roundZeroPair();
+			pair.questions[0].workflowGate = workflowGate as Record<string, unknown>;
+			expect(() => validateCandidate(pair)).toThrow("raw arguments rejected before coercion");
+		}
+		for (const intentContract of malformedIntentMetadata) {
+			const pair = roundZeroPair();
+			pair.questions[0].deepInterview.intent_contract = intentContract as never;
+			expect(() => validateCandidate(pair)).toThrow("raw arguments rejected before coercion");
+		}
+		for (const intentReview of malformedIntentMetadata) {
+			const pair = roundZeroPair();
+			pair.questions[0].deepInterview.intent_review = intentReview as never;
+			expect(() => validateCandidate(pair)).toThrow("raw arguments rejected before coercion");
+		}
+		expect(execute).not.toHaveBeenCalled();
+		expect(gateEmitter.emitGate).not.toHaveBeenCalled();
+		expect(recorder).not.toHaveBeenCalled();
+	});
+
+	it("recovers the canonical pair once, emits its exact gate, and records only the contract", async () => {
+		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
+			action: "created",
+			record: {} as AppendOrMergeResult["record"],
+		});
+		spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockResolvedValue(undefined);
+		const gateEmitter = {
+			supportsRemoteGateAnswers: () => true,
+			emitGate: vi.fn(async () => ({ selected: ["Looks right"] })),
+		};
+		const tool = new AskTool(
+			createSession({
+				hasUI: false,
+				getSessionId: () => "round-zero",
+				getWorkflowGateEmitter: () => gateEmitter,
+				getDeepInterviewAskStage: () => "topology",
+			}),
+		);
+		const rawHook = spyOn(tool, "rawArgumentValidation");
+		const execute = spyOn(tool, "execute");
+		const recovered = askSchema.parse(
+			validateToolArguments(tool, {
+				type: "toolCall",
+				id: "ask-round-0-recovered",
+				name: "ask",
+				arguments: roundZeroPair(),
+			}),
+		);
+
+		await tool.execute("ask-round-0-recovered", recovered, undefined, undefined, undefined);
+
+		expect(rawHook).toHaveBeenCalledTimes(1);
+		expect(execute).toHaveBeenCalledTimes(1);
+		expect(gateEmitter.emitGate).toHaveBeenCalledTimes(1);
+		expect((gateEmitter.emitGate.mock.calls as unknown as Array<[unknown]>)[0]?.[0]).toMatchObject({
+			stage: "deep-interview",
+			kind: "question",
+		});
+		expect(recorder).toHaveBeenCalledTimes(1);
+		expect(recorder.mock.calls[0]?.[2]).toMatchObject({
+			intent_contract: { confirmation_options: ["Looks right"] },
+			intent_review: undefined,
+		});
+	});
+
+	it("leaves valid contract-only Round 0 and post-Round-0 review validation unchanged", () => {
+		const contractOnly = roundZeroPair();
+		Reflect.deleteProperty(contractOnly.questions[0].deepInterview, "intent_review");
+		expect(validateAsk(contractOnly).questions[0]).toMatchObject({
+			deepInterview: { intent_contract: expect.any(Object) },
+		});
+		const postRoundReview = roundZeroPair();
+		Reflect.deleteProperty(postRoundReview.questions[0].deepInterview, "intent_contract");
+		postRoundReview.questions[0].deepInterview.round = 1;
+		postRoundReview.questions[0].deepInterview.component = "locked-intent";
+		postRoundReview.questions[0].deepInterview.dimension = "constraints";
+		expect(validateAsk(postRoundReview, "post-topology").questions[0]).toMatchObject({
+			deepInterview: { intent_review: expect.any(Object) },
+		});
+	});
+
+	it("coerces JSON-string containers for single-sided deep-interview asks", () => {
+		const contractOnly = roundZeroPair();
+		Reflect.deleteProperty(contractOnly.questions[0].deepInterview, "intent_review");
+		const encodedQuestions = { questions: JSON.stringify(contractOnly.questions) } as unknown as Record<
+			string,
+			unknown
+		>;
+		expect(validateAsk(encodedQuestions).questions[0]).toMatchObject({
+			deepInterview: { intent_contract: expect.any(Object) },
+		});
+
+		const postRoundReview = roundZeroPair();
+		Reflect.deleteProperty(postRoundReview.questions[0].deepInterview, "intent_contract");
+		postRoundReview.questions[0].deepInterview.round = 1;
+		postRoundReview.questions[0].deepInterview.component = "locked-intent";
+		postRoundReview.questions[0].deepInterview.dimension = "constraints";
+		const encodedReview = { questions: JSON.stringify(postRoundReview.questions) } as unknown as Record<
+			string,
+			unknown
+		>;
+		expect(validateAsk(encodedReview, "post-topology").questions[0]).toMatchObject({
+			deepInterview: { intent_review: expect.any(Object) },
+		});
+	});
+
+	it("rejects an incomplete Round-0 topology object with a targeted correction, not generic coercion errors (#4649)", () => {
+		const incomplete = roundZeroPair();
+		Reflect.deleteProperty(incomplete.questions[0].deepInterview, "intent_review");
+		Reflect.deleteProperty(incomplete.questions[0].deepInterview, "intent_contract");
+		Reflect.deleteProperty(incomplete.questions[0].deepInterview, "ambiguity");
+		// The incident shape: the deepInterview object is present with Round-0
+		// topology identity, but ambiguity and intent_contract are omitted. Before
+		// the fix this passthrough into generic Zod validation, whose message named
+		// no contract and no correction, and a metadata-only retry repeated the
+		// invalid shape.
+		let message = "";
+		try {
+			validateAsk(incomplete);
+			throw new Error("expected a raw-argument rejection");
+		} catch (error) {
+			message = (error as Error).message;
+		}
+		expect(message).toContain("raw arguments rejected before coercion");
+		expect(message).toContain("Round 0 review-topology deepInterview metadata requires every topology field");
+		expect(message).toContain('rejected keys: "deepInterview.ambiguity", "deepInterview.intent_contract"');
+		expect(message).toContain("intent_contract = { items: [{ id, category, statement }], confirmation_options }");
+		expect(message).not.toContain("Received arguments:");
+	});
+
+	it("names only the actually-missing Round-0 topology fields", () => {
+		const missingContractOnly = roundZeroPair();
+		Reflect.deleteProperty(missingContractOnly.questions[0].deepInterview, "intent_review");
+		Reflect.deleteProperty(missingContractOnly.questions[0].deepInterview, "intent_contract");
+		expect(() => validateAsk(missingContractOnly)).toThrow('rejected key: "deepInterview.intent_contract"');
+
+		const missingAmbiguityOnly = roundZeroPair();
+		Reflect.deleteProperty(missingAmbiguityOnly.questions[0].deepInterview, "intent_review");
+		Reflect.deleteProperty(missingAmbiguityOnly.questions[0].deepInterview, "ambiguity");
+		expect(() => validateAsk(missingAmbiguityOnly)).toThrow('rejected key: "deepInterview.ambiguity"');
+	});
+
+	it("keeps the Round-0 topology-field rejection scoped to the topology stage and topology identity", () => {
+		const incomplete = roundZeroPair();
+		Reflect.deleteProperty(incomplete.questions[0].deepInterview, "intent_review");
+		Reflect.deleteProperty(incomplete.questions[0].deepInterview, "intent_contract");
+		Reflect.deleteProperty(incomplete.questions[0].deepInterview, "ambiguity");
+		// Outside the topology stage the targeted rejection does not fire; the
+		// ordinary stage schema (no deepInterview key at all) reports it instead.
+		expect(() => validateAsk(incomplete, "post-topology")).toThrow('Validation failed for tool "ask"');
+		// A positive-round deepInterview object is not the Round-0 topology shape;
+		// it keeps its existing ordinary validation behavior.
+		const positiveRound = {
+			questions: [
+				{
+					id: "round-1",
+					question: "Clarify scope",
+					options: [{ label: "A" }],
+					deepInterview: { round: 1, component: "scope", dimension: "constraints" },
+				},
+			],
+		};
+		expect(() => validateAsk(positiveRound)).toThrow('Validation failed for tool "ask"');
+		expect(() => validateAsk(positiveRound, "post-topology")).toThrow('Validation failed for tool "ask"');
+		// Round 0 with a wrong component or wrong dimension is not the incident
+		// topology identity; the targeted rejection must not broaden to it, and
+		// those payloads keep their ordinary validation behavior.
+		const wrongComponent = {
+			questions: [
+				{
+					id: "round-0-wrong-component",
+					question: "Clarify scope",
+					options: [{ label: "A" }],
+					deepInterview: { round: 0, component: "scope", dimension: "topology" },
+				},
+			],
+		};
+		expect(() => validateAsk(wrongComponent)).toThrow('Validation failed for tool "ask"');
+		const wrongDimension = {
+			questions: [
+				{
+					id: "round-0-wrong-dimension",
+					question: "Clarify scope",
+					options: [{ label: "A" }],
+					deepInterview: { round: 0, component: "review-topology", dimension: "constraints" },
+				},
+			],
+		};
+		expect(() => validateAsk(wrongDimension)).toThrow('Validation failed for tool "ask"');
+	});
+
+	it("rejects an incomplete Round-0 topology object before the deferred registry loads the tool", () => {
+		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound");
+		const gateEmitter = { supportsRemoteGateAnswers: () => true, emitGate: vi.fn() };
+		const tool = new AskTool(
+			createSession({
+				hasUI: false,
+				getWorkflowGateEmitter: () => gateEmitter,
+				getDeepInterviewAskStage: () => "topology",
+			} as Partial<ToolSession>),
+		);
+		const incomplete = roundZeroPair();
+		Reflect.deleteProperty(incomplete.questions[0].deepInterview, "intent_review");
+		Reflect.deleteProperty(incomplete.questions[0].deepInterview, "intent_contract");
+		Reflect.deleteProperty(incomplete.questions[0].deepInterview, "ambiguity");
+		expect(() =>
+			validateToolArguments(tool, {
+				type: "toolCall",
+				id: "ask-round-0-incomplete",
+				name: "ask",
+				arguments: incomplete,
+			}),
+		).toThrow("requires every topology field");
+		expect(gateEmitter.emitGate).not.toHaveBeenCalled();
+		expect(recorder).not.toHaveBeenCalled();
 	});
 });

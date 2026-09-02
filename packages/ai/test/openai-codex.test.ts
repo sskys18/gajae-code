@@ -1,12 +1,45 @@
 import { describe, expect, it } from "bun:test";
 import { type RequestBody, transformRequestBody } from "@gajae-code/ai/providers/openai-codex/request-transformer";
 import { parseCodexError } from "@gajae-code/ai/providers/openai-codex/response-handler";
-import { convertOpenAICodexResponsesTools } from "@gajae-code/ai/providers/openai-codex-responses";
+import {
+	codexToolCanonicalName,
+	codexToolWireName,
+	convertOpenAICodexResponsesTools,
+	formatCodexUserAgent,
+	isCodexWebSocketSafeByDefault,
+	normalizeCodexToolChoice,
+} from "@gajae-code/ai/providers/openai-codex-responses";
 import type { Tool } from "@gajae-code/ai/types";
 import { createCodexModel } from "./helpers";
 
 const DEFAULT_PROMPT_PREFIX =
 	"You are an expert coding assistant. You help users with coding tasks by reading files, executing commands";
+
+describe("openai-codex user agent", () => {
+	it("removes non-ASCII kernel release characters before constructing the header", () => {
+		const userAgent = formatCodexUserAgent("linux", "4.4.302-Minimal™-EAS-QTI_Haptic-R26", "arm64");
+
+		expect(userAgent).toMatch(/^pi\/[^ ]+ \(linux 4\.4\.302-Minimal-EAS-QTI_Haptic-R26; arm64\)$/);
+		expect(() => new Headers({ "User-Agent": userAgent })).not.toThrow();
+	});
+
+	it("removes control characters from dynamic platform values", () => {
+		const userAgent = formatCodexUserAgent("linux\n", "6.8.0\t-generic", "arm64\r");
+
+		expect(userAgent).toMatch(/^pi\/[^ ]+ \(linux 6\.8\.0-generic; arm64\)$/);
+	});
+});
+
+describe("openai-codex websocket platform policy", () => {
+	it("requires explicit opt-in on Windows", () => {
+		expect(isCodexWebSocketSafeByDefault("win32")).toBe(false);
+	});
+
+	it("keeps model websocket defaults enabled off Windows", () => {
+		expect(isCodexWebSocketSafeByDefault("linux")).toBe(true);
+		expect(isCodexWebSocketSafeByDefault("darwin")).toBe(true);
+	});
+});
 
 describe("openai-codex tool schemas", () => {
 	it("adds empty properties to no-argument object parameter schemas", () => {
@@ -26,6 +59,41 @@ describe("openai-codex tool schemas", () => {
 			description: "List outgoing messages",
 			parameters: { type: "object", properties: {} },
 		});
+	});
+});
+
+describe("openai-codex reserved tool namespaces", () => {
+	const reservedTools: Tool[] = [
+		{ name: "browser", description: "Control a browser", parameters: { type: "object", properties: {} } },
+		{ name: "computer", description: "Control the desktop", parameters: { type: "object", properties: {} } },
+		{ name: "read_file", description: "Read a file", parameters: { type: "object", properties: {} } },
+	];
+
+	it("renames reserved tool names on the wire and leaves others untouched", () => {
+		const converted = convertOpenAICodexResponsesTools(reservedTools, createCodexModel("gpt-5.1-codex"));
+
+		expect(converted.map(tool => tool.name)).toEqual(["browser_tool", "computer_tool", "read_file"]);
+		expect(converted.every(tool => tool.type === "function")).toBe(true);
+	});
+
+	it("renames reserved names in pinned tool choices", () => {
+		const model = createCodexModel("gpt-5.1-codex");
+
+		expect(normalizeCodexToolChoice({ type: "tool", name: "computer" }, reservedTools, model)).toEqual({
+			type: "function",
+			name: "computer_tool",
+		});
+		expect(normalizeCodexToolChoice({ type: "tool", name: "read_file" }, reservedTools, model)).toEqual({
+			type: "function",
+			name: "read_file",
+		});
+	});
+
+	it("maps wire names back to canonical names", () => {
+		expect(codexToolCanonicalName("browser_tool")).toBe("browser");
+		expect(codexToolCanonicalName("computer_tool")).toBe("computer");
+		expect(codexToolCanonicalName("read_file")).toBe("read_file");
+		expect(codexToolWireName("read_file")).toBe("read_file");
 	});
 });
 

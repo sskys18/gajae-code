@@ -69,6 +69,9 @@ Unified LLM API with automatic model discovery, provider configuration, token an
 - **MiniMax Coding Plan** (requires `MINIMAX_CODE_API_KEY` or `MINIMAX_CODE_CN_API_KEY`)
 - **Xiaomi MiMo** (requires `XIAOMI_API_KEY`)
 - **ZenMux** (requires `ZENMUX_API_KEY`)
+- **OpenGateway by Sionic AI** (requires `OPENGATEWAY_API_KEY`)
+- **BizRouter** (requires `BIZROUTER_API_KEY`)
+- **Mara Cloud** (requires `MARA_API_KEY`)
 - **Qwen Portal** (supports `QWEN_OAUTH_TOKEN` or `QWEN_PORTAL_API_KEY`)
 - **Cloudflare AI Gateway** (requires `CLOUDFLARE_AI_GATEWAY_API_KEY` and provider-specific gateway base URL)
 - **Ollama** (local OpenAI-compatible runtime; optional `OLLAMA_API_KEY`)
@@ -779,6 +782,7 @@ interface OpenAICompat {
 	supportsStore?: boolean; // Whether provider supports the `store` field (default: true)
 	supportsDeveloperRole?: boolean; // Whether provider supports `developer` role vs `system` (default: true)
 	sendSessionHeaders?: boolean; // Forward the session id as `session_id`/`x-session-id` headers for relay session-affinity & prompt-cache reuse (default: false)
+	supportsResponsesSessionAffinity?: boolean; // Opt in to session-affinity headers for custom openai-responses relays; canonical OpenAI routing is automatic (default: false)
 	supportsReasoningEffort?: boolean; // Whether provider supports `reasoning_effort` (default: true)
 	maxTokensField?: "max_completion_tokens" | "max_tokens"; // Which field name to use (default: max_completion_tokens)
 	extraBody?: Record<string, unknown>; // Extra request-body fields for custom proxy routing or provider-specific options
@@ -954,6 +958,9 @@ In Node.js environments, you can set environment variables to avoid passing API 
 | MiniMax Code   | `MINIMAX_CODE_API_KEY` (international) or `MINIMAX_CODE_CN_API_KEY` (China) |
 | Xiaomi MiMo    | `XIAOMI_API_KEY`                                                             |
 | ZenMux         | `ZENMUX_API_KEY`                                                             |
+| OpenGateway    | `OPENGATEWAY_API_KEY`                                                        |
+| BizRouter      | `BIZROUTER_API_KEY`                                                          |
+| Mara Cloud     | `MARA_API_KEY`                                                               |
 | vLLM           | `VLLM_API_KEY`                                                               |
 | Cloudflare AI Gateway | `CLOUDFLARE_AI_GATEWAY_API_KEY`                                      |
 | GitHub Copilot | `COPILOT_GITHUB_TOKEN` or `GH_TOKEN` or `GITHUB_TOKEN`                      |
@@ -977,6 +984,9 @@ Provider endpoint defaults for the current OpenAI-compatible integrations:
 - Xiaomi MiMo: `https://api.xiaomimimo.com/anthropic`
 - ZenMux (OpenAI): `https://zenmux.ai/api/v1`
 - ZenMux (Anthropic models): `https://zenmux.ai/api/anthropic`
+- OpenGateway by Sionic AI: `https://apis.opengateway.ai/v1`
+- BizRouter: `https://api.bizrouter.ai/v1`
+- Mara Cloud: `https://api.cloud.mara.com/v1`
 - vLLM: `http://127.0.0.1:8000/v1`
 - Ollama: local OpenAI-compatible runtime (`http://127.0.0.1:11434/v1`)
 - Ollama Cloud: native Ollama API host (`https://ollama.com/api`, configured here as base URL `https://ollama.com`)
@@ -1064,7 +1074,7 @@ The quickest way to authenticate:
 ```bash
 bunx @gajae-code/ai login              # interactive provider selection
 bunx @gajae-code/ai login anthropic    # login to specific provider
-bunx @gajae-code/ai login vllm         # store vLLM API key (or placeholder for local no-auth)
+bunx @gajae-code/ai login vllm         # store vLLM API key (local no-auth servers are discovered automatically)
 bunx @gajae-code/ai login xai          # sign in with xAI/Grok OAuth
 bunx @gajae-code/ai list               # list available providers
 ```

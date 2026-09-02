@@ -43,6 +43,13 @@ function fakeSession(initial = model("provider-a", "initial")) {
 		thinkingLevel: ThinkingLevel.Low as ThinkingLevel | undefined,
 		sessionId: "session-1",
 		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel }>,
+		configuredModelChains: new Map<string, readonly string[]>(),
+		getConfiguredModelChain(role: string) {
+			return this.configuredModelChains.get(role);
+		},
+		setConfiguredModelChain(role: string, entries: readonly string[]) {
+			this.configuredModelChains.set(role, [...entries]);
+		},
 		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
 			this.setModelTemporaryCalls.push({ model: next, thinkingLevel });
 			this.model = next;
@@ -78,7 +85,7 @@ function instrumentSettings(settings: Settings) {
 }
 
 describe("model profile activation red-team", () => {
-	test("ATOMICITY: unresolvable role selector after resolved default throws with zero mutation", async () => {
+	test("fully unresolved custom non-default role fails atomically", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated({
 			"task.agentModelOverrides": { executor: "provider-a/original" },
@@ -88,7 +95,7 @@ describe("model profile activation red-team", () => {
 		const registry = fakeRegistry({
 			profiles: [
 				{
-					name: "bad-role",
+					name: "unresolved-role",
 					requiredProviders: [],
 					modelMapping: { default: "provider-a/default:high", executor: "provider-b/missing" },
 					source: "user",
@@ -97,16 +104,38 @@ describe("model profile activation red-team", () => {
 		});
 
 		await expect(
-			activateModelProfile({ session, modelRegistry: registry, settings, profileName: "bad-role" }),
-		).rejects.toThrow('Model profile "bad-role" executor selector did not resolve: provider-b/missing');
+			activateModelProfile({ session, modelRegistry: registry, settings, profileName: "unresolved-role" }),
+		).rejects.toThrow(/executor selectors do not match any catalog model/);
 		expect(session.model?.id).toBe("initial");
-		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
-		expect(session.setModelTemporaryCalls).toEqual([]);
 		expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "provider-a/original" });
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
 		expect(calls.setCalls).toEqual([]);
 		expect(calls.overrideCalls).toEqual([]);
 		expect(calls.flushCount).toBe(0);
+	});
+
+	test("registry profile rejects an unresolved qualified role even when its default resolves", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated({ "modelProfile.default": "old-profile" });
+		const calls = instrumentSettings(settings);
+		const registry = fakeRegistry({
+			profiles: [
+				{
+					name: "registry-unresolved-role",
+					requiredProviders: ["provider-a"],
+					modelMapping: { default: "provider-a/default", executor: "provider-b/missing" },
+					source: "registry",
+				},
+			],
+		});
+
+		await expect(
+			activateModelProfile({ session, modelRegistry: registry, settings, profileName: "registry-unresolved-role" }),
+		).rejects.toThrow(/executor selectors do not match any catalog model/);
+		expect(session.model?.id).toBe("initial");
+		expect(settings.get("modelProfile.default")).toBe("old-profile");
+		expect(calls.setCalls).toEqual([]);
+		expect(calls.overrideCalls).toEqual([]);
 	});
 
 	test("ATOMICITY: one missing required provider hard-blocks naming only missing providers with zero mutation", async () => {
@@ -127,7 +156,6 @@ describe("model profile activation red-team", () => {
 				},
 			],
 		});
-
 		await expect(
 			activateModelProfile({ session, modelRegistry: registry, settings, profileName: "needs-two" }),
 		).rejects.toThrow(
@@ -143,13 +171,13 @@ describe("model profile activation red-team", () => {
 		expect(calls.flushCount).toBe(0);
 	});
 
-	test("AUTHZ: underdeclared mapped provider hard-blocks with zero mutation", async () => {
+	test("AUTHZ: underdeclared mapped provider is a resolution-time candidate, not an activation gate", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated({
 			"task.agentModelOverrides": { executor: "provider-a/original" },
 			"modelProfile.default": "old-profile",
 		});
-		const calls = instrumentSettings(settings);
+		instrumentSettings(settings);
 		const registry = fakeRegistry({
 			missingProviders: ["provider-b"],
 			profiles: [
@@ -161,20 +189,76 @@ describe("model profile activation red-team", () => {
 				},
 			],
 		});
+		const probes: string[] = [];
+		const getApiKeyForProvider = registry.getApiKeyForProvider;
+		registry.getApiKeyForProvider = async (provider: string) => {
+			probes.push(provider);
+			return getApiKeyForProvider(provider);
+		};
 
-		await expect(
-			activateModelProfile({ session, modelRegistry: registry, settings, profileName: "underdeclared-provider" }),
-		).rejects.toThrow(
-			'Model profile "underdeclared-provider" requires credentials for: provider-b. Run /login and configure the missing provider(s), then retry.',
-		);
-		expect(session.model?.id).toBe("initial");
-		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
-		expect(session.setModelTemporaryCalls).toEqual([]);
-		expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "provider-a/original" });
-		expect(settings.get("modelProfile.default")).toBe("old-profile");
-		expect(calls.setCalls).toEqual([]);
-		expect(calls.overrideCalls).toEqual([]);
-		expect(calls.flushCount).toBe(0);
+		// Only explicitly declared requiredProviders hard-gate activation.
+		// Mapped fallback providers (provider-b) are resolved entry-by-entry at
+		// request time, so activation succeeds and the mapped selector is kept.
+		await activateModelProfile({ session, modelRegistry: registry, settings, profileName: "underdeclared-provider" });
+		expect(settings.get("task.agentModelOverrides").executor).toBe("provider-b/executor");
+		expect(probes).toContain("provider-b");
+	});
+
+	test("AUTHZ: alternative credentials are probed and rewrite an unavailable mapped provider", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated();
+		const registry = fakeRegistry({
+			missingProviders: ["provider-b"],
+			models: [model("provider-a", "default"), model("provider-c", "executor")],
+			profiles: [
+				{
+					name: "alternative-mapped-provider",
+					requiredProviders: ["provider-a"],
+					alternativeProviderGroups: [["provider-b", "provider-c"]],
+					modelMapping: { default: "provider-a/default", executor: "provider-b/executor" },
+					source: "user",
+				},
+			],
+		});
+
+		await activateModelProfile({
+			session,
+			modelRegistry: registry,
+			settings,
+			profileName: "alternative-mapped-provider",
+		});
+
+		expect(settings.get("task.agentModelOverrides").executor).toBe("provider-c/executor");
+	});
+
+	test("AUTHZ: fallback proxy routing keeps a directly authenticated mapped provider direct", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated({
+			"modelProfile.proxyProvider": "litellm",
+			"modelProfile.proxyMode": "fallback",
+		});
+		const profile: ModelProfileDefinition = {
+			name: "registry-direct-mapped-provider",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default", executor: "provider-b/executor" },
+			source: "registry",
+		};
+		const registry = {
+			...fakeRegistry({
+				profiles: [profile],
+				models: [
+					model("provider-a", "default"),
+					model("provider-b", "executor"),
+					model("litellm", "provider-b/executor"),
+				],
+			}),
+			getConfiguredProviderIds: () => ["litellm"],
+			getApiKeyForProvider: async (provider: string) => `key-${provider}`,
+		};
+
+		await activateModelProfile({ session, modelRegistry: registry, settings, profileName: profile.name });
+
+		expect(settings.get("task.agentModelOverrides").executor).toBe("provider-b/executor");
 	});
 
 	test("--default failure path does not persist or flush modelProfile.default", async () => {
@@ -232,7 +316,7 @@ describe("model profile activation red-team", () => {
 		});
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
 		expect(calls.setCalls).toEqual([]);
-		expect(calls.overrideCalls).toEqual(["task.agentModelOverrides"]);
+		expect(calls.overrideCalls).toEqual(["modelRoles", "task.agentModelOverrides"]);
 		expect(calls.flushCount).toBe(0);
 	});
 

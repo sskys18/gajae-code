@@ -23,9 +23,18 @@ interface RalplanHudState extends WorkflowGateHudState {
 	iteration?: number;
 	iterationFromIndex?: number;
 	stages?: string;
+	architectPasses?: number;
+	criticPasses?: number;
+	reviewPassBudget?: number;
 	verdict?: string;
 	latestSummary?: string;
 	pendingApproval?: boolean;
+	autoHandoff?: {
+		configuredTarget: string;
+		effectiveTarget: string;
+		degradationReason: string | null;
+	};
+	planningStuck?: boolean;
 	updatedAt?: string;
 }
 
@@ -42,21 +51,6 @@ interface UltragoalHudState extends WorkflowGateHudState {
 	goals: UltragoalLikeGoal[];
 	latestLedgerEvent?: { event?: string; goalId?: string; timestamp?: string; kind?: string; evidence?: string };
 	updatedAt?: string;
-}
-
-interface TeamHudWorker {
-	id: string;
-	status?: string;
-}
-
-interface TeamHudState extends WorkflowGateHudState {
-	phase: string;
-	task_total: number;
-	task_counts: Record<string, number>;
-	workers: TeamHudWorker[];
-	updated_at?: string;
-	latestEvent?: { type?: string; worker?: string; message?: string };
-	latestMessage?: { from_worker?: string; body?: string };
 }
 
 function percent(value: number | undefined): string | undefined {
@@ -194,13 +188,41 @@ export function deriveDeepInterviewHud(
 export function buildRalplanHudSummary(state: RalplanHudState): WorkflowHudSummary {
 	const verdict = state.verdict?.toUpperCase();
 	const verdictSeverity =
-		verdict === "BLOCK"
+		verdict === "BLOCK" || verdict === "REJECT"
 			? "blocked"
 			: verdict === "ITERATE" || verdict === "WATCH"
 				? "warning"
-				: verdict === "APPROVE" || verdict === "CLEAR"
+				: verdict === "APPROVE" || verdict === "CLEAR" || verdict === "OKAY"
 					? "success"
 					: undefined;
+	const reviewPassChip = (
+		label: "arch" | "crit",
+		passes: number | undefined,
+		priority: number,
+	): WorkflowHudChip | null => {
+		if (
+			state.pendingApproval ||
+			typeof passes !== "number" ||
+			!Number.isFinite(passes) ||
+			passes <= 0 ||
+			typeof state.reviewPassBudget !== "number" ||
+			!Number.isFinite(state.reviewPassBudget) ||
+			state.reviewPassBudget <= 0
+		) {
+			return null;
+		}
+		return chip(label, `${passes}/${state.reviewPassBudget}`, priority);
+	};
+	const handoffValue = state.autoHandoff
+		? `${state.autoHandoff.configuredTarget}→${state.autoHandoff.effectiveTarget}${
+				state.autoHandoff.degradationReason ? `:${state.autoHandoff.degradationReason}` : ""
+			}`
+		: undefined;
+	const handoffSeverity = state.planningStuck
+		? "blocked"
+		: state.autoHandoff?.degradationReason
+			? "warning"
+			: undefined;
 	return {
 		version: 1,
 		summary: state.latestSummary,
@@ -217,8 +239,52 @@ export function buildRalplanHudSummary(state: RalplanHudState): WorkflowHudSumma
 				30,
 			),
 			chip("stages", state.stages, 35),
+			reviewPassChip("arch", state.architectPasses, 36),
+			reviewPassChip("crit", state.criticPasses, 38),
 			chip("verdict", verdict, 40, verdictSeverity),
+			chip("handoff", handoffValue, 45, handoffSeverity),
 		]),
+		...(state.updatedAt ? { updated_at: state.updatedAt } : {}),
+	};
+}
+
+export interface AutoresearchHudState extends WorkflowGateHudState {
+	phase: string;
+	mode?: string;
+	intake?: string;
+	slug?: string;
+	specPath?: string;
+	verdict?: string;
+	experimentCount?: number;
+	experimentStatuses?: string[];
+	updatedAt?: string;
+}
+
+export function buildAutoresearchHudSummary(state: AutoresearchHudState): WorkflowHudSummary {
+	const statuses = state.experimentStatuses ?? [];
+	const total = Math.max(state.experimentCount ?? statuses.length, statuses.length);
+	const kept = statuses.filter(status => status === "keep").length;
+	const crash = statuses.filter(status => status === "crash").length;
+	const checksFailed = statuses.filter(status => status === "checks_failed").length;
+	const chips: Array<WorkflowHudChip | null> = [
+		...(state.phase === "verdict" ? [chip("verdict", state.verdict ?? "issued", 5)] : []),
+		chip("phase", state.phase, 10),
+		...(total > 0 ? [chip("exp", `${kept}/${total}`, 20)] : []),
+		crash > 0 ? { label: "crash", value: String(crash), priority: 4, severity: "warning" } : null,
+		checksFailed > 0
+			? { label: "checks_failed", value: String(checksFailed), priority: 5, severity: "warning" }
+			: null,
+		chip("mode", state.mode, 30),
+		chip("intake", state.intake, 40),
+		chip("spec", state.specPath, 45),
+		...gateChips(state, 50),
+	];
+	const visibleChips =
+		total === 0 && state.phase !== "verdict" ? compactChips([chip("phase", state.phase, 10)]) : compactChips(chips);
+	return {
+		version: 1,
+		...(state.slug ? { summary: `autoresearch mission ${state.slug}` } : {}),
+		chips: visibleChips,
 		...(state.updatedAt ? { updated_at: state.updatedAt } : {}),
 	};
 }
@@ -246,31 +312,5 @@ export function buildUltragoalHudSummary(state: UltragoalHudState): WorkflowHudS
 			...gateChips(state, 40),
 		]),
 		...(state.updatedAt ? { updated_at: state.updatedAt } : {}),
-	};
-}
-
-export function buildTeamHudSummary(state: TeamHudState): WorkflowHudSummary {
-	const failedWorkers = state.workers.filter(
-		worker => worker.status === "failed" || worker.status === "blocked",
-	).length;
-	const stoppedWorkers = state.workers.filter(worker => worker.status === "stopped").length;
-	const completed = state.task_counts.completed ?? 0;
-	const failedTasks = (state.task_counts.failed ?? 0) + (state.task_counts.blocked ?? 0);
-	const latest = state.latestEvent?.message ?? state.latestEvent?.type ?? state.latestMessage?.body;
-	return {
-		version: 1,
-		chips: compactChips([
-			failedWorkers > 0 || failedTasks > 0
-				? { label: "blocked", value: String(failedWorkers + failedTasks), priority: 5, severity: "blocked" }
-				: stoppedWorkers > 0
-					? { label: "stopped", value: String(stoppedWorkers), priority: 5, severity: "warning" }
-					: null,
-			chip("phase", state.phase, 10),
-			chip("workers", `${state.workers.length - failedWorkers}/${state.workers.length}`, 20),
-			chip("tasks", `${completed}/${state.task_total}`, 30),
-			...gateChips(state, 40),
-			chip("latest", latest, 70),
-		]),
-		...(state.updated_at ? { updated_at: state.updated_at } : {}),
 	};
 }

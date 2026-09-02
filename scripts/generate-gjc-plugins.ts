@@ -10,11 +10,12 @@
  *
  * Usage:
  *   bun scripts/generate-gjc-plugins.ts            # write files
- *   bun scripts/generate-gjc-plugins.ts --check    # compare bytes, exit 1 on drift
+ *   bun scripts/generate-gjc-plugins.ts --check    # compare complete file set + bytes, exit 1 on drift
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as os from "node:os";
 import { COORDINATOR_MCP_TOOL_NAMES } from "../packages/coding-agent/src/coordinator/contract";
 
 const repoRoot = path.join(import.meta.dir, "..");
@@ -27,8 +28,8 @@ const NAMESPACE_LABEL = "gajae-code-plugin";
 
 interface DelegateMeta {
 	tool: string;
-	workflow: "plan" | "execute" | "team";
-	skill: "ralplan" | "ultragoal" | "team";
+	workflow: "plan" | "execute";
+	skill: "ralplan" | "ultragoal";
 	summary: string;
 }
 
@@ -45,13 +46,20 @@ const DELEGATE_META: DelegateMeta[] = [
 		skill: "ultragoal",
 		summary: "Delegate execution to GJC (runs /skill:ultragoal to completion with verification).",
 	},
-	{
-		tool: "gjc_delegate_team",
-		workflow: "team",
-		skill: "team",
-		summary: "Delegate parallel team execution to GJC (runs /skill:team with internal tmux workers).",
-	},
 ];
+/**
+ * Inventory of `gjc sdk session` semantic verbs plus the raw hatch kinds,
+ * mirrored from the SDK session CLI (`SdkSessionCliAction` / raw kinds in
+ * `packages/coding-agent/src/sdk/cli/session-cli.ts`). The advisory
+ * `gjc-sdk-session` skill is rendered from this inventory and
+ * `scripts/verify-gjc-skill-docs.ts` checks every skill reference against it,
+ * so a skill can never advertise a verb the CLI does not ship.
+ */
+export const SDK_SESSION_CLI_VERBS = ["list", "inspect", "send", "status", "tail", "raw"] as const;
+export type SdkSessionCliVerb = (typeof SDK_SESSION_CLI_VERBS)[number];
+
+export const SDK_SESSION_RAW_KINDS = ["control", "query", "global"] as const;
+export type SdkSessionRawKind = (typeof SDK_SESSION_RAW_KINDS)[number];
 
 function readPackageVersion(): string {
 	const pkgPath = path.join(repoRoot, "packages", "coding-agent", "package.json");
@@ -108,6 +116,12 @@ Call the \`${meta.tool}\` coordinator MCP tool to delegate this work to gajae-co
 GJC starts a session and runs \`/skill:${meta.skill}\` to completion, returning a
 durable \`turn_id\`, status, and artifact references. Poll with
 \`gjc_coordinator_await_turn\` or \`gjc_coordinator_watch_events\`.
+Codex resume bridge correlation: after registering an app-server handoff with
+\`gjc_coordinator_register_codex_handoff\`, pass the same \`session_id\` as
+\`codex_host_session_id\` on delegate calls so the new GJC session auto-binds to
+the Codex thread for wake-on-completion and questions. Acknowledge durable wakes
+by \`wake_key\` with \`gjc_coordinator_ack_codex_handoff\`; heartbeats are unsupported
+(\`automation_update_unavailable\`), so delivery is event-driven with startup drain.
 `;
 }
 
@@ -117,7 +131,7 @@ function skillDoc(): string {
 	).join("\n");
 	return `---
 name: gjc-delegation
-description: Delegate planning, execution, and team workflows to gajae-code via the coordinator MCP server.
+description: Delegate planning and execution workflows to gajae-code via the coordinator MCP server.
 ---
 
 # GJC delegation
@@ -138,6 +152,13 @@ project directory and does **not** set \`GJC_COORDINATOR_MCP_MUTATIONS\`.
 Delegation is read-only until the user explicitly enables a mutation class and
 passes \`allow_mutation: true\` per call. \`GJC_COORDINATOR_MCP_REPO\` is a
 namespace label only, never a filesystem path.
+## Codex resume bridge correlation
+
+After registering an app-server handoff with \`gjc_coordinator_register_codex_handoff\`,
+pass the same \`session_id\` as \`codex_host_session_id\` on delegate calls so new GJC
+sessions auto-bind to the Codex thread for wake-on-completion and questions. Acknowledge
+durable wakes by \`wake_key\` with \`gjc_coordinator_ack_codex_handoff\`; heartbeats are
+unsupported (\`automation_update_unavailable\`), so delivery is event-driven with startup drain.
 
 ## Polling
 
@@ -146,76 +167,123 @@ or \`gjc_coordinator_watch_events\` for the \`delegation.started\` event and the
 terminal turn state. Turn state is the source of truth, not terminal scrollback.
 `;
 }
-function sessionSkillDoc(): string {
+
+function sdkSessionSkillDoc(): string {
+	const verbs = SDK_SESSION_CLI_VERBS.join("|");
+	const rawKinds = SDK_SESSION_RAW_KINDS.join("|");
 	return `---
-name: gjc-session
-description: Use GJC's published tmux session helpers for Clawhip-visible worktree sessions, prompt injection, tail checks, and harness owner debugging.
+name: gjc-sdk-session
+description: Operate GJC SDK sessions from the CLI (\`gjc sdk session ${verbs}\` plus the explicit raw ${rawKinds} hatch). Advisory reference: broker-bound, credential-free output; mutating verbs run only when explicitly invoked.
 ---
 
-# GJC session helpers
+# GJC SDK session CLI (advisory)
 
-Use this skill when a task needs an operator-visible GJC session in tmux: Clawhip/Hermes/OpenClaw can watch the pane, route stale-session alerts, and send follow-up prompts while the work stays in a dedicated git worktree.
+Advisory reference for interacting with live GJC SDK sessions through the
+broker-bound \`gjc sdk session\` command family. This skill is informational:
+it never prints endpoint credentials or changes configuration, and it never
+references removed command routes. Mutating commands are only documented and
+run when the operator explicitly invokes them.
 
-Prefer Coordinator MCP for pure machine control. Prefer RPC/ACP when a host owns the tools. Use this visible-session helper flow when humans or chatops need tmux scrollback and a stable session name.
+## Broker authority
 
-## Public helpers
+\`list\`, \`inspect\`, \`send\`, \`status\`, and \`tail\` resolve sessions through the
+SDK broker. The broker validates the indexed session against its durable
+endpoint record and hands the CLI a connection credential the CLI uses and
+never prints. \`--agent-dir\` selects the broker state directory.
 
-- \`scripts/gjc-session/create.sh\` starts interactive \`gjc\` in a named tmux session, validates the worktree, preserves the pane after exit, prints and writes the session-specific durable state path, writes \`metadata.json\`, mirrors pane output to \`pane.log\`, records lifecycle events in \`events.log\`, writes normal-exit \`final.json\`, and optionally registers a Clawhip-style router watch.
-- \`scripts/gjc-session/prompt.sh\` sends text or an \`@file\` prompt after the pane looks like a ready GJC TUI; if the tmux session vanished, it refuses injection and prints the durable metadata/log/final/events recovery paths plus the last pane-log excerpt.
-- \`scripts/gjc-session/tail.sh\` captures bounded pane output for readiness and acceptance checks, with durable metadata, pane-log, event-log, and final-status fallback when tmux vanished.
-- \`scripts/gjc-session/harness-tmux-owner-start.sh\` starts the harness RuntimeOwner inside tmux for dogfood/debug cases that need visible owner liveness.
-- \`docs/gjc-session-clawhip-routing.md\` documents the full routed-session contract.
+## Semantic verbs
 
-## Standard flow
+- \`gjc sdk session list\` — broker \`session.list\` projected to the versioned,
+  credential-free row DTO (session id, locator, pid, liveness, tombstone,
+  activity, heartbeat, identity provenance, ambiguity).
+- \`gjc sdk session inspect <sessionId>\` — one indexed row from the broker. It
+  never reads endpoint discovery records directly: a missing or unavailable
+  broker fails closed rather than exposing endpoint authority outside SDK core.
+- \`gjc sdk session send <sessionId> --text <prompt>\` — ordered \`turn.prompt\`
+  carrying a caller-chosen operation reference (ULID). \`--wait\` polls
+  \`turn.result\` with \`kind: "prompt"\` until terminal or the wait window elapses;
+  it never cancels a running turn.
+- \`gjc sdk session status <sessionId> <opRef>\` — lossless \`turn.result\` with
+  \`kind: "prompt"\` for a previously submitted operation reference.
 
-1. Prepare a dedicated worktree and branch for the issue or PR. Do not use the canonical checkout for visible routed work.
-2. Pick a stable, unambiguous session name that includes the repository and artifact id, such as \`gajae-code-issue-1055-gjc-session-skill\`.
-3. Start the session:
+- \`gjc sdk session tail <sessionId>\` — retained transcript replay from the
+  durable checkpoint followed by live event-ring frames. \`--strict\` fails
+  closed on retention gaps, \`--until-idle\` exits at a terminal turn state,
+  \`--all-events\` widens the emitted event kinds, and \`--cursor\` resumes from a
+  saved checkpoint token that is re-minted per connection.
 
-   \`\`\`sh
-   ./scripts/gjc-session/create.sh <session-name> <worktree-path> [channel-id] [mention]
-   \`\`\`
+## Raw hatch
 
-   Channel ids and mentions are runtime inputs owned by the host/router. Never hard-code private ids, bot mentions, credentials, tokens, or private host paths into public docs or scripts.
-4. Confirm readiness with bounded tail output:
+\`gjc sdk session raw ${rawKinds}\` dispatches one SDK operation with \`--op\`
+(control/global) or \`--query\` (query) plus a JSON input source. Lifecycle
+globals require \`--idempotency-key\`; destructive control operations accept
+\`--confirm\`. Endpoint-disclosure operations are refused by default and stay
+refused by this skill.
 
-   \`\`\`sh
-   ./scripts/gjc-session/tail.sh <session-name> 80
-   \`\`\`
+## Lossless prompt results
 
-   Wait for a ready GJC TUI signal such as \`Gajae forge\`, \`Type your message\`, \`> Type your message\`, or \`Working\`.
-5. Send the actual task separately:
+\`turn.result\` with \`kind: "prompt"\` reports \`accepted\`, \`in_flight\`,
+\`terminal_ok\`, or \`failed\`; only retained-record eviction yields \`unknown\`,
+which means uncertainty, never proof of non-execution. \`turn.prompt_status\`
+remains a legacy prompt-only alias. Never reuse an operation reference as a retry
+mechanism.
 
-   \`\`\`sh
-   ./scripts/gjc-session/prompt.sh <session-name> @/path/to/task.md
-   \`\`\`
+## Checkpoint gaps
 
-6. Verify prompt acceptance from work evidence, not from pasted text alone. Acceptable evidence includes a tool call or file read, a plan/todo update, a diff or test command, a GitHub comment/review/PR URL, or a terminal verdict such as \`MERGE_READY\` or \`REQUEST_CHANGES\`.
+\`tail\` reports a \`retention_gap\` with the missing sequence range and a
+\`resync\` checkpoint when retained history or the event ring dropped entries;
+\`--strict\` turns any gap into exit code 1.
 
-If tmux disappears before terminal verdict, inspect the state path printed by \`create.sh\`: \`metadata.json\` identifies the worktree/session, \`pane.log\` contains the mirrored transcript, \`events.log\` records launch/exit milestones, and \`final.json\` is present when \`gjc\` exited normally. Use \`tail.sh <session-name> [lines]\` to surface these artifacts without a live tmux server.
+## Scoped search
 
-## Prompt expectations
+\`gjc sdk search [--scope repo|pwd|global] [--json]\` lists broker-visible
+sessions inside one exact scope (default \`repo\`: the identical canonical Git
+worktree, never a path prefix). Every result carries a scope/status envelope
+(requested and resolved scope, \`populated\`, \`empty\`, \`not-in-git-worktree\`,
+or \`unavailable\`); empty and non-Git results exit 0 and never fall back to a
+wider scope. Rows are probed after scoping (\`reachable\`, \`unreachable\`,
+\`stale\`) without printing endpoint credentials.
 
-Include repository, worktree, branch, base branch, issue/PR id, scope, non-goals, verification, and whether to commit/push/open a PR. Keep channel and mention values outside the prompt unless the host policy explicitly requires them.
+## Local-only spawn
 
-## Harness owner sessions
+\`gjc sdk spawn --cwd <dir> --prompt <task> [--model <selector>] [--profile <name>]\`
+creates one task-seeded background child through the broker and is legal only
+inside a live interactive \`gjc --master\` session. Each invocation uses a fresh
+idempotency identity: one identity yields at most one child and one seed
+prompt, replays return stored outcomes, and a semantically new task requires a
+new invocation. \`spawn_in_progress\` and \`terminal_uncertain\` are honest
+states, never retry triggers. The task and master capability never persist in
+broker state, logs, or output; spawn is prohibited on MCP, ACP, daemon CLI/raw,
+Telegram, Discord, and Slack surfaces. Clean up children through the standard
+\`session.close\` path; orphaned children are reaped after
+\`sdk.masterOrphanGraceMs\`.
+`;
+}
 
-For harness/RPC dogfooding where the RuntimeOwner itself must remain visible, use:
+function sdkGuidesSkillDoc(): string {
+	return `---
+name: gjc-sdk-guides
+description: Index of trusted GJC SDK reference guides (broker, session CLI, embedding, app development). Advisory only: read these documents for background; there is no guide to execute and no workflow skill to run.
+---
 
-\`\`\`sh
-./scripts/gjc-session/harness-tmux-owner-start.sh <session-name> <workspace> [issue-or-pr] [branch-label] [base]
-\`\`\`
+# GJC SDK guides (advisory)
 
-The helper requires the branch label to match the workspace checkout and prints \`SESSION_ID\`, \`STATE_ROOT\`, \`TMUX_SESSION\`, and a bounded monitor-capture command.
+Advisory index of trusted GJC SDK reference documents. These guides are
+reading material for background understanding; nothing in this skill is
+executable and no workflow skill is invoked.
 
-## Anti-patterns
+- \`docs/sdk.md\` — SDK overview: endpoint discovery, protocol, query and
+  control surfaces, broker launch isolation, managed notification adapters.
+- \`docs/sdk-session-cli.md\` — the \`gjc sdk session\` command family: semantic
+  verbs, raw hatch, lossless statuses, broker authority, and checkpoint gaps.
+- \`docs/sdk-embedding.md\` — embedding GJC in-process.
+- \`docs/sdk-app-guide.md\` — building applications on the SDK.
 
-- Starting long-running visible repo work with \`gjc -p\` instead of an interactive tmux session.
-- Running the owner process under short shell timeouts or wrappers that can SIGKILL the session.
-- Treating tmux process existence or a visible pasted prompt as proof of acceptance.
-- Restarting a vanished session without first checking its durable metadata, pane log, event log, and final status.
-- Launching from a shared canonical checkout instead of a task worktree.
-- Hard-coding private channel ids, mentions, tokens, credentials, or internal-only paths.
+## Advisory boundary
+
+The references above are consulted as background, never executed. The plugin
+bundle keeps the four default workflow skills unchanged; this skill adds no
+workflow and performs no configuration or state mutation.
 `;
 }
 
@@ -232,7 +300,9 @@ hand; run \`bun run generate-plugins\` and commit the result. CI runs
 - \`.codex-plugin/plugin.json\` — Codex manifest.
 - \`.mcp.json\` — Claude coordinator MCP wiring (\${CLAUDE_PROJECT_DIR}).
 - \`.codex.mcp.json\` — Codex coordinator MCP wiring (host-neutral; \`gjc setup codex\` rewrites concrete roots).
-- \`commands/\`, \`skills/\` — host-facing delegate command + skill docs.
+- \`commands/\`, \`skills/\` — host-facing delegate command + skill docs, including
+  the advisory \`gjc-sdk-session\` (SDK session CLI reference) and
+  \`gjc-sdk-guides\` (trusted SDK guide index) skills.
 
 Install: \`codex plugin marketplace add ./plugins\` (Codex) or \`/plugin marketplace add ./plugins\` (Claude Code), then install the \`gajae-code\` plugin.
 `;
@@ -267,15 +337,16 @@ export function renderPluginFiles(): Map<string, string> {
 		json({
 			name: PLUGIN_NAME,
 			owner: { name: "Gajae Code" },
-			metadata: { description: "GJC delegation plugin", version },
+			metadata: { description: "GJC delegation plugin with advisory SDK skills", version },
 			plugins: [
 				{
 					name: PLUGIN_NAME,
 					source: `./${dir}`,
-					description: "Delegate GJC planning/execution/team workflows via coordinator MCP.",
+					description:
+						"Delegate GJC planning/execution workflows via coordinator MCP, plus advisory SDK session CLI and guide skills.",
 					version,
 					author: { name: "Gajae Code" },
-					keywords: ["gjc", "delegation", "mcp", "planning", "agents"],
+					keywords: ["gjc", "delegation", "mcp", "planning", "agents", "sdk"],
 				},
 			],
 		}),
@@ -286,7 +357,8 @@ export function renderPluginFiles(): Map<string, string> {
 		path.join(dir, ".claude-plugin", "plugin.json"),
 		json({
 			name: PLUGIN_NAME,
-			description: "Delegate planning, execution, and team workflows to GJC through the coordinator MCP server.",
+			description:
+				"Delegate planning and execution workflows to GJC through the coordinator MCP server, plus advisory SDK session CLI and guide skills.",
 			version,
 			commands: "./commands",
 			skills: "./skills",
@@ -301,7 +373,8 @@ export function renderPluginFiles(): Map<string, string> {
 		json({
 			name: PLUGIN_NAME,
 			version,
-			description: "Delegate Codex tasks to GJC workflows through coordinator MCP.",
+			description:
+				"Delegate Codex tasks to GJC workflows through coordinator MCP, plus advisory SDK session CLI and guide skills.",
 			skills: "./skills/",
 			mcpServers: "./.codex.mcp.json",
 		}),
@@ -315,7 +388,8 @@ export function renderPluginFiles(): Map<string, string> {
 		files.set(path.join(dir, "commands", `delegate_${meta.workflow}.md`), commandDoc(meta));
 	}
 	files.set(path.join(dir, "skills", "gjc-delegation", "SKILL.md"), skillDoc());
-	files.set(path.join(dir, "skills", "gjc-session", "SKILL.md"), sessionSkillDoc());
+	files.set(path.join(dir, "skills", "gjc-sdk-session", "SKILL.md"), sdkSessionSkillDoc());
+	files.set(path.join(dir, "skills", "gjc-sdk-guides", "SKILL.md"), sdkGuidesSkillDoc());
 	files.set(path.join(dir, "README.md"), readmeDoc());
 
 	return files;
@@ -332,10 +406,31 @@ function writeFiles(files: Map<string, string>): void {
 	process.stdout.write(`Generated ${files.size} plugin file(s) under plugins/\n`);
 }
 
-function checkFiles(files: Map<string, string>): number {
+function listPluginFiles(dir: string, rel = ""): string[] {
+	if (!fs.existsSync(dir)) return [];
+	const files: string[] = [];
+	for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+		const entryRel = path.join(rel, entry.name);
+		const entryPath = path.join(dir, entry.name);
+		if (entry.isDirectory()) {
+			files.push(...listPluginFiles(entryPath, entryRel));
+		} else {
+			// Treat symlinks and special entries as files: no unrendered entry may be installable.
+			files.push(entryRel);
+		}
+	}
+	return files;
+}
+
+export function findUnexpectedPluginFiles(files: ReadonlyMap<string, string>, root = pluginsDir): string[] {
+	const expected = new Set(files.keys());
+	return listPluginFiles(root).filter(rel => !expected.has(rel)).sort();
+}
+
+function checkFiles(files: Map<string, string>, root = pluginsDir, report = true): number {
 	const problems: string[] = [];
 	for (const [rel, content] of files) {
-		const target = path.join(pluginsDir, rel);
+		const target = path.join(root, rel);
 		let actual: string | null = null;
 		try {
 			actual = fs.readFileSync(target, "utf8");
@@ -348,27 +443,63 @@ function checkFiles(files: Map<string, string>): number {
 			problems.push(`drift: plugins/${rel}`);
 		}
 	}
+	for (const rel of findUnexpectedPluginFiles(files, root)) {
+		problems.push(`unexpected: plugins/${rel}`);
+	}
 	if (problems.length > 0) {
-		for (const problem of problems) process.stderr.write(`${problem}\n`);
-		process.stderr.write(`Plugin bundle drift detected. Run \`bun run generate-plugins\`.\n`);
+		if (report) {
+			for (const problem of problems) process.stderr.write(`${problem}\n`);
+			process.stderr.write(`Plugin bundle drift detected. Run \`bun run generate-plugins\`.\n`);
+		}
 		return 1;
 	}
 	process.stdout.write(`Plugin bundle is in sync (${files.size} file(s)).\n`);
 	return 0;
 }
 
+function runSelfTest(): void {
+	const files = renderPluginFiles();
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-plugin-self-test-"));
+	try {
+		for (const [rel, content] of files) {
+			const target = path.join(root, rel);
+			fs.mkdirSync(path.dirname(target), { recursive: true });
+			fs.writeFileSync(target, content);
+		}
+		for (const rel of [
+			path.join(PLUGIN_NAME, "commands", "stale.md"),
+			path.join(PLUGIN_NAME, "skills", "stale", "SKILL.md"),
+		]) {
+			const target = path.join(root, rel);
+			fs.mkdirSync(path.dirname(target), { recursive: true });
+			fs.writeFileSync(target, "stale\n");
+		}
+		const unexpected = findUnexpectedPluginFiles(files, root);
+		if (
+			checkFiles(files, root, false) !== 1 ||
+			!unexpected.includes(path.join(PLUGIN_NAME, "commands", "stale.md")) ||
+			!unexpected.includes(path.join(PLUGIN_NAME, "skills", "stale", "SKILL.md"))
+		) {
+			throw new Error("plugin file-set check did not reject stale command and skill files");
+		}
+		process.stdout.write("Plugin file-set self-test passed.\n");
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+}
+
 export { DELEGATE_TOOLS };
 
 if (import.meta.main) {
-	if (DELEGATE_TOOLS.length !== 3) {
-		process.stderr.write(`Expected 3 delegate tools in the coordinator contract, found ${DELEGATE_TOOLS.length}.\n`);
+	if (DELEGATE_TOOLS.length !== 2) {
+		process.stderr.write(`Expected 2 delegate tools in the coordinator contract, found ${DELEGATE_TOOLS.length}.\n`);
 		process.exit(1);
 	}
-	const check = process.argv.includes("--check");
-	const files = renderPluginFiles();
-	if (check) {
-		process.exit(checkFiles(files));
+	if (process.argv.includes("--self-test")) {
+		runSelfTest();
+	} else if (process.argv.includes("--check")) {
+		process.exit(checkFiles(renderPluginFiles()));
 	} else {
-		writeFiles(files);
+		writeFiles(renderPluginFiles());
 	}
 }

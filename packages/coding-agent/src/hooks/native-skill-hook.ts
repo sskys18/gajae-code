@@ -1,10 +1,15 @@
-import { appendFile, mkdir } from "node:fs/promises";
-import * as os from "node:os";
+import { appendFile, mkdir, stat } from "node:fs/promises";
 import * as path from "node:path";
+import { getAgentDir, getConfigDirName } from "@gajae-code/utils";
 import { YAML } from "bun";
 import type { SkillDiscoverySettings } from "../config/skill-settings-defaults";
 import { DEFAULT_DISABLED_EXTENSIONS, DEFAULT_SKILL_DISCOVERY_SETTINGS } from "../config/skill-settings-defaults";
 import { sessionLogsDir } from "../gjc-runtime/session-layout";
+import {
+	detectMcpDelegateFlowActivation,
+	type McpDelegateHostContextV1,
+	persistMcpDelegateHostContext,
+} from "./mcp-delegate-host-context";
 import {
 	buildActiveUltragoalPromptContext,
 	buildSkillActivationAdditionalContext,
@@ -29,6 +34,56 @@ interface GjcNativeHookDispatchOptions {
 	stateDir?: string;
 	effectiveSkillConfig?: EffectiveSkillConfigInput;
 	configPaths?: string[];
+}
+
+interface ConfigCacheEntry {
+	fingerprint: string;
+	value: EffectiveSkillConfigInput;
+}
+
+const effectiveSkillConfigCache = new Map<string, ConfigCacheEntry>();
+let effectiveSkillConfigResolutionCount = 0;
+
+async function configPathFingerprint(configPaths: readonly string[]): Promise<string> {
+	const parts: string[] = [];
+	for (const configPath of configPaths) {
+		try {
+			const stats = await stat(configPath);
+			parts.push(`${configPath}:${stats.mtimeMs}:${stats.size}`);
+		} catch (error) {
+			if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+				parts.push(`${configPath}:missing`);
+				continue;
+			}
+			parts.push(`${configPath}:unavailable`);
+		}
+	}
+	return parts.join("|");
+}
+
+function configCacheKey(input: {
+	cwd: string;
+	configPaths: readonly string[];
+	sessionId?: string;
+	threadId?: string;
+	stateDir?: string;
+}): string {
+	return JSON.stringify({
+		cwd: input.cwd,
+		configPaths: input.configPaths,
+		sessionId: input.sessionId ?? "",
+		threadId: input.threadId ?? "",
+		stateDir: input.stateDir ?? "",
+	});
+}
+
+export function clearGjcNativeSkillHookCachesForTesting(): void {
+	effectiveSkillConfigCache.clear();
+	effectiveSkillConfigResolutionCount = 0;
+}
+
+export function getGjcNativeSkillHookCacheStatsForTesting(): { effectiveSkillConfigResolutions: number } {
+	return { effectiveSkillConfigResolutions: effectiveSkillConfigResolutionCount };
 }
 
 function readNestedRecord(value: Record<string, unknown>, key: string): Record<string, unknown> {
@@ -64,6 +119,8 @@ function mergeRawSkillConfig(
 	const rawSkills = readNestedRecord(raw, "skills");
 	const enabled = readBoolean(rawSkills.enabled);
 	const enableSkillCommands = readBoolean(rawSkills.enableSkillCommands);
+	const trustProjectSkills = readBoolean(rawSkills.trustProjectSkills);
+	const trustUserSkills = readBoolean(rawSkills.trustUserSkills);
 	const enablePiUser = readBoolean(rawSkills.enablePiUser);
 	const enablePiProject = readBoolean(rawSkills.enablePiProject);
 	const enableCodexUser = readBoolean(rawSkills.enableCodexUser);
@@ -78,6 +135,8 @@ function mergeRawSkillConfig(
 		...currentSkills,
 		...(enabled !== undefined ? { enabled } : {}),
 		...(enableSkillCommands !== undefined ? { enableSkillCommands } : {}),
+		...(trustProjectSkills !== undefined ? { trustProjectSkills } : {}),
+		...(trustUserSkills !== undefined ? { trustUserSkills } : {}),
 		...(enablePiUser !== undefined ? { enablePiUser } : {}),
 		...(enablePiProject !== undefined ? { enablePiProject } : {}),
 		...(enableCodexUser !== undefined ? { enableCodexUser } : {}),
@@ -103,31 +162,70 @@ async function readRawConfig(filePath: string): Promise<Record<string, unknown> 
 	}
 }
 
+/**
+ * Config files that decide skill discovery, resolved through the trusted helpers.
+ *
+ * These paths pick the `config.yml` whose `skills.customDirectories` the agent
+ * then loads skills from, so the directory they are built from is a trust
+ * boundary. Bun loads `cwd/.env` into `process.env` before any module runs, so
+ * reading `GJC_CODING_AGENT_DIR` / `GJC_CONFIG_DIR` directly let a repository
+ * point this at a directory it ships and inject its own skill directories.
+ *
+ * `getAgentDir()` and `getConfigDirName()` apply the escalation guards that
+ * already exist for exactly this (`trustedAgentDirOverride`,
+ * `trustedConfigDirName`), and resolve to the same locations this used to build
+ * by hand: `dirs.agentDir` is `path.join(os.homedir(), getConfigDirName(), "agent")`
+ * when no trusted override is present.
+ */
 function resolveConfigPaths(cwd: string, override?: string[]): string[] {
 	if (override) return override;
-	const configDirName = process.env.GJC_CONFIG_DIR ?? process.env.PI_CONFIG_DIR ?? ".gjc";
-	const userAgentDir = process.env.GJC_CODING_AGENT_DIR ?? path.join(os.homedir(), configDirName, "agent");
-	return [path.join(userAgentDir, "config.yml"), path.join(cwd, configDirName, "config.yml")];
+	return [path.join(getAgentDir(), "config.yml"), path.join(cwd, getConfigDirName(), "config.yml")];
 }
 
 async function resolveEffectiveSkillConfig(
 	cwd: string,
 	override?: EffectiveSkillConfigInput,
 	configPaths?: string[],
+	cacheContext: { sessionId?: string; threadId?: string; stateDir?: string } = {},
 ): Promise<EffectiveSkillConfigInput> {
 	if (override) return override;
+	const resolvedConfigPaths = resolveConfigPaths(cwd, configPaths);
+	const cacheKey = configCacheKey({ cwd, configPaths: resolvedConfigPaths, ...cacheContext });
+	const fingerprint = await configPathFingerprint(resolvedConfigPaths);
+	const cached = effectiveSkillConfigCache.get(cacheKey);
+	if (cached?.fingerprint === fingerprint) {
+		return cached.value;
+	}
 	try {
+		effectiveSkillConfigResolutionCount += 1;
 		let config = buildDefaultEffectiveSkillConfig();
-		for (const configPath of resolveConfigPaths(cwd, configPaths)) {
+		for (const configPath of resolvedConfigPaths) {
 			const raw = await readRawConfig(configPath);
 			if (raw) config = mergeRawSkillConfig(config, raw);
 		}
+		effectiveSkillConfigCache.set(cacheKey, { fingerprint, value: config });
 		return config;
 	} catch {
-		return {
+		const unavailableConfig = {
 			unavailableReason: "config unavailable",
 		};
+		effectiveSkillConfigCache.set(cacheKey, { fingerprint, value: unavailableConfig });
+		return unavailableConfig;
 	}
+}
+
+export async function resolveGjcNativeSkillConfigForTesting(input: {
+	cwd: string;
+	configPaths?: string[];
+	sessionId?: string;
+	threadId?: string;
+	stateDir?: string;
+}): Promise<EffectiveSkillConfigInput> {
+	return await resolveEffectiveSkillConfig(input.cwd, undefined, input.configPaths, {
+		sessionId: input.sessionId,
+		threadId: input.threadId,
+		stateDir: input.stateDir,
+	});
 }
 
 function safeString(value: unknown): string {
@@ -141,6 +239,34 @@ function readHookEventName(payload: HookPayload): GjcNativeHookEventName | null 
 
 function readPromptText(payload: HookPayload): string {
 	return safeString(payload.prompt ?? payload.user_prompt ?? payload.userPrompt).trim();
+}
+
+const QUESTION_ONLY_ADVISORY_CONTEXT =
+	"Question-only prompt advisory: Treat bare '?' and unambiguous informational questions as answer-only/read-only; do not modify files, run commands, or execute workflow changes unless the user explicitly asks for action.";
+
+const QUESTION_EXPLICIT_ACTION_PATTERN =
+	/\b(add|apply|build|change|commit|create|delete|edit|execute|fix|implement|install|merge|modify|move|patch|refactor|remove|rename|replace|run|ship|start|stop|test|update|write)\b/i;
+const QUESTION_START_PATTERN =
+	/^(what|why|how|when|where|who|which|does|do|did|is|are|was|were|can|could|should|would)\b/i;
+
+function classifyQuestionOnlyPrompt(prompt: string): string | null {
+	const normalized = prompt.trim().replace(/\s+/g, " ");
+	if (!normalized) {
+		return null;
+	}
+	if (normalized === "?") {
+		return QUESTION_ONLY_ADVISORY_CONTEXT;
+	}
+	if (!normalized.endsWith("?")) {
+		return null;
+	}
+	if (QUESTION_EXPLICIT_ACTION_PATTERN.test(normalized)) {
+		return null;
+	}
+	if (!QUESTION_START_PATTERN.test(normalized)) {
+		return null;
+	}
+	return QUESTION_ONLY_ADVISORY_CONTEXT;
 }
 
 function readSessionId(payload: HookPayload): string | undefined {
@@ -182,18 +308,35 @@ export async function dispatchGjcNativeSkillHook(
 		});
 		const recoveryContext = buildStateRecoveryDiagnosticsContext(recoveryDiagnostics);
 		const prompt = readPromptText(payload);
-		const skillState = prompt
-			? await recordSkillActivation({
-					cwd,
-					text: prompt,
+		let delegateHostContext: { path: string; context: McpDelegateHostContextV1 } | null = null;
+		try {
+			delegateHostContext = await persistMcpDelegateHostContext({
+				cwd,
+				sessionId: readSessionId(payload),
+				threadId: readThreadId(payload),
+				turnId: readTurnId(payload),
+				prompt,
+			});
+		} catch (error) {
+			await logHookError(cwd, "mcp_delegate_host_context_persist_error", error);
+		}
+		const skillState =
+			prompt && !detectMcpDelegateFlowActivation(prompt)
+				? await recordSkillActivation({
+						cwd,
+						text: prompt,
+						sessionId: readSessionId(payload),
+						threadId: readThreadId(payload),
+						turnId: readTurnId(payload),
+						stateDir: options.stateDir,
+					})
+				: null;
+		const effectiveSkillConfig = skillState
+			? await resolveEffectiveSkillConfig(cwd, options.effectiveSkillConfig, options.configPaths, {
 					sessionId: readSessionId(payload),
 					threadId: readThreadId(payload),
-					turnId: readTurnId(payload),
 					stateDir: options.stateDir,
 				})
-			: null;
-		const effectiveSkillConfig = skillState
-			? await resolveEffectiveSkillConfig(cwd, options.effectiveSkillConfig, options.configPaths)
 			: undefined;
 		const activeUltragoalContext = skillState
 			? null
@@ -220,7 +363,9 @@ export async function dispatchGjcNativeSkillHook(
 		}
 		const additionalContext = [
 			skillState ? buildSkillActivationAdditionalContext(skillState, effectiveSkillConfig) : activeUltragoalContext,
+			delegateHostContext ? `GJC MCP delegate-flow host context persisted at ${delegateHostContext.path}.` : null,
 			recoveryContext,
+			classifyQuestionOnlyPrompt(prompt),
 		]
 			.filter((value): value is string => Boolean(value))
 			.join(" ");
@@ -251,6 +396,17 @@ export async function dispatchGjcNativeSkillHook(
 	}
 
 	return { hookEventName, outputJson: null };
+}
+
+export async function runGjcNativeSkillHookInProcess(payload: HookPayload): Promise<string> {
+	const result = await dispatchGjcNativeSkillHook(payload);
+	if (result.outputJson) {
+		return `${JSON.stringify(result.outputJson)}\n`;
+	}
+	if (result.hookEventName === "Stop") {
+		return "{}\n";
+	}
+	return "";
 }
 
 async function readStdinJson(): Promise<{ payload: HookPayload; parseError: Error | null }> {

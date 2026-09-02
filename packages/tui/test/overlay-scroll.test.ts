@@ -91,17 +91,120 @@ describe("TUI overlays", () => {
 	let previousTmux: string | undefined;
 	let previousSty: string | undefined;
 	let previousZellij: string | undefined;
+	let previousTmuxPane: string | undefined;
+	let previousGjcTmuxLaunched: string | undefined;
+	let previousTerm: string | undefined;
 	let previousLegacyFullRender: string | undefined;
+	let previousImeCursor: string | undefined;
 
 	beforeEach(() => {
 		previousTmux = Bun.env.TMUX;
 		previousSty = Bun.env.STY;
 		previousZellij = Bun.env.ZELLIJ;
 		previousLegacyFullRender = Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
+		previousTmuxPane = Bun.env.TMUX_PANE;
+		previousGjcTmuxLaunched = Bun.env.GJC_TMUX_LAUNCHED;
+		previousTerm = Bun.env.TERM;
+		previousImeCursor = Bun.env.GJC_TUI_IME_CURSOR;
 		delete Bun.env.TMUX;
 		delete Bun.env.STY;
 		delete Bun.env.ZELLIJ;
 		delete Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
+		delete Bun.env.TMUX_PANE;
+		delete Bun.env.GJC_TMUX_LAUNCHED;
+		delete Bun.env.GJC_TUI_IME_CURSOR;
+		Bun.env.TERM = "xterm-256color";
+	});
+
+	it("bounds non-finite overlay geometry without stalling the render loop", async () => {
+		const term = new VirtualTerminal(40, 8);
+		const tui = new TUI(term);
+		tui.addChild(new LineComponent("base-", 2));
+		try {
+			tui.start();
+			await flushRender(term);
+			tui.showOverlay(new LineComponent("overlay-", 2), {
+				margin: { top: Number.POSITIVE_INFINITY, right: Number.NaN },
+				row: Number.POSITIVE_INFINITY,
+				col: Number.NaN,
+				offsetX: Number.POSITIVE_INFINITY,
+				offsetY: Number.NEGATIVE_INFINITY,
+				minWidth: Number.POSITIVE_INFINITY,
+			});
+			await flushRender(term);
+			expect(term.getViewport().join("\n")).toContain("overlay-0");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("clamps enormous finite margins to the terminal bounds", async () => {
+		const term = new VirtualTerminal(40, 8);
+		const tui = new TUI(term);
+		tui.addChild(new LineComponent("base-", 2));
+		try {
+			tui.start();
+			await flushRender(term);
+			tui.showOverlay(new LineComponent("overlay-", 2), { margin: Number.MAX_VALUE });
+			await flushRender(term);
+			expect(term.getViewport().join("\n")).toContain("o");
+			expect(term.getScrollBuffer().length).toBeLessThan(100);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("falls back from overflowing overlay percentages without terminating rendering", async () => {
+		const term = new VirtualTerminal(40, 8);
+		const tui = new TUI(term);
+		tui.addChild(new LineComponent("base-", 2));
+		try {
+			tui.start();
+			await flushRender(term);
+			const overflowingPercent = `${"9".repeat(400)}%` as `${number}%`;
+			tui.showOverlay(new LineComponent("overlay-", 8), {
+				width: overflowingPercent,
+				row: overflowingPercent,
+				col: overflowingPercent,
+			});
+			await flushRender(term);
+			expect(term.getViewport().join("\n")).toContain("overlay-0");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("bounds a non-finite maximum height to the terminal", async () => {
+		const term = new VirtualTerminal(40, 8);
+		const tui = new TUI(term);
+		tui.addChild(new LineComponent("base-", 2));
+		try {
+			tui.start();
+			await flushRender(term);
+			tui.showOverlay(new LineComponent("overlay-", 10_000), { maxHeight: Number.POSITIVE_INFINITY });
+			await flushRender(term);
+			expect(term.getViewport().join("\n")).toContain("overlay-");
+			expect(term.getScrollBuffer().length).toBeLessThan(100);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("bounds an overflowing percentage maximum height to the terminal", async () => {
+		const term = new VirtualTerminal(40, 8);
+		const tui = new TUI(term);
+		tui.addChild(new LineComponent("base-", 2));
+		try {
+			tui.start();
+			await flushRender(term);
+			const overflowingPercent = `${"9".repeat(400)}%` as `${number}%`;
+			tui.showOverlay(new LineComponent("overlay-", 10_000), { maxHeight: overflowingPercent });
+			await flushRender(term);
+			expect(term.getViewport().join("\n")).toContain("overlay-");
+			expect(term.getScrollBuffer().length).toBeLessThan(100);
+		} finally {
+			tui.stop();
+		}
 	});
 
 	afterEach(() => {
@@ -124,6 +227,26 @@ describe("TUI overlays", () => {
 			delete Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
 		} else {
 			Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER = previousLegacyFullRender;
+		}
+		if (previousTmuxPane === undefined) {
+			delete Bun.env.TMUX_PANE;
+		} else {
+			Bun.env.TMUX_PANE = previousTmuxPane;
+		}
+		if (previousGjcTmuxLaunched === undefined) {
+			delete Bun.env.GJC_TMUX_LAUNCHED;
+		} else {
+			Bun.env.GJC_TMUX_LAUNCHED = previousGjcTmuxLaunched;
+		}
+		if (previousTerm === undefined) {
+			delete Bun.env.TERM;
+		} else {
+			Bun.env.TERM = previousTerm;
+		}
+		if (previousImeCursor === undefined) {
+			delete Bun.env.GJC_TUI_IME_CURSOR;
+		} else {
+			Bun.env.GJC_TUI_IME_CURSOR = previousImeCursor;
 		}
 	});
 
@@ -339,6 +462,28 @@ describe("TUI overlays", () => {
 			const viewport = term.getViewport();
 			expect(viewport[0]?.trim()).toBe("cursor-anchor");
 			expect(term.getScrollBuffer().length - before).toBeLessThan(2);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("anchors macOS IME cursor-only updates with a steady block cursor in soft-cursor mode", async () => {
+		Bun.env.GJC_TUI_IME_CURSOR = "1";
+		const term = new VirtualTerminal(40, 6);
+		const tui = new TUI(term, false);
+		const component = new CursorOnlyComponent();
+		tui.addChild(component);
+		try {
+			tui.start();
+			await flushRender(term);
+			term.clearWriteLog();
+
+			component.setCursorCol(5);
+			tui.requestRender();
+			await flushRender(term);
+
+			expect(term.getWriteLog()).toEqual(["\x1b[6G\x1b[2 q\x1b[?25h"]);
+			expect(term.getViewport()[0]?.trim()).toBe("cursor-anchor");
 		} finally {
 			tui.stop();
 		}

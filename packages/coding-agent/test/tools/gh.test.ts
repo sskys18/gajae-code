@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -13,6 +13,7 @@ import {
 import * as git from "@gajae-code/coding-agent/utils/git";
 import { getAgentDir, hashPath, setAgentDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { safeRm } from "../../../../scripts/safe-cleanup";
 
 // Isolate every `git` invocation in this file from the developer's host
 // configuration. The fixture spawns dozens of git subprocesses against tiny
@@ -84,7 +85,7 @@ function runGit(cwd: string, args: string[]): string {
 	return new TextDecoder().decode(result.stdout).trim();
 }
 
-async function createPrFixture(): Promise<{
+async function createPrFixture({ includeFork = true }: { includeFork?: boolean } = {}): Promise<{
 	baseDir: string;
 	repoRoot: string;
 	originBare: string;
@@ -100,7 +101,7 @@ async function createPrFixture(): Promise<{
 
 	await fs.mkdir(repoRoot, { recursive: true });
 	runGit(baseDir, ["init", "--bare", originBare]);
-	runGit(baseDir, ["init", "--bare", forkBare]);
+	if (includeFork) runGit(baseDir, ["init", "--bare", forkBare]);
 	runGit(baseDir, ["init", "-b", "main", repoRoot]);
 	runGit(repoRoot, ["config", "user.name", "Test User"]);
 	runGit(repoRoot, ["config", "user.email", "test@example.com"]);
@@ -109,13 +110,13 @@ async function createPrFixture(): Promise<{
 	runGit(repoRoot, ["commit", "-m", "base commit"]);
 	runGit(repoRoot, ["remote", "add", "origin", originBare]);
 	runGit(repoRoot, ["push", "-u", "origin", "main"]);
-	runGit(repoRoot, ["remote", "add", "forksrc", forkBare]);
+	if (includeFork) runGit(repoRoot, ["remote", "add", "forksrc", forkBare]);
 	runGit(repoRoot, ["checkout", "-b", headRefName]);
 	await fs.writeFile(path.join(repoRoot, "README.md"), "base\nfeature\n");
 	runGit(repoRoot, ["add", "README.md"]);
 	runGit(repoRoot, ["commit", "-m", "feature commit"]);
 	const headRefOid = runGit(repoRoot, ["rev-parse", "HEAD"]);
-	runGit(repoRoot, ["push", "-u", "forksrc", headRefName]);
+	if (includeFork) runGit(repoRoot, ["push", "-u", "forksrc", headRefName]);
 	runGit(repoRoot, ["checkout", "main"]);
 
 	return {
@@ -126,6 +127,27 @@ async function createPrFixture(): Promise<{
 		headRefName,
 		headRefOid,
 	};
+}
+
+type RemoteFixture = Pick<
+	Awaited<ReturnType<typeof createPrFixture>>,
+	"baseDir" | "repoRoot" | "originBare" | "forkBare"
+>;
+
+async function createRemoteFixture(): Promise<RemoteFixture> {
+	const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "gh-remote-tool-"));
+	const repoRoot = path.join(baseDir, "repo");
+	const originBare = path.join(baseDir, "origin.git");
+	const forkBare = path.join(baseDir, "fork.git");
+
+	await fs.mkdir(repoRoot, { recursive: true });
+	runGit(baseDir, ["init", "--bare", originBare]);
+	runGit(baseDir, ["init", "--bare", forkBare]);
+	runGit(baseDir, ["init", "-b", "main", repoRoot]);
+	runGit(repoRoot, ["remote", "add", "origin", originBare]);
+	runGit(repoRoot, ["remote", "add", "forksrc", forkBare]);
+
+	return { baseDir, repoRoot, originBare, forkBare };
 }
 
 /**
@@ -145,7 +167,7 @@ async function setupTempHome(): Promise<{ home: string; cleanup: () => Promise<v
 		home,
 		cleanup: async () => {
 			setAgentDir(originalAgentDir);
-			await fs.rm(home, { recursive: true, force: true });
+			await safeRm(home, { recursive: true, force: true });
 		},
 	};
 }
@@ -205,6 +227,171 @@ describe("parsePrUnifiedDiff", () => {
 			deletions: 1,
 			changeType: "modified",
 		});
+	});
+
+	it("decodes octal-escaped UTF-8 bytes in quoted diff headers", () => {
+		const diff = [
+			'diff --git "a/docs/\\355\\225\\234\\352\\270\\200.md" "b/docs/\\355\\225\\234\\352\\270\\200.md"',
+			"index 0000000..1111111 100644",
+			'--- "a/docs/\\355\\225\\234\\352\\270\\200.md"',
+			'+++ "b/docs/\\355\\225\\234\\352\\270\\200.md"',
+			"@@ -1 +1 @@",
+			"-old",
+			"+new",
+		].join("\n");
+
+		const parsed = parsePrUnifiedDiff(diff);
+
+		expect(parsed.files[0]?.path).toBe("docs/\uD55C\uAE00.md");
+	});
+
+	it.each([
+		["two-byte sequence", "caf\\303\\251.md", "caf\u00E9.md"],
+		["four-byte sequence", "\\360\\237\\232\\200.md", "\u{1F680}.md"],
+		["octal bytes beside named escapes and spaces", "na\\tme \\303\\251.md", "na\tme \u00E9.md"],
+		["escaped quote and backslash", 'q\\"b\\\\.md', 'q"b\\.md'],
+		["truncated multi-byte sequence kept in escaped form", "x\\303y.md", "x\\303y.md"],
+	])("decodes a quoted header path with a %s", (_label, quoted, expected) => {
+		const diff = [
+			`diff --git "a/${quoted}" "b/${quoted}"`,
+			"index 0000000..1111111 100644",
+			"@@ -1 +1 @@",
+			"+new",
+		].join("\n");
+
+		expect(parsePrUnifiedDiff(diff).files[0]?.path).toBe(expected);
+	});
+
+	it("decodes quoted rename lines", () => {
+		const diff = [
+			'diff --git "a/old \\355\\225\\234.md" "b/new \\352\\270\\200.md"',
+			"similarity index 100%",
+			'rename from "old \\355\\225\\234.md"',
+			'rename to "new \\352\\270\\200.md"',
+		].join("\n");
+
+		const parsed = parsePrUnifiedDiff(diff);
+
+		expect(parsed.files[0]).toMatchObject({
+			changeType: "renamed",
+			oldPath: "old \uD55C.md",
+			path: "new \uAE00.md",
+		});
+	});
+
+	it("keeps distinct invalid-UTF-8 byte sequences distinct", () => {
+		const diffFor = (quoted: string) =>
+			[`diff --git "a/${quoted}" "b/${quoted}"`, "index 0000000..1111111 100644", "@@ -1 +1 @@", "+new"].join("\n");
+
+		const first = parsePrUnifiedDiff(diffFor("x\\303y.md")).files[0];
+		const second = parsePrUnifiedDiff(diffFor("x\\304y.md")).files[0];
+
+		expect(first).toMatchObject({ path: "x\\303y.md", pathEscaped: true });
+		expect(second).toMatchObject({ path: "x\\304y.md", pathEscaped: true });
+		expect(first?.path).not.toBe(second?.path);
+		expect(first?.path).not.toContain("\uFFFD");
+	});
+
+	it.each([
+		["an invalid byte", "x\\303y.md", "x\\\\303y.md"],
+		["a malformed escape", "x\\qy.md", "x\\\\qy.md"],
+	])("separates %s fallback from a valid literal-backslash path", (_label, invalidQuoted, validQuoted) => {
+		const diffFor = (quoted: string) =>
+			[`diff --git "a/${quoted}" "b/${quoted}"`, "index 0000000..1111111 100644", "@@ -1 +1 @@", "+new"].join("\n");
+
+		const invalid = parsePrUnifiedDiff(diffFor(invalidQuoted)).files[0];
+		const valid = parsePrUnifiedDiff(diffFor(validQuoted)).files[0];
+
+		expect(invalid?.path).toBe(valid?.path);
+		expect(invalid?.pathEscaped).toBe(true);
+		expect(valid?.pathEscaped).toBeUndefined();
+	});
+
+	it("separates invalid and valid literal-backslash rename metadata", () => {
+		const diffFor = (oldQuoted: string, newQuoted: string) =>
+			[
+				`diff --git "a/${oldQuoted}" "b/${newQuoted}"`,
+				"similarity index 100%",
+				`rename from "${oldQuoted}"`,
+				`rename to "${newQuoted}"`,
+			].join("\n");
+
+		const invalid = parsePrUnifiedDiff(diffFor("old \\303.md", "new \\304.md")).files[0];
+		const valid = parsePrUnifiedDiff(diffFor("old \\\\303.md", "new \\\\304.md")).files[0];
+
+		expect(invalid).toMatchObject({
+			changeType: "renamed",
+			oldPath: "old \\303.md",
+			oldPathEscaped: true,
+			path: "new \\304.md",
+			pathEscaped: true,
+		});
+		expect(valid).toMatchObject({ changeType: "renamed", oldPath: "old \\303.md", path: "new \\304.md" });
+		expect(valid?.pathEscaped).toBeUndefined();
+		expect(valid?.oldPathEscaped).toBeUndefined();
+	});
+
+	it.each([
+		["two-digit octal", "x\\77y.md"],
+		["octal above \\377", "x\\455y.md"],
+		["unknown escape", "x\\qy.md"],
+	])("keeps a %s escape in its source form", (_label, quoted) => {
+		const diff = [
+			`diff --git "a/${quoted}" "b/${quoted}"`,
+			"index 0000000..1111111 100644",
+			"@@ -1 +1 @@",
+			"+new",
+		].join("\n");
+
+		expect(parsePrUnifiedDiff(diff).files[0]?.path).toBe(quoted);
+	});
+
+	it("preserves invalid-UTF-8 rename metadata in escaped form", () => {
+		const diff = [
+			'diff --git "a/old \\303.md" "b/new \\304.md"',
+			"similarity index 100%",
+			'rename from "old \\303.md"',
+			'rename to "new \\304.md"',
+		].join("\n");
+
+		const parsed = parsePrUnifiedDiff(diff);
+
+		expect(parsed.files[0]).toMatchObject({
+			changeType: "renamed",
+			oldPath: "old \\303.md",
+			path: "new \\304.md",
+		});
+	});
+
+	it("keeps unquoted rename lines verbatim", () => {
+		const diff = [
+			"diff --git a/old.md b/new.md",
+			"similarity index 100%",
+			"rename from old.md",
+			"rename to new.md",
+		].join("\n");
+
+		const parsed = parsePrUnifiedDiff(diff);
+
+		expect(parsed.files[0]).toMatchObject({ changeType: "renamed", oldPath: "old.md", path: "new.md" });
+	});
+
+	it("retains old-path identity when opposite encoding tags share the same display text", () => {
+		const diff = [
+			'diff --git "a/old \\303.md" "b/new \\\\303.md"',
+			"similarity index 100%",
+			'rename from "old \\303.md"',
+			'rename to "new \\\\303.md"',
+		].join("\n");
+
+		const file = parsePrUnifiedDiff(diff).files[0];
+		expect(file).toMatchObject({
+			changeType: "renamed",
+			path: "new \\303.md",
+			oldPath: "old \\303.md",
+			oldPathEscaped: true,
+		});
+		expect(file?.pathEscaped).toBeUndefined();
 	});
 });
 
@@ -1070,31 +1257,33 @@ describe("github tool", () => {
 			expect(runGit(worktreePath, ["branch", "--show-current"])).toBe("pr-123");
 		} finally {
 			await tempHome.cleanup();
-			await fs.rm(fixture.baseDir, { recursive: true, force: true });
+			await safeRm(fixture.baseDir, { recursive: true, force: true });
 		}
 	});
 
-	it("treats git.remote.add as a no-op when the remote already exists with the same URL", async () => {
-		const fixture = await createPrFixture();
-		try {
+	describe("git remote add", () => {
+		let fixture: RemoteFixture;
+
+		beforeAll(async () => {
+			fixture = await createRemoteFixture();
+		});
+
+		afterAll(async () => {
+			await safeRm(fixture.baseDir, { recursive: true, force: true });
+		});
+
+		it("treats git.remote.add as a no-op when the remote already exists with the same URL", async () => {
 			await git.remote.add(fixture.repoRoot, "forksrc", fixture.forkBare);
 			expect(runGit(fixture.repoRoot, ["remote", "get-url", "forksrc"])).toBe(fixture.forkBare);
-		} finally {
-			await fs.rm(fixture.baseDir, { recursive: true, force: true });
-		}
-	});
+		});
 
-	it("rejects git.remote.add when the remote already exists with a different URL", async () => {
-		const fixture = await createPrFixture();
-		try {
+		it("rejects git.remote.add when the remote already exists with a different URL", async () => {
 			await expect(git.remote.add(fixture.repoRoot, "forksrc", fixture.originBare)).rejects.toThrow(
 				/already exists with URL/,
 			);
 			// Existing URL is preserved — we never overwrote it.
 			expect(runGit(fixture.repoRoot, ["remote", "get-url", "forksrc"])).toBe(fixture.forkBare);
-		} finally {
-			await fs.rm(fixture.baseDir, { recursive: true, force: true });
-		}
+		});
 	});
 
 	it("serializes concurrent git mutations through withRepoLock so callers don't race git's internal locks", async () => {
@@ -1115,12 +1304,12 @@ describe("github tool", () => {
 				expect(runGit(fixture.repoRoot, ["config", "--get", `branch.race-test.key${idx}`])).toBe(`value-${idx}`);
 			}
 		} finally {
-			await fs.rm(fixture.baseDir, { recursive: true, force: true });
+			await safeRm(fixture.baseDir, { recursive: true, force: true });
 		}
 	});
 
 	it("checks out multiple pull requests in a single call when pr is an array", async () => {
-		const fixture = await createPrFixture();
+		const fixture = await createPrFixture({ includeFork: false });
 		const tempHome = await setupTempHome();
 		try {
 			// PR #100 reuses the fixture's contributor branch; push it to origin so
@@ -1186,9 +1375,9 @@ describe("github tool", () => {
 			expect(summaries?.every(s => s.reused === false)).toBe(true);
 		} finally {
 			await tempHome.cleanup();
-			await fs.rm(fixture.baseDir, { recursive: true, force: true });
+			await safeRm(fixture.baseDir, { recursive: true, force: true });
 		}
-	});
+	}, 30_000);
 
 	it("rejects PR pushes from branches without checkout metadata", async () => {
 		const fixture = await createPrFixture();
@@ -1213,7 +1402,7 @@ describe("github tool", () => {
 				originMainBefore,
 			);
 		} finally {
-			await fs.rm(fixture.baseDir, { recursive: true, force: true });
+			await safeRm(fixture.baseDir, { recursive: true, force: true });
 		}
 	});
 
@@ -1244,7 +1433,7 @@ describe("github tool", () => {
 				}),
 			);
 		} finally {
-			await fs.rm(fixture.baseDir, { recursive: true, force: true });
+			await safeRm(fixture.baseDir, { recursive: true, force: true });
 		}
 	});
 
@@ -1336,7 +1525,7 @@ describe("github tool", () => {
 			expect(artifactText).toContain("epsilon");
 			expect(artifactText).toContain("zeta");
 		} finally {
-			await fs.rm(artifactsDir, { recursive: true, force: true });
+			await safeRm(artifactsDir, { recursive: true, force: true });
 		}
 	});
 });

@@ -2,9 +2,331 @@
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-02
+
+## [0.15.6] - 2026-08-30
+
+### Fixed
+
+- Composer file autocomplete now keeps the `@` fuzzy/chosung path reachable from explicit Tab and while Korean query characters are typed, without changing ordinary path-prefix completion.
+
+## [0.15.5] - 2026-08-29
+
+### Added
+
+- `@` fuzzy file search supports Hangul chosung (초성) matching: a bare consonant matches any syllable with that initial, so `@ㅎㄱ` finds `한글.txt`. Literal and full-syllable matches keep ranking above chosung matches.
+
+## [0.15.4] - 2026-08-29
+
+### Fixed
+
+- Path autocomplete matches decomposed (NFD) file names against composed (NFC) input. Composer keystrokes are NFC-normalized while macOS volumes commonly return Hangul and other composed scripts in NFD, so `@한` found nothing even though `한글.txt` existed; both the directory-listing prefix match and the fuzzy filter now compare NFC forms while completion values keep the on-disk name. The native fuzzy finder applies the same normalization to queries and candidates.
+
+## [0.15.3] - 2026-08-27
+
+### Fixed
+
+- Loader instances can opt into layout-only repaint requests so transient status animation does not force unchanged transcript subtree reconstruction.
+
+## [0.15.2] - 2026-08-25
+
+### Changed
+
+- Version 0.15.1 was tagged but never published: release automation failed while deriving release notes, before any package reached npm. Everything listed under `## [0.15.1]` below ships in this release.
+
+## [0.15.1] - 2026-08-25
+
+### Fixed
+
+- Capability-probe replies no longer echo endlessly across the screen after a foreground child leaves the tty in cooked mode (`^[]11;rgb:0000/0000/0000^G^[[?62;22;52c` repeating every two seconds while the prompt stops accepting keys). `ProcessTerminal.start()` enabled raw mode exactly once, while Node/Bun cache only the last `setRawMode()` request and keep reporting raw mode when a child changes the shared tty's termios directly; even another `setRawMode(true)` is then a runtime no-op. The 2s OSC 11 poll could therefore keep writing `\x1b]11;?\x07` plus its DA1 sentinel into a cooked tty, where the kernel echoes and line-buffers the replies before the input parser can see them. Each OSC 11 query now synchronously cycles the runtime's raw-mode setter before writing, restores Windows VT-input flags that `setRawMode()` resets, and skips the probe when restoration fails. Non-TTY and stopped or dead terminals retain their existing behavior; probe-reply parsing, the Mode 2031 push path, and the poll interval are unchanged.
+
+### Added
+
+- Mouse selection now supports double-click word select and triple-click line select. Enabling GJC's own mouse capture previously removed the terminal's native word/line selection without replacing it: SGR mouse reports carry no click counter, so the TUI only ever saw single presses and drags. Repeat presses on the same cell within `DEFAULT_MULTI_CLICK_INTERVAL_MS` (400ms) now escalate char -> word -> line, a fourth press stays on line rather than cycling back, and any wheel notch, different cell, or expired window restarts at char. A word/line press is a complete selection, so it paints and copies on release without needing a drag; a plain single click still copies nothing. Dragging after a double or triple click extends by whole words or rows in either direction, pivoting on the anchor span instead of collapsing it. Word bounds use the xterm `wordSeparator` set, so a path stays intact and a click on whitespace selects the whitespace run, and all ranges are measured in grapheme-aligned columns so wide CJK and emoji cells are never split. `TUI`'s new `multiClickIntervalMs` option overrides the window; `0` disables escalation entirely.
+
+### Fixed
+
+- `ctrl+backspace` now deletes the previous word in the composer, including on Windows Terminal. `tui.editor.deleteWordBackward` has always declared `ctrl+w`, `alt+backspace` **and** `ctrl+backspace`, but the editor's literal chain only implemented the first two, so the third declared chord silently did nothing. Windows Terminal additionally sends raw `0x08` for that chord while the native matcher resolves `0x08` as unmodified backspace only, so `matchesKey` now disambiguates the byte on that host (a purpose-built heuristic for this existed but had no caller). Raw `0x08` still means plain backspace everywhere else, including a Windows Terminal session forwarded over SSH.
+- Composer kill-ring, word-delete and line-kill chords are now resolved through the keybinding registry instead of hard-coded literals, so remapping them actually moves them: `tui.editor.deleteToLineEnd`, `tui.editor.deleteToLineStart`, `tui.editor.deleteWordBackward`, `tui.editor.deleteWordForward`, `tui.editor.yank`, and `tui.editor.yankPop`. `docs/keybindings.md` already advertised these as registry-managed, so this makes the published contract true; the same file now also names the two remaining exceptions (`tui.editor.cursorLineStart` and `tui.editor.cursorLineEnd`, still matched by literal `ctrl+a` / `ctrl+e` ahead of their registry branches). Default behavior for all five migrated chords is unchanged, and `Editor` now dispatches these ids the same way `Input` and `SecretInput` already did.
+
+## [0.15.0] - 2026-08-22
+
+### Fixed
+- OSC 8 hyperlinks now survive soft wrapping: a rendered URL longer than the terminal width keeps the identical clickable target on every visual row across narrow↔wide resize reflow, instead of rendering continuation rows as plain text; links no longer bleed over adjacent punctuation or hard-newline-adjacent text, and copy/select of a wrapped link returns the original URL with no injected control bytes (#4711).
+
+## [0.14.2] - 2026-08-20
+
+## [0.14.1] - 2026-08-18
+
+## [0.14.0] - 2026-08-17
+
+### Fixed
+- iTerm2 pet capability probes now wait for pending input without disabling Kitty keyboard mode, disabling `modifyOtherKeys`, or detaching the live input handler.
+- iTerm2 Gajae Pet frames now carry a dedicated filename, so dragging one retains iTerm's native drag behavior while the coding agent can discard only the temporary pet pathname pasted back into its composer.
+- iTerm2 Gajae Pet now uses one animated GIF upload per meaningful state change and a raster lease that excludes its cell rectangle from generic TUI redraw erases, eliminating animation flicker while preserving geometry-derived art placement and leaving Kitty and Sixel encoding unchanged.
+
+- Layout-only animation and selector frames can now reuse an unchanged revisioned transcript subtree instead of rebuilding every off-screen transcript component, anchor row, and Kitty placement on each tick. Ordinary render requests remain conservative, and transcript revision, width, identity, and global invalidation changes still force a full subtree render.
+
+- A fast double-Esc (or triple-Esc) whose ESC bytes coalesce into one stdin chunk — which tmux always produces within its escape-time window, and SSH batching produces routinely — is now emitted as individual Escape key presses instead of a single `"\x1b\x1b"` sequence that parsed as the unbound `alt+escape` and silently swallowed both presses. This restores the double-Esc draft-clear and double-Esc selector gestures under tmux/SSH. Option-as-Meta sequences with a real continuation (e.g. Option+Up as `ESC ESC [ A`) remain atomic, and an ESC-cancelled incomplete sequence is still emitted whole.
+- An ambiguous trailing run of Escape bytes now stays buffered until a continuation or the flush timeout resolves it, so `ESC ESC ESC` followed by `[A` in the next chunk still decodes as Escape then `alt+up` instead of two Escapes plus a plain Up that fired the destructive double-Escape gesture.
+- Escape presses immediately followed by a bracketed paste in the same read are now emitted as individual Escape presses instead of one coalesced sequence that parsed as the unbound `alt+escape` and swallowed every press.
+- A long run of Escape bytes arriving as many small reads no longer rescans the accumulated buffer on every read; only the two-byte ambiguous tail stays buffered, so 50,000 byte-by-byte Escape reads cost 50ms instead of 2.4s.
+- A long run of Escape bytes followed by another key now decodes in linear time instead of rescanning the remaining input on every step, which blocked the event loop for over a second on a 50,000-byte run.
+- Apple Terminal.app now retains its default keyboard mode when it does not support the Kitty keyboard protocol, avoiding the modifyOtherKeys fallback that breaks Korean/Hangul IME composition.
+
+## [0.13.3] - 2026-08-15
+
+### Added
+- Added the Ouroboros pet component with frame data, selector integration, and animation lifecycle shared with the existing Gajae Pet (#4468).
+
+### Fixed
+- Non-finite overlay geometry can no longer turn frame padding into an infinite allocating loop on the main thread; margins, positions, offsets, and minimum widths now fall back to bounded terminal-relative values (#4481).
+- Kitty inline images are no longer deleted when live output moves their anchor above the viewport, so terminal-native scrollback keeps previously rendered images visible (#4424).
+
+## [0.13.2] - 2026-08-13
+
+### Fixed
+
+- Fast double-Esc and triple-Esc sequences coalesced into one stdin chunk by tmux or SSH are now emitted as individual Escape presses, restoring draft-clear and selector gestures while preserving atomic Option-as-Meta sequences (#4312 by @Yeachan-Heo).
+- Ambiguous trailing Escape bytes now remain buffered until a continuation or flush timeout resolves them, preventing a split `ESC ESC ESC [A` sequence from firing the destructive double-Escape gesture (#4312 by @Yeachan-Heo).
+- Escape presses immediately followed by bracketed paste are now emitted individually instead of being swallowed as an unbound `alt+escape` sequence (#4312 by @Yeachan-Heo).
+- Long runs of Escape bytes now decode in linear time without repeatedly rescanning accumulated input; 50,000 byte-by-byte reads now complete in milliseconds instead of seconds (#4312 by @Yeachan-Heo).
+- Apple Terminal.app now retains its default keyboard mode when it does not support the Kitty keyboard protocol, avoiding the modifyOtherKeys fallback that broke Korean/Hangul IME composition (#4297 by @Yeachan-Heo).
+
+## [0.13.1] - 2026-08-11
+
+### Added
+
+- Added atomic same-line deletion APIs and an `Editor` undo callback for keeping application state synchronized with editor history.
+### Fixed
+
+- macOS Terminal.app Option+Arrow input is now buffered and decoded as a single Meta-wrapped escape sequence, so Option+Up/Down can open and navigate queued-message selectors.
+- Terminal.app Meta-prefix decoding now covers legacy Option shortcuts for printable symbols, digits, spaces, and Ctrl+Option symbol chords while preserving enhanced Kitty and modifyOtherKeys Super/Command matching.
+- Kitty and modifyOtherKeys function-key sequences now match consistently for F1–F12, including unmodified CSI forms.
+- Kitty protocol release/repeat and modifyOtherKeys lock-mask handling now fail closed and stay symmetric across native and TypeScript key matching, including duplicate macOS modifier aliases.
+- TypeScript Kitty and modifyOtherKeys printable decoding now rejects surrogate and out-of-range Unicode code points before text extraction.
+
+## [0.12.21] - 2026-08-09
+
+## [0.12.20] - 2026-08-09
+
+## [0.12.19] - 2026-08-08
+
+## [0.12.18] - 2026-08-08
+
+## [0.12.17] - 2026-08-08
+
+## [0.12.16] - 2026-08-08
+
+### Changed
+
+- Native fuzzy matching and image encoding bindings now load only when their TUI feature is used instead of at module startup.
+- Kitty-protocol shortcuts can match modified Korean Dubeolsik compatibility-jamo input when terminals omit base-layout metadata, without treating unmodified or Shift-only text input as shortcuts.
+
+### Fixed
+
+- Slash-command autocomplete now uses the same prompt-start rule for suggestions and Enter-time completion, preserves inline file-path suggestions, and never rewrites slash-like text on later prompt lines.
+
+## [0.12.15] - 2026-08-06
+
+## [0.12.14] - 2026-08-06
+
+## [0.12.13] - 2026-08-06
+
+## [0.12.12] - 2026-08-05
+### Fixed
+
+- Applied the compact 12–32-column primary layout to slash-command autocomplete while leaving file and other completion lists on their existing layout.
+- Restored 60 fps time-dependent loader gradients on direct local terminals while retaining the 80 ms cadence and congestion dropping on SSH and multiplexed terminals.
+- Bounded loader animation scheduling to 80 ms, stopped OSC 11 polling after DA1 proves the query unsupported while preserving Mode 2031 recovery, and added the default-on `GJC_TUI_SYNCHRONIZED_OUTPUT=0` compatibility opt-out for terminal parsers that mishandle synchronized-output framing. Real iOS-client validation remains pending for #3798.
+- Decorative animation ticks now pause while stdout has more than 64 KiB buffered, preventing slow SSH terminals and multiplexers from accumulating stale spinner frames.
+
+## [0.12.11] - 2026-08-03
+
+## [0.12.10] - 2026-08-03
+### Fixed
+
+- Corrected the off-screen transcript duplication fix released in 0.12.8, which could still render a Bash tool block twice and could stop appended rows reaching native scrollback. It keyed on whether the last committed row's bytes changed, which is neither necessary nor sufficient: a substituted status line changes that row without anything moving, and repeated or blank rows at the frontier hide a real insertion. The suffix commit now repaints the live viewport instead when two things hold together: the previously visible rows reappear almost intact at some uniform offset below their old index, and the rows that offset pulls into the top of the visible region are exactly the last rows already committed to scrollback — which is the damage itself, since those are the rows about to be emitted twice. Requiring both keeps an ordinary append committing even when repeated or blank rows make it look displaced. Rendered rows carry no identity, so no test on their bytes can prove which logical row moved; this is a policy for which failure to prefer when a frame is ambiguous, chosen to be never worse than the previous behavior and strictly better on every duplication case found.
+
+### Fixed
+
+- `Ctrl+J` now inserts a newline when multiplexers such as Herdr forward it through Kitty CSI-u or xterm `modifyOtherKeys`, matching the existing legacy line-feed behavior and displayed shortcut.
+- A terminal that disappears under a running session (tmux pane killed, SSH connection dropped, terminal window closed) no longer kills the agent process. The in-flight `stdin` read fails with `EIO`, and `process.stdin` had no `error` listener, so the event was rethrown as an uncaught exception; an `EIO` on `stdin` now retires the terminal the same way `stdout` errors already did. Only `EIO` is treated as a detach — any other `stdin` error (`EBADF`, `EPIPE`, an unexpected platform failure) keeps its default `EventEmitter` propagation and leaves the terminal usable, so the new listener cannot silently swallow unrelated stream failures.
+
+## [0.12.8] - 2026-08-02
+### Fixed
+
+- Fixed a tool block being rendered two or three times in the transcript (a pending `⏳` copy stranded above its own completed `✓` copy, with the rows between duplicated). When a block above the live viewport top grows in place — the bash tool's compact call render becoming a partial box and then a final box, with the editor/status chrome keeping it off-screen — the "commit only the changed visible suffix" path emitted rows by index even though the growth had shifted committed content down across the native-scrollback frontier, so rows already in scrollback were appended a second time under their new content. The suffix commit is now taken only when the last committed row is unchanged (a same-length off-screen substitution, such as a streaming status line); growth that shifts the committed boundary repaints the live viewport instead.
+- Temporary TUI restarts now retain their native-scrollback admission frontier when the following viewport repaint fails, preventing newly appended rows from being duplicated on retry.
+- Restored the `isProcessTerminal`/`shouldUseViewportRepaintForHost` gate on the width-change viewport-repaint intercept so plain terminals (non-multiplexer, non-process-terminal) use `fullRender` for width changes instead of an unconditional viewport repaint. The #3684 chain removed this gate, causing lossless Korean/CJK prose wrapping to break at narrow widths because the viewport repaint only painted the visible rows without committing the full transcript to scrollback (#1979).
+- Restored the `fullRender` fallback for the `firstChanged < viewportTop` branch on non-viewport-repaint hosts, so above-viewport mutations replay the full frame instead of silently viewport-repainting.
+- Propagated IME cursor write failure from `#writeRenderBufferAndReanchorImeCursor` so callers detect terminal detach when the deferred cursor write fails after the shared frame commits.
+- The win32 viewport-repaint fallback no longer outranks a terminal that reports `isProcessTerminal: false`. Platform identity exists to recognize Windows console hosts that cannot report the capability, so a terminal that has answered now decides; previously every non-process terminal on Windows (embedders, pipes, the render regression suite) inherited viewport-repaint semantics, suppressed durable history replay, and left contracted rows behind as duplicates.
+
+## [0.12.7] - 2026-07-31
+
+## [0.12.6] - 2026-07-31
+### Fixed
+
+- Truncated text now shrinks horizontal padding when the viewport is narrower than the requested inset, keeping every rendered line within its width contract.
+- Select-list no-match rows now stay within the requested render width instead of wrapping into extra terminal lines after narrow resizes (#3600).
+- Preserve transcript rows when a resize/reflow is coalesced with appended output.
+
+## [0.12.5] - 2026-07-30
+
+## [0.12.5] - 2026-07-30
+
+## [0.12.4] - 2026-07-30
+
+## [0.12.3] - 2026-07-30
+
+## [0.12.2] - 2026-07-30
+
+## [0.12.1] - 2026-07-29
+### Added
+
+- `Tui` now exposes renderer-owned viewport observations so tests and evidence capture can assert against committed paint state instead of re-deriving geometry: `getViewportObservation()` (returns a defensive copy of the latest committed observation), `getViewportAnchorSnapshot()`, `getViewportAnchorComponent()`, `getFocusedComponent()`, and `setViewportSelection()`, plus the `TuiViewportObservation` and `MouseSelectionPoint` types.
+
+### Changed
+
+- Alternate-scroll mode (`DECSET 1007`) is now explicitly disabled at startup, on every mouse-capture toggle, at stop, and during emergency restore, so no host translates wheel input into cursor keys. While mouse capture is off this leaves wheel scrollback to the host terminal or multiplexer; while capture is on GJC consumes SGR wheel reports itself, and the reset removes a conflicting second translation path. Hosts that never answer a `DECRQM ?1007$p` query (Apple Terminal among them) cannot report this mode, so it is reset unconditionally rather than conditionally on a reported state.
+
+### Fixed
+
+- The renderer's reported cursor column is now clamped to the last real cell, so it always names a column that exists in the current terminal width. On the wire this is unchanged (a terminal already clamps `CHA` to the last column), but the reported value is now truthful for callers reading it through the viewport observation.
+
+## [0.12.3] - 2026-07-30
+
+## [0.12.2] - 2026-07-30
+
+## [0.12.1] - 2026-07-29
+
+### Fixed
+
+- Kitty/Ghostty inline images no longer remain visually pinned when sticky or semantic viewport repaints move their anchors into application scrollback. The renderer now soft-deletes only the named placement from the old viewport, retains uploaded pixels for history replay, and keeps placement tracking aligned across unresolved-anchor and follow-live transitions.
+
+## [0.12.0] - 2026-07-28
+
+### Changed
+
+- Mouse wheel scrolling now moves the session viewport by exactly three lines (`DEFAULT_WHEEL_LINES = 3`) instead of a full page. PageUp/PageDown keep page-sized steps with edge pinning.
+- Manual transcript scrolling now keeps a valid registered status/composer boundary fixed at the bottom independently of output-source registration. Output sources control only the exact semantic new-output notice; transcript selection excludes pinned chrome, short transcript lanes emit blanks instead of duplicating suffix rows, and constrained heights retain the focused suffix component before decorative rows.
+- Manual viewport revisions now advance for semantic changes in a visible capped sidebar even without an inline component; duplicate, elided, hidden, geometry-only, and theme-only changes do not raise a false new-output notice. Equal output-source updates do not render, and constrained pinned suffixes avoid copying transcript-length prefixes.
+- A downward manual scroll (wheel or `PageDown`) that reaches the true transcript bottom now transitions through the existing live-follow transaction instead of repainting another manual frame, so wheel and PageDown automatically return to live output at the bottom. A partial downward movement retains manual ownership and the notice; upward movement never follows. The transition preserves editor focus, pinned chrome, notice clearing, and fatal terminal transaction semantics, clears manual anchor state through the existing transaction, and does not replay manual-era output into native/host scrollback.
+
+### Fixed
+
+- Slash-command autocomplete no longer treats the final segment of a nested filesystem path or URL as a command token, preventing accepted skill suggestions from rewriting literal paths.
+
+- Terminal capability-probe replies no longer leak into the prompt as text (`^[]11;rgb:0000/0000/0000^G^[[?62;22;52c` appearing in the editor after a long-running foreground command). Three separate paths fed them to the input handler: replies whose pending-query counters had already been reset (`stop()`/`start()` around an editor handoff, Ctrl+Z, or a session resume) failed the `#pendingDa1Sentinels`/`#osc11Pending` gates and were forwarded; a reply split across stdin reads with a gap larger than `StdinBuffer`'s 10ms completion timeout was flushed as individual characters; and an unterminated sequence kept absorbing the following ESC. Probe replies are now consumed by shape, incomplete probe-reply prefixes are held at the stdin decoding boundary (bounded by 500ms/256 bytes, and only 150ms for a bare ESC inside a probe window), an ESC cuts the sequence in progress unless it is an OSC/DCS/APC string terminator, and an unsolicited reply is dropped by an explicit backstop. A dropped or mangled reply can no longer latch `#osc11Pending` either: a 1s watchdog and a 64-byte reassembly cap resolve the query cycle instead of swallowing keystrokes. DA1 and XTSMGRAPHICS replies stay owned by the sixel probe and are dropped in `Tui` once that probe has finished, so an orphaned device report is no longer typed into the focused component.
+
+- `waitForRenderCommit` / generation-scoped render tokens resolve only after a successful buffer write (or fail open on stopped/unavailable terminals), enabling awaitable progress frames for interactive resume without hanging (#2914).
+- Streaming layout contraction followed by regrowth no longer re-admits an already committed logical row into native terminal scrollback, preventing occasional duplicated assistant lines after Markdown reflow.
+- Repeated clearing of an already-clear viewport output source is now a render-request no-op, matching identical non-null source updates.
+- A terminal width change now ends in one forced full redraw 1000ms after the last observed resize event, repairing stale bands left by lines wrapped at the old column count — across the full transcript, including scrollback history, on every host. Interim resize frames keep their cheap per-host path; the debounce is what makes the one full replay safe, so drag-resizing still does not replay the transcript per `SIGWINCH`. While the user is reading scrollback (manual viewport), the repair is deferred and runs when they return to live output. Height-only changes are unaffected (#3360, #3361).
+
+## [0.11.7] - 2026-07-22
+### Fixed
+
+- Internal transcript PageUp/PageDown now continues through tool-output and other non-semantic rows instead of intermittently becoming a no-op after a semantic viewport anchor was established.
+
+### Fixed
+
+- Spurious resize events with unchanged terminal dimensions (iTerm2 tab switches and window focus changes deliver SIGWINCH without a size change) no longer trigger a forced full redraw. On hosts still using the full clear+replay path (legacy multiplexer opt-in, non-process terminals) that redraw cleared scrollback (`2J`/`H`/`3J`) and replayed the entire transcript, which could park the native viewport at the top of the thread when returning to the tab. `requestResizeRender()` now forces only when the grid size actually changed since the last committed frame; same-size events fall through to a no-op diff render.
+
+## [0.11.4] - 2026-07-20
+### Fixed
+
+- Keybinding configuration arrays are now defensively copied so external mutations cannot diverge snapshots from resolved key matches.
+- Supplementary Unicode terminal input now crosses the stdin decoding boundary as complete code points instead of separate UTF-16 surrogate events.
+- Bracketed-paste framing now preserves ordinary input before coalesced or split start markers, retains split end markers byte-for-byte, and reprocesses multiple framed pastes in order instead of dropping command prefixes.
+
+## [0.11.3] - 2026-07-19
+### Fixed
+
+- Keybinding configuration arrays are now defensively copied so external mutations cannot diverge snapshots from resolved key matches.
+- Suppressed slash-command and skill autocomplete inside line-local single-backtick code spans while preserving path completion and ordinary slash matching outside literals (#2619).
+- Supplementary Unicode terminal input now crosses the stdin decoding boundary as complete code points instead of separate UTF-16 surrogate events.
+- Bracketed-paste framing now preserves ordinary input before coalesced or split start markers, retains split end markers byte-for-byte, and reprocesses multiple framed pastes in order instead of dropping command prefixes.
+
+## [0.11.0] - 2026-07-15
+### Fixed
+
+- Shared the temporary stdout error listener across terminal instances, preventing `MaxListenersExceededWarning` during repeated TUI start/stop cycles while retaining late detached-PTY error handling.
+- Added a TUI-lifetime terminal cleanup queue so component-owned escape cleanup can be retried after terminal recovery even when the originating component has already been disposed.
+
+### Added
+
+- Added opt-in disabled items to `SelectList` (`SelectItem.disabled`): disabled entries render dimmed; arrow navigation wraps while page navigation clamps and both skip disabled targets; filter resets choose the first enabled item; and programmatic selection searches forward from the requested index before falling back backward. Callbacks never receive disabled entries, while enabled-only arrow/page inputs preserve their existing notification behavior. All-disabled lists keep a null selection while an independent viewport remains navigable, with no cursor and a `(-/N)` scroll position.
+
+## [0.10.2] - 2026-07-14
+### Fixed
+
+- Shared the temporary stdout error listener across terminal instances, preventing `MaxListenersExceededWarning` during repeated TUI start/stop cycles while retaining late detached-PTY error handling.
+- Added a TUI-lifetime terminal cleanup queue so component-owned escape cleanup can be retried after terminal recovery even when the originating component has already been disposed.
+
+### Added
+
+- Added opt-in disabled items to `SelectList` (`SelectItem.disabled`): disabled entries render dimmed; arrow navigation wraps while page navigation clamps and both skip disabled targets; filter resets choose the first enabled item; and programmatic selection searches forward from the requested index before falling back backward. Callbacks never receive disabled entries, while enabled-only arrow/page inputs preserve their existing notification behavior. All-disabled lists keep a null selection while an independent viewport remains navigable, with no cursor and a `(-/N)` scroll position.
+
+## [0.10.1] - 2026-07-13
+### Fixed
+
+- Real interactive terminals now repaint only the visible viewport during forced renders instead of clearing and replaying native scrollback.
+- Terminal graphics protocols are no longer assumed under terminal multiplexers: the blind Kitty fallback for `TERM=tmux-*`/`screen-*` (and detected kitty/iTerm2 protocols leaking through multiplexer env) emitted raw graphics escapes the multiplexer consumed, leaving the Gajae composer pet invisible while its out-of-band cursor writes intermittently corrupted the TUI frame. Image protocols are now unconditionally dropped under tmux/screen/zellij (shared multiplexer predicate with the renderer host policy, including `$TMUX_PANE`, `$STY`, `$ZELLIJ`, and `GJC_TMUX_LAUNCHED`) unless `PI_FORCE_IMAGE_PROTOCOL` explicitly forces a protocol, which remains an expert override.
+- Fixed the startup sixel capability probe's response parsing and authority: XTSMGRAPHICS replies are read per spec (`Ps=0` success; `1/2/3` errors — tmux's `CSI ?2;3;0S` error no longer counts as support), the DA1 device-class parameter is no longer misread as the sixel extension attribute (`CSI ?4;6c` identifies a VT132, not sixel), an explicit `PI_FORCE_IMAGE_PROTOCOL` (including `off`) suppresses probing entirely, and the probe never runs inside a multiplexer because tmux advertises DA1 `;4` from compile-time support regardless of the attached client.
+- A configured Gajae pet now re-applies automatically when the asynchronous sixel probe enables graphics after startup (new `onImageProtocolChanged` subscription), instead of staying hidden until `/pet` is re-run; `/pet` also reports multiplexer graphics suppression explicitly instead of suggesting a different terminal.
+
+## [0.10.0] - 2026-07-12
+### Fixed
+
+- Unified TUI wrapping, truncation, and visible-width measurements on the native grapheme-width engine, preventing Hangul tone marks from causing Korean/CJK layout width drift (#1979).
+
+- Preserved durable transcript semantic anchors at their screen rows when completion removes transient content, including CJK/emoji/ANSI reflow, prefix eviction, provider replacement, explicit exclusion of synthetic/IRC/pinned rows, and supported SSH, tmux, Termux, and Windows terminal paths (#1969).
+
+### Added
+
+- Added transparent Sixel and Kitty real-pixel encoders plus animated 16x16 frame art for the Gajae composer pet.
+- Added an opt-in IRC sidebar split (`alt+i`, remappable): a responsive 70:30 vertical right-hand split that renders Discord-style IRC message blocks through a shared inline/sidebar formatter, with unbounded session backfill and tail-aligned panes. Kitty terminals render inline images inside the split via a cursor-neutral graphics fallback; cursor-advancing protocols (iTerm2, raw Sixel) keep the textual placeholder (#2018).
+
+## [0.9.4] - 2026-07-09
+
+### Fixed
+
+- Markdown terminal rendering now treats HTML comments as invisible markup, preventing React-style `<!-- -->` text separators from leaking into chat output while preserving visible HTML-like model text.
+
+## [0.9.1] - 2026-07-08
+### Fixed
+
+- Native Windows console hosts now use the live-viewport repaint path even when `WT_SESSION` is missing, and full clears avoid `3J` there, preventing Windows Terminal/PowerShell from jumping to the transcript top during forced redraws such as prompt bells and context compaction.
+- Manual viewport paging and resize repaint paths remain stable after terminal resizes, including the Windows/psmux live-viewport path.
+- Kitty inline image repaints now reuse uploaded image data and avoid duplicate placements or transcript overpaint.
+- Empty filtered paste operations no longer leave ghost undo snapshots, and footer git watcher disposal no longer races late watcher creation.
+
+## [0.8.2] - 2026-07-06
+### Fixed
+
+- Fixed backward jump-to-character (`ctrl+alt+]`) matching the character under the cursor when the cursor is at column 0: `lastIndexOf` clamps a negative start position to 0, so the jump stopped in place instead of skipping the cursor position and continuing into earlier lines.
+- GJC-launched psmux panes are now treated as multiplexer sessions even when they do not expose `$TMUX`, so resize and forced redraw paths repaint the live viewport instead of replaying/clearing scrollback and leaving the bottom-pinned composer area above stale blank rows.
+
+## [0.8.0] - 2026-07-04
+
+### Fixed
+
+- Added manual transcript viewport paging support so applications can repaint older terminal output with PageUp/PageDown without reusing editor history navigation.
+
+- Empty select/settings lists now still honor cancel while preserving populated-list keybinding precedence, and settings lists keep selection indices clamped when items disappear or submenus close after list shrinkage.
+
+- Fixed Windows Hangul/CJK IME composition breaking the queue-message shortcut (Alt+Enter/Alt+Q): the app no longer enables the xterm `modifyOtherKeys` fallback on win32, where Windows Terminal/conhost do not support the Kitty keyboard protocol anyway. `modifyOtherKeys` made modified-key chords bypass the IME commit, so a syllable still being composed was dropped and the queue action fired on empty text unless the user typed a trailing space first. Legacy encodings still deliver Alt+Enter and the newline chords; opt back into the enhancement with `GJC_TUI_KEYBOARD_PROTOCOL`.
+
+## [0.7.11] - 2026-07-03
+
 ### Fixed
 
 - Kept the terminal stdout error handler armed briefly after TUI shutdown so late `EIO`/closed-PTY errors from SSH or Windows Terminal detach do not crash tmux-backed GJC panes.
+### Fixed
+
+- Added an editor right-gutter render option so bordered input chrome can stay one cell inside the terminal edge without changing component width.
 
 ## [0.7.9] - 2026-07-01
 

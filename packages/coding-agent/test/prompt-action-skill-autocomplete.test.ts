@@ -8,6 +8,8 @@ function createProvider() {
 			{ name: "fast", description: "Built-in fast mode" },
 			{ name: "model", description: "Select model" },
 			{ name: "skill:deep-interview", description: "Deep interview" },
+			{ name: "skill:ralplan", description: "Consensus planning" },
+			{ name: "skill:ultragoal", description: "Durable goal execution" },
 			{ name: "skill:fast", description: "Colliding skill" },
 			{ name: "skill:mode", description: "Mode skill" },
 			{ name: "skill:team", description: "Multi-worker team orchestration" },
@@ -15,10 +17,11 @@ function createProvider() {
 			{ name: "goal", description: "Toggle team goal mode for this session" },
 		],
 		basePath: "/tmp",
-		keybindings: { getKeys: () => [] } as unknown as KeybindingsManager,
+		keybindings: { getKeys: () => [], getDisplayString: () => "" } as unknown as KeybindingsManager,
 		copyCurrentLine: () => {},
 		copyPrompt: () => {},
 		pasteImage: () => {},
+		pasteText: () => {},
 		newSession: () => {},
 		showHelp: () => {},
 		scrollTmuxToPreviousUserInput: () => {},
@@ -40,14 +43,38 @@ describe("prompt action skill autocomplete", () => {
 		expect(applied.lines[0]).toBe("/skill:deep-interview ");
 	});
 
-	it("normalizes slash-skill-name typing at intermediate positions", async () => {
+	it.each([
+		"please use /ra",
+		"/skill:deep-interview first /skill-deep",
+	])("does not offer skill completions after existing prompt text: %s", async line => {
 		const provider = createProvider();
-		const line = "/skill:deep-interview first /skill-deep";
-		const suggestions = await provider.getSuggestions([line], 0, line.length);
-		expect(suggestions?.prefix).toBe("/skill-deep");
-		expect(suggestions?.items[0]?.value).toBe("skill:deep-interview");
-		const applied = provider.applyCompletion([line], 0, line.length, suggestions!.items[0]!, suggestions!.prefix);
-		expect(applied.lines[0]).toBe("/skill:deep-interview first /skill:deep-interview ");
+
+		expect(await provider.getSuggestions([line], 0, line.length)).toBeNull();
+	});
+
+	it("does not offer skill completions from a bare top-level slash token", async () => {
+		const provider = createProvider();
+		const suggestions = await provider.getSuggestions(["/"], 0, 1);
+		const values = suggestions?.items.map(item => item.value) ?? [];
+		expect(suggestions?.prefix).toBe("/");
+		expect(values).toEqual(expect.arrayContaining(["fast", "model"]));
+		expect(values.some(value => value.startsWith("skill:"))).toBe(false);
+	});
+
+	it.each([
+		"please use/",
+		"please use /skill",
+	])("keeps skill autocomplete closed for inline slash tokens: %s", async line => {
+		const provider = createProvider();
+
+		expect(await provider.getSuggestions([line], 0, line.length)).toBeNull();
+	});
+
+	it("does not rewrite a nested filesystem path as a skill command", async () => {
+		const provider = createProvider();
+		const line = "/chromium/src";
+		expect(await provider.getSuggestions([line], 0, line.length)).toBeNull();
+		expect(provider.trySyncSlashCompletion(line)).toBeNull();
 	});
 
 	it("does not let direct-name normalization shadow an exact non-skill command", async () => {

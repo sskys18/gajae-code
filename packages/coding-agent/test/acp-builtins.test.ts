@@ -1,10 +1,13 @@
 import { describe, expect, it, spyOn } from "bun:test";
-import type { AgentMessage } from "@gajae-code/agent-core";
+import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
+import type { CachedUsageReport, CredentialInventoryRecord, Usage } from "@gajae-code/ai";
 import { Settings } from "../src/config/settings";
+import { createMemoryBackendService } from "../src/memory-backend";
 import { getThemeByName, setThemeInstance, theme } from "../src/modes/theme/theme";
 import type { AgentSession } from "../src/session/agent-session";
 import type { SessionManager } from "../src/session/session-manager";
 import { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "../src/slash-commands/acp-builtins";
+import { executeBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
 import * as sshConfig from "../src/ssh/config-writer";
 
 interface FakeAcpBuiltinSession {
@@ -13,8 +16,12 @@ interface FakeAcpBuiltinSession {
 	isStreaming: boolean;
 	sessionFile: string | undefined;
 	sessionId: string;
+	credentialSessionId: string;
 	sessionName: string;
 	_todoPhases: Array<{ name: string; tasks: Array<{ content: string; status: string }> }>;
+	thinkingLevel: ThinkingLevel | undefined;
+	memoryBackend: AgentSession["memoryBackend"];
+	thinkingLevelCalls: Array<{ thinkingLevel: ThinkingLevel | undefined; persist: boolean | undefined }>;
 	toggleFastMode(): boolean;
 	setFastMode(enabled: boolean): void;
 	isFastModeEnabled(): boolean;
@@ -23,18 +30,39 @@ interface FakeAcpBuiltinSession {
 	resolveRoleModelWithThinking(role: string): { model?: { provider: string; id: string } };
 	setForcedToolChoice(toolName: string): void;
 	fetchUsageReports?: () => Promise<unknown>;
+	getSessionStats: () => {
+		sessionFile: string | undefined;
+		sessionId: string;
+		userMessages: number;
+		assistantMessages: number;
+		toolCalls: number;
+		toolResults: number;
+		totalMessages: number;
+		tokens: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+		premiumRequests: number;
+		cost: number;
+		costBreakdown?: Usage["cost"];
+	};
 	getAsyncJobSnapshot: (opts?: { recentLimit?: number }) => { running: unknown[]; recent: unknown[] } | null;
 	formatSessionAsText: () => string;
 	getLastAssistantText: () => string | undefined;
 	messages: unknown[];
 	modelRegistry: {
+		authStorage: AgentSession["modelRegistry"]["authStorage"];
 		getApiKey(model: { provider: string; id: string }, sessionId?: string): Promise<string | undefined>;
 		resolveCanonicalModel?: (
 			canonicalId: string,
 			options?: { candidates?: Array<{ provider: string; id: string; contextWindow?: number }> },
 		) => { provider: string; id: string; contextWindow?: number } | undefined;
 	};
-	model: { provider: string; id: string; contextWindow?: number } | undefined;
+	model:
+		| {
+				provider: string;
+				id: string;
+				contextWindow?: number;
+				cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+		  }
+		| undefined;
 	agent: {
 		state: {
 			tools: Array<{ name: string; description: string; parameters: Record<string, unknown> }>;
@@ -55,21 +83,43 @@ interface FakeAcpBuiltinSession {
 	compact(args?: string): Promise<void>;
 	getContextUsage(): { tokens?: number; contextWindow: number } | undefined;
 	getAvailableModels(): Array<{ provider: string; id: string; contextWindow?: number }>;
+	getAvailableThinkingLevels(): ThinkingLevel[];
 	setModel(model: unknown): Promise<void>;
-	setThinkingLevel(thinkingLevel: unknown): void;
+	setThinkingLevel(thinkingLevel: ThinkingLevel | undefined, persist?: boolean): void;
 }
 
 function createRuntime() {
 	const output: string[] = [];
 	const settings = Settings.isolated();
+	let credentialInventory: CredentialInventoryRecord[] = [];
+	const cachedUsage = new Map<number, CachedUsageReport | undefined>();
+	const activeCredentialRows = new Map<string, number>();
+	const authStorage = {
+		listCredentialInventory: () => credentialInventory,
+		listCredentialRemovalTargets: () => [],
+		getGeneration: () => 0,
+		getCachedCredentialHealth: () => ({ status: "unknown", reason: null }),
+		getCachedUsageReport: (_provider: string, credentialId: number) => cachedUsage.get(credentialId),
+		getSessionCredentialRowId: (provider: string, sessionId?: string) =>
+			activeCredentialRows.get(`${sessionId ?? ""}\u0000${provider}`),
+		hasRuntimeApiKey: () => false,
+		hasConfigApiKey: () => false,
+		getEffectiveCredentialType: () => undefined,
+		peekCachedCredentialHealthForSource: () => ({ status: "unknown", reason: null }),
+		recordCredentialHealthForSource: () => {},
+	} as unknown as AgentSession["modelRegistry"]["authStorage"];
 	const session: FakeAcpBuiltinSession = {
+		memoryBackend: createMemoryBackendService(settings),
 		fastMode: false,
 		forcedToolChoice: undefined as string | undefined,
 		isStreaming: false,
 		sessionFile: undefined,
 		sessionId: "fake-session-id",
+		credentialSessionId: "fake-credential-session-id",
 		sessionName: "Fake Session",
 		_todoPhases: [],
+		thinkingLevel: ThinkingLevel.Low,
+		thinkingLevelCalls: [],
 		toggleFastMode() {
 			this.fastMode = !this.fastMode;
 			return this.fastMode;
@@ -112,10 +162,23 @@ function createRuntime() {
 		},
 		async refreshBaseSystemPrompt() {},
 		getAsyncJobSnapshot: () => null,
+		getSessionStats: () => ({
+			sessionFile: undefined,
+			sessionId: "fake-session-id",
+			userMessages: 0,
+			assistantMessages: 0,
+			toolCalls: 0,
+			toolResults: 0,
+			totalMessages: 0,
+			tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			premiumRequests: 0,
+			cost: 0,
+		}),
 		formatSessionAsText: () => "",
 		getLastAssistantText: () => undefined,
 		messages: [],
 		modelRegistry: {
+			authStorage,
 			async getApiKey(_model: { provider: string; id: string }, _sessionId?: string) {
 				return "test-api-key";
 			},
@@ -129,11 +192,14 @@ function createRuntime() {
 		async compact(_args?: string) {},
 		getContextUsage: () => undefined,
 		getAvailableModels: () => [] as Array<{ provider: string; id: string; contextWindow?: number }>,
+		getAvailableThinkingLevels: () => [ThinkingLevel.Low, ThinkingLevel.Medium, ThinkingLevel.High],
 		async setModel(_model: unknown) {},
-		setThinkingLevel(_thinkingLevel: unknown) {},
+		setThinkingLevel(thinkingLevel: ThinkingLevel | undefined, persist?: boolean) {
+			this.thinkingLevel = thinkingLevel;
+			this.thinkingLevelCalls.push({ thinkingLevel, persist });
+		},
 		async refreshSshTool(_options?: { activateIfAvailable?: boolean }) {},
 	};
-	const typedSession = session as unknown as AgentSession & FakeAcpBuiltinSession;
 	const fakeSessionManager = {
 		_sessionFile: undefined as string | undefined,
 		_cwd: "/tmp/project",
@@ -187,10 +253,25 @@ function createRuntime() {
 			return true;
 		},
 	};
+	const typedSession = Object.assign(session, {
+		sessionManager: fakeSessionManager as unknown as SessionManager,
+	}) as unknown as AgentSession & FakeAcpBuiltinSession;
 	return {
 		output,
 		session,
 		fakeSessionManager,
+		setAccountInventory(
+			inventory: typeof credentialInventory,
+			usageByCredentialId: ReadonlyMap<number, CachedUsageReport>,
+			activeRows: ReadonlyMap<string, number> = new Map(),
+		): void {
+			credentialInventory = inventory;
+			cachedUsage.clear();
+			for (const [credentialId, usage] of usageByCredentialId) cachedUsage.set(credentialId, usage);
+			activeCredentialRows.clear();
+			for (const [scopeAndProvider, credentialId] of activeRows)
+				activeCredentialRows.set(scopeAndProvider, credentialId);
+		},
 		runtime: {
 			session: typedSession,
 			sessionManager: fakeSessionManager as unknown as SessionManager,
@@ -277,31 +358,192 @@ describe("ACP builtin slash commands", () => {
 	});
 
 	it("renders provider usage reports when the session can fetch them", async () => {
-		const { output, runtime } = createRuntime();
-		runtime.session.fetchUsageReports = async () => [
-			{
-				provider: "openai-codex",
-				fetchedAt: Date.now(),
-				limits: [
+		const { output, runtime, setAccountInventory } = createRuntime();
+		const now = Date.now();
+		setAccountInventory(
+			[
+				{
+					id: 1,
+					provider: "openai-codex",
+					credentialKind: "oauth",
+					identityLabel: "user@example.com",
+					disabled: false,
+					disabledCause: null,
+				},
+				{
+					id: 2,
+					provider: "openai-codex",
+					credentialKind: "oauth",
+					identityLabel: "selected@example.com",
+					disabled: false,
+					disabledCause: null,
+				},
+			],
+			new Map([
+				[
+					1,
 					{
-						id: "codex-5h",
-						label: "5 hours",
-						scope: { provider: "openai-codex", tier: "prolite", accountId: "account-1" },
-						window: { id: "5h", label: "5 hours", resetsAt: Date.now() + 60 * 60 * 1000 },
-						amount: { used: 0.24, usedFraction: 0.24, unit: "unknown" },
+						report: {
+							provider: "openai-codex",
+							fetchedAt: now,
+							limits: [
+								{
+									id: "codex-5h",
+									label: "5 hours",
+									scope: { provider: "openai-codex", tier: "prolite", accountId: "account-1" },
+									window: { id: "5h", label: "5 hours", resetsAt: now + 60 * 60 * 1000 },
+									amount: { used: 0.24, usedFraction: 0.24, unit: "unknown" },
+								},
+							],
+							metadata: { email: "user@example.com" },
+						},
+						fetchedAt: now,
+						freshUntil: now + 60_000,
+						retainUntil: now + 86_400_000,
+						freshness: "fresh",
 					},
 				],
-				metadata: { email: "user@example.com" },
-			},
-		];
+				[
+					2,
+					{
+						report: {
+							provider: "openai-codex",
+							fetchedAt: now,
+							limits: [
+								{
+									id: "codex-weekly",
+									label: "Weekly",
+									scope: { provider: "openai-codex", accountId: "account-2" },
+									amount: { used: 2, usedFraction: 0.02, unit: "requests" },
+								},
+							],
+							metadata: { email: "selected@example.com" },
+						},
+						fetchedAt: now,
+						freshUntil: now + 60_000,
+						retainUntil: now + 86_400_000,
+						freshness: "fresh",
+					},
+				],
+			]),
+			new Map([["fake-credential-session-id\u0000openai-codex", 2]]),
+		);
 
 		const result = await executeAcpBuiltinSlashCommand("/usage", runtime);
 
 		expect(result).toEqual({ consumed: true });
-		expect(output[0]).toContain("Openai Codex");
-		expect(output[0]).toContain("5 hours (prolite)");
-		expect(output[0]).toContain("user@example.com: 0.24 unknown used (76.0% left)");
-		expect(output[0]).toContain("resets in");
+		expect(output[0]).toContain("openai-codex:stored:1");
+		expect(output[0]).toContain("user@example.com");
+		expect(output[0]).toContain("5 hours: 0.24 unknown used (76.0% left)");
+		expect(output[0]).toContain("openai-codex:stored:2");
+		expect(output[0]).toContain("selected@example.com [active]");
+		expect(output[0]).toContain("Weekly: 2.00 requests used (98.0% left)");
+	});
+
+	it("does not cross-label active accounts between credential sessions or providers", async () => {
+		const { output, runtime, session, setAccountInventory } = createRuntime();
+		setAccountInventory(
+			[
+				{
+					id: 1,
+					provider: "openai-codex",
+					credentialKind: "oauth",
+					identityLabel: "codex@example.com",
+					disabled: false,
+					disabledCause: null,
+				},
+				{
+					id: 2,
+					provider: "anthropic",
+					credentialKind: "oauth",
+					identityLabel: "claude@example.com",
+					disabled: false,
+					disabledCause: null,
+				},
+			],
+			new Map(),
+			new Map([
+				["other-session\u0000openai-codex", 1],
+				["fake-credential-session-id\u0000anthropic", 2],
+			]),
+		);
+
+		await expect(executeAcpBuiltinSlashCommand("/usage", runtime)).resolves.toEqual({ consumed: true });
+
+		expect(session.credentialSessionId).toBe("fake-credential-session-id");
+		expect(output[0]).not.toContain("codex@example.com [active]");
+		expect(output[0]).toContain("claude@example.com [active]");
+	});
+
+	it("renders the deterministic empty stored-account inventory without probing", async () => {
+		const { output, runtime } = createRuntime();
+		runtime.session.fetchUsageReports = async () => {
+			throw new Error("plain /usage must not probe providers");
+		};
+		const fetchUsageReports = spyOn(runtime.session, "fetchUsageReports").mockRejectedValue(
+			new Error("plain /usage must not probe providers"),
+		);
+
+		await expect(executeAcpBuiltinSlashCommand("/usage", runtime)).resolves.toEqual({ consumed: true });
+
+		expect(fetchUsageReports).not.toHaveBeenCalled();
+		expect(output[0]).toContain("Accounts (cache only)");
+		expect(output[0]).not.toContain(":stored:");
+	});
+
+	it("keeps one fallback account identity across multiple quota windows in one report", async () => {
+		const { output, runtime, setAccountInventory } = createRuntime();
+		const now = Date.now();
+		setAccountInventory(
+			[
+				{
+					id: 1,
+					provider: "grok-build",
+					credentialKind: "oauth",
+					identityLabel: "account 1",
+					disabled: false,
+					disabledCause: null,
+				},
+			],
+			new Map([
+				[
+					1,
+					{
+						report: {
+							provider: "grok-build",
+							fetchedAt: now,
+							limits: [
+								{
+									id: "grok-build:7d",
+									label: "SuperGrok monthly credits",
+									scope: { provider: "grok-build", windowId: "7d" },
+									window: { id: "7d", label: "Monthly credits", resetsAt: now + 20 * 86400_000 },
+									amount: { used: 25, usedFraction: 0.25, unit: "percent" },
+								},
+								{
+									id: "grok-build:weekly",
+									label: "SuperGrok weekly credits",
+									scope: { provider: "grok-build", windowId: "weekly" },
+									window: { id: "weekly", label: "Weekly", resetsAt: now + 6 * 86400_000 },
+									amount: { used: 6, usedFraction: 0.06, unit: "percent" },
+								},
+							],
+							metadata: {},
+						},
+						fetchedAt: now,
+						freshUntil: now + 60_000,
+						retainUntil: now + 86_400_000,
+						freshness: "fresh",
+					},
+				],
+			]),
+		);
+
+		await expect(executeAcpBuiltinSlashCommand("/usage", runtime)).resolves.toEqual({ consumed: true });
+
+		expect(output[0]?.match(/account 1/g)).toHaveLength(1);
+		expect(output[0]).toContain("SuperGrok monthly credits");
+		expect(output[0]).toContain("SuperGrok weekly credits");
 	});
 
 	it("returns false for unknown commands", async () => {
@@ -310,6 +552,24 @@ describe("ACP builtin slash commands", () => {
 		const result = await executeAcpBuiltinSlashCommand("/not-a-real-command-xyz", runtime);
 
 		expect(result).toBe(false);
+	});
+
+	it("changelog: advertises and renders recent or full changelog output", async () => {
+		const advertised = ACP_BUILTIN_SLASH_COMMANDS.find(command => command.name === "changelog");
+		expect(advertised?.description).toBe("Show release notes and changelog entries");
+		expect(advertised?.input?.hint).toBe("[full|--full]");
+
+		const recent = createRuntime();
+		await expect(executeAcpBuiltinSlashCommand("/changelog", recent.runtime)).resolves.toEqual({ consumed: true });
+		expect(recent.output[0]).toContain("Recent Changes");
+		expect(recent.output[0]).toContain("Use `/changelog --full`");
+
+		const full = createRuntime();
+		await expect(executeAcpBuiltinSlashCommand("/changelog --full", full.runtime)).resolves.toEqual({
+			consumed: true,
+		});
+		expect(full.output[0]).toContain("Full Changelog");
+		expect(full.output[0]).not.toContain("Use `/changelog --full`");
 	});
 
 	// /jobs
@@ -409,13 +669,14 @@ describe("ACP builtin slash commands", () => {
 		expect(output[0]).not.toContain("Quick");
 	});
 
-	it("model: returns ACP usage message when args provided", async () => {
+	it("model: returns model usage message when args cannot resolve", async () => {
 		const { output, runtime } = createRuntime();
 
 		const result = await executeAcpBuiltinSlashCommand("/model claude-3-5-sonnet", runtime);
 
 		expect(result).toEqual({ consumed: true });
-		expect(output[0]?.toLowerCase()).toContain("acp");
+		expect(output[0]).toContain("Unknown model: claude-3-5-sonnet");
+		expect(output[0]).toContain("/model <target> <model[:effort]>");
 	});
 
 	it("model: applies known id and emits both title + config change notifications", async () => {
@@ -436,6 +697,7 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).toHaveBeenCalledWith(available[0], "default", {
+			cause: "user-selection",
 			selector: "anthropic/claude-3-5-sonnet",
 			thinkingLevel: undefined,
 		});
@@ -455,6 +717,7 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).toHaveBeenCalledWith(available[0], "default", {
+			cause: "user-selection",
 			selector: "anthropic/claude-3-5-sonnet",
 			thinkingLevel: "low",
 		});
@@ -472,11 +735,115 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).toHaveBeenCalledWith(available[0], "default", {
+			cause: "user-selection",
 			selector: "anthropic/claude-3-5-sonnet",
 			thinkingLevel: "low",
 		});
 		expect(setThinkingLevelSpy).toHaveBeenCalledWith("low");
 		expect(output[0]).toContain("Default model set to anthropic/claude-3-5-sonnet:low");
+	});
+
+	it("model: requires explicit Grok effort for argument-based default assignment", async () => {
+		const { output, runtime, session } = createRuntime();
+		const grok = {
+			provider: "xai",
+			id: "grok-4.6",
+			reasoning: true,
+			contextWindow: 500_000,
+			maxTokens: 64_000,
+		};
+		session.getAvailableModels = () => [grok];
+		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
+
+		const result = await executeAcpBuiltinSlashCommand("/model xai/grok-4.6", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(setModelSpy).not.toHaveBeenCalled();
+		expect(output[0]).toContain("requires an explicit effort suffix");
+		expect(output[0]).toContain("/model <target> <model[:effort]>");
+	});
+
+	it("model: requires explicit effort for argument-based reasoning defaults from other providers", async () => {
+		const { output, runtime, session } = createRuntime();
+		const reasoningModel = {
+			provider: "anthropic",
+			id: "claude-fable-5",
+			reasoning: true,
+			contextWindow: 500_000,
+			maxTokens: 64_000,
+		};
+		session.getAvailableModels = () => [reasoningModel];
+		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
+
+		const result = await executeAcpBuiltinSlashCommand("/model anthropic/claude-fable-5", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(setModelSpy).not.toHaveBeenCalled();
+		expect(output[0]).toContain("requires an explicit effort suffix");
+	});
+
+	it("model: accepts explicit effort for argument-based reasoning defaults from other providers", async () => {
+		const { runtime, session } = createRuntime();
+		const reasoningModel = {
+			provider: "anthropic",
+			id: "claude-fable-5",
+			reasoning: true,
+			contextWindow: 500_000,
+			maxTokens: 64_000,
+		};
+		session.getAvailableModels = () => [reasoningModel];
+		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
+
+		const result = await executeAcpBuiltinSlashCommand("/model anthropic/claude-fable-5:xhigh", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(setModelSpy).toHaveBeenCalledWith(reasoningModel, "default", {
+			cause: "user-selection",
+			selector: "anthropic/claude-fable-5",
+			thinkingLevel: "xhigh",
+		});
+		expect(runtime.settings.getModelRole("default")).toBe("anthropic/claude-fable-5:xhigh");
+	});
+
+	it("model: requires explicit Grok effort for argument-based role assignment", async () => {
+		const { output, runtime, session } = createRuntime();
+		session.getAvailableModels = () => [
+			{
+				provider: "xai",
+				id: "grok-4.5",
+				reasoning: true,
+				contextWindow: 500_000,
+				maxTokens: 64_000,
+			},
+		];
+
+		const result = await executeAcpBuiltinSlashCommand("/model executor xai/grok-4.5", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(runtime.settings.get("task.agentModelOverrides")).toEqual({});
+		expect(output[0]).toContain("requires an explicit effort suffix");
+	});
+
+	it("model: accepts explicit Grok effort for argument-based assignment", async () => {
+		const { runtime, session } = createRuntime();
+		const grok = {
+			provider: "xai",
+			id: "grok-4.6",
+			reasoning: true,
+			contextWindow: 500_000,
+			maxTokens: 64_000,
+		};
+		session.getAvailableModels = () => [grok];
+		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
+
+		const result = await executeAcpBuiltinSlashCommand("/model xai/grok-4.6:xhigh", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(setModelSpy).toHaveBeenCalledWith(grok, "default", {
+			cause: "user-selection",
+			selector: "xai/grok-4.6",
+			thinkingLevel: "xhigh",
+		});
 	});
 
 	it("model: assigns a known model to a GJC role-agent target without switching active model", async () => {
@@ -535,6 +902,33 @@ describe("ACP builtin slash commands", () => {
 		});
 	});
 
+	it("model: updates the live role-agent override when a runtime profile is active", async () => {
+		const { runtime, session } = createRuntime();
+		session.getAvailableModels = () => [{ provider: "anthropic", id: "claude-3-5-sonnet", contextWindow: 200_000 }];
+		runtime.settings.set("task.agentModelOverrides", {
+			executor: "anthropic/persisted-executor:low",
+		});
+		runtime.settings.override("task.agentModelOverrides", {
+			executor: "anthropic/profile-executor:high",
+			planner: "anthropic/profile-planner:low",
+		});
+
+		const result = await executeAcpBuiltinSlashCommand("/model planner anthropic/claude-3-5-sonnet:high", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(runtime.settings.get("task.agentModelOverrides")).toEqual({
+			executor: "anthropic/profile-executor:high",
+			planner: "anthropic/claude-3-5-sonnet:high",
+		});
+
+		runtime.settings.clearOverride("task.agentModelOverrides");
+
+		expect(runtime.settings.get("task.agentModelOverrides")).toEqual({
+			executor: "anthropic/persisted-executor:low",
+			planner: "anthropic/claude-3-5-sonnet:high",
+		});
+	});
+
 	it("model: preserves canonical selectors for text role-agent assignments", async () => {
 		const { output, runtime, session } = createRuntime();
 		const available = [{ provider: "anthropic", id: "claude-sonnet-4-5", contextWindow: 200_000 }];
@@ -551,6 +945,44 @@ describe("ACP builtin slash commands", () => {
 		expect(output[0]).toContain("executor agent model set to claude-sonnet:low");
 	});
 
+	it("model: TUI args assign a role-agent target instead of reopening the selector", async () => {
+		const { runtime, session } = createRuntime();
+		session.getAvailableModels = () => [{ provider: "anthropic", id: "claude-3-5-sonnet", contextWindow: 200_000 }];
+
+		const statuses: string[] = [];
+		let configNotified = 0;
+		const showModelSelector = spyOn({ showModelSelector() {} }, "showModelSelector");
+		const ctx = {
+			session: runtime.session,
+			sessionManager: runtime.sessionManager,
+			settings: runtime.settings,
+			showStatus: (text: string) => statuses.push(text),
+			showError: (_text: string) => {},
+			showModelSelector,
+			editor: { setText: spyOn({ setText(_text: string) {} }, "setText") },
+			statusLine: { invalidate: spyOn({ invalidate() {} }, "invalidate") },
+			updateEditorBorderColor: spyOn({ updateEditorBorderColor() {} }, "updateEditorBorderColor"),
+			ui: { requestRender: spyOn({ requestRender() {} }, "requestRender") },
+			refreshSlashCommandState: async () => {},
+			notifyConfigChanged: () => {
+				configNotified++;
+			},
+		};
+
+		const result = await executeBuiltinSlashCommand("/model executor anthropic/claude-3-5-sonnet:low", {
+			ctx: ctx as never,
+			handleBackgroundCommand: () => {},
+		});
+
+		expect(result).toBe(true);
+		expect(showModelSelector).not.toHaveBeenCalled();
+		expect(runtime.settings.get("task.agentModelOverrides")).toEqual({
+			executor: "anthropic/claude-3-5-sonnet:low",
+		});
+		expect(statuses[0]).toContain("executor agent model set to anthropic/claude-3-5-sonnet:low");
+		expect(configNotified).toBe(1);
+	});
+
 	it("model: does not emit config change when id is unknown", async () => {
 		const { runtime } = createRuntime();
 		let configNotified = 0;
@@ -562,8 +994,159 @@ describe("ACP builtin slash commands", () => {
 
 		expect(configNotified).toBe(0);
 	});
+
+	it("effort: advertises ACP command with the exact accepted-value hint and no thinking alias", () => {
+		const advertised = ACP_BUILTIN_SLASH_COMMANDS.find(command => command.name === "effort");
+		expect(advertised?.description).toBe("Show or set model reasoning effort");
+		expect(advertised?.input?.hint).toBe("[inherit|off|minimal|low|medium|high|xhigh|max]");
+		expect(ACP_BUILTIN_SLASH_COMMANDS.some(command => command.name === "thinking")).toBe(false);
+	});
+
+	it("effort: bare command reports current, default, accepted values, and supported guidance", async () => {
+		const { output, runtime, session } = createRuntime();
+		session.thinkingLevel = ThinkingLevel.Medium;
+		runtime.settings.set("defaultThinkingLevel", ThinkingLevel.High);
+		session.getAvailableThinkingLevels = () => [ThinkingLevel.Low, ThinkingLevel.High];
+
+		const result = await executeAcpBuiltinSlashCommand("/effort", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toContain("Current effective effort: medium");
+		expect(output[0]).toContain("Configured default effort: high");
+		expect(output[0]).toContain("Accepted values: inherit, off, minimal, low, medium, high, xhigh, max");
+		expect(output[0]).toContain("Current-model supported levels: low, high");
+	});
+
+	it("effort: inherit applies configured default to the current session without persistence", async () => {
+		const { output, runtime, session } = createRuntime();
+		runtime.settings.set("defaultThinkingLevel", ThinkingLevel.High);
+
+		const result = await executeAcpBuiltinSlashCommand("/effort inherit", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(session.thinkingLevelCalls).toEqual([{ thinkingLevel: ThinkingLevel.High, persist: false }]);
+		expect(output[0]).toContain("Reasoning effort set to inherit (high)");
+		expect(output[0]).toContain("Effective effort: high");
+	});
+
+	it("effort: off and typed efforts set the current session without persistence", async () => {
+		const { runtime, session } = createRuntime();
+
+		const offResult = await executeAcpBuiltinSlashCommand("/effort off", runtime);
+		const xhighResult = await executeAcpBuiltinSlashCommand("/effort xhigh", runtime);
+
+		expect(offResult).toEqual({ consumed: true });
+		expect(xhighResult).toEqual({ consumed: true });
+		expect(session.thinkingLevelCalls).toEqual([
+			{ thinkingLevel: ThinkingLevel.Off, persist: false },
+			{ thinkingLevel: ThinkingLevel.XHigh, persist: false },
+		]);
+	});
+
+	it("effort: accepts parseable efforts outside current-model guidance and reports requested/effective clamp", async () => {
+		const { output, runtime, session } = createRuntime();
+		session.getAvailableThinkingLevels = () => [ThinkingLevel.Low];
+		session.setThinkingLevel = (thinkingLevel, persist) => {
+			session.thinkingLevelCalls.push({ thinkingLevel, persist });
+			session.thinkingLevel = ThinkingLevel.Low;
+		};
+
+		const result = await executeAcpBuiltinSlashCommand("/effort max", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(session.thinkingLevelCalls).toEqual([{ thinkingLevel: ThinkingLevel.Max, persist: false }]);
+		expect(output[0]).toContain("Requested max; effective low.");
+	});
+
+	it("effort: invalid and malformed inputs consume with usage and do not mutate thinking level", async () => {
+		for (const command of ["/effort turbo", "/effort low high"]) {
+			const { output, runtime, session } = createRuntime();
+
+			const result = await executeAcpBuiltinSlashCommand(command, runtime);
+
+			expect(result).toEqual({ consumed: true });
+			expect(session.thinkingLevelCalls).toEqual([]);
+			expect(output[0]).toContain("Usage: /effort [inherit|off|minimal|low|medium|high|xhigh|max]");
+		}
+	});
+
+	it("effort: /thinking is not resolved as an effort alias", async () => {
+		const { output, runtime } = createRuntime();
+
+		const result = await executeAcpBuiltinSlashCommand("/thinking high", runtime);
+
+		expect(result).toBe(false);
+		expect(output).toEqual([]);
+	});
+	it("effort: TUI bare command opens selector instead of printing status", async () => {
+		const { runtime } = createRuntime();
+		const statuses: string[] = [];
+		const showEffortSelector = spyOn({ showEffortSelector() {} }, "showEffortSelector");
+		const ctx = {
+			session: runtime.session,
+			sessionManager: runtime.sessionManager,
+			settings: runtime.settings,
+			showStatus: (text: string) => statuses.push(text),
+			showError: (_text: string) => {},
+			showEffortSelector,
+			editor: { setText: spyOn({ setText(_text: string) {} }, "setText") },
+			statusLine: { invalidate: spyOn({ invalidate() {} }, "invalidate") },
+			updateEditorBorderColor: spyOn({ updateEditorBorderColor() {} }, "updateEditorBorderColor"),
+			updateEditorTopBorder: spyOn({ updateEditorTopBorder() {} }, "updateEditorTopBorder"),
+			ui: { requestRender: spyOn({ requestRender() {} }, "requestRender") },
+			refreshSlashCommandState: async () => {},
+		};
+
+		const result = await executeBuiltinSlashCommand("/effort", {
+			ctx: ctx as never,
+			handleBackgroundCommand: () => {},
+		});
+
+		expect(result).toBe(true);
+		expect(showEffortSelector).toHaveBeenCalledTimes(1);
+		expect(statuses).toEqual([]);
+		expect(ctx.editor.setText).toHaveBeenCalledWith("");
+	});
+
+	it("effort: TUI args delegate to shared typed handler and do not open selector", async () => {
+		const { runtime, session } = createRuntime();
+		const statuses: string[] = [];
+		const showEffortSelector = spyOn({ showEffortSelector() {} }, "showEffortSelector");
+		const ctx = {
+			session: runtime.session,
+			sessionManager: runtime.sessionManager,
+			settings: runtime.settings,
+			showStatus: (text: string) => statuses.push(text),
+			showError: (_text: string) => {},
+			showEffortSelector,
+			editor: { setText: spyOn({ setText(_text: string) {} }, "setText") },
+			statusLine: { invalidate: spyOn({ invalidate() {} }, "invalidate") },
+			updateEditorBorderColor: spyOn({ updateEditorBorderColor() {} }, "updateEditorBorderColor"),
+			updateEditorTopBorder: spyOn({ updateEditorTopBorder() {} }, "updateEditorTopBorder"),
+			ui: { requestRender: spyOn({ requestRender() {} }, "requestRender") },
+			refreshSlashCommandState: async () => {},
+		};
+
+		const result = await executeBuiltinSlashCommand("/effort high", {
+			ctx: ctx as never,
+			handleBackgroundCommand: () => {},
+		});
+
+		expect(result).toBe(true);
+		expect(showEffortSelector).not.toHaveBeenCalled();
+		expect(session.thinkingLevelCalls).toEqual([{ thinkingLevel: ThinkingLevel.High, persist: false }]);
+		expect(statuses[0]).toContain("Reasoning effort set to high");
+		expect(ctx.statusLine.invalidate).toHaveBeenCalled();
+		expect(ctx.updateEditorBorderColor).toHaveBeenCalled();
+		expect(ctx.updateEditorTopBorder).toHaveBeenCalled();
+		expect(ctx.ui.requestRender).toHaveBeenCalled();
+		expect(ctx.editor.setText).toHaveBeenCalledWith("");
+	});
 	it("does not advertise /copy to ACP clients", () => {
 		expect(ACP_BUILTIN_SLASH_COMMANDS.some(command => command.name === "copy")).toBe(false);
+	});
+	it("does not advertise /extensions to ACP clients", () => {
+		expect(ACP_BUILTIN_SLASH_COMMANDS.some(command => command.name === "extensions")).toBe(false);
 	});
 	// TUI-only and dropped commands fall through as false
 	it("TUI-only and dropped commands return false (fall through to model)", async () => {
@@ -574,7 +1157,6 @@ describe("ACP builtin slash commands", () => {
 			"/tree",
 			"/branch",
 			"/browser",
-			"/changelog",
 			"/plan",
 			"/share",
 			"/hotkeys",
@@ -587,7 +1169,6 @@ describe("ACP builtin slash commands", () => {
 			"/btw hi",
 			"/new",
 			"/drop",
-			"/handoff",
 			"/fork",
 		];
 		for (const cmd of fallthroughCommands) {
@@ -599,6 +1180,90 @@ describe("ACP builtin slash commands", () => {
 });
 
 describe("session lifecycle commands", () => {
+	it("/session info: reports persisted aggregate cache costs without selected-model repricing", async () => {
+		const { output, session, runtime } = createRuntime();
+		session.getSessionStats = () => ({
+			sessionFile: undefined,
+			sessionId: "fake-session-id",
+			userMessages: 1,
+			assistantMessages: 1,
+			toolCalls: 0,
+			toolResults: 0,
+			totalMessages: 2,
+			tokens: { input: 2_000, output: 500, cacheRead: 1_000_000, cacheWrite: 40_000, total: 1_042_500 },
+			premiumRequests: 0,
+			cost: 0.67,
+			costBreakdown: { input: 0.52, output: 0, cacheRead: 0.03, cacheWrite: 0.12, total: 0.67 },
+		});
+
+		const result = await executeAcpBuiltinSlashCommand("/session info", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toContain("Tokens\nInput: 2,000\nOutput: 500\nCache Read: 1,000,000");
+		expect(output[0]).toContain("Cost\nTotal: 0.6700");
+		expect(output[0]).toContain("Cache Miss Cost\nUncached Input Cost: $0.52");
+		expect(output[0]).toContain("Cache Write Cost: $0.12");
+		expect(output[0]).not.toContain("Estimated Miss Premium");
+
+		session.model = {
+			provider: "test",
+			id: "expensive-selected-model",
+			cost: { input: 100, output: 15, cacheRead: 0.01, cacheWrite: 100 },
+		};
+		await expect(executeAcpBuiltinSlashCommand("/session info", runtime)).resolves.toEqual({ consumed: true });
+		expect(output[1]).toBe(output[0]);
+	});
+
+	it("/session info: does not price material usage when aggregate provenance is absent", async () => {
+		const absentBreakdown = createRuntime();
+		absentBreakdown.session.getSessionStats = () => ({
+			sessionFile: undefined,
+			sessionId: "fake-session-id",
+			userMessages: 1,
+			assistantMessages: 1,
+			toolCalls: 0,
+			toolResults: 0,
+			totalMessages: 2,
+			tokens: { input: 2_000, output: 500, cacheRead: 1_000_000, cacheWrite: 40_000, total: 1_042_500 },
+			premiumRequests: 0,
+			cost: 0,
+		});
+		absentBreakdown.session.model = {
+			provider: "test",
+			id: "expensive-selected-model",
+			cost: { input: 100, output: 100, cacheRead: 0.01, cacheWrite: 100 },
+		};
+
+		await expect(executeAcpBuiltinSlashCommand("/session info", absentBreakdown.runtime)).resolves.toEqual({
+			consumed: true,
+		});
+		expect(absentBreakdown.output[0]).toContain("Cache Read: 1,000,000");
+		expect(absentBreakdown.output[0]).not.toContain("Cache Miss Cost");
+	});
+
+	it("/session info: omits cache miss summary without a complete persisted aggregate breakdown", async () => {
+		const unpriced = createRuntime();
+		unpriced.session.getSessionStats = () => ({
+			sessionFile: undefined,
+			sessionId: "fake-session-id",
+			userMessages: 1,
+			assistantMessages: 1,
+			toolCalls: 0,
+			toolResults: 0,
+			totalMessages: 2,
+			tokens: { input: 2_000, output: 500, cacheRead: 1_000_000, cacheWrite: 0, total: 1_002_500 },
+			premiumRequests: 0,
+			cost: 0,
+			costBreakdown: { input: 0.52, output: 0, cacheRead: 0.03, cacheWrite: Number.NaN, total: 0.67 },
+		});
+
+		await expect(executeAcpBuiltinSlashCommand("/session info", unpriced.runtime)).resolves.toEqual({
+			consumed: true,
+		});
+		expect(unpriced.output[0]).toContain("Cache Read: 1,000,000");
+		expect(unpriced.output[0]).not.toContain("Cache Miss Cost");
+	});
+
 	it("/session delete: returns in-memory usage when no sessionFile", async () => {
 		const { output, runtime } = createRuntime();
 		const result = await executeAcpBuiltinSlashCommand("/session delete", runtime);
@@ -752,6 +1417,42 @@ describe("wave 3 commands", () => {
 		expect(compactCalled).toBe(true);
 		expect(output[0]).toContain("Compaction complete.");
 	});
+
+	// /handoff
+	it("/handoff: reports success without a saved path for a manual handoff", async () => {
+		// Manual ACP/TUI handoff never passes autoTriggered, so production never
+		// returns a savedPath here; only automatic handoff can save to disk.
+		const { output, session, runtime } = createRuntime();
+		let receivedInstr: string | undefined = "unset";
+		session.handoff = async (instr?: string) => {
+			receivedInstr = instr;
+			return { document: "## Goal\nContinue", savedPath: undefined };
+		};
+		const result = await executeAcpBuiltinSlashCommand("/handoff preserve failing test", runtime);
+		expect(result).toEqual({ consumed: true });
+		expect(receivedInstr).toBe("preserve failing test");
+		expect(output[0]).toContain("Handoff created");
+		expect(output[0]).not.toContain("saved to");
+	});
+
+	it("/handoff: surfaces a usage notice when nothing is handed off", async () => {
+		const { output, session, runtime } = createRuntime();
+		session.handoff = async (_instr?: string) => undefined;
+		const result = await executeAcpBuiltinSlashCommand("/handoff", runtime);
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toContain("Handoff not created");
+	});
+
+	it("/handoff: surfaces a non-destructive usage notice when handoff throws", async () => {
+		const { output, session, runtime } = createRuntime();
+		session.handoff = async (_instr?: string) => {
+			throw new Error("Cannot hand off while a response is streaming; wait for it to finish or abort it first.");
+		};
+		const result = await executeAcpBuiltinSlashCommand("/handoff", runtime);
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toContain("Handoff failed");
+		expect(output[0]).toContain("current session is unchanged");
+	});
 });
 
 describe("wave 4 commands", () => {
@@ -876,26 +1577,48 @@ describe("wave 5 — adapters and polish", () => {
 
 	// /usage bar character
 	it("/usage: includes bar character when usedFraction is 0.5", async () => {
-		const { output, runtime } = createRuntime();
-		runtime.session.fetchUsageReports = async () => [
-			{
-				provider: "test-provider",
-				fetchedAt: Date.now(),
-				limits: [
+		const { output, runtime, setAccountInventory } = createRuntime();
+		const now = Date.now();
+		setAccountInventory(
+			[
+				{
+					id: 1,
+					provider: "test-provider",
+					credentialKind: "oauth",
+					identityLabel: null,
+					disabled: false,
+					disabledCause: null,
+				},
+			],
+			new Map([
+				[
+					1,
 					{
-						id: "test-limit",
-						label: "Monthly",
-						scope: { provider: "test-provider", tier: "pro", accountId: "acct-1" },
-						window: { id: "monthly", label: "monthly", resetsAt: Date.now() + 30 * 86400_000 },
-						amount: { used: 50, usedFraction: 0.5, unit: "requests" },
+						report: {
+							provider: "test-provider",
+							fetchedAt: now,
+							limits: [
+								{
+									id: "test-limit",
+									label: "Monthly",
+									scope: { provider: "test-provider", tier: "pro", accountId: "acct-1" },
+									window: { id: "monthly", label: "monthly", resetsAt: now + 30 * 86400_000 },
+									amount: { used: 50, usedFraction: 0.5, unit: "requests" },
+								},
+							],
+							metadata: {},
+						},
+						fetchedAt: now,
+						freshUntil: now + 60_000,
+						retainUntil: now + 86_400_000,
+						freshness: "fresh",
 					},
 				],
-				metadata: {},
-			},
-		];
+			]),
+		);
 		const result = await executeAcpBuiltinSlashCommand("/usage", runtime);
 		expect(result).toEqual({ consumed: true });
-		expect(output[0]).toContain("█");
+		expect(output[0]).toContain("Monthly: 50.00 requests used (50.0% left)");
 	});
 
 	// /context breakdown
@@ -986,5 +1709,18 @@ describe("wave 5 — adapters and polish", () => {
 		const result = await executeAcpBuiltinSlashCommand("/marketplace discover", runtime);
 		expect(result).toBe(false);
 		expect(output).toEqual([]);
+	});
+
+	it("/routing on|off refuses to mutate autorouting in a --models-scoped session", async () => {
+		const { output, runtime } = createRuntime();
+		(
+			runtime.session as unknown as { scopedModels: Array<{ model: { provider: string; id: string } }> }
+		).scopedModels = [{ model: { provider: "anthropic", id: "claude-haiku-4-5" } }];
+
+		const result = await executeAcpBuiltinSlashCommand("/routing on", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toContain("read-only in a --models-scoped session");
+		expect(runtime.settings.get("task.autorouting.enabled")).not.toBe(true);
 	});
 });

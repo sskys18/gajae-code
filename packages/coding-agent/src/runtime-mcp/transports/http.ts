@@ -2,7 +2,10 @@
  * MCP HTTP transport (Streamable HTTP).
  *
  * Implements JSON-RPC 2.0 over HTTP POST with optional SSE streaming.
- * Based on MCP spec 2025-03-26.
+ * Legacy era: session-oriented Streamable HTTP per MCP spec 2025-03-26
+ * (`Mcp-Session-Id`, standalone GET SSE listener, DELETE termination).
+ * Modern era (2026-07-28): stateless per-request `_meta` + mirrored headers,
+ * no sessions, no standalone stream, no replay. See ../protocol.ts.
  */
 import { logger, readSseJson, Snowflake } from "@gajae-code/utils";
 import type {
@@ -15,7 +18,26 @@ import type {
 	MCPSseServerConfig,
 	MCPTransport,
 } from "../../runtime-mcp/types";
-import { toJsonRpcError } from "../../runtime-mcp/types";
+import { MCPExpectedFailure, MCPHttpRequestError, MCPJsonRpcError, toJsonRpcError } from "../../runtime-mcp/types";
+import {
+	cancelMCPStream,
+	MCP_MAX_CONTENT_BYTES,
+	MCP_MAX_ERROR_BYTES,
+	MCP_MAX_SSE_BATCH_MESSAGES,
+	MCP_MAX_SSE_REQUEST_MESSAGES,
+	readMCPResponseText,
+} from "../content-limits";
+import { fetchPluginMcpRequest, isPluginMcpPublicNetworkBound } from "../plugin-network-boundary";
+import { buildModernMcpHeaders, type MCPModernClientContext, type MCPProtocolEra, withModernMeta } from "../protocol";
+
+/** Best-effort JSON parse of an error body for structured era classification. */
+function tryParseJsonBody(text: string): unknown {
+	try {
+		return JSON.parse(text);
+	} catch {
+		return undefined;
+	}
+}
 
 /**
  * HTTP transport for MCP servers.
@@ -27,6 +49,12 @@ export class HttpTransport implements MCPTransport {
 	#sseConnection: AbortController | null = null;
 	#streamControllers = new Set<AbortController>();
 	#streamReaders = new Set<Promise<void>>();
+	/**
+	 * Negotiated protocol era. Legacy keeps the sessionful 2025-03-26 behavior;
+	 * modern (2026-07-28) is stateless: no session id, no GET stream, no DELETE.
+	 */
+	#era: MCPProtocolEra = "legacy";
+	#modernContext: MCPModernClientContext | null = null;
 
 	onClose?: () => void;
 	onError?: (error: Error) => void;
@@ -40,9 +68,31 @@ export class HttpTransport implements MCPTransport {
 	get connected(): boolean {
 		return this.#connected;
 	}
+	get closeBeforeReconnect(): false {
+		return false;
+	}
 
 	get url(): string {
 		return this.config.url;
+	}
+
+	/** Negotiated protocol era (defaults to legacy until the client negotiates). */
+	get era(): MCPProtocolEra {
+		return this.#era;
+	}
+
+	/**
+	 * Select the protocol era. Modern mode requires the per-request client
+	 * context (protocol version, identity, capabilities) mirrored into `_meta`
+	 * and HTTP headers on every request.
+	 */
+	setProtocolMode(era: MCPProtocolEra, modernContext?: MCPModernClientContext): void {
+		if (era === "modern" && !modernContext) {
+			throw new Error("modern MCP protocol mode requires a client context");
+		}
+		this.#era = era;
+		this.#modernContext = era === "modern" ? (modernContext ?? null) : null;
+		if (era === "modern") this.#sessionId = null;
 	}
 
 	/**
@@ -52,6 +102,12 @@ export class HttpTransport implements MCPTransport {
 	async connect(): Promise<void> {
 		if (this.#connected) return;
 		this.#connected = true;
+	}
+
+	#fetch(init: BunFetchRequestInit): Promise<Response> {
+		return isPluginMcpPublicNetworkBound(this.config)
+			? fetchPluginMcpRequest(this.config.url, init)
+			: fetch(this.config.url, init);
 	}
 
 	#trackReader(promise: Promise<void>, controller?: AbortController): void {
@@ -70,9 +126,15 @@ export class HttpTransport implements MCPTransport {
 	 */
 	async startSSEListener(): Promise<void> {
 		if (!this.#connected) return;
+		// The modern era removed the standalone GET stream; request-scoped SSE
+		// responses and subscriptions/listen are the only streams.
+		if (this.#era === "modern") return;
 		if (this.#sseConnection) return;
 
 		const sseConnection = new AbortController();
+		const headerController = new AbortController();
+		const headerTimeout = this.config.timeout ?? 30000;
+		const headerTimeoutId = setTimeout(() => headerController.abort(), headerTimeout);
 		this.#sseConnection = sseConnection;
 		const headers: Record<string, string> = {
 			Accept: "text/event-stream",
@@ -85,21 +147,25 @@ export class HttpTransport implements MCPTransport {
 
 		let response: Response;
 		try {
-			response = await fetch(this.config.url, {
+			response = await this.#fetch({
 				method: "GET",
 				headers,
-				signal: sseConnection.signal,
+				signal: AbortSignal.any([sseConnection.signal, headerController.signal]),
 			});
 		} catch (error) {
 			this.#sseConnection = this.#sseConnection === sseConnection ? null : this.#sseConnection;
-			if (error instanceof Error && error.name !== "AbortError") {
+			if (headerController.signal.aborted && !sseConnection.signal.aborted) {
+				this.onError?.(new Error(`SSE connection timeout after ${headerTimeout}ms`));
+			} else if (error instanceof Error && error.name !== "AbortError") {
 				this.onError?.(error);
 			}
 			return;
+		} finally {
+			clearTimeout(headerTimeoutId);
 		}
 
 		if (response.status === 405 || !response.ok || !response.body) {
-			await response.body?.cancel().catch(() => {});
+			cancelMCPStream(response.body);
 			this.#sseConnection = this.#sseConnection === sseConnection ? null : this.#sseConnection;
 			return;
 		}
@@ -117,13 +183,18 @@ export class HttpTransport implements MCPTransport {
 	}
 	async #readSSEStream(body: ReadableStream<Uint8Array>, signal: AbortSignal): Promise<void> {
 		try {
-			for await (const message of readSseJson<JsonRpcMessage>(body, signal)) {
+			for await (const message of readSseJson<JsonRpcMessage>(body, signal, undefined, {
+				maxEventBytes: MCP_MAX_CONTENT_BYTES,
+			})) {
 				if (!this.#connected) break;
+				if (Array.isArray(message) && message.length > MCP_MAX_SSE_BATCH_MESSAGES) {
+					throw new Error("MCP SSE batch exceeds message limit");
+				}
 				this.#dispatchSSEMessage(message);
 			}
 		} catch (error) {
 			if (error instanceof Error && error.name !== "AbortError") {
-				logger.debug("HTTP SSE stream error", { url: this.config.url, error: error.message });
+				logger.debug("HTTP SSE stream error");
 				this.onError?.(error);
 			}
 		}
@@ -137,6 +208,13 @@ export class HttpTransport implements MCPTransport {
 		}
 		// Server-to-client request: has both method and id
 		if ("method" in message && "id" in message && message.id != null) {
+			if (this.#era === "modern") {
+				// 2026-07-28 forbids server-initiated JSON-RPC requests on SSE streams;
+				// server-to-client interactions use MRTR input requests instead. Do not
+				// fall back to the legacy elicitation-over-stream pattern.
+				logger.debug("Dropping server-initiated request on modern-era stream");
+				return;
+			}
 			void this.#handleServerRequest(message as JsonRpcRequest);
 			return;
 		}
@@ -154,16 +232,24 @@ export class HttpTransport implements MCPTransport {
 		try {
 			return await this.#executeRequest<T>(method, params, options);
 		} catch (error) {
-			// Retry once on auth failure if onAuthError is wired
-			if (this.onAuthError && error instanceof Error && /^HTTP (401|403):/.test(error.message)) {
+			// Retry once on auth failure only for explicitly replay-safe requests.
+			if (
+				this.onAuthError &&
+				!options?.noReplay &&
+				error instanceof Error &&
+				/^HTTP (401|403):/.test(error.message)
+			) {
 				const newHeaders = await this.onAuthError();
 				if (newHeaders) {
-					// Persist refreshed headers so subsequent requests use them directly
 					this.config = { ...this.config, headers: newHeaders };
-					return this.#executeRequest<T>(method, params, options);
+					try {
+						return await this.#executeRequest<T>(method, params, options);
+					} catch (retryError) {
+						throw retryError instanceof MCPExpectedFailure ? retryError : new MCPExpectedFailure(retryError);
+					}
 				}
 			}
-			throw error;
+			throw error instanceof MCPExpectedFailure ? error : new MCPExpectedFailure(error);
 		}
 	}
 
@@ -173,7 +259,7 @@ export class HttpTransport implements MCPTransport {
 		options: MCPRequestOptions | undefined,
 	): Promise<T> {
 		if (!this.#connected) {
-			throw new Error("Transport not connected");
+			throw new MCPExpectedFailure();
 		}
 
 		const id = Snowflake.next();
@@ -181,7 +267,10 @@ export class HttpTransport implements MCPTransport {
 			jsonrpc: "2.0" as const,
 			id,
 			method,
-			params: params ?? {},
+			params:
+				this.#era === "modern" && this.#modernContext
+					? withModernMeta(params ?? {}, this.#modernContext)
+					: (params ?? {}),
 		};
 
 		const headers: Record<string, string> = {
@@ -190,7 +279,18 @@ export class HttpTransport implements MCPTransport {
 			...this.config.headers,
 		};
 
-		if (this.#sessionId) {
+		if (this.#era === "modern" && this.#modernContext) {
+			// 2026-07-28: mirrored request metadata headers are REQUIRED.
+			Object.assign(
+				headers,
+				buildModernMcpHeaders({
+					protocolVersion: this.#modernContext.protocolVersion,
+					method,
+					params: body.params,
+				}),
+			);
+			if (options?.mcpParamHeaders) Object.assign(headers, options.mcpParamHeaders);
+		} else if (this.#sessionId) {
 			headers["Mcp-Session-Id"] = this.#sessionId;
 		}
 
@@ -203,21 +303,23 @@ export class HttpTransport implements MCPTransport {
 			: abortController.signal;
 
 		try {
-			const response = await fetch(this.config.url, {
+			const response = await this.#fetch({
 				method: "POST",
 				headers,
 				body: JSON.stringify(body),
 				signal: operationSignal,
 			});
 
-			// Check for session ID in response
-			const newSessionId = response.headers.get("Mcp-Session-Id");
-			if (newSessionId) {
-				this.#sessionId = newSessionId;
+			// Check for session ID in response (legacy era only; modern servers do not mint sessions)
+			if (this.#era !== "modern") {
+				const newSessionId = response.headers.get("Mcp-Session-Id");
+				if (newSessionId) {
+					this.#sessionId = newSessionId;
+				}
 			}
 
 			if (!response.ok) {
-				const text = await response.text();
+				const text = await readMCPResponseText(response, MCP_MAX_ERROR_BYTES, true, operationSignal);
 				const wwwAuthenticate = response.headers.get("WWW-Authenticate");
 				const mcpAuthServer = response.headers.get("Mcp-Auth-Server");
 				const authHints = [
@@ -227,7 +329,11 @@ export class HttpTransport implements MCPTransport {
 					.filter(Boolean)
 					.join("; ");
 				const suffix = authHints ? ` [${authHints}]` : "";
-				throw new Error(`HTTP ${response.status}: ${text}${suffix}`);
+				throw new MCPHttpRequestError(
+					response.status,
+					`HTTP ${response.status}: ${text}${suffix}`,
+					tryParseJsonBody(text),
+				);
 			}
 
 			const contentType = response.headers.get("Content-Type") ?? "";
@@ -238,10 +344,31 @@ export class HttpTransport implements MCPTransport {
 			}
 
 			// Handle JSON response
-			const result = (await response.json()) as JsonRpcResponse;
+			if (!response.body) {
+				throw new MCPExpectedFailure();
+			}
+			const parsedResult = JSON.parse(
+				await readMCPResponseText(response, MCP_MAX_CONTENT_BYTES, false, operationSignal),
+			) as unknown;
 
-			if (result.error) {
-				throw new Error(`MCP error ${result.error.code}: ${result.error.message}`);
+			if (
+				typeof parsedResult !== "object" ||
+				parsedResult === null ||
+				!("id" in parsedResult) ||
+				parsedResult.id !== id ||
+				(!("result" in parsedResult) && !("error" in parsedResult))
+			) {
+				throw new MCPExpectedFailure();
+			}
+
+			const result = parsedResult as JsonRpcResponse;
+			if ("error" in result) {
+				if (!result.error) {
+					throw new MCPExpectedFailure();
+				}
+				throw new MCPExpectedFailure(
+					new MCPJsonRpcError(result.error.code, result.error.message, result.error.data),
+				);
 			}
 
 			return result.result as T;
@@ -260,7 +387,7 @@ export class HttpTransport implements MCPTransport {
 
 	#parseSSEResponse<T>(response: Response, expectedId: string | number, options?: MCPRequestOptions): Promise<T> {
 		if (!response.body) {
-			throw new Error("No response body");
+			throw new MCPExpectedFailure();
 		}
 
 		const timeout = this.config.timeout ?? 30000;
@@ -272,6 +399,7 @@ export class HttpTransport implements MCPTransport {
 
 		const { promise, resolve, reject } = Promise.withResolvers<T>();
 		let captured = false;
+		let messageCount = 0;
 
 		// Drain this per-request SSE response from a single iterator. Once the
 		// matching response arrives, resolve/reject and abort the reader so the
@@ -283,8 +411,20 @@ export class HttpTransport implements MCPTransport {
 		this.#streamControllers.add(drainController);
 		const drain = async (): Promise<void> => {
 			try {
-				for await (const raw of readSseJson<JsonRpcMessage | JsonRpcMessage[]>(response.body!, operationSignal)) {
+				for await (const raw of readSseJson<JsonRpcMessage | JsonRpcMessage[]>(
+					response.body!,
+					operationSignal,
+					undefined,
+					{
+						maxEventBytes: MCP_MAX_CONTENT_BYTES,
+						maxTotalBytes: MCP_MAX_CONTENT_BYTES,
+					},
+				)) {
 					const messages = Array.isArray(raw) ? raw : [raw];
+					if (messages.length > MCP_MAX_SSE_BATCH_MESSAGES) throw new Error("MCP SSE batch exceeds message limit");
+					messageCount += messages.length;
+					if (messageCount > MCP_MAX_SSE_REQUEST_MESSAGES)
+						throw new Error("MCP SSE response exceeds message limit");
 					for (const message of messages) {
 						if (
 							!captured &&
@@ -294,10 +434,19 @@ export class HttpTransport implements MCPTransport {
 						) {
 							captured = true;
 							drainController.abort();
-							if (message.error) {
-								reject(new Error(`MCP error ${message.error.code}: ${message.error.message}`));
+							const response = message as JsonRpcResponse;
+							if ("error" in response) {
+								if (!response.error) {
+									reject(new MCPExpectedFailure());
+								} else {
+									reject(
+										new MCPExpectedFailure(
+											new MCPJsonRpcError(response.error.code, response.error.message, response.error.data),
+										),
+									);
+								}
 							} else {
-								resolve(message.result as T);
+								resolve(response.result as T);
 							}
 							return;
 						}
@@ -306,23 +455,23 @@ export class HttpTransport implements MCPTransport {
 					}
 				}
 				if (!captured) {
-					reject(new Error(`No response received for request ID ${expectedId}`));
+					reject(new MCPExpectedFailure());
 				}
 			} catch (error) {
 				if (captured) return;
 				if (error instanceof Error && error.name === "AbortError") {
 					if (options?.signal?.aborted) {
-						reject(error);
+						reject(new MCPExpectedFailure(error));
 					} else {
-						reject(new Error(`SSE response timeout after ${timeout}ms`));
+						reject(new MCPExpectedFailure(new Error(`SSE response timeout after ${timeout}ms`)));
 					}
 				} else {
-					reject(error as Error);
+					reject(error instanceof MCPExpectedFailure ? error : new MCPExpectedFailure(error));
 				}
 			} finally {
 				clearTimeout(timeoutId);
 				this.#streamControllers.delete(drainController);
-				await response.body?.cancel().catch(() => {});
+				cancelMCPStream(response.body);
 			}
 		};
 
@@ -358,7 +507,7 @@ export class HttpTransport implements MCPTransport {
 			headers["Mcp-Session-Id"] = this.#sessionId;
 		}
 		try {
-			const resp = await fetch(this.config.url, {
+			const resp = await this.#fetch({
 				method: "POST",
 				headers,
 				body: JSON.stringify(body),
@@ -366,23 +515,23 @@ export class HttpTransport implements MCPTransport {
 			});
 			// Retry once on auth failure if onAuthError is wired
 			if (this.onAuthError && (resp.status === 401 || resp.status === 403)) {
-				await resp.body?.cancel();
+				cancelMCPStream(resp.body);
 				const newHeaders = await this.onAuthError();
 				if (newHeaders) {
 					this.config.headers ??= {};
 					Object.assign(this.config.headers, newHeaders);
 					Object.assign(headers, newHeaders);
-					const retry = await fetch(this.config.url, {
+					const retry = await this.#fetch({
 						method: "POST",
 						headers,
 						body: JSON.stringify(body),
 						signal: AbortSignal.timeout(this.config.timeout ?? 30000),
 					});
-					await retry.body?.cancel();
+					cancelMCPStream(retry.body);
 					return;
 				}
 			}
-			await resp.body?.cancel();
+			cancelMCPStream(resp.body);
 		} catch {
 			// Best-effort response delivery — server may have disconnected
 		}
@@ -390,7 +539,7 @@ export class HttpTransport implements MCPTransport {
 
 	async notify(method: string, params?: Record<string, unknown>): Promise<void> {
 		if (!this.#connected) {
-			throw new Error("Transport not connected");
+			throw new MCPExpectedFailure();
 		}
 
 		const body = {
@@ -415,18 +564,16 @@ export class HttpTransport implements MCPTransport {
 		const timeoutId = setTimeout(() => abortController.abort(), timeout);
 
 		try {
-			const response = await fetch(this.config.url, {
+			const response = await this.#fetch({
 				method: "POST",
 				headers,
 				body: JSON.stringify(body),
 				signal: abortController.signal,
 			});
 
-			clearTimeout(timeoutId);
-
 			// 202 Accepted is success for notifications
 			if (!response.ok && response.status !== 202) {
-				const text = await response.text();
+				const text = await readMCPResponseText(response, MCP_MAX_ERROR_BYTES, true, abortController.signal);
 				throw new Error(`HTTP ${response.status}: ${text}`);
 			}
 
@@ -442,14 +589,15 @@ export class HttpTransport implements MCPTransport {
 				const reader = this.#readSSEStream(response.body, AbortSignal.any(signals));
 				this.#trackReader(reader, streamController);
 			} else {
-				await response.body?.cancel();
+				cancelMCPStream(response.body);
 			}
 		} catch (error) {
-			clearTimeout(timeoutId);
 			if (error instanceof Error && error.name === "AbortError") {
-				throw new Error(`Notify timeout after ${timeout}ms`);
+				throw new MCPExpectedFailure(new Error(`Notify timeout after ${timeout}ms`));
 			}
-			throw error;
+			throw error instanceof MCPExpectedFailure ? error : new MCPExpectedFailure(error);
+		} finally {
+			clearTimeout(timeoutId);
 		}
 	}
 
@@ -469,8 +617,9 @@ export class HttpTransport implements MCPTransport {
 
 		if (!wasConnected && !this.#sessionId) return;
 
-		// Send session termination if we have a session
-		if (this.#sessionId) {
+		// Send session termination if we have a session (legacy era only;
+		// the modern era has no protocol session to terminate)
+		if (this.#era !== "modern" && this.#sessionId) {
 			try {
 				const timeout = this.config.timeout ?? 30000;
 				const headers: Record<string, string> = {
@@ -478,7 +627,7 @@ export class HttpTransport implements MCPTransport {
 					"Mcp-Session-Id": this.#sessionId,
 				};
 
-				await fetch(this.config.url, {
+				await this.#fetch({
 					method: "DELETE",
 					headers,
 					signal: AbortSignal.timeout(timeout),

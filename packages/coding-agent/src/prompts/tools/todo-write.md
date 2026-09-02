@@ -12,12 +12,12 @@ Allowed `op` values are only `init`, `start`, `done`, `drop`, `rm`, `append`, an
 |`start`|`task`|Mark in progress|
 |`done`|`task` or `phase`|Mark completed|
 |`drop`|`task` or `phase`|Mark abandoned|
-|`rm`|`task` or `phase`|Remove|
+|`rm`|`task` or `phase` or *(none = clear all tasks)*|Remove a task; with `phase`, empties the phase (the phase entry remains); bare `rm` clears every task in every phase|
 |`append`|`phase`, `items: string[]`|Append tasks to `phase`; lazily creates phase|
 |`note`|`task`, `text`|Append a note to a task. Reminders for future-you only.|
 
 ## Anatomy
-- **Task content**: 5–10 words, what is being done, not how. Used as the task identifier — unique.
+- **Task content**: 5–10 words, what is being done, not how. This string *is* how you address the task — unique.
 - **Phase name**: short noun phrase (e.g. `Foundation`, `Auth`, `Verification`). Used as the phase identifier — unique. Do not add prefixes like `1.`, `A)`, `Phase 1:`, etc.
 
 ## Rules

@@ -1,3 +1,4 @@
+import { copyProviderSafetyStopAdapterInvocation } from "../adapter-internals/provider-safety-stop";
 import { ANTHROPIC_THINKING, mapAnthropicToolChoice } from "../stream";
 import type { Api, Context, FetchImpl, Model, SimpleStreamOptions } from "../types";
 import { AssistantMessageEventStream } from "../utils/event-stream";
@@ -175,12 +176,14 @@ const directAccessCache = new Map<string, DirectAccessToken>();
 async function getDirectAccessToken(
 	gitlabAccessToken: string,
 	fetchImpl: FetchImpl = fetch,
+	onStreamCreated?: () => void,
 ): Promise<DirectAccessToken> {
 	const cached = directAccessCache.get(gitlabAccessToken);
 	if (cached && cached.expiresAt > Date.now()) {
 		return cached;
 	}
 
+	onStreamCreated?.();
 	const response = await fetchImpl(`${GITLAB_COM_URL}/api/v4/ai/third_party_agents/direct_access`, {
 		method: "POST",
 		headers: {
@@ -243,7 +246,7 @@ export function streamGitLabDuo(
 				throw new Error(`Unsupported GitLab Duo model: ${model.id}`);
 			}
 
-			const directAccess = await getDirectAccessToken(options.apiKey, options.fetch);
+			const directAccess = await getDirectAccessToken(options.apiKey, options.fetch, options.onStreamCreated);
 			const headers = {
 				...directAccess.headers,
 				...options.headers,
@@ -261,7 +264,7 @@ export function streamGitLabDuo(
 								baseUrl: ANTHROPIC_PROXY_URL,
 							} as Model<"anthropic-messages">,
 							context,
-							{
+							copyProviderSafetyStopAdapterInvocation(options, {
 								apiKey: directAccess.token,
 								isOAuth: true,
 								temperature: options.temperature,
@@ -275,10 +278,16 @@ export function streamGitLabDuo(
 								cacheRetention: options.cacheRetention,
 								headers,
 								maxRetryDelayMs: options.maxRetryDelayMs,
+								requestMaxRetries: options.requestMaxRetries,
+								streamMaxRetries: options.streamMaxRetries,
+								fallbackManaged: options.fallbackManaged,
+								disableProviderRetries: options.disableProviderRetries,
 								metadata: options.metadata,
 								sessionId: options.sessionId,
 								providerSessionState: options.providerSessionState,
 								onPayload: options.onPayload,
+								onStreamCreated: options.onStreamCreated,
+								attemptScope: options?.attemptScope,
 								onResponse: options.onResponse,
 								onSseEvent: options.onSseEvent,
 								fetch: options.fetch,
@@ -288,7 +297,7 @@ export function streamGitLabDuo(
 									: undefined,
 								reasoning: reasoningEffort,
 								toolChoice: mapAnthropicToolChoice(options.toolChoice),
-							},
+							}),
 						)
 					: mapping.openaiApiType === "responses"
 						? streamOpenAIResponses(
@@ -299,7 +308,7 @@ export function streamGitLabDuo(
 									baseUrl: OPENAI_PROXY_URL,
 								} as Model<"openai-responses">,
 								context,
-								{
+								copyProviderSafetyStopAdapterInvocation(options, {
 									apiKey: directAccess.token,
 									temperature: options.temperature,
 									topP: options.topP,
@@ -312,16 +321,22 @@ export function streamGitLabDuo(
 									cacheRetention: options.cacheRetention,
 									headers,
 									maxRetryDelayMs: options.maxRetryDelayMs,
+									requestMaxRetries: options.requestMaxRetries,
+									streamMaxRetries: options.streamMaxRetries,
+									fallbackManaged: options.fallbackManaged,
+									disableProviderRetries: options.disableProviderRetries,
 									metadata: options.metadata,
 									sessionId: options.sessionId,
 									providerSessionState: options.providerSessionState,
 									onPayload: options.onPayload,
+									onStreamCreated: options.onStreamCreated,
+									attemptScope: options?.attemptScope,
 									onResponse: options.onResponse,
 									onSseEvent: options.onSseEvent,
 									fetch: options.fetch,
 									reasoning: reasoningEffort,
 									toolChoice: options.toolChoice,
-								} satisfies OpenAIResponsesOptions,
+								}) satisfies OpenAIResponsesOptions,
 							)
 						: streamOpenAICompletions(
 								{
@@ -331,7 +346,7 @@ export function streamGitLabDuo(
 									baseUrl: OPENAI_PROXY_URL,
 								} as Model<"openai-completions">,
 								context,
-								{
+								copyProviderSafetyStopAdapterInvocation(options, {
 									apiKey: directAccess.token,
 									temperature: options.temperature,
 									topP: options.topP,
@@ -344,16 +359,22 @@ export function streamGitLabDuo(
 									cacheRetention: options.cacheRetention,
 									headers,
 									maxRetryDelayMs: options.maxRetryDelayMs,
+									requestMaxRetries: options.requestMaxRetries,
+									streamMaxRetries: options.streamMaxRetries,
+									fallbackManaged: options.fallbackManaged,
+									disableProviderRetries: options.disableProviderRetries,
 									metadata: options.metadata,
 									sessionId: options.sessionId,
 									providerSessionState: options.providerSessionState,
 									onPayload: options.onPayload,
+									onStreamCreated: options.onStreamCreated,
+									attemptScope: options?.attemptScope,
 									onResponse: options.onResponse,
 									onSseEvent: options.onSseEvent,
 									fetch: options.fetch,
 									reasoning: reasoningEffort,
 									toolChoice: options.toolChoice,
-								} satisfies OpenAICompletionsOptions,
+								}) satisfies OpenAICompletionsOptions,
 							);
 
 			for await (const event of inner) {

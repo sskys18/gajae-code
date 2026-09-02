@@ -1,15 +1,18 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { stripVTControlCharacters } from "node:util";
 import { CURSOR_MARKER } from "@gajae-code/tui";
-import { CombinedAutocompleteProvider } from "@gajae-code/tui/autocomplete";
-import { Editor } from "@gajae-code/tui/components/editor";
+import { type AutocompleteProvider, CombinedAutocompleteProvider } from "@gajae-code/tui/autocomplete";
+import { __editorPerfCounters, Editor } from "@gajae-code/tui/components/editor";
 import { visibleWidth } from "@gajae-code/tui/utils";
-import { setDefaultTabWidth } from "@gajae-code/utils";
+import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
 import { KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "../src/keybindings";
 import { defaultEditorTheme } from "./test-themes";
 
 describe("Editor component", () => {
+	const originalTabWidth = getDefaultTabWidth();
+
 	afterEach(() => {
+		setDefaultTabWidth(originalTabWidth);
 		setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS));
 	});
 
@@ -316,6 +319,140 @@ describe("Editor component", () => {
 			await expect(promise).resolves.toBe("@");
 		});
 
+		it("triggers prompt-action autocomplete when typing hash", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			const { promise, resolve } = Promise.withResolvers<string>();
+
+			editor.setAutocompleteProvider({
+				async getSuggestions(lines, cursorLine, cursorCol) {
+					const currentLine = lines[cursorLine] ?? "";
+					resolve(currentLine.slice(0, cursorCol));
+					return { items: [{ label: "#undo", value: "#undo" }], prefix: "#" };
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+			});
+
+			editor.handleInput("#");
+
+			await expect(promise).resolves.toBe("#");
+		});
+
+		it("inserts trigger-leading bracketed paste literally without autocomplete", async () => {
+			const cases = [
+				"# Heading",
+				"/not-a-command prompt",
+				"@literal file mention",
+				":literal shortcode",
+				"./relative/path prompt",
+				"~/literal/path prompt",
+				"# Heading\nbody with /slash and @mention",
+			];
+
+			for (const pasted of cases) {
+				const editor = new Editor(defaultEditorTheme);
+				const suggestionCalls: string[] = [];
+				editor.setAutocompleteProvider({
+					async getSuggestions(lines, cursorLine, cursorCol) {
+						const currentLine = lines[cursorLine] ?? "";
+						suggestionCalls.push(currentLine.slice(0, cursorCol));
+						return { items: [{ label: "suggestion", value: "suggestion" }], prefix: pasted[0] ?? "" };
+					},
+					applyCompletion(lines, cursorLine, cursorCol) {
+						return { lines, cursorLine, cursorCol };
+					},
+				});
+
+				editor.handleInput(`\x1b[200~${pasted}\x1b[201~`);
+				await Bun.sleep(120);
+
+				expect(editor.getText()).toBe(pasted);
+				expect(editor.isShowingAutocomplete()).toBe(false);
+				expect(suggestionCalls).toEqual([]);
+			}
+		});
+
+		it("cancels stale autocomplete before applying bracketed paste", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			const pending = Promise.withResolvers<{
+				items: Array<{ label: string; value: string }>;
+				prefix: string;
+			} | null>();
+			let suggestionCalls = 0;
+
+			editor.setAutocompleteProvider({
+				async getSuggestions() {
+					suggestionCalls += 1;
+					return pending.promise;
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+			});
+
+			editor.handleInput("/");
+			await Bun.sleep(0);
+			expect(suggestionCalls).toBe(1);
+
+			editor.handleInput("\x1b[200~# pasted prompt\x1b[201~");
+			pending.resolve({ items: [{ label: "/help", value: "help" }], prefix: "/" });
+			await Bun.sleep(0);
+
+			expect(editor.getText()).toBe("/# pasted prompt");
+			expect(editor.isShowingAutocomplete()).toBe(false);
+			expect(suggestionCalls).toBe(1);
+		});
+
+		it("closes open autocomplete before applying bracketed paste", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			let suggestionCalls = 0;
+
+			editor.setAutocompleteProvider({
+				async getSuggestions() {
+					suggestionCalls += 1;
+					return { items: [{ label: "/help", value: "help" }], prefix: "/" };
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+			});
+
+			editor.handleInput("/");
+			await Bun.sleep(0);
+			expect(editor.isShowingAutocomplete()).toBe(true);
+
+			editor.handleInput("\x1b[200~# pasted prompt\x1b[201~");
+			await Bun.sleep(120);
+
+			expect(editor.getText()).toBe("/# pasted prompt");
+			expect(editor.isShowingAutocomplete()).toBe(false);
+			expect(suggestionCalls).toBe(1);
+		});
+
+		it("preserves exact pasted text after existing content", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			const suggestionCalls: string[] = [];
+			editor.setText("prefix");
+			editor.setAutocompleteProvider({
+				async getSuggestions(lines, cursorLine, cursorCol) {
+					const currentLine = lines[cursorLine] ?? "";
+					suggestionCalls.push(currentLine.slice(0, cursorCol));
+					return { items: [{ label: "path", value: "path" }], prefix: "/" };
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+			});
+
+			editor.handleInput("\x1b[200~/tmp/copied\x1b[201~");
+			await Bun.sleep(120);
+
+			expect(editor.getText()).toBe("prefix/tmp/copied");
+			expect(editor.isShowingAutocomplete()).toBe(false);
+			expect(suggestionCalls).toEqual([]);
+		});
+
 		it("chains into argument completions after tab-completing slash command names", async () => {
 			const editor = new Editor(defaultEditorTheme);
 			editor.setAutocompleteProvider(
@@ -351,6 +488,40 @@ describe("Editor component", () => {
 
 			expect(editor.getText()).toBe("/model claude-opus");
 			expect(editor.isShowingAutocomplete()).toBe(false);
+		});
+
+		it("lets app-level Tab handlers consume before force file autocomplete", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			let forceFileSuggestionCalls = 0;
+			const provider = {
+				async getSuggestions() {
+					return null;
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+				async getForceFileSuggestions() {
+					forceFileSuggestionCalls += 1;
+					return { prefix: "", items: [{ label: "src/", value: "src/" }] };
+				},
+			} satisfies AutocompleteProvider & {
+				getForceFileSuggestions(): Promise<{ prefix: string; items: Array<{ label: string; value: string }> }>;
+			};
+			editor.setAutocompleteProvider(provider);
+			editor.setText("draft");
+			const tabTexts: string[] = [];
+			editor.onTab = text => {
+				tabTexts.push(text);
+				return true;
+			};
+
+			editor.handleInput("\t");
+			await Bun.sleep(0);
+
+			expect(tabTexts).toEqual(["draft"]);
+			expect(forceFileSuggestionCalls).toBe(0);
+			expect(editor.isShowingAutocomplete()).toBe(false);
+			expect(editor.getText()).toBe("draft");
 		});
 
 		it("does not show argument completions when command has no argument completer", async () => {
@@ -417,6 +588,36 @@ describe("Editor component", () => {
 			const narrow = editor.render(20).length;
 
 			expect(narrow).toBeGreaterThan(wide);
+		});
+
+		it("renders cursor movement immediately after a trailing space on wrapped input", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setBorderVisible(false);
+			editor.setPaddingX(0);
+			editor.focused = true;
+
+			for (const char of "aaaaaaaaaa") editor.handleInput(char);
+			const beforeSpace = editor.render(10).map(line => stripVTControlCharacters(line));
+
+			editor.handleInput(" ");
+			const afterSpace = editor.render(10);
+			const afterSpacePlain = afterSpace.map(line => stripVTControlCharacters(line));
+
+			expect(editor.getText()).toBe("aaaaaaaaaa ");
+			expect(beforeSpace).toHaveLength(1);
+			expect(afterSpace).toHaveLength(2);
+			expect(afterSpacePlain[0]).toBe("aaaaaaaaaa");
+			expect(afterSpace[1]).toContain("\x1b[5m|\x1b[0m");
+
+			editor.handleInput("bbb");
+			const beforeWrappedSpace = editor.render(10);
+
+			editor.handleInput(" ");
+			const afterWrappedSpace = editor.render(10);
+
+			expect(editor.getText()).toBe("aaaaaaaaaa bbb ");
+			expect(beforeWrappedSpace[1]).toContain("bbb\x1b_pi:c\u0007\x1b[5m|\x1b[0m");
+			expect(afterWrappedSpace[1]).toContain("bbb \x1b_pi:c\u0007\x1b[5m|\x1b[0m");
 		});
 
 		it("recomputes layout after synchronous autocomplete replacement", () => {
@@ -506,6 +707,20 @@ describe("Editor component", () => {
 			}
 		});
 
+		it("inserts a newline for Ctrl+J enhanced keyboard protocol variants", () => {
+			const variants = ["\x1b[106;5u", "\x1b[106;5:1u", "\x1b[106;5:2u", "\x1b[27;5;106~"];
+
+			for (const variant of variants) {
+				const editor = new Editor(defaultEditorTheme);
+
+				editor.handleInput("a");
+				editor.handleInput(variant);
+				editor.handleInput("b");
+
+				expect(editor.getText()).toBe("a\nb");
+			}
+		});
+
 		it("inserts a newline for Ctrl+Shift+Enter terminal protocol variants", () => {
 			const variants = ["\x1b[13;6u", "\x1b[27;6;13~", "\x1b[13;6~", "\x1b[13;2~", "\x1b[13;2u"];
 
@@ -560,7 +775,67 @@ describe("Editor component", () => {
 				if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
 			}
 		});
+		it("preserves the submitted text for onSubmit before clearing onChange state", () => {
+			const editor = new Editor(defaultEditorTheme);
+			const events: string[] = [];
+			editor.onChange = text => events.push(`change:${text}`);
+			editor.onSubmit = text => events.push(`submit:${text}`);
 
+			editor.handleInput("!pwd");
+			events.length = 0;
+			editor.handleInput("\r");
+
+			expect(events).toEqual(["submit:!pwd", "change:"]);
+			expect(editor.getText()).toBe("");
+		});
+
+		it("deletes an exact text run before the cursor as one undoable edit", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("before [image 1] after");
+			for (let index = 0; index < " after".length; index++) {
+				editor.handleInput("\x1b[D");
+			}
+
+			expect(editor.deleteTextBeforeCursor("[image 1]")).toBe(true);
+			expect(editor.getText()).toBe("before  after");
+			expect(editor.getCursor()).toEqual({ line: 0, col: "before ".length });
+
+			editor.handleInput("\x1b[45;5u"); // Ctrl+- (undo)
+			expect(editor.getText()).toBe("before [image 1] after");
+		});
+
+		it("does not delete when the exact text is absent before the cursor", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("before [image 2]");
+
+			expect(editor.deleteTextBeforeCursor("[image 1]")).toBe(false);
+			expect(editor.getText()).toBe("before [image 2]");
+		});
+		it("deletes a range around the cursor as one undoable edit", () => {
+			const editor = new Editor(defaultEditorTheme);
+			const text = 'before [image 1] source="/tmp/a.png" after';
+			const startCol = "before ".length;
+			const endCol = text.indexOf(" after");
+			editor.setText(text);
+			for (let index = 0; index < ' source="/tmp/a.png" after'.length; index += 1) {
+				editor.handleInput("\x1b[D");
+			}
+
+			expect(editor.deleteTextRangeAroundCursor(startCol, endCol)).toBe(true);
+			expect(editor.getText()).toBe("before  after");
+			expect(editor.getCursor()).toEqual({ line: 0, col: startCol });
+
+			editor.handleInput("\x1b[45;5u"); // Ctrl+- (undo)
+			expect(editor.getText()).toBe(text);
+		});
+
+		it("rejects ranges that do not contain the cursor", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("before [image 1]");
+
+			expect(editor.deleteTextRangeAroundCursor(0, 3)).toBe(false);
+			expect(editor.getText()).toBe("before [image 1]");
+		});
 		it("deletes single-code-unit unicode characters (umlauts) with Backspace", () => {
 			const editor = new Editor(defaultEditorTheme);
 
@@ -659,7 +934,57 @@ describe("Editor component", () => {
 				editor.setText("foo\tbar");
 				expect(editor.getText()).toBe("foo     bar");
 			} finally {
-				setDefaultTabWidth(3);
+				setDefaultTabWidth(originalTabWidth);
+			}
+		});
+
+		it("preserves raw tabs inserted through insertText", () => {
+			const editor = new Editor(defaultEditorTheme);
+
+			editor.insertText("foo\tbar");
+
+			expect(editor.getText()).toBe("foo\tbar");
+		});
+		it("splits embedded newlines inserted through insertText", () => {
+			const editor = new Editor(defaultEditorTheme);
+			const changes: string[] = [];
+			editor.onChange = text => changes.push(text);
+
+			editor.insertText("a\nb");
+
+			expect(editor.getLines()).toEqual(["a", "b"]);
+			expect(editor.getCursor()).toEqual({ line: 1, col: 1 });
+			expect(changes).toEqual(["a\nb"]);
+		});
+
+		it("keeps suffix text after the final line when insertText inserts newlines mid-line", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("xz");
+			editor.handleInput("\x1b[D"); // Move between x and z
+
+			editor.insertText("a\r\nb\rc");
+
+			expect(editor.getLines()).toEqual(["xa", "b", "cz"]);
+			expect(editor.getCursor()).toEqual({ line: 2, col: 1 });
+		});
+
+		it("recomputes tab-containing input prefix width when the default tab width changes", () => {
+			try {
+				setDefaultTabWidth(2);
+				const editor = new Editor(defaultEditorTheme);
+				editor.setInputPrefix("\t");
+				editor.insertText("wrapped text after tab prefix");
+				editor.render(18);
+
+				setDefaultTabWidth(8);
+				const refreshed = editor.render(18).join("\n");
+				const fresh = new Editor(defaultEditorTheme);
+				fresh.setInputPrefix("\t");
+				fresh.insertText("wrapped text after tab prefix");
+
+				expect(refreshed).toBe(fresh.render(18).join("\n"));
+			} finally {
+				setDefaultTabWidth(originalTabWidth);
 			}
 		});
 
@@ -904,6 +1229,22 @@ describe("Editor component", () => {
 
 			// Line should still be correct width
 			expect(visibleWidth(contentLine)).toBeLessThanOrEqual(width);
+		});
+
+		it("keeps bordered editor chrome inside a configured right gutter", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setRightGutterWidth(1);
+			editor.setInputPrefix("> ");
+			editor.setClosedBorderBox(true);
+			editor.setText("이전 커밋들");
+
+			const lines = editor.render(24).map(line => stripVTControlCharacters(line));
+
+			expect(lines.every(line => visibleWidth(line) === 24)).toBeTrue();
+			expect(lines.every(line => line.endsWith(" "))).toBeTrue();
+			expect(lines[0]!.trimEnd()).toEndWith(defaultEditorTheme.symbols.boxRound.topRight);
+			expect(lines.at(-1)!.trimEnd()).toEndWith(defaultEditorTheme.symbols.boxRound.bottomRight);
+			expect(lines.some(line => line.includes("이전 커밋들") && line.trimEnd().endsWith("|"))).toBeTrue();
 		});
 
 		it("shows cursor at end before wrap and wraps on next char", () => {
@@ -1950,6 +2291,183 @@ describe("Editor component", () => {
 			expect(editor.getCursor()).toEqual({ line: 0, col: 0 });
 		});
 
+		// `setText` leaves the cursor at end-of-text; ctrl+a moves it to line start.
+		// Both are used instead of a setter because Editor exposes no public one.
+		const LITERALS_BY_ACTION = {
+			"tui.editor.deleteToLineStart": ["\x15"],
+			"tui.editor.deleteWordBackward": ["\x17", "\x1b\x7f"],
+		} as const;
+
+		it.each([
+			"tui.editor.deleteToLineStart",
+			"tui.editor.deleteWordBackward",
+		] as const)("routes %s through the registry so a remap moves it", action => {
+			setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, { [action]: "f8" }));
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("abc def");
+			const before = editor.getText();
+
+			// The action's own former literals are inert once it is remapped away.
+			for (const literal of LITERALS_BY_ACTION[action]) editor.handleInput(literal);
+			expect(editor.getText()).toBe(before);
+
+			editor.handleInput("\x1b[19~"); // F8 now performs the edit
+			expect(editor.getText()).not.toBe(before);
+		});
+
+		it("routes the kill-ring yank ids through the registry", () => {
+			setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, { "tui.editor.yank": "f8" }));
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("abc def");
+			editor.handleInput("\x15"); // ctrl+u kills to line start, filling the ring
+			expect(editor.getText()).toBe("");
+
+			// ctrl+y is no longer bound to yank, so it must not restore.
+			editor.handleInput("\x19");
+			expect(editor.getText()).toBe("");
+
+			editor.handleInput("\x1b[19~"); // F8 yanks
+			expect(editor.getText()).toBe("abc def");
+		});
+
+		it("keeps every declared default chord working for the migrated ids", () => {
+			setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, {}));
+
+			// deleteToLineStart: cursor at end kills the whole line.
+			const killToStart = new Editor(defaultEditorTheme);
+			killToStart.setText("abc def");
+			killToStart.handleInput("\x15");
+			expect(killToStart.getText()).toBe("");
+
+			// deleteToLineEnd: ctrl+a to line start, then kill forward.
+			const killToEnd = new Editor(defaultEditorTheme);
+			killToEnd.setText("abc def");
+			killToEnd.handleInput("\x01");
+			killToEnd.handleInput("\x0b");
+			expect(killToEnd.getText()).toBe("");
+
+			// deleteWordBackward declares ctrl+w and alt+backspace; both must work.
+			for (const chord of ["\x17", "\x1b\x7f"]) {
+				const wordBack = new Editor(defaultEditorTheme);
+				wordBack.setText("abc def");
+				wordBack.handleInput(chord);
+				expect(wordBack.getText()).toBe("abc ");
+			}
+
+			// deleteWordForward from line start removes the leading word.
+			const wordForward = new Editor(defaultEditorTheme);
+			wordForward.setText("abc def");
+			wordForward.handleInput("\x01");
+			wordForward.handleInput("\x1bd");
+			expect(wordForward.getText()).toBe(" def");
+
+			// yank restores what the kill ring captured.
+			const yank = new Editor(defaultEditorTheme);
+			yank.setText("abc def");
+			yank.handleInput("\x15");
+			yank.handleInput("\x19");
+			expect(yank.getText()).toBe("abc def");
+		});
+
+		describe("ctrl+backspace repair", () => {
+			const originalWt = process.env.WT_SESSION;
+			const originalSsh = {
+				connection: process.env.SSH_CONNECTION,
+				client: process.env.SSH_CLIENT,
+				tty: process.env.SSH_TTY,
+			};
+
+			const restore = (key: string, value: string | undefined) => {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			};
+
+			afterEach(() => {
+				restore("WT_SESSION", originalWt);
+				restore("SSH_CONNECTION", originalSsh.connection);
+				restore("SSH_CLIENT", originalSsh.client);
+				restore("SSH_TTY", originalSsh.tty);
+			});
+
+			it("deletes the previous word on the explicit CSI-u encoding", () => {
+				setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, {}));
+				const editor = new Editor(defaultEditorTheme);
+				editor.setText("abc def");
+
+				// ctrl+backspace, explicitly encoded (Kitty / CSI-u / modifyOtherKeys).
+				editor.handleInput("\x1b[127;5u");
+
+				expect(editor.getText()).toBe("abc ");
+			});
+
+			it("deletes the previous word for raw 0x08 inside Windows Terminal", () => {
+				// Windows Terminal sends 0x08 for ctrl+backspace. The native matcher
+				// resolves that byte as unmodified backspace only, so the declared
+				// ctrl+backspace chord never fired on that host until matchesKey began
+				// consulting the Windows Terminal heuristic.
+				setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, {}));
+				process.env.WT_SESSION = "test-session";
+				delete process.env.SSH_CONNECTION;
+				delete process.env.SSH_CLIENT;
+				delete process.env.SSH_TTY;
+
+				const editor = new Editor(defaultEditorTheme);
+				editor.setText("abc def");
+				editor.handleInput("\x08");
+
+				expect(editor.getText()).toBe("abc ");
+			});
+
+			it("keeps raw 0x08 as ctrl+backspace only when no SSH markers are present", () => {
+				setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, {}));
+				process.env.WT_SESSION = "test-session";
+				process.env.SSH_CONNECTION = "1.2.3.4 5 6.7.8.9 22";
+
+				const editor = new Editor(defaultEditorTheme);
+				editor.setText("abc def");
+				editor.handleInput("\x08");
+
+				// Forwarded over SSH the far end is not Windows Terminal, so the byte
+				// must fall back to plain backspace.
+				expect(editor.getText()).toBe("abc de");
+			});
+
+			it("leaves raw 0x08 as plain backspace on a non-Windows-Terminal host", () => {
+				// Raw 0x08 is ambiguous: Windows Terminal sends it for ctrl+backspace,
+				// other terminals for plain backspace. `matchesKey` resolves it through
+				// the raw-backspace heuristic, which reads the environment on every
+				// call, so this pins the safe default: off Windows Terminal the byte
+				// must stay plain backspace and never start eating whole words.
+				setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, {}));
+				delete process.env.WT_SESSION;
+
+				const editor = new Editor(defaultEditorTheme);
+				editor.setText("abc def");
+				editor.handleInput("\x08");
+
+				expect(editor.getText()).toBe("abc de");
+			});
+		});
+
+		it("keeps ctrl+a and ctrl+e on their literal branches (documented exception)", () => {
+			// Non-goal 9: these literals still precede the registry-driven
+			// cursorLineStart/cursorLineEnd branches, which docs/keybindings.md names
+			// as the remaining Editor exceptions.
+			setKeybindings(
+				new KeybindingsManager(TUI_KEYBINDINGS, {
+					"tui.editor.cursorLineStart": "f8",
+					"tui.editor.cursorLineEnd": "f9",
+				}),
+			);
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("abc def");
+
+			editor.handleInput("\x01"); // ctrl+a still goes to line start
+			expect(editor.getCursor()).toEqual({ line: 0, col: 0 });
+			editor.handleInput("\x05"); // ctrl+e still goes to line end
+			expect(editor.getCursor()).toEqual({ line: 0, col: 7 });
+		});
+
 		it("does not swallow keys rebound to copy", () => {
 			setKeybindings(
 				new KeybindingsManager(TUI_KEYBINDINGS, {
@@ -2174,6 +2692,21 @@ describe("Editor component", () => {
 			editor.handleInput("\x1b[B"); // Down to line 1
 			expect(editor.getCursor()).toEqual({ line: 1, col: 15 });
 		});
+		it("does not record a ghost undo snapshot for a paste that filters to nothing", () => {
+			const editor = new Editor(defaultEditorTheme);
+
+			editor.handleInput("\x1b[200~hello\x1b[201~");
+			expect(editor.getText()).toBe("hello");
+
+			// A paste of only non-printable characters inserts nothing…
+			editor.handleInput("\x1b[200~\x07\x07\x1b[201~");
+			expect(editor.getText()).toBe("hello");
+
+			// …so a single undo must revert the previous edit, not a no-op snapshot.
+			editor.handleInput("\x1b[45;5u"); // Ctrl+- (undo)
+			expect(editor.getText()).toBe("");
+		});
+
 		it("expands large pasted content literally in getExpandedText", () => {
 			const editor = new Editor(defaultEditorTheme);
 			const pastedText = [
@@ -2260,6 +2793,127 @@ describe("Editor component", () => {
 			// The leading Hangul jamo block (U+1100..U+1112) only appears in
 			// NFD output. The Editor must not leak it after normalization.
 			expect(rendered).not.toMatch(/[\u1100-\u1112]/);
+		});
+	});
+
+	describe("Jump to character", () => {
+		it("jumps backward to an earlier occurrence on the same line", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("abca");
+			expect(editor.getCursor()).toEqual({ line: 0, col: 4 });
+
+			editor.handleInput("\x1b[93;7u"); // ctrl+alt+] - enter jump-backward mode
+			editor.handleInput("b");
+
+			expect(editor.getCursor()).toEqual({ line: 0, col: 1 });
+		});
+
+		it("jumps backward into the previous line when the cursor is at column 0", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("xa\nab");
+			editor.handleInput("\x01"); // ctrl+a - move to start of current line
+			expect(editor.getCursor()).toEqual({ line: 1, col: 0 });
+
+			editor.handleInput("\x1b[93;7u"); // ctrl+alt+] - enter jump-backward mode
+			editor.handleInput("a"); // must skip the 'a' under the cursor
+
+			expect(editor.getCursor()).toEqual({ line: 0, col: 1 });
+		});
+
+		it("stays in place when jumping backward from column 0 with no earlier match", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("xb\nab");
+			editor.handleInput("\x01"); // ctrl+a - move to start of current line
+			expect(editor.getCursor()).toEqual({ line: 1, col: 0 });
+
+			editor.handleInput("\x1b[93;7u"); // ctrl+alt+] - enter jump-backward mode
+			editor.handleInput("a"); // only occurrence is under the cursor - no match
+
+			expect(editor.getCursor()).toEqual({ line: 1, col: 0 });
+		});
+
+		it("jumps forward across lines from the cursor position", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("ab\nxa");
+			editor.handleInput("\x1b[A"); // up arrow
+			editor.handleInput("\x01"); // ctrl+a - move to start of current line
+			expect(editor.getCursor()).toEqual({ line: 0, col: 0 });
+
+			editor.handleInput("\x1b[93;5u"); // ctrl+] - enter jump-forward mode
+			editor.handleInput("a"); // must skip the 'a' under the cursor
+
+			expect(editor.getCursor()).toEqual({ line: 1, col: 1 });
+		});
+	});
+	describe("layout cache", () => {
+		it("patches cursor-only moves without relaying out the whole buffer or remeasuring visible widths", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText(Array.from({ length: 1000 }, (_, i) => `line ${i} content`).join("\n"));
+			editor.render(80);
+
+			__editorPerfCounters.reset();
+			editor.handleInput("\x1b[D");
+			editor.render(80);
+
+			expect(__editorPerfCounters.layoutLogicalLinesProcessed).toBeLessThanOrEqual(1);
+			expect(__editorPerfCounters.visibleWidthMeasurements).toBeLessThanOrEqual(1);
+
+			__editorPerfCounters.reset();
+			editor.handleInput("\x1b[A");
+			editor.render(80);
+
+			expect(__editorPerfCounters.layoutLogicalLinesProcessed).toBeLessThanOrEqual(2);
+			expect(__editorPerfCounters.visibleWidthMeasurements).toBeLessThanOrEqual(2);
+			expect(editor.wrappedLineCacheSize).toBe(1000);
+		});
+
+		it("invalidates on edits and width changes while preserving rendered output", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("alpha\nbeta\ngamma");
+			const first = editor.render(40);
+			expect(stripVTControlCharacters(first.join("\n"))).toContain("gamma");
+
+			__editorPerfCounters.reset();
+			editor.insertText("!");
+			const edited = editor.render(40);
+			expect(stripVTControlCharacters(edited.join("\n"))).toContain("gamma!");
+			expect(__editorPerfCounters.layoutLogicalLinesProcessed).toBe(3);
+
+			__editorPerfCounters.reset();
+			const resized = editor.render(20);
+			expect(stripVTControlCharacters(resized.join("\n"))).toContain("gamma!");
+			expect(__editorPerfCounters.layoutLogicalLinesProcessed).toBe(3);
+		});
+
+		it("keeps cursor rendering stable at wrapped-line boundaries and empty lines", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText(`abcdef ghijkl mnopqr\n\ntrail   `);
+			const freshAtEnd = editor.render(16).join("\n");
+			editor.handleInput("\x1b[D");
+			editor.render(16);
+			editor.handleInput("\x1b[C");
+			const cachedAtEnd = editor.render(16).join("\n");
+			expect(cachedAtEnd).toBe(freshAtEnd);
+
+			editor.handleInput("\x1b[A");
+			const cachedEmpty = editor.render(16).join("\n");
+			const fresh = new Editor(defaultEditorTheme);
+			fresh.setText(editor.getText());
+			fresh.handleInput("\x1b[A");
+			expect(cachedEmpty).toBe(fresh.render(16).join("\n"));
+		});
+
+		it("invalidates placeholder and borderless layout-affecting transitions", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setPlaceholder("type here");
+			expect(stripVTControlCharacters(editor.render(30).join("\n"))).toContain("type here");
+			editor.setPlaceholder("new hint");
+			expect(stripVTControlCharacters(editor.render(30).join("\n"))).toContain("new hint");
+
+			editor.setBorderVisible(false);
+			editor.setPromptGutter("> ");
+			const borderless = stripVTControlCharacters(editor.render(10).join("\n"));
+			expect(borderless).toContain("> ");
 		});
 	});
 });

@@ -44,12 +44,43 @@ export async function* readLines(stream: ReadableStream<Uint8Array>, signal?: Ab
 	}
 }
 
-export async function* readJsonl<T>(stream: ReadableStream<Uint8Array>, signal?: AbortSignal): AsyncGenerator<T> {
+export type JsonlLineObserver = (raw: string) => void;
+
+function notifyJsonlLineObserver(observer: JsonlLineObserver | undefined, raw: string): void {
+	if (!observer) return;
+	try {
+		observer(raw);
+	} catch {
+		// Diagnostic observers must never perturb provider stream consumption.
+	}
+}
+
+export async function* readJsonl<T>(
+	stream: ReadableStream<Uint8Array>,
+	signal?: AbortSignal,
+	onLine?: JsonlLineObserver,
+): AsyncGenerator<T> {
 	const buffer = new ConcatSink();
+	const rawLineState = onLine
+		? {
+				buffer: new ConcatSink(),
+				decoder: new TextDecoder(),
+			}
+		: undefined;
 	const source = createAbortableStream(stream, signal);
 	try {
 		for await (const chunk of source) {
+			if (rawLineState) {
+				for (const line of rawLineState.buffer.appendAndFlushLines(chunk)) {
+					notifyJsonlLineObserver(onLine, rawLineState.decoder.decode(line));
+				}
+			}
 			yield* buffer.pullJSONL<T>(chunk, 0, chunk.length);
+		}
+		if (rawLineState && !rawLineState.buffer.isEmpty) {
+			const rawTail = rawLineState.buffer.flush();
+			if (rawTail) notifyJsonlLineObserver(onLine, rawLineState.decoder.decode(rawTail));
+			rawLineState.buffer.clear();
 		}
 		if (!buffer.isEmpty) {
 			const tail = buffer.flush();
@@ -125,16 +156,22 @@ class ConcatSink {
 		this.#length = 0;
 	}
 
-	*appendAndFlushLines(chunk: Uint8Array) {
+	*appendAndFlushLines(chunk: Uint8Array, maxLineBytes?: () => number) {
 		let pos = 0;
 		while (pos < chunk.length) {
 			const nl = chunk.indexOf(LF, pos);
 			if (nl === -1) {
+				if (maxLineBytes && this.#length + chunk.length - pos > maxLineBytes()) {
+					throw new Error("SSE event exceeds size limit");
+				}
 				this.append(chunk.subarray(pos));
 				return;
 			}
 			const suffix = chunk.subarray(pos, nl);
 			pos = nl + 1;
+			if (maxLineBytes && this.#length + suffix.length + 1 > maxLineBytes()) {
+				throw new Error("SSE event exceeds size limit");
+			}
 			if (this.isEmpty) {
 				yield suffix;
 			} else {
@@ -201,6 +238,11 @@ class ConcatSink {
  */
 export type SseEventObserver = (event: ServerSentEvent) => void;
 
+export interface SseReadOptions {
+	maxEventBytes?: number;
+	maxTotalBytes?: number;
+}
+
 function notifySseEventObserver(observer: SseEventObserver | undefined, event: ServerSentEvent): void {
 	if (!observer) return;
 	try {
@@ -214,8 +256,9 @@ export async function* readSseJson<T>(
 	stream: ReadableStream<Uint8Array>,
 	signal?: AbortSignal,
 	onEvent?: SseEventObserver,
+	options?: SseReadOptions,
 ): AsyncGenerator<T> {
-	for await (const sse of readSseEvents(stream, signal)) {
+	for await (const sse of readSseEvents(stream, signal, options)) {
 		notifySseEventObserver(onEvent, sse);
 		const data = sse.data;
 		if (data === "" || data === "[DONE]") {
@@ -336,14 +379,26 @@ function pushSseLine(line: Uint8Array, state: SseEventState): ServerSentEvent | 
 export async function* readSseEvents(
 	stream: ReadableStream<Uint8Array>,
 	signal?: AbortSignal,
+	options?: SseReadOptions,
 ): AsyncGenerator<ServerSentEvent> {
 	const lineBuffer = new ConcatSink();
 	const state: SseEventState = { event: null, data: null, raw: [] };
 	const source = createAbortableStream(stream, signal);
+	let eventBytes = 0;
+	let totalBytes = 0;
 	try {
 		for await (const chunk of source) {
-			for (const line of lineBuffer.appendAndFlushLines(chunk)) {
+			totalBytes += chunk.length;
+			if (options?.maxTotalBytes !== undefined && totalBytes > options.maxTotalBytes) {
+				throw new Error("SSE stream exceeds size limit");
+			}
+			for (const line of lineBuffer.appendAndFlushLines(
+				chunk,
+				() => (options?.maxEventBytes ?? Infinity) - eventBytes,
+			)) {
+				eventBytes += line.length + 1;
 				const event = pushSseLine(line, state);
+				if (line.length === 0 || (line.length === 1 && line[0] === 0x0d)) eventBytes = 0;
 				if (event) yield event;
 			}
 		}

@@ -1,6 +1,33 @@
-import { describe, expect, it } from "bun:test";
-import { extractSegments, sliceWithWidth, truncateToWidth, visibleWidth } from "@gajae-code/tui/utils";
+import { afterEach, describe, expect, it } from "bun:test";
+import { type Component, renderMetrics, Text, TUI } from "@gajae-code/tui";
+import {
+	__textHelperPerfCounters,
+	Ellipsis,
+	extractSegments,
+	invalidateTabWidthCache,
+	sliceWithWidth,
+	truncateLinesToWidth,
+	truncateToWidth,
+	visibleWidth,
+	visibleWidths,
+} from "@gajae-code/tui/utils";
+import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
+import { VirtualTerminal } from "./virtual-terminal";
 
+const originalTabWidth = getDefaultTabWidth();
+
+afterEach(() => {
+	setDefaultTabWidth(originalTabWidth);
+	invalidateTabWidthCache();
+	__textHelperPerfCounters.reset();
+});
+class LinesComponent implements Component {
+	constructor(private readonly lines: string[]) {}
+	invalidate(): void {}
+	render(): string[] {
+		return this.lines;
+	}
+}
 describe("text utils", () => {
 	it("computes visible width for ANSI and tabs", () => {
 		const text = `\x1b[31mhi\tthere\x1b[0m`;
@@ -10,6 +37,20 @@ describe("text utils", () => {
 	it("ignores OSC hyperlinks in visible width", () => {
 		const text = "\x1b]8;;https://example.com\x07link\x1b]8;;\x07";
 		expect(visibleWidth(text)).toBe(4);
+	});
+
+	it("captures the padded fragments that make long URLs unsafe to copy from tmux", () => {
+		const url = `https://example.test/oauth/authorize/${"x".repeat(90)}`;
+		const rows = new Text(url, 1, 0).render(24).filter(row => visibleWidth(row) > 0);
+		const captured = rows.join("\n");
+
+		expect(rows.length).toBeGreaterThan(1);
+		expect(rows.map(visibleWidth)).toEqual(rows.map(() => 24));
+		expect(rows.slice(0, -1).every(row => row.endsWith(" "))).toBe(true);
+		expect(captured).not.toBe(url);
+		expect(captured.replaceAll(" ", "").replaceAll("\n", "")).toBe(url);
+		expect(rows.join("")).not.toBe(url);
+		expect(rows.join("").replaceAll(" ", "")).toBe(url);
 	});
 
 	it("truncates ANSI text with ellipsis", () => {
@@ -32,5 +73,66 @@ describe("text utils", () => {
 		expect(result.before).toContain("hel");
 		expect(result.after.startsWith("\x1b[31m")).toBe(true);
 		expect(result.afterWidth).toBeGreaterThan(0);
+	});
+
+	it("batched helpers match single-string helpers across terminal text cases", () => {
+		const lines = [
+			"",
+			"plain ascii",
+			"a\tb",
+			"\x1b[31mred text that truncates\x1b[0m",
+			"한글 jamo 한",
+			"ไทยคำลาวຄໍາ",
+			"emoji 👩‍💻 wide",
+		];
+
+		expect(truncateLinesToWidth(lines, 8, Ellipsis.Omit)).toEqual(
+			lines.map(line => truncateToWidth(line, 8, Ellipsis.Omit)),
+		);
+		expect(visibleWidths(lines)).toEqual(lines.map(line => visibleWidth(line)));
+	});
+
+	it("records batched visible-width work when render metrics are enabled", () => {
+		const wasEnabled = renderMetrics.enabled;
+		renderMetrics.reset();
+		renderMetrics.enable();
+		try {
+			expect(visibleWidths(["한글", "❤️", "👍🏽"])).toEqual([4, 2, 2]);
+			const helper = renderMetrics.snapshot().helperStats["text.visibleWidths"];
+			expect(helper?.count).toBe(1);
+			expect(helper?.totalMs).toBeGreaterThanOrEqual(0);
+		} finally {
+			renderMetrics.reset();
+			if (!wasEnabled) renderMetrics.disable();
+		}
+	});
+
+	it("invalidates the cached tab width automatically", () => {
+		setDefaultTabWidth(2);
+		expect(visibleWidth("a\tb")).toBe(4);
+		setDefaultTabWidth(5);
+		expect(visibleWidth("a\tb")).toBe(7);
+		expect(visibleWidths(["a\tb"])).toEqual([7]);
+	});
+
+	it("normalizes transcript frames with batched native calls instead of per-line truncation calls", async () => {
+		const term = new VirtualTerminal(16, 100);
+		const tui = new TUI(term);
+		tui.start();
+		tui.addChild(
+			new LinesComponent(
+				Array.from(
+					{ length: 80 },
+					(_, i) => `unicode-${i}-한글-ไทย-ลาว-\x1b[31mcolored tail that must truncate\x1b[0m`,
+				),
+			),
+		);
+		__textHelperPerfCounters.reset();
+		tui.requestRender(true, "batch-count-test");
+		await term.waitForRender();
+		expect(__textHelperPerfCounters.visibleWidthsCalls).toBe(1);
+		expect(__textHelperPerfCounters.truncateLinesToWidthCalls).toBe(1);
+		expect(__textHelperPerfCounters.truncateToWidthCalls).toBe(0);
+		tui.stop();
 	});
 });

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { getBundledModel } from "../src/models";
 import { streamOpenAIResponses } from "../src/providers/openai-responses";
-import type { Context, Model } from "../src/types";
+import type { Context, Model, ServiceTier } from "../src/types";
 
 const originalFetch = global.fetch;
 
@@ -43,6 +43,7 @@ function createSseResponse(): Response {
 async function captureRequestBody(
 	model: Model<"openai-responses">,
 	context: Context,
+	serviceTier?: ServiceTier,
 ): Promise<Record<string, unknown>> {
 	let captured: Record<string, unknown> = {};
 	const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
@@ -51,7 +52,7 @@ async function captureRequestBody(
 	});
 	global.fetch = Object.assign(fetchMock, { preconnect: originalFetch.preconnect }) as typeof fetch;
 
-	const stream = streamOpenAIResponses(model, context, { apiKey: "test-key" });
+	const stream = streamOpenAIResponses(model, context, { apiKey: "test-key", serviceTier });
 	for await (const event of stream) {
 		if (event.type === "done" || event.type === "error") break;
 	}
@@ -114,6 +115,23 @@ describe("openai-responses system prompt routing", () => {
 			const input = body.input as Array<{ role: string }>;
 			expect(input.every(m => m.role !== "system")).toBe(true);
 		});
+
+		it("forwards priority for an explicitly capable custom proxy", async () => {
+			const proxyModel: Model<"openai-responses"> = {
+				...gpt4oMiniModel,
+				provider: "custom-proxy",
+				baseUrl: "https://proxy.example.com/v1",
+				compat: { ...gpt4oMiniModel.compat, supportsServiceTier: true },
+			};
+			const context: Context = {
+				systemPrompt: ["You are a proxy assistant."],
+				messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
+			};
+
+			const body = await captureRequestBody(proxyModel, context, "priority");
+
+			expect(body.service_tier).toBe("priority");
+		});
 	});
 
 	describe("reasoning model on known OpenAI endpoints (developer role)", () => {
@@ -163,5 +181,44 @@ describe("openai-responses system prompt routing", () => {
 			const input = body.input as Array<{ role: string }>;
 			expect(input.every(m => m.role !== "developer" && m.role !== "system")).toBe(true);
 		});
+	});
+});
+describe("openai-responses endpoint query routing", () => {
+	it("keeps duplicate endpoint query values on path-first client retries", async () => {
+		const model: Model<"openai-responses"> = {
+			...gpt4oMiniModel,
+			provider: "custom" as Model["provider"],
+			baseUrl: "https://proxy.example.com/v1?scope=read&scope=write&sig=a%2fb%20c",
+		};
+		const requests: string[] = [];
+		let attempt = 0;
+		const fetchMock = Object.assign(
+			async (input: string | URL | Request): Promise<Response> => {
+				requests.push(input instanceof Request ? input.url : String(input));
+				attempt++;
+				if (attempt === 1) {
+					return new Response("retry", { status: 500, headers: { "retry-after-ms": "0" } });
+				}
+				return createSseResponse();
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+
+		const result = await streamOpenAIResponses(
+			model,
+			{
+				messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
+			},
+			{ apiKey: "test-key", fetch: fetchMock, requestMaxRetries: 1 },
+		).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(requests).toHaveLength(2);
+		for (const request of requests) {
+			const url = new URL(request);
+			expect(url.pathname).toBe("/v1/responses");
+			expect(url.searchParams.getAll("scope")).toEqual(["read", "write"]);
+			expect(request).toContain("sig=a%2fb%20c");
+		}
 	});
 });

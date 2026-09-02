@@ -9,8 +9,8 @@ import {
 	type GjcPluginRegistryEntry,
 	parseManifest,
 	readRegistry,
-	updateRegistry,
 } from "../src/extensibility/gjc-plugins";
+import { updateRegistry } from "../src/extensibility/gjc-plugins/registry";
 
 const tempDirs: string[] = [];
 
@@ -115,7 +115,6 @@ describe("GJC plugin Milestone 1 red-team QA", () => {
 			["forbidden commands", { commands: [{ name: "evil" }] }, "forbidden_surface"],
 			["forbidden slash commands", { "slash-commands": [{ name: "evil" }] }, "forbidden_surface"],
 			["legacy mcp alias", { mcp: { command: "node" } }, "unsupported_surface"],
-			["legacy mcpServers alias", { mcpServers: { docs: { command: "node" } } }, "unsupported_surface"],
 			["hooks not array", { hooks: { name: "audit" } }, "invalid_manifest"],
 			["hooks entry not object", { hooks: ["hooks/audit.ts"] }, "invalid_manifest"],
 			["mcps not array", { mcps: { name: "docs" } }, "invalid_manifest"],
@@ -131,6 +130,37 @@ describe("GJC plugin Milestone 1 red-team QA", () => {
 		}
 	});
 
+	test("mcpServers alias normalizes representable fields and rejects unrepresentable ones", () => {
+		// The Claude Code-familiar map alias is accepted when every field has an
+		// unambiguous canonical equivalent (command -> stdio).
+		const accepted = parseManifest(
+			{
+				kind: "gajae-code-plugin",
+				name: "alias",
+				version: "1.0.0",
+				mcpServers: { docs: { command: "node", args: ["s.ts"] } },
+			},
+			"redteam-mcpServers-accepted.json",
+		);
+		expect(accepted.mcps[0]).toMatchObject({ name: "docs", transport: "stdio", command: "node" });
+
+		// env cannot be preserved by the canonical mcps entry: targeted
+		// migration diagnostic, never a silent drop (loose mcp.json supports it).
+		expectLoadError(
+			() =>
+				parseManifest(
+					{
+						kind: "gajae-code-plugin",
+						name: "alias",
+						version: "1.0.0",
+						mcpServers: { docs: { command: "node", args: ["s.ts"], env: { TOKEN: "t" } } },
+					},
+					"redteam-mcpServers-env.json",
+				),
+			"unsupported_surface",
+		);
+	});
+
 	test("rejects traversal paths and never imports plugin code while compiling", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-redteam-traversal-"));
 		tempDirs.push(dir);
@@ -144,7 +174,11 @@ describe("GJC plugin Milestone 1 red-team QA", () => {
 		);
 		await fs.writeFile(
 			path.join(dir, "gajae-plugin.json"),
-			JSON.stringify(baseManifest({ tools: [{ name: "sentinel", path: "tools/sentinel.ts" }] })),
+			JSON.stringify(
+				baseManifest({
+					tools: [{ name: "sentinel", path: "tools/sentinel.ts", parameters: { type: "object", properties: {} } }],
+				}),
+			),
 		);
 		const prev = process.env.GJC_TEST_IMPORT_SENTINEL;
 		process.env.GJC_TEST_IMPORT_SENTINEL = sentinel;

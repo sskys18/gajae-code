@@ -1,10 +1,18 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { Api, Model } from "@gajae-code/ai";
-import { kNoAuth } from "@gajae-code/coding-agent/config/model-registry";
+import { kNoAuth, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import {
 	type ModelLookupRegistry,
 	resolveModelOverrideWithAuthFallback,
 } from "@gajae-code/coding-agent/config/model-resolver";
+import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import {
+	type ConfiguredFallbackChain,
+	FallbackChainController,
+} from "@gajae-code/coding-agent/session/fallback-chain-controller";
 
 /**
  * Regression test for #985.
@@ -46,6 +54,14 @@ const unauthedTaskModel: Model<Api> = {
 	maxTokens: 8192,
 };
 
+const cursorTaskModel: Model<Api> = {
+	...unauthedTaskModel,
+	id: "cursor-task",
+	name: "Cursor Task",
+	api: "cursor-agent",
+	provider: "cursor",
+};
+
 const sharedModel: Model<Api> = {
 	id: "shared-id",
 	name: "Shared",
@@ -75,6 +91,43 @@ function createMockRegistry(options: MockRegistryOptions): ModelLookupRegistry &
 }
 
 describe("issue #985: subagent dispatch auth fallback", () => {
+	test("uses the parent session's canonical stickiness for bare subagent overrides only", async () => {
+		const registry = {
+			getAvailable: () => [parentModel, unauthedTaskModel],
+			getApiKey: async () => "sk-test-token",
+			resolveCanonicalModel: (canonicalId: string, options?: { sessionId?: string }) => {
+				if (canonicalId !== "task-canonical") return undefined;
+				return options?.sessionId === "parent-session" ? parentModel : unauthedTaskModel;
+			},
+		} as unknown as ModelLookupRegistry & { getApiKey(model: Model<Api>): Promise<string | undefined> };
+
+		const bare = await resolveModelOverrideWithAuthFallback(
+			["task-canonical"],
+			undefined,
+			registry,
+			undefined,
+			"parent-session",
+		);
+		const explicit = await resolveModelOverrideWithAuthFallback(
+			["opencode-zen/qwen3.6-plus-free"],
+			undefined,
+			registry,
+			undefined,
+			"parent-session",
+		);
+		const parentFallback = await resolveModelOverrideWithAuthFallback(
+			["unknown-task-model"],
+			"task-canonical",
+			registry,
+			undefined,
+			"parent-session",
+		);
+
+		expect(parentFallback.model).toBe(parentModel);
+		expect(bare.model).toBe(parentModel);
+		expect(explicit.model).toBe(unauthedTaskModel);
+	});
+
 	test("falls back to parent active model when resolved subagent model has no auth", async () => {
 		const registry = createMockRegistry({
 			models: [parentModel, unauthedTaskModel],
@@ -93,6 +146,95 @@ describe("issue #985: subagent dispatch auth fallback", () => {
 		expect(result.requestedModel?.provider).toBe("opencode-zen");
 		expect(result.requestedModel?.id).toBe("qwen3.6-plus-free");
 		expect(result.fallbackReason).toBe("auth_unavailable");
+		expect(result.parentFallbackSelector).toBe("deepseek/deepseek-v4-pro");
+	});
+
+	test("rebases the fallback controller to the concrete parent after every override is unauthenticated", async () => {
+		const registry = createMockRegistry({
+			models: [parentModel, unauthedTaskModel],
+			authedProviders: new Set(["deepseek"]),
+		});
+		const result = await resolveModelOverrideWithAuthFallback(
+			["qwen3.6-plus-free", "opencode-zen/qwen3.6-plus-free"],
+			"deepseek/deepseek-v4-pro",
+			registry,
+		);
+
+		expect(result.parentFallbackSelector).toBe("deepseek/deepseek-v4-pro");
+		const controller = new FallbackChainController(
+			{
+				role: "default",
+				entries: [result.parentFallbackSelector!],
+				origin: "subagent",
+				explicitHead: true,
+			} satisfies ConfiguredFallbackChain,
+			1,
+		);
+		expect(controller.currentSelector()).toBe("deepseek/deepseek-v4-pro");
+		expect(controller.attemptsUsed).toBe(0);
+	});
+
+	test("retains authenticated override tails for request-time fallback", async () => {
+		const fallbackModel = { ...parentModel, id: "deepseek-v4-fallback", name: "DeepSeek V4 Fallback" };
+		const patterns = ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-fallback"];
+		const registry = createMockRegistry({
+			models: [parentModel, fallbackModel],
+			authedProviders: new Set(["deepseek"]),
+		});
+		const result = await resolveModelOverrideWithAuthFallback(patterns, undefined, registry);
+		const controller = new FallbackChainController(
+			{ role: "default", entries: patterns, origin: "subagent", explicitHead: true },
+			1,
+		);
+		controller.seedResolution(result.activeIndex ?? 0, result.skips);
+
+		expect(controller.currentSelector()).toBe("deepseek/deepseek-v4-pro");
+		expect(controller.onAttemptFailure("server", "500")).toBe("advance");
+		expect(controller.currentSelector()).toBe("deepseek/deepseek-v4-fallback");
+	});
+
+	test("rebases to the parent when every override selector is unknown", async () => {
+		const registry = createMockRegistry({
+			models: [parentModel],
+			authedProviders: new Set(["deepseek"]),
+		});
+		const result = await resolveModelOverrideWithAuthFallback(
+			["unknown/first", "unknown/second"],
+			"deepseek/deepseek-v4-pro",
+			registry,
+		);
+
+		expect(result.requestedModel).toBeUndefined();
+		expect(result.parentFallbackSelector).toBe("deepseek/deepseek-v4-pro");
+		const controller = new FallbackChainController(
+			{ role: "default", entries: [result.parentFallbackSelector!], origin: "subagent", explicitHead: true },
+			1,
+		);
+		expect(controller.onAttemptFailure("server", "500")).toBe("exhausted");
+		expect(controller.tried).toEqual([
+			{ selector: "deepseek/deepseek-v4-pro", triggerClass: "server", reason: "500" },
+		]);
+	});
+
+	test("rebases to a keyless parent fallback", async () => {
+		const registry: ModelLookupRegistry & { getApiKey(model: Model<Api>): Promise<string | undefined> } = {
+			getAvailable: () => [parentModel, unauthedTaskModel],
+			getApiKey: async (model: Model<Api>) => (model.provider === "deepseek" ? kNoAuth : undefined),
+		} as never;
+		const result = await resolveModelOverrideWithAuthFallback(
+			["qwen3.6-plus-free"],
+			"deepseek/deepseek-v4-pro",
+			registry,
+		);
+
+		expect(result.model).toBe(parentModel);
+		expect(result.parentFallbackSelector).toBe("deepseek/deepseek-v4-pro");
+		const controller = new FallbackChainController(
+			{ role: "default", entries: [result.parentFallbackSelector!], origin: "subagent", explicitHead: true },
+			1,
+		);
+		expect(controller.onAttemptFailure("server", "500")).toBe("exhausted");
+		expect(controller.tried[0]?.selector).toBe("deepseek/deepseek-v4-pro");
 	});
 
 	test("does not fall back when resolved subagent model has working auth", async () => {
@@ -205,5 +347,139 @@ describe("issue #985: subagent dispatch auth fallback", () => {
 		expect(result.authFallbackUsed).toBe(false);
 		expect(result.model?.provider).toBe("opencode-zen");
 		expect(sessionIds).toEqual(["parent-session"]);
+	});
+});
+
+test("skips a Cursor subagent chain head when managed fallback is enabled", async () => {
+	const registry = createMockRegistry({
+		models: [cursorTaskModel, parentModel],
+		authedProviders: new Set(["cursor", "deepseek"]),
+	});
+
+	const result = await resolveModelOverrideWithAuthFallback(
+		["cursor/cursor-task", "deepseek/deepseek-v4-pro"],
+		undefined,
+		registry,
+		undefined,
+		undefined,
+		{ managedFallback: true },
+	);
+
+	expect(result.model).toBe(parentModel);
+	expect(result.activeIndex).toBe(1);
+	expect(result.skips[0]?.reason).toContain("cannot be used in a retryable fallback chain");
+});
+
+describe("preset-equivalent alias boundaries with the real registry", () => {
+	// A slash-prefixed catalog id keeps the alias out of the exact canonical-id
+	// path, so resolution must pass through the final-segment alias stage.
+	const aliasModel: Model<Api> = {
+		id: "synthetic/flare-alias",
+		name: "Flare Alias",
+		api: "openai-completions",
+		provider: "alias-provider",
+		baseUrl: "http://127.0.0.1:9/v1",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128000,
+		maxTokens: 8192,
+	};
+
+	async function createRealRegistry(): Promise<{ registry: ModelRegistry; cleanup: () => void }> {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-985-alias-"));
+		const authStorage = await AuthStorage.create(path.join(dir, "auth.db"));
+		authStorage.setRuntimeApiKey("alias-provider", "test-key");
+		const registry = new ModelRegistry(authStorage, path.join(dir, "models.yml"));
+		registry.registerProvider("alias-provider", {
+			baseUrl: "http://127.0.0.1:9/v1",
+			apiKey: "ALIAS_KEY",
+			api: "openai-completions",
+			models: [aliasModel],
+		});
+		return {
+			registry,
+			cleanup: () => {
+				authStorage.close();
+				fs.rmSync(dir, { recursive: true, force: true });
+			},
+		};
+	}
+
+	test("active parent profile resolves a bare persisted override through the alias stage", async () => {
+		const { registry, cleanup } = await createRealRegistry();
+		try {
+			const lookupAliasSpy = vi.spyOn(registry, "lookupAliasExists");
+			const resolveAliasSpy = vi.spyOn(registry, "resolveModelByLookupAlias");
+			const result = await resolveModelOverrideWithAuthFallback(
+				["flare-alias"],
+				undefined,
+				registry,
+				undefined,
+				"parent-session",
+				{ aliasIntent: "preset-equivalent" },
+			);
+
+			expect(result.authFallbackUsed).toBe(false);
+			expect(result.model).toMatchObject({ provider: "alias-provider", id: "synthetic/flare-alias" });
+			// Regression: the alias stage previously crashed on the real registry
+			// (unbound private-field access); it must consult the alias methods.
+			expect(lookupAliasSpy).toHaveBeenCalled();
+			expect(resolveAliasSpy).toHaveBeenCalled();
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("active parent profile retries an equivalent provider when the preferred alias fails authentication", async () => {
+		const alpha = { ...aliasModel, provider: "alpha" };
+		const beta = { ...aliasModel, provider: "beta" };
+		const clearCanonicalVariant = vi.fn();
+		const registry = {
+			getAvailable: () => [alpha, beta],
+			getApiKey: async (candidate: Model) => (candidate.provider === "beta" ? "beta-key" : undefined),
+			lookupAliasExists: (alias: string) => alias === "flare-alias",
+			resolveModelByLookupAlias: (_alias: string, options?: { candidates?: readonly Model[] }) =>
+				options?.candidates?.[0],
+			resolveCanonicalModel: () => undefined,
+			clearCanonicalVariant,
+		} as unknown as ModelRegistry;
+
+		const result = await resolveModelOverrideWithAuthFallback(
+			["flare-alias"],
+			undefined,
+			registry,
+			undefined,
+			"credential-session",
+			{ aliasIntent: "preset-equivalent" },
+			"child-scope",
+		);
+
+		expect(result.model?.provider).toBe("beta");
+		expect(result.requestedModel?.provider).toBe("alpha");
+		expect(result.authFallbackUsed).toBe(true);
+		expect(clearCanonicalVariant).toHaveBeenCalledWith("child-scope");
+	});
+
+	test("no active profile keeps persisted override resolution exact without consulting aliases", async () => {
+		const { registry, cleanup } = await createRealRegistry();
+		try {
+			const lookupAliasSpy = vi.spyOn(registry, "lookupAliasExists");
+			const resolveAliasSpy = vi.spyOn(registry, "resolveModelByLookupAlias");
+			const result = await resolveModelOverrideWithAuthFallback(
+				["flare-alias"],
+				undefined,
+				registry,
+				undefined,
+				"parent-session",
+			);
+
+			expect(result.authFallbackUsed).toBe(false);
+			expect(result.model).toMatchObject({ provider: "alias-provider", id: "synthetic/flare-alias" });
+			expect(lookupAliasSpy).not.toHaveBeenCalled();
+			expect(resolveAliasSpy).not.toHaveBeenCalled();
+		} finally {
+			cleanup();
+		}
 	});
 });

@@ -7,8 +7,8 @@ import type { FinalizeChecks } from "../../src/harness-control-plane/finalize";
 import { RuntimeOwner } from "../../src/harness-control-plane/owner";
 import { RECEIPT_SPOOL_FILENAME, type ReceiptSpoolRecord } from "../../src/harness-control-plane/receipt-spool";
 import { type CompletionEvidence, validateReceipt } from "../../src/harness-control-plane/receipts";
-import type { HarnessRpc, RpcStateSnapshot } from "../../src/harness-control-plane/rpc-adapter";
 import { acquireLease } from "../../src/harness-control-plane/session-lease";
+import type { HarnessSessionTransport, SessionStateSnapshot } from "../../src/harness-control-plane/session-transport";
 import { controlSocketPath, sessionPaths, writeSessionState } from "../../src/harness-control-plane/storage";
 import { SESSION_SCHEMA_VERSION, type SessionHandle, type SessionState } from "../../src/harness-control-plane/types";
 import { createHarnessCliEnv, type HarnessCliEnv } from "./cli-workspace-env";
@@ -17,10 +17,10 @@ const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
 const SID = "o";
 
-class FakeRpc implements HarnessRpc {
+class FakeTransport implements HarnessSessionTransport {
 	cursor = 0;
-	state: RpcStateSnapshot = { isStreaming: false, steeringQueueDepth: 0, followupQueueDepth: 0 };
-	async getState(): Promise<RpcStateSnapshot> {
+	state: SessionStateSnapshot = { isStreaming: false, steeringQueueDepth: 0, followupQueueDepth: 0 };
+	async getState(): Promise<SessionStateSnapshot> {
 		return this.state;
 	}
 	eventCursor(): number {
@@ -39,6 +39,12 @@ class FakeRpc implements HarnessRpc {
 let root: string;
 let owner: RuntimeOwner | null = null;
 let hungServer: net.Server | null = null;
+/**
+ * Server-side sockets of the degraded-owner fixture. `close()` only resolves
+ * once every accepted connection is gone, and a connection this fixture
+ * half-closed stays open after the peer goes away.
+ */
+const hungSockets = new Set<net.Socket>();
 let cliEnv: HarnessCliEnv;
 
 function seed(workspace: string): SessionState {
@@ -98,7 +104,7 @@ beforeEach(async () => {
 	owner = new RuntimeOwner({
 		root,
 		sessionId: SID,
-		rpc: new FakeRpc(),
+		transport: new FakeTransport(),
 		acceptanceTimeoutMs: 200,
 		finalizeChecks: passingFinalizeChecks,
 		validationCommands: [{ name: "test", command: "bun test" }],
@@ -109,6 +115,8 @@ beforeEach(async () => {
 afterEach(async () => {
 	cliEnv.cleanup();
 	await owner?.stop();
+	for (const socket of hungSockets) socket.destroy();
+	hungSockets.clear();
 	await new Promise<void>(resolve => hungServer?.close(() => resolve()) ?? resolve());
 	hungServer = null;
 	await rm(root, { recursive: true, force: true });
@@ -171,6 +179,7 @@ describe("gjc harness CLI -> live owner routing", () => {
 		owner = null;
 		const socketPath = controlSocketPath(root, SID);
 		hungServer = net.createServer(socket => {
+			hungSockets.add(socket);
 			socket.on("data", () => {});
 		});
 		await new Promise<void>((resolve, reject) => {
@@ -204,6 +213,7 @@ describe("gjc harness CLI -> live owner routing", () => {
 		owner = null;
 		const socketPath = controlSocketPath(root, SID);
 		hungServer = net.createServer(socket => {
+			hungSockets.add(socket);
 			socket.end("not-json\n");
 		});
 		await new Promise<void>((resolve, reject) => {

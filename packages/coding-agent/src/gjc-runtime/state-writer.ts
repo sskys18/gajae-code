@@ -50,7 +50,7 @@ export interface StateWriterReceiptContext {
 	skill: CanonicalGjcWorkflowSkill;
 	owner: WorkflowStateMutationOwner;
 	command: string;
-	sessionId?: string;
+	sessionId: string;
 	mutationId?: string;
 	nowIso?: string;
 	verb?: string;
@@ -99,20 +99,37 @@ export interface GuardedStateWriterOptions extends StateWriterOptions {
 }
 
 export type GuardedWriteResult =
-	| { path: string; written: true; revision: number }
+	| { path: string; written: true; revision: number; stamped: unknown }
 	| { path: string; written: false; reason: "stale-skip"; revision: number };
+
+export interface GuardedStateWriteReceipt {
+	path: string;
+	revision: number;
+	stamped: unknown;
+}
+
+export function guardedStateWriteReceipt(result: GuardedWriteResult): GuardedStateWriteReceipt | undefined {
+	return result.written ? { path: result.path, revision: result.revision, stamped: result.stamped } : undefined;
+}
 
 export interface StateWriterOptions {
 	cwd?: string;
 	receipt?: StateWriterReceiptContext;
 	audit?: StateWriterAuditContext;
 	sourceRevision?: number;
+	/** Advance a cache source revision under the target lock when the value carries none. */
+	advanceSourceRevision?: boolean;
 	/**
 	 * Cross-process lock tuning for read-modify-write paths that route through
 	 * `withWorkflowStateLock` / `updateJsonAtomic`. Omit for the hardened
 	 * `withFileLock` defaults.
 	 */
 	lock?: FileLockOptions;
+	/**
+	 * Caller already holds the workflow state lock for this target path (via
+	 * `withWorkflowStateLock`). Skip re-acquisition to avoid self-deadlock.
+	 */
+	lockHeld?: boolean;
 }
 
 export class StateWriteConflictError extends Error {
@@ -267,7 +284,7 @@ export function stampWorkflowEnvelopeChecksum<T>(value: T, filePath: string, com
 		content_sha256: {
 			algorithm: "sha256",
 			value: workflowEnvelopeContentSha256(envelope),
-			covered_path: filePath,
+			covered_path: path.resolve(filePath),
 			computed_at: computedAt,
 		},
 	};
@@ -302,6 +319,18 @@ function requireSessionId(sessionScope: string | ActiveSessionScope | undefined,
 
 function activeStateDir(cwd: string, sessionScope?: string | ActiveSessionScope): string {
 	return layoutActiveStateDir(cwd, requireSessionId(sessionScope, "activeStateDir"));
+}
+
+type ActiveStateCacheInvalidator = (cwd?: string, sessionId?: string) => void;
+var activeStateCacheInvalidator: ActiveStateCacheInvalidator | undefined;
+
+export function setActiveStateCacheInvalidator(invalidator: ActiveStateCacheInvalidator): void {
+	activeStateCacheInvalidator = invalidator;
+}
+
+function invalidateActiveStateCacheForScope(cwd: string, sessionScope?: string | ActiveSessionScope): void {
+	const sessionId = typeof sessionScope === "string" ? sessionScope : sessionScope?.sessionId;
+	activeStateCacheInvalidator?.(cwd, sessionId);
 }
 
 function activeSnapshotPath(cwd: string, sessionScope?: string | ActiveSessionScope): string {
@@ -425,6 +454,12 @@ function stampStateRevision(value: unknown, stateRevision: number, sourceRevisio
 		state_revision: stateRevision,
 	};
 }
+export function matchesGuardedStateWriteReceipt(current: unknown, receipt: GuardedStateWriteReceipt): boolean {
+	return (
+		persistedStateRevision(current) === receipt.revision &&
+		JSON.stringify(current) === JSON.stringify(receipt.stamped)
+	);
+}
 
 function withWorkflowReceipt(value: unknown, receipt: WorkflowStateReceipt | undefined): unknown {
 	if (!receipt || !value || typeof value !== "object" || Array.isArray(value)) return value;
@@ -511,11 +546,13 @@ async function writeGuardedResolvedJsonAtomic(
 				const next = stampStateRevision(withWorkflowReceipt(value, buildReceipt(options)), currentRevision + 1);
 				await atomicWrite(filePath, jsonText(next));
 				await maybeAudit(filePath, options);
-				return { path: filePath, written: true, revision: currentRevision + 1 };
+				return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
 			}
 
+			const valueSourceRevision = isPlainObject(value) ? persistedSourceRevision(value) : 0;
 			const incomingSourceRevision =
-				options.sourceRevision ?? (isPlainObject(value) ? persistedStateRevision(value) : 0);
+				options.sourceRevision ??
+				(valueSourceRevision || (options.advanceSourceRevision ? persistedSourceRevision(current) + 1 : 0));
 			if (current !== undefined && incomingSourceRevision <= persistedSourceRevision(current)) {
 				return { path: filePath, written: false, reason: "stale-skip", revision: currentRevision };
 			}
@@ -526,7 +563,7 @@ async function writeGuardedResolvedJsonAtomic(
 			);
 			await atomicWrite(filePath, jsonText(next));
 			await maybeAudit(filePath, options);
-			return { path: filePath, written: true, revision: currentRevision + 1 };
+			return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
 		},
 		options.lock,
 	);
@@ -547,46 +584,18 @@ export async function writeGuardedWorkflowEnvelopeAtomic(
 	options: GuardedStateWriterOptions,
 ): Promise<GuardedWriteResult> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	return lockResolvedWorkflowTarget(
-		filePath,
-		async () => {
-			const current = await readJsonIfPresentTolerant(filePath);
-			const currentRevision = persistedStateRevision(current);
-
-			if (options.policy === "source") {
-				if (options.expectedRevision !== undefined && options.expectedRevision !== currentRevision) {
-					throw new StateWriteConflictError(filePath, options.expectedRevision, currentRevision);
-				}
-				const next = stampWorkflowEnvelopeRevisionAndChecksum(
-					value,
-					filePath,
-					currentRevision + 1,
-					undefined,
-					options,
-				);
-				const parsed = RequiredOnWriteEnvelopeSchema.safeParse(next);
-				if (!parsed.success) {
-					throw new Error(
-						`Refusing to write invalid workflow state envelope to ${filePath}: ${parsed.error.issues
-							.map(issue => `${issue.path.join(".") || "<root>"}: ${issue.message}`)
-							.join("; ")}`,
-					);
-				}
-				await atomicWrite(filePath, jsonText(next));
-				await maybeAudit(filePath, options);
-				return { path: filePath, written: true, revision: currentRevision + 1 };
-			}
-
-			const incomingSourceRevision =
-				options.sourceRevision ?? (isPlainObject(value) ? persistedStateRevision(value) : 0);
-			if (current !== undefined && incomingSourceRevision <= persistedSourceRevision(current)) {
-				return { path: filePath, written: false, reason: "stale-skip", revision: currentRevision };
+	const write = async (): Promise<GuardedWriteResult> => {
+		const current = await readJsonIfPresentTolerant(filePath);
+		const currentRevision = persistedStateRevision(current);
+		if (options.policy === "source") {
+			if (options.expectedRevision !== undefined && options.expectedRevision !== currentRevision) {
+				throw new StateWriteConflictError(filePath, options.expectedRevision, currentRevision);
 			}
 			const next = stampWorkflowEnvelopeRevisionAndChecksum(
 				value,
 				filePath,
 				currentRevision + 1,
-				incomingSourceRevision,
+				undefined,
 				options,
 			);
 			const parsed = RequiredOnWriteEnvelopeSchema.safeParse(next);
@@ -599,10 +608,33 @@ export async function writeGuardedWorkflowEnvelopeAtomic(
 			}
 			await atomicWrite(filePath, jsonText(next));
 			await maybeAudit(filePath, options);
-			return { path: filePath, written: true, revision: currentRevision + 1 };
-		},
-		options.lock,
-	);
+			return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
+		}
+		const incomingSourceRevision =
+			options.sourceRevision ?? (isPlainObject(value) ? persistedStateRevision(value) : 0);
+		if (current !== undefined && incomingSourceRevision <= persistedSourceRevision(current)) {
+			return { path: filePath, written: false, reason: "stale-skip", revision: currentRevision };
+		}
+		const next = stampWorkflowEnvelopeRevisionAndChecksum(
+			value,
+			filePath,
+			currentRevision + 1,
+			incomingSourceRevision,
+			options,
+		);
+		const parsed = RequiredOnWriteEnvelopeSchema.safeParse(next);
+		if (!parsed.success) {
+			throw new Error(
+				`Refusing to write invalid workflow state envelope to ${filePath}: ${parsed.error.issues
+					.map(issue => `${issue.path.join(".") || "<root>"}: ${issue.message}`)
+					.join("; ")}`,
+			);
+		}
+		await atomicWrite(filePath, jsonText(next));
+		await maybeAudit(filePath, options);
+		return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
+	};
+	return options.lockHeld ? write() : lockResolvedWorkflowTarget(filePath, write, options.lock);
 }
 
 export async function writeJsonAtomic(
@@ -673,63 +705,71 @@ export async function writeWorkflowEnvelopeAtomic(
 	options?: StateWriterOptions,
 ): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	const withReceipt = withWorkflowReceipt(value, buildReceipt(options));
-	const stamped = stampWorkflowEnvelopeChecksum(withReceipt, filePath);
-	const parsed = RequiredOnWriteEnvelopeSchema.safeParse(stamped);
-	if (!parsed.success) {
-		throw new Error(
-			`Refusing to write invalid workflow state envelope to ${filePath}: ${parsed.error.issues
-				.map(issue => `${issue.path.join(".") || "<root>"}: ${issue.message}`)
-				.join("; ")}`,
-		);
-	}
-	// #658: internal runtime writers (ralplan/ultragoal/deep-interview/team) persist
-	// envelopes directly, bypassing the `gjc state` CLI transition gate (`isValidTransition`,
-	// historically the sole call site in state-runtime.ts). Re-assert that gate on every
-	// sanctioned envelope write so internal writes cannot persist invalid state-machine phase
-	// transitions silently. Forced writes (`gjc state ... --force`, reconcile repairs) carry
-	// `audit.forced` and bypass, mirroring the CLI's `use --force to bypass`.
-	//
-	// The gate governs ACTIVE workflow progression only. Deactivation/teardown writes
-	// (`active: false`, e.g. `gjc state clear`, which persists the universal `complete`
-	// sentinel that is not a per-skill manifest state) leave the transition graph and are
-	// intentionally exempt.
-	if (options?.audit?.forced !== true && parsed.data.active === true) {
-		const toPhase = parsed.data.current_phase.trim();
-		if (toPhase) {
-			// Lazy import: workflow-manifest dereferences CANONICAL_GJC_WORKFLOW_SKILLS at
-			// module load, and active-state -> state-writer -> workflow-manifest -> active-state
-			// is a load-time cycle. Importing at call time (after init) avoids the TDZ.
-			const { isKnownWorkflowState, isValidTransition } = await import("./workflow-manifest");
-			const skill = parsed.data.skill;
-			// Structural invariant (hard): a `current_phase` absent from the skill's manifest is
-			// never a legitimate internal write, matching the CLI/reconcile unknown-phase gate.
-			if (!isKnownWorkflowState(skill, toPhase)) {
-				throw new Error(
-					`Refusing to write unknown ${skill} phase "${toPhase}" to ${filePath}: not a known ${skill} manifest state (forced writes bypass via audit.forced)`,
-				);
-			}
-			// Transition invariant (#658, diagnostic-only safety net): resolve the prior phase
-			// (caller-supplied `audit.fromPhase`, else the active persisted envelope on disk) and
-			// flag edges the manifest does not define. Intentionally NON-blocking and audit-only
-			// — the CLI path already hard-fails invalid edges before reaching here, and legitimate
-			// internal repairs / ralplan short-mode stage skips move between valid states without a
-			// direct manifest edge. It records an `invalid_transition_detected` audit entry (no
-			// stderr) so such transitions are non-silent without breaking those flows.
-			const fromPhase = (options?.audit?.fromPhase ?? (await readPersistedPhase(filePath)))?.trim();
-			if (
-				fromPhase &&
-				fromPhase !== toPhase &&
-				isKnownWorkflowState(skill, fromPhase) &&
-				!isValidTransition(skill, fromPhase, toPhase)
-			) {
-				await recordInvalidWorkflowTransition({ filePath, skill, fromPhase, toPhase, options });
+	const write = async (): Promise<string> => {
+		const withReceipt = withWorkflowReceipt(value, buildReceipt(options));
+		const stamped = stampWorkflowEnvelopeChecksum(withReceipt, filePath);
+		const parsed = RequiredOnWriteEnvelopeSchema.safeParse(stamped);
+		if (!parsed.success) {
+			throw new Error(
+				`Refusing to write invalid workflow state envelope to ${filePath}: ${parsed.error.issues
+					.map(issue => `${issue.path.join(".") || "<root>"}: ${issue.message}`)
+					.join("; ")}`,
+			);
+		}
+		// #658: internal runtime writers (ralplan/ultragoal/deep-interview/team) persist
+		// envelopes directly, bypassing the `gjc state` CLI transition gate (`isValidTransition`,
+		// historically the sole call site in state-runtime.ts). Re-assert that gate on every
+		// sanctioned envelope write so internal writes cannot persist invalid state-machine phase
+		// transitions silently. Forced writes (`gjc state ... --force`, reconcile repairs) carry
+		// `audit.forced` and bypass, mirroring the CLI's `use --force to bypass`.
+		//
+		// The gate governs ACTIVE workflow progression only. Deactivation/teardown writes
+		// (`active: false`, e.g. `gjc state clear`, which persists the universal `complete`
+		// sentinel that is not a per-skill manifest state) leave the transition graph and are
+		// intentionally exempt.
+		if (options?.audit?.forced !== true && parsed.data.active === true) {
+			const toPhase = parsed.data.current_phase.trim();
+			if (toPhase) {
+				// Lazy import: workflow-manifest dereferences CANONICAL_GJC_WORKFLOW_SKILLS at
+				// module load, and active-state -> state-writer -> workflow-manifest -> active-state
+				// is a load-time cycle. Importing at call time (after init) avoids the TDZ.
+				const { isKnownWorkflowState, isValidTransition } = await import("./workflow-manifest");
+				const skill = parsed.data.skill;
+				// Structural invariant (hard): a `current_phase` absent from the skill's manifest is
+				// never a legitimate internal write, matching the CLI/reconcile unknown-phase gate.
+				if (!isKnownWorkflowState(skill, toPhase)) {
+					throw new Error(
+						`Refusing to write unknown ${skill} phase "${toPhase}" to ${filePath}: not a known ${skill} manifest state (forced writes bypass via audit.forced)`,
+					);
+				}
+				// Transition invariant (#658, diagnostic-only safety net): resolve the prior phase
+				// (caller-supplied `audit.fromPhase`, else the active persisted envelope on disk) and
+				// flag edges the manifest does not define. Intentionally NON-blocking and audit-only
+				// — the CLI path already hard-fails invalid edges before reaching here, and legitimate
+				// internal repairs / ralplan short-mode stage skips move between valid states without a
+				// direct manifest edge. It records an `invalid_transition_detected` audit entry (no
+				// stderr) so such transitions are non-silent without breaking those flows.
+				const fromPhase = (options?.audit?.fromPhase ?? (await readPersistedPhase(filePath)))?.trim();
+				if (
+					fromPhase &&
+					fromPhase !== toPhase &&
+					isKnownWorkflowState(skill, fromPhase) &&
+					!isValidTransition(skill, fromPhase, toPhase)
+				) {
+					await recordInvalidWorkflowTransition({ filePath, skill, fromPhase, toPhase, options });
+				}
 			}
 		}
-	}
-	await atomicWrite(filePath, jsonText(stamped));
-	await maybeAudit(filePath, options);
-	return filePath;
+		await atomicWrite(filePath, jsonText(stamped));
+		await maybeAudit(filePath, options);
+		return filePath;
+	};
+	// Serialize with every other writer of the same state path. Without this, a
+	// revision-preserving envelope write (seed/spec persistence) can interleave
+	// inside a staged apply's check-then-write window and be silently overwritten
+	// (#3387 architect finding 1). Callers already inside `withWorkflowStateLock`
+	// for this path pass `lockHeld: true`.
+	return options?.lockHeld ? write() : lockResolvedWorkflowTarget(filePath, write, options?.lock);
 }
 
 export async function writeTextAtomic(targetPath: string, text: string, options?: StateWriterOptions): Promise<string> {
@@ -940,12 +980,18 @@ export async function deleteIfOwned(
 	const options = typeof predicateOrOptions === "function" ? undefined : predicateOrOptions;
 	const predicate = typeof predicateOrOptions === "function" ? predicateOrOptions : predicateOrOptions?.predicate;
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	const current = await readJsonIfPresent(filePath);
-	if (current === undefined) return { path: filePath, deleted: false };
-	if (predicate && !(await predicate(current))) return { path: filePath, deleted: false };
-	const deleted = await atomicRemove(filePath);
-	if (deleted) await maybeAudit(filePath, options);
-	return { path: filePath, deleted };
+	return lockResolvedWorkflowTarget(
+		filePath,
+		async () => {
+			const current = await readJsonIfPresent(filePath);
+			if (current === undefined) return { path: filePath, deleted: false };
+			if (predicate && !(await predicate(current))) return { path: filePath, deleted: false };
+			const deleted = await atomicRemove(filePath);
+			if (deleted) await maybeAudit(filePath, options);
+			return { path: filePath, deleted };
+		},
+		options?.lock,
+	);
 }
 
 export async function removeFileAudited(targetPath: string, options?: StateWriterOptions): Promise<DeleteResult> {
@@ -967,19 +1013,19 @@ export async function writeActiveEntry(
 	skill: string,
 	entry: SkillActiveEntry,
 	options?: StateWriterOptions,
-): Promise<string> {
+): Promise<GuardedWriteResult> {
 	const filePath = activeEntryPath(path.resolve(cwd), sessionScope, skill);
-	await writeGuardedResolvedJsonAtomic(
+	const result = await writeGuardedResolvedJsonAtomic(
 		filePath,
 		{ ...entry, skill },
 		{
 			...options,
 			policy: "cache",
-			sourceRevision:
-				persistedSourceRevision(entry) || persistedSourceRevision(await readJsonIfPresent(filePath)) + 1,
+			advanceSourceRevision: true,
 		},
 	);
-	return filePath;
+	invalidateActiveStateCacheForScope(cwd, sessionScope);
+	return result;
 }
 
 export async function removeActiveEntry(
@@ -1003,6 +1049,7 @@ export async function removeActiveEntry(
 			}
 			const deleted = await atomicRemove(filePath);
 			if (deleted) await maybeAudit(filePath, options);
+			if (deleted) invalidateActiveStateCacheForScope(cwd, sessionScope);
 			return { path: filePath, deleted };
 		},
 		options?.lock,
@@ -1049,6 +1096,7 @@ export async function rebuildActiveSnapshot(
 			...entries.map(entry => persistedSourceRevision(entry)),
 		),
 	});
+	invalidateActiveStateCacheForScope(cwd, sessionScope);
 	return snapshotPath;
 }
 
@@ -1059,9 +1107,9 @@ export async function mergeActiveState(
 	entry: SkillActiveEntry,
 	options?: StateWriterOptions,
 ): Promise<ActiveEntryWriteResult> {
-	const entryPath = await writeActiveEntry(cwd, sessionScope, skill, entry, options);
+	const entryWrite = await writeActiveEntry(cwd, sessionScope, skill, entry, options);
 	const snapshotPath = await rebuildActiveSnapshot(cwd, sessionScope, options);
-	return { entryPath, snapshotPath };
+	return { entryPath: entryWrite.path, snapshotPath };
 }
 
 export async function writeArtifact(

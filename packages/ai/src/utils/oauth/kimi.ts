@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
-import { $env, getAgentDir, isEnoent } from "@gajae-code/utils";
+import { $pickCredentialEnv, getAgentDir, isEnoent, sanitizeHeaderComponent } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
 import type { OAuthController, OAuthCredentials } from "./types";
 
@@ -38,8 +38,23 @@ interface TokenResponse {
 	interval?: number;
 }
 
+/**
+ * OAuth host for the device flow, from trusted environment sources only.
+ *
+ * This host receives the device-authorization request, the authorization-code
+ * exchange, and the refresh call that carries the existing refresh token, so
+ * whatever can set it can collect the user's Kimi credentials. `$env` merges the
+ * caller's `cwd/.env`, so reading it there would let repository content redirect
+ * the login flow. Resolve it the same way the credentials themselves are:
+ * launching shell plus GJC/user-owned `.env` files, never the project `.env`.
+ */
 function resolveOAuthHost(): string {
-	return $env.KIMI_CODE_OAUTH_HOST || $env.KIMI_OAUTH_HOST || DEFAULT_OAUTH_HOST;
+	return $pickCredentialEnv("KIMI_CODE_OAUTH_HOST", "KIMI_OAUTH_HOST") || DEFAULT_OAUTH_HOST;
+}
+
+/** Test seam: the OAuth host as resolved from trusted env. */
+export function resolveKimiOAuthHostForTest(): string {
+	return resolveOAuthHost();
 }
 
 function formatDeviceModel(system: string, release: string, arch: string): string {
@@ -75,18 +90,24 @@ let getDeviceId = (): string => {
 	return deviceId;
 };
 
-export let getKimiCommonHeaders = () => {
-	const headers = Object.freeze({
+/** @internal Exported for tests. Builds unsanitized-input-safe Kimi common headers. */
+export function buildKimiCommonHeaders(): Readonly<Record<string, string>> {
+	return Object.freeze({
 		"User-Agent": `KimiCLI/${packageJson.version}`,
 		"X-Msh-Platform": "kimi_cli",
 		"X-Msh-Version": packageJson.version,
-		"X-Msh-Device-Name": os.hostname(),
-		"X-Msh-Device-Model": getDeviceModel(),
-		"X-Msh-Os-Version": os.version(),
+		"X-Msh-Device-Name": sanitizeHeaderComponent(os.hostname()),
+		"X-Msh-Device-Model": sanitizeHeaderComponent(getDeviceModel()),
+		"X-Msh-Os-Version": sanitizeHeaderComponent(os.version()),
 		"X-Msh-Device-Id": getDeviceId(),
 	});
-	getKimiCommonHeaders = () => headers;
-	return headers;
+}
+
+let memoizedKimiCommonHeaders: Readonly<Record<string, string>> | undefined;
+
+export const getKimiCommonHeaders = () => {
+	memoizedKimiCommonHeaders ??= buildKimiCommonHeaders();
+	return memoizedKimiCommonHeaders;
 };
 
 async function requestDeviceAuthorization(): Promise<{

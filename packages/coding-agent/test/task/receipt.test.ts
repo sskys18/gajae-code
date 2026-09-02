@@ -13,7 +13,13 @@ import {
 	type RawTaskToolDetails,
 	sanitizeTaskToolDetails,
 } from "../../src/task/receipt";
-import type { SingleResult, TaskToolDetails } from "../../src/task/types";
+import {
+	createLocalErrorSummary,
+	hasCompleteAggregateUsageCostBreakdown,
+	hasCompleteUsageCostBreakdown,
+	type SingleResult,
+	type TaskToolDetails,
+} from "../../src/task/types";
 
 const CANONICAL_USAGE = {
 	input: 1,
@@ -88,6 +94,7 @@ describe("task result receipts", () => {
 			sizeBytes: Buffer.byteLength(output),
 			lineCount: output.split("\n").length,
 			sha256,
+			durability: "session",
 		});
 		expect(receipt.outputUnavailable).toBeUndefined();
 		expect(receipt.review?.overallCorrectness).toBe("patch is correct");
@@ -102,6 +109,106 @@ describe("task result receipts", () => {
 			lowRoi: false,
 		});
 		expect(findRawTaskLeakKeys(receipt)).toEqual([]);
+	});
+
+	it("bounds child-controlled overall correctness in review receipts", () => {
+		const oversizedCorrectness = `${"safe ".repeat(40)}LEAK_SENTINEL_DO_NOT_DIGEST`;
+		const receipt = buildTaskReceipt(
+			makeRaw({
+				extractedToolData: {
+					yield: [{ data: { overall_correctness: oversizedCorrectness } }],
+					report_finding: [{ severity: "medium", summary: `${"finding ".repeat(40)}LEAK_SENTINEL_DO_NOT_DIGEST` }],
+				},
+			}),
+		);
+
+		expect(receipt.review?.overallCorrectness).toBe(oversizedCorrectness.slice(0, 200));
+		expect(receipt.review?.overallCorrectness).toHaveLength(200);
+		expect(receipt.review?.findings?.[0]?.summary).toHaveLength(200);
+		expect(JSON.stringify(receipt)).not.toContain("LEAK_SENTINEL_DO_NOT_DIGEST");
+		expect(findRawTaskLeakKeys(receipt)).toEqual([]);
+	});
+
+	it("normalizes hostile review finding severity and priority values", () => {
+		const hostileSeverity = `${"x".repeat(1000)}LEAK_SENTINEL_DO_NOT_DIGEST`;
+		const hostilePriority = `${"P".repeat(1000)}LEAK_SENTINEL_DO_NOT_DIGEST`;
+		const receipt = buildTaskReceipt(
+			makeRaw({
+				extractedToolData: {
+					report_finding: [
+						{ severity: hostileSeverity, summary: "short" },
+						{ priority: hostilePriority, summary: "short" },
+						{ severity: hostileSeverity, priority: "p2", summary: "short" },
+						{ priority: 1, summary: "short" },
+					],
+				},
+			}),
+		);
+
+		expect(receipt.review?.findings?.map(finding => finding.severity)).toEqual([undefined, undefined, "P2", "P1"]);
+		expect(JSON.stringify(receipt)).not.toContain("LEAK_SENTINEL_DO_NOT_DIGEST");
+		expect(JSON.stringify(receipt)).not.toContain("x".repeat(1000));
+		expect(JSON.stringify(receipt)).not.toContain("P".repeat(1000));
+		expect(findRawTaskLeakKeys(receipt)).toEqual([]);
+	});
+
+	it("exposes a canonical findings reference without leaking full findings", () => {
+		const receipt = buildTaskReceipt(
+			makeRaw({
+				reviewFindingsRef: {
+					uri: "artifact://7",
+					sizeBytes: 4096,
+					sha256: "a".repeat(64),
+					findingCount: 21,
+				},
+				extractedToolData: {
+					report_finding: Array.from({ length: 21 }, (_, index) => ({
+						priority: "P1",
+						title: `finding ${index}`,
+						body: `${"detail ".repeat(40)}${index === 20 ? "FULL-FINDING-TAIL-SENTINEL" : ""}`,
+						file_path: "/tmp/private/example.ts",
+					})),
+				},
+			}),
+		);
+
+		expect(receipt.review?.findingCount).toBe(21);
+		expect(receipt.review?.findings).toHaveLength(20);
+		expect(receipt.review?.findingsRef).toEqual({
+			uri: "artifact://7",
+			sizeBytes: 4096,
+			sha256: "a".repeat(64),
+			findingCount: 21,
+		});
+		expect(JSON.stringify(receipt)).not.toContain("FULL-FINDING-TAIL-SENTINEL");
+		expect(JSON.stringify(receipt)).not.toContain("/tmp/private");
+		expect(findRawTaskLeakKeys(receipt)).toEqual([]);
+	});
+
+	it("keeps review metadata visible when only the canonical reference remains", () => {
+		const receipt = buildTaskReceipt(
+			makeRaw({
+				reviewFindingsRef: {
+					uri: "artifact://8",
+					sizeBytes: 128,
+					sha256: "b".repeat(64),
+					findingCount: 2,
+				},
+			}),
+		);
+
+		expect(receipt.review).toEqual({
+			overallCorrectness: undefined,
+			findingCount: 2,
+			findings: undefined,
+			findingsRef: {
+				uri: "artifact://8",
+				sizeBytes: 128,
+				sha256: "b".repeat(64),
+				findingCount: 2,
+			},
+		});
+		expect(receipt.roi?.materialContribution).toBe(true);
 	});
 
 	it("buildTaskReceipt marks output unavailable when no artifact metadata is present", () => {
@@ -157,7 +264,7 @@ describe("task result receipts", () => {
 	it("sanitizeTaskToolDetails maps raw results to receipts and preserves usage", () => {
 		const raw = {
 			projectAgentsDir: null,
-			results: [makeRaw()],
+			results: [makeRaw({ fastMode: true })],
 			totalDurationMs: 10,
 			usage: CANONICAL_USAGE,
 			outputPaths: ["/tmp/LEAK_SENTINEL_DO_NOT_DIGEST/0-Test.md"],
@@ -165,6 +272,7 @@ describe("task result receipts", () => {
 		const sanitized = sanitizeTaskToolDetails(raw);
 		expect(sanitized.usage).toBe(CANONICAL_USAGE);
 		expect(sanitized.results[0]?.preview).toBe("Task completed; output artifact unavailable.");
+		expect(sanitized.results[0]?.fastMode).toBe(true);
 		expect(sanitized.roiSummary).toEqual({ childCount: 1, totalTokens: 20, lowRoiChildIds: [] });
 		expect(findRawTaskLeakKeys(sanitized)).toEqual([]);
 		expect("outputPaths" in sanitized).toBe(false);
@@ -176,6 +284,78 @@ describe("task result receipts", () => {
 		expect(receipt.usage?.output).toBe(2);
 		expect(findRawTaskLeakKeys(receipt)).toEqual([]);
 		expect(() => assertNoRawTaskFields(receipt, "receipt")).not.toThrow();
+	});
+
+	it("preserves explicit complete cost provenance through receipts and sanitized task details", () => {
+		const raw = makeRaw({ usage: CANONICAL_USAGE, usageCostBreakdownComplete: true });
+		const receipt = buildTaskReceipt(raw);
+		expect(receipt.usageCostBreakdownComplete).toBe(true);
+
+		const sanitized = sanitizeTaskToolDetails({
+			projectAgentsDir: null,
+			results: [raw],
+			totalDurationMs: 10,
+			usage: CANONICAL_USAGE,
+			usageCostBreakdownComplete: true,
+		});
+		expect(sanitized.results[0]?.usageCostBreakdownComplete).toBe(true);
+		expect(sanitized.usageCostBreakdownComplete).toBe(true);
+	});
+
+	it("authorizes aggregate provenance for all-complete zero-cost children", () => {
+		const children = [
+			makeRaw({ usage: CANONICAL_USAGE, usageCostBreakdownComplete: true }),
+			makeRaw({ index: 1, id: "1-Test", usage: CANONICAL_USAGE, usageCostBreakdownComplete: true }),
+		];
+
+		expect(hasCompleteAggregateUsageCostBreakdown(children)).toBe(true);
+	});
+
+	it("fails aggregate provenance for legacy or invalid usage contributors", () => {
+		const complete = makeRaw({ usage: CANONICAL_USAGE, usageCostBreakdownComplete: true });
+		const legacy = makeRaw({ index: 1, id: "1-Test", usage: CANONICAL_USAGE });
+		const invalid = makeRaw({
+			index: 2,
+			id: "2-Test",
+			usage: { ...CANONICAL_USAGE, cost: { ...CANONICAL_USAGE.cost, total: Number.NaN } },
+			usageCostBreakdownComplete: true,
+		});
+
+		expect(hasCompleteAggregateUsageCostBreakdown([complete, legacy])).toBe(false);
+		expect(hasCompleteAggregateUsageCostBreakdown([complete, invalid])).toBe(false);
+	});
+
+	it("rejects marked usage with an invalid cost contributor", () => {
+		const invalidUsage = {
+			...CANONICAL_USAGE,
+			cost: { ...CANONICAL_USAGE.cost, cacheWrite: -1 },
+		};
+		const raw = makeRaw({ usage: invalidUsage, usageCostBreakdownComplete: true });
+
+		expect(hasCompleteUsageCostBreakdown(raw.usage)).toBe(false);
+		expect(buildTaskReceipt(raw).usageCostBreakdownComplete).toBeUndefined();
+		expect(
+			sanitizeTaskToolDetails({
+				projectAgentsDir: null,
+				results: [raw],
+				totalDurationMs: 10,
+				usage: invalidUsage,
+				usageCostBreakdownComplete: true,
+			}).usageCostBreakdownComplete,
+		).toBeUndefined();
+	});
+
+	it("fails closed for absent or legacy cost provenance despite zero-filled canonical usage", () => {
+		const legacyRaw = makeRaw({ usage: CANONICAL_USAGE });
+		expect(buildTaskReceipt(legacyRaw).usageCostBreakdownComplete).toBeUndefined();
+
+		const sanitized = sanitizeTaskToolDetails({
+			projectAgentsDir: null,
+			results: [legacyRaw],
+			totalDurationMs: 10,
+			usage: CANONICAL_USAGE,
+		});
+		expect(sanitized.usageCostBreakdownComplete).toBeUndefined();
 	});
 
 	it("preserves numeric fork-context accounting on receipts and sanitized details", () => {
@@ -223,6 +403,158 @@ describe("task result receipts", () => {
 		expect(findRawTaskLeakKeys(receipt)).toEqual([]);
 	});
 
+	it("surfaces a local_buffer_overflow summary in the parent preview instead of the generic error text (#4618)", () => {
+		const structuredSummary = createLocalErrorSummary("local_buffer_overflow", "ignored message text", {
+			stage: "overflow.staged",
+			exceeded: "bytes",
+			stagedEventCount: 12,
+			stagedBytes: 0,
+			incomingEventBytes: 16_777_217,
+			maxStagedEvents: 10_000,
+			maxStagedBytes: 16 * 1024 * 1024,
+		});
+		const receipt = buildTaskReceipt(
+			makeRaw({
+				exitCode: 1,
+				error: "provider-ish error recorded",
+				localErrorSummary: { kind: "local_buffer_overflow", summary: structuredSummary.summary },
+			}),
+		);
+		expect(receipt.status).toBe("failed");
+		// The preview names the local kind and carries the actionable shape, so
+		// the parent session cannot misread this as a provider/context failure.
+		expect(receipt.preview).toBe(`Task failed; local failure (local_buffer_overflow): ${structuredSummary.summary}`);
+		expect(receipt.localErrorSummary).toMatchObject({ kind: "local_buffer_overflow" });
+		expect(receipt.errorSummary).toContain("overflow.staged");
+		expect(receipt.errorSummary).toContain("exceeded=bytes");
+		expect(receipt.errorSummary).toContain("not a provider or context-window failure");
+	});
+
+	it("redacts credentials and local paths inside a local error summary (#4618)", () => {
+		// The producer boundary sanitizes; buildTaskReceipt trusts the summary
+		// exactly as it trusts setupFailure summaries.
+		const summary = createLocalErrorSummary(
+			"local_snapshot_failure",
+			"boom Authorization: Bearer sk-ant-abcdefghijklmnopqrst1234 at /Users/veritas/.gjc/secrets.env",
+		);
+		expect(summary.kind).toBe("local_snapshot_failure");
+		expect(summary.summary).not.toContain("sk-ant-abcdefghijklmnopqrst1234");
+		expect(summary.summary).not.toContain("/Users/veritas");
+		const receipt = buildTaskReceipt(makeRaw({ exitCode: 1, error: "leak", localErrorSummary: summary }));
+		const serialized = JSON.stringify(receipt);
+		expect(serialized).not.toContain("sk-ant-abcdefghijklmnopqrst1234");
+		expect(serialized).not.toContain("/Users/veritas");
+		expect(receipt.localErrorSummary?.kind).toBe("local_snapshot_failure");
+		expect(receipt.preview).toContain("Task failed; local failure (local_snapshot_failure):");
+	});
+
+	it("degrades a foreign errorKind to the neutral local kind with a fixed sentence (#4618)", () => {
+		// A self-labeled kind cannot forward free-form message text either:
+		// the summary is the fixed neutral sentence, never child-controlled.
+		const summary = createLocalErrorSummary("<script>alert(1)</script>", "boom");
+		expect(summary.kind).toBe("local");
+		expect(summary.summary).toBe("Subagent failed with a local error.");
+	});
+
+	it("renders overflow summaries from the structured shape only and degrades shape-less overflow kinds (#4618)", () => {
+		const marker = "FORGED-CONTENT-must-not-be-forwarded";
+		// Shape present: summary built from numbers/vocabulary only.
+		const withShape = createLocalErrorSummary("local_buffer_overflow", `prefix ${marker} suffix`, {
+			stage: "overflow.preMeasure",
+			exceeded: "both",
+			// Internally consistent with the caps: projected events
+			// (10000 + 1) and projected bytes (16777000 + 4096) both cross.
+			stagedEventCount: 10_000,
+			stagedBytes: 16_777_000,
+			incomingEventBytes: 4096,
+			maxStagedEvents: 10_000,
+			maxStagedBytes: 16 * 1024 * 1024,
+		});
+		expect(withShape.summary).not.toContain(marker);
+		expect(withShape.summary).toContain("exceeded=both");
+		expect(withShape.summary).toContain("10000/10000 events");
+		expect(withShape.summary).toContain("16777000 staged bytes");
+		expect(withShape.summary).toContain("rejected event 4096 bytes");
+		expect(withShape.summary).toContain("projected 16781096/16777216 bytes");
+		// Shape absent: neutral sentence, no message forwarding.
+		const withoutShape = createLocalErrorSummary("local_buffer_overflow", `prefix ${marker} suffix`);
+		expect(withoutShape.summary).toBe("Local staging-buffer overflow; structured diagnostic unavailable.");
+	});
+
+	it("keeps the generic error preview when no local error summary is present (#4618 fallback isolation)", () => {
+		const receipt = buildTaskReceipt(makeRaw({ exitCode: 1, error: "provider exploded" }));
+		expect(receipt.preview).toBe("Task failed; error recorded.");
+		expect(receipt.localErrorSummary).toBeUndefined();
+		expect(receipt.errorSummary).toBe("Error recorded.");
+	});
+
+	it("exposes identity-bound isolated persistence and recovery outcomes", () => {
+		const applied = buildTaskReceipt(
+			makeRaw({
+				persistence: {
+					outcome: "applied",
+					ownerWorktreeApplied: true,
+					recoveryRef: {
+						uri: "local://subagents/0-Applied.patch",
+						sizeBytes: 64,
+						sha256: "b".repeat(64),
+						durability: "session",
+					},
+				},
+			}),
+		);
+		expect(applied.status).toBe("completed");
+		expect(applied.persistence).toMatchObject({ outcome: "applied", ownerWorktreeApplied: true });
+		expect(applied.preview).toContain("persisted to the owner worktree");
+		expect(applied.persistence?.recoveryRef?.uri).toBe("local://subagents/0-Applied.patch");
+
+		const recovery = buildTaskReceipt(
+			makeRaw({
+				recoveryRef: {
+					uri: "local://subagents/0-Recovery.patch",
+					sizeBytes: 128,
+					sha256: "a".repeat(64),
+					durability: "session",
+				},
+				persistence: {
+					outcome: "recovery_available",
+					ownerWorktreeApplied: false,
+					recoveryRef: {
+						uri: "local://subagents/0-Recovery.patch",
+						sizeBytes: 128,
+						sha256: "a".repeat(64),
+						durability: "session",
+					},
+				},
+			}),
+		);
+		expect(recovery.status).toBe("merge_failed");
+		expect(recovery.persistence?.recoveryRef?.uri).toBe("local://subagents/0-Recovery.patch");
+		expect(recovery.preview).toContain("changes were not persisted");
+		expect(recovery.preview).toContain("local://subagents/0-Recovery.patch");
+	});
+
+	it.each(["paused", "aborted"] as const)("keeps %s recovery identity in the public receipt", status => {
+		const ref = {
+			uri: `local://subagents/0-${status}.patch`,
+			sizeBytes: 96,
+			sha256: "d".repeat(64),
+			durability: "session" as const,
+		};
+		const receipt = buildTaskReceipt(
+			makeRaw({
+				...(status === "paused" ? { paused: true } : { aborted: true, abortReason: "test abort" }),
+				recoveryRef: ref,
+				persistence: { outcome: "recovery_available", ownerWorktreeApplied: false, recoveryRef: ref },
+			}),
+		);
+
+		expect(receipt.status).toBe(status);
+		expect(receipt.persistence?.recoveryRef?.uri).toBe(ref.uri);
+		expect(receipt.preview).toContain("changes were not persisted");
+		expect(receipt.preview).toContain(ref.uri);
+	});
+
 	it("renders task-summary with synopsis refs and without raw payloads or paths", () => {
 		const sentinel = "LEAK_SENTINEL_DO_NOT_DIGEST";
 		const receipt = buildTaskReceipt(
@@ -259,6 +591,27 @@ describe("task result receipts", () => {
 		expect(rendered).not.toContain("/tmp/");
 		expect(rendered).not.toContain("raw ");
 		expect(rendered).not.toContain("stderr");
+	});
+	it("preserves duplicate disposition in a receipt and converts failed scheduling to failure", () => {
+		const warned = buildTaskReceipt(
+			makeRaw({ id: "DuplicateWarned", duplicateDisposition: { action: "warned", predecessorIds: ["Earlier"] } }),
+		);
+		expect(warned.status).toBe("completed");
+		expect(warned.duplicateDisposition).toEqual({ action: "warned", predecessorIds: ["Earlier"] });
+
+		const failedSchedule = buildTaskReceipt(
+			makeRaw({
+				id: "DuplicateSupersedeFailed",
+				exitCode: 1,
+				output: "",
+				stderr: "duplicate_supersede_failed",
+				error: "duplicate_supersede_failed",
+				duplicateDisposition: { action: "superseded", predecessorIds: ["Earlier"] },
+			}),
+		);
+		expect(failedSchedule.status).toBe("failed");
+		expect(failedSchedule.errorSummary).toBe("Error recorded.");
+		expect(failedSchedule.duplicateDisposition).toEqual({ action: "superseded", predecessorIds: ["Earlier"] });
 	});
 });
 

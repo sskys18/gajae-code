@@ -1,61 +1,73 @@
-# Standalone GJC MCP support
+# Standalone MCP configuration
 
-This page answers the common user question: “Does normal `gjc` inherit my Claude Code/Codex MCP servers, or can I configure MCP servers directly for the standalone TUI?”
+`gjc mcp add` writes the definition supplied on that invocation to GJC's own MCP config (`~/.gjc/agent/mcp.json` by default, or `./.gjc/mcp.json` with `--project`). `gjc mcp list` and `gjc mcp remove` print redacted definitions with source scope and runtime status. Enabled registrations are consumed by ordinary standalone sessions at startup (conventional autoload).
 
-## Short answer
+## Conventional autoload
 
-Normal standalone GJC (`gjc`, `gjc --tmux`, and print-mode prompts) does **not** inherit MCP servers from Claude Code, Codex, Cursor, Gemini, Windsurf, or other tools as a public startup contract.
+Ordinary top-level standalone sessions (`gjc`, `gjc --tmux`, print/text/json modes) discover and connect MCP servers from GJC's own native config scopes only:
 
-Standalone GJC also has a narrow direct-registration command for explicit user-provided server definitions:
+| Source | Scope | Notes |
+| --- | --- | --- |
+| `.gjc/mcp.json`, `.gjc/.mcp.json` | project | Native GJC config; written by `gjc mcp add --project`. |
+| `~/.gjc/agent/mcp.json`, `~/.gjc/agent/.mcp.json` | user | Native GJC config; written by `gjc mcp add`. |
+
+User scope is the agent directory, not a fixed home path: an agent-directory profile (`GJC_CODING_AGENT_DIR`, an SDK session's `agentDir`) moves discovery, `gjc mcp add`, and the `disabledServers` denylist together, so a profile always autoloads its own registrations and never the default profile's.
+
+Precedence per server name is deterministic: the native project scope wins over the native user scope on a name collision. Plugin-bundle MCP servers (from installed GJC plugins) override conventional servers with the same name; they are a validated, always-on product surface.
+
+Claude Code and Codex MCP files (project `.claude/mcp.json` / `.claude/.mcp.json`, `.codex/config.toml` `[mcp_servers.*]`, and their user-global counterparts) are **import sources, not runtime authorities**: sessions never load them at startup. A bounded compatibility layer normalizes them into the same internal MCP contract, and an explicit import transaction writes the normalized definitions into the chosen `.gjc` scope (the `/extensions` import surface). `~/.claude`, `~/.codex`, and other foreign user-home configs are never read.
+
+### Which servers load
+
+A server is loaded at startup when all of the following hold:
+
+- the server is not marked `enabled: false`;
+- the server name is not in the `disabledServers` list of either native config scope (`<agent dir>/mcp.json` or `./.gjc/mcp.json`);
+- the server is not marked `autoload: false` (autoload defaults to true; `autoload: false` keeps a server configured for on-demand `/mcp` connection);
+- project-scope servers load by default; setting `mcp.enableProjectConfig` explicitly to `false` in settings disables every project-scope source for that environment.
+
+Malformed or unparseable definitions are skipped fail-closed: they are never partially loaded, a warning is emitted, and the session continues with the remaining valid servers. A server that fails to connect reports an error entry and the session continues.
+
+### Opt out
+
+Pass `--no-mcp` to skip conventional autoload for one session (plugin-bundle MCPs and exact-file `--mcp-config` remain governed by their own surfaces). `--no-mcp` and `--mcp-config` are mutually exclusive.
+
+### Subagents and lifecycle
+
+Top-level sessions own their MCP manager and clean up server processes on session end. Subagents inherit the parent session's manager facade: they never spawn duplicate server processes and never take ownership of cleanup.
+
+## Use an explicit config
+
+A caller can opt one top-level standalone session into one trusted config file instead of conventional autoload:
 
 ```bash
-gjc mcp add context7 npx -y @upstash/context7-mcp
-gjc mcp add docs --type http --url https://example.test/mcp --header Authorization="Bearer $TOKEN"
-gjc mcp list
-gjc mcp remove context7
+gjc --mcp-config /absolute/path/to/mcp.json
 ```
 
-`gjc mcp add` writes only the definition supplied on that invocation to GJC's own MCP config (`~/.gjc/agent/mcp.json` by default, or `./.gjc/mcp.json` with `--project`). It does not read Claude Code, Codex, OpenCode, Cursor, Gemini, Windsurf, or other live configs. `gjc mcp list` and `gjc mcp remove` print redacted definitions so env/header/auth/OAuth credential values are not exposed in public output.
+The path must be absolute and identify a regular file directly; symbolic links and other indirection are rejected. GJC reads the file through one open handle and rejects it if the path, file identity, size, or modification metadata changes during the read. Exact-file mode **replaces** conventional autoload: it exposes only that file's MCP tools and does not overlay `.gjc/mcp.json` registrations from either scope. GJC owns the server processes for that session. It does not load server prompts, resources, instructions, sampling, or other config files. Expected read, parse, validation, and connection failures emit one sanitized warning and continue. Unexpected errors and final-catalog tool-name collisions clean up and abort startup.
 
-## What is supported today
+There is no MCP config reload while the session runs except `/mcp reload` in sessions without plugin-bundle MCP servers, and no subagent inheritance of exact-file tools beyond the parent session's exposed catalog.
+
+## Supported integrations
 
 | Need | Use | Notes |
 | --- | --- | --- |
-| External bot or multi-session controller wants to drive GJC | [Coordinator MCP](./hermes-mcp-bridge.md) via `gjc mcp-serve coordinator` | GJC exposes an **outward** MCP server with GJC coordinator tools. This is not a way to import arbitrary MCP tools into the standalone TUI. |
-| Editor/ACP client owns MCP servers and wants GJC as the agent backend | [ACP mode](./external-control-readiness.md#acp-mode) via `gjc --mode acp` or `gjc acp` | The ACP client supplies and owns MCP servers. GJC keeps those client-owned MCP tools isolated from standalone on-disk discovery. |
-| Host application already manages MCP servers and policies | [RPC host tools](./rpc.md#host-tool-sub-protocol) via `gjc --mode rpc` | Convert the selected MCP capabilities into host-owned RPC tools. The host executes the MCP call and returns `host_tool_result`. |
-| OpenClaw/Hermes-style host wants to map its own MCP/skills into GJC | [OpenClaw / Hermes RPC integration notes](./openclaw-hermes-rpc-integration.md) | Treat MCP as a host implementation detail and expose only policy-approved capabilities as RPC host tools. |
-| Codex / Claude Code want a one-step install to delegate planning/execution to GJC | [Canonical gajae-code plugin](./hermes-mcp-bridge.md) under `plugins/` via `gjc setup claude` / `gjc setup codex` | Installs the Coordinator MCP server plus `gjc_delegate_plan/execute/team` commands. Fail-closed: workdir-scoped roots, mutations off until opt-in. Install with `codex plugin marketplace add ./plugins` (verified on Codex CLI 0.139.0) or `/plugin marketplace add ./plugins` for Claude Code. |
+| Register servers for every standalone session | `gjc mcp add <name> ...` | Conventional autoload in user scope; `--project` scopes to the current project. |
+| Trust one MCP config for one standalone session | `gjc --mcp-config /absolute/path/to/mcp.json` | Exact-file, top-level, tools-only opt-in; GJC owns cleanup; replaces autoload. |
+| Disable conventional autoload for one session | `gjc --no-mcp` | Skips native `.gjc` user/project discovery; plugin-bundle and exact-file surfaces are unaffected. |
+| External bot or multi-session controller | [Coordinator MCP](./hermes-mcp-bridge.md) | Coordinator MCP exposes GJC lifecycle and coordination tools. |
+| External session control | [SDK session CLI](./sdk-session-cli.md) or a managed adapter | Broker-bound controls and opaque Router attachments; no direct endpoint transport. |
+| Editor/ACP client owns MCP servers | ACP via `gjc --mode acp` or `gjc acp` | ACP remains a stdio editor protocol. |
+| Codex / Claude Code delegation plugin | [Canonical gajae-code plugin](./hermes-mcp-bridge.md) | Installs Coordinator MCP plus GJC delegation commands. |
 
-## What standalone GJC does not do
+## Boundary
 
-Standalone GJC does **not** currently promise any of these behaviors:
+Standalone GJC does not inherit user-home MCP configurations from Claude Code, Codex, OpenCode, or other tools (`~/.claude`, `~/.codex`, and similar user-global configs are never read). MCP servers often carry credentials, filesystem reach, browser state, approval semantics, and lifecycle that belong to the configuring host. Claude/Codex MCP files are normalized only through the bounded compatibility layer on explicit import, and the only MCP config read from the user's home directory at session startup is GJC's own `~/.gjc/agent/mcp.json` (or the active agent directory when a profile overrides it).
 
-- reading Claude Code's global MCP server list and automatically enabling it;
-- reading Codex MCP server config as an inherited runtime contract;
-- merging multiple tools' MCP configs into the normal TUI at startup;
-- making `.mcp.json`, `mcp.json`, `.codex/config.toml`, or other discovered files a stable public standalone-TUI config API;
-- exposing Coordinator MCP tools as ordinary in-session model tools.
-
-This boundary is intentional: MCP servers often carry credentials, local filesystem reach, browser/session state, approval semantics, and tool names that belong to the host that configured them. Blind inheritance would mix policies between products and make it unclear which process owns credentials, approvals, sandboxing, and lifecycle.
-
-## Recommended workaround for a specific MCP server
-
-If you need a context engine, internal search server, browser MCP, database MCP, or another custom MCP inside GJC:
-
-1. Keep the MCP server configured in the host that owns its credentials and policy.
-2. Start GJC through RPC (`gjc --mode rpc`) from that host.
-3. Register a narrow host-owned tool with `set_host_tools` / `RpcClient#setCustomTools()`.
-4. Have the host tool call the real MCP server and return the result to GJC as `host_tool_result`.
-
-That shape keeps the MCP server's auth, approvals, filesystem access, and process lifetime with the host while still letting the GJC model request the capability when needed.
-
-For multi-session orchestration, prefer Coordinator MCP instead. Coordinator MCP lets an external controller start/register sessions, send turns, answer questions, read artifacts, and write durable status reports; it does not import arbitrary MCP servers into a standalone TUI session.
+`--mode rpc`, `--mode rpc-ui`, `--mode bridge`, and `gjc sdk serve` have been removed. Do not use the former RPC host-tool protocol to connect an MCP server; use Coordinator MCP, the [SDK session CLI](./sdk-session-cli.md), or a managed adapter for supported external control.
 
 ## Related docs
 
+- [SDK machine interfaces](./sdk.md)
 - [Coordinator MCP bridge](./hermes-mcp-bridge.md)
 - [External control surface readiness](./external-control-readiness.md)
-- [RPC Protocol Reference](./rpc.md)
-- [OpenClaw / Hermes RPC integration notes](./openclaw-hermes-rpc-integration.md)
-- [Clawhip-routed GJC sessions](./gjc-session-clawhip-routing.md)

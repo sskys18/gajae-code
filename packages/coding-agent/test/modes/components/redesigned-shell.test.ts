@@ -13,9 +13,45 @@ import { resolveWelcomeLogoMode } from "@gajae-code/coding-agent/modes/interacti
 import { getEditorTheme, initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { type TUI, visibleWidth } from "@gajae-code/tui";
-import { StatusLineComponent } from "../../../src/modes/components/status-line";
+import { StatusLineComponent } from "../../../src/modes/components/tool-status-header";
 
-function createFooterSession(): AgentSession {
+interface FooterUsageStatistics {
+	readonly input: number;
+	readonly output: number;
+	readonly cacheRead: number;
+	readonly cacheWrite: number;
+	readonly premiumRequests: number;
+	readonly cost: number;
+}
+
+const DEFAULT_FOOTER_USAGE: FooterUsageStatistics = {
+	input: 1234,
+	output: 567,
+	cacheRead: 89,
+	cacheWrite: 12,
+	premiumRequests: 0,
+	cost: 0.123,
+};
+
+function createFooterSession(
+	usageStatistics: FooterUsageStatistics = DEFAULT_FOOTER_USAGE,
+	getEntries: () => readonly unknown[] = () => [
+		{
+			type: "message",
+			message: {
+				role: "assistant",
+				usage: {
+					input: 1234,
+					output: 567,
+					cacheRead: 89,
+					cacheWrite: 12,
+					cost: { total: 0.123 },
+					premiumRequests: 0,
+				},
+			},
+		},
+	],
+): AgentSession {
 	return {
 		state: {
 			messages: [],
@@ -24,32 +60,15 @@ function createFooterSession(): AgentSession {
 		sessionManager: {
 			getSessionName: () => "forge-session",
 			getSessionId: () => "session-123456",
-			getUsageStatistics: () => ({
-				input: 1234,
-				output: 567,
-				cacheRead: 89,
-				cacheWrite: 12,
-				premiumRequests: 0,
-				cost: 0.123,
-			}),
-			getEntries: () => [
-				{
-					type: "message",
-					message: {
-						role: "assistant",
-						usage: {
-							input: 1234,
-							output: 567,
-							cacheRead: 89,
-							cacheWrite: 12,
-							cost: { total: 0.123 },
-							premiumRequests: 0,
-						},
-					},
-				},
-			],
+			getUsageStatistics: () => usageStatistics,
+			getEntries,
 		},
-		getContextUsage: () => ({ contextWindow: 200_000, percent: 42.5 }),
+		getContextUsage: () => ({
+			tokens: 85_000,
+			contextWindow: 200_000,
+			percent: 42.5,
+			source: "provider_anchor" as const,
+		}),
 		getGoalModeState: () => undefined,
 		getAsyncJobSnapshot: () => ({ running: [] }),
 		isFastModeActive: () => false,
@@ -131,7 +150,7 @@ describe("redesigned interactive shell chrome", () => {
 		const lines = component.render(54);
 		const rendered = Bun.stripANSI(lines.join("\n"));
 
-		expect(rendered).toContain("Gajae forge");
+		expect(rendered).toContain("GJC Forge");
 		expect(rendered).toContain("╭────────────────╮        ╭────────╮");
 		expect(rendered).toContain("╰────────────────╯        ╰────────╯");
 		expect(rendered).not.toContain("●");
@@ -147,10 +166,10 @@ describe("redesigned interactive shell chrome", () => {
 		const narrowTop = Bun.stripANSI(narrowLines[0] ?? "");
 		const wideTop = Bun.stripANSI(wideLines[0] ?? "");
 
-		expect(visibleWidth(narrowTop)).toBe(98);
-		expect(visibleWidth(wideTop)).toBe(158);
+		expect(visibleWidth(narrowTop)).toBe(100);
+		expect(visibleWidth(wideTop)).toBe(160);
 		expect(visibleWidth(wideTop)).toBeGreaterThan(visibleWidth(narrowTop));
-		expect(wideTop).toContain("GJC forge");
+		expect(wideTop).toContain("GJC Forge");
 		for (const line of wideLines) {
 			expect(visibleWidth(line)).toBeLessThanOrEqual(160);
 		}
@@ -219,6 +238,7 @@ describe("redesigned interactive shell chrome", () => {
 
 		expect(statusRendered).toContain("very-long-model-name-for-footer-budget");
 		expect(statusRendered).toContain("forge-session");
+		expect(statusRendered).toMatch(/very-long-model-name-for-footer-budget[^\n]*\d+(\.\d+)?%/);
 		expect(editorRendered).toContain("› draft");
 		expect(editorRendered).not.toContain("very-long-model-name-for-footer-budget");
 		expect(editorRendered).not.toContain("╭");
@@ -278,6 +298,35 @@ describe("redesigned interactive shell chrome", () => {
 		}
 	});
 
+	it("renders cumulative parent and task usage in the legacy footer exactly once", () => {
+		const footer = new FooterComponent(
+			createFooterSession({
+				input: 4000,
+				output: 6000,
+				cacheRead: 8000,
+				cacheWrite: 10_000,
+				premiumRequests: 3,
+				cost: 4,
+			}),
+		);
+		const rendered = Bun.stripANSI(footer.render(160).join("\n"));
+
+		expect(rendered).toContain("↑4K ↓6K R8K W10K");
+		expect(rendered).toContain("$4.000 ★ 3");
+		expect(rendered.match(/\$4\.000/g)).toHaveLength(1);
+	});
+
+	it("uses the session usage aggregate without rescanning legacy task entries", () => {
+		const footer = new FooterComponent(
+			createFooterSession(DEFAULT_FOOTER_USAGE, () => {
+				throw new Error("Footer must not rescan persisted entries");
+			}),
+		);
+		const rendered = Bun.stripANSI(footer.render(160).join("\n"));
+
+		expect(rendered).toContain("↑1.2K ↓567 R89 W12 $0.123");
+	});
+
 	it("keeps public status presets on the GJC identity", () => {
 		for (const [name, preset] of Object.entries(STATUS_LINE_PRESETS)) {
 			expect(preset.leftSegments, name).not.toContain("pi");
@@ -289,13 +338,7 @@ describe("redesigned interactive shell chrome", () => {
 
 	it("keeps the default status preset dense and pulse-forward", () => {
 		expect(STATUS_LINE_PRESETS.default.leftSegments).toEqual(["model", "mode", "git", "pr", "path"]);
-		expect(STATUS_LINE_PRESETS.default.rightSegments).toEqual([
-			"session_name",
-			"jobs",
-			"token_rate",
-			"context_pct",
-			"cost",
-		]);
+		expect(STATUS_LINE_PRESETS.default.rightSegments).toEqual(["session_name", "jobs", "token_rate", "cost"]);
 		expect(STATUS_LINE_PRESETS.default.segmentOptions?.path?.maxLength).toBe(32);
 	});
 
@@ -306,7 +349,6 @@ describe("redesigned interactive shell chrome", () => {
 			"jobs",
 			"token_rate",
 			"usage",
-			"context_pct",
 			"cost",
 		]);
 		expect(STATUS_LINE_PRESETS["default-usage"].segmentOptions).toEqual(STATUS_LINE_PRESETS.default.segmentOptions);

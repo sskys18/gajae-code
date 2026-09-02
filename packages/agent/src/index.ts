@@ -7,13 +7,17 @@ export * from "./append-only-context";
 // Compaction
 export * from "./compaction";
 export * from "./harmony-leak";
+export * from "./image-placeholder-guard";
 // Proxy utilities
 export * from "./proxy";
 // Run-level telemetry collector + aggregators
 export * from "./run-collector";
+export * from "./run-resource-ledger";
 // Telemetry
 export * from "./telemetry";
 // Thinking selectors
 export * from "./thinking";
+// Dispatch-bound tool identity (non-serializable side channel keyed by event object)
+export * from "./tool-dispatch-identity";
 // Types
 export * from "./types";

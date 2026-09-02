@@ -6,6 +6,11 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { scheduler } from "node:timers/promises";
 import { extractHttpStatusFromError, fetchWithRetry, readSseJson } from "@gajae-code/utils";
+import {
+	isProviderSafetyStopAdapterInvocation,
+	mintProviderSafetyStop,
+	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+} from "../adapter-internals/provider-safety-stop";
 import { calculateCost } from "../models";
 import type {
 	Api,
@@ -20,6 +25,7 @@ import type {
 } from "../types";
 import { normalizeSystemPrompts } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
+import { transportFailureFacts } from "../utils/fallback-transport";
 import { appendRawHttpRequestDumpFor400, type RawHttpRequestDump, withHttpStatus } from "../utils/http-inspector";
 import { resolveRetryBudget } from "../utils/retry-budget";
 // Refresh is the sole responsibility of AuthStorage (broker-aware, single-flighted);
@@ -40,6 +46,9 @@ import {
 	convertMessages,
 	convertTools,
 	type GoogleThinkingLevel,
+	getGooglePromptBlockReason,
+	isGoogleCandidateSafetyStopReason,
+	isGooglePromptSafetyStopReason,
 	isThinkingPart,
 	mapStopReasonString,
 	mapToolChoice,
@@ -124,6 +133,22 @@ function extractErrorMessage(errorText: string): string {
 		// Not JSON, return as-is
 	}
 	return errorText;
+}
+
+function createGeminiCliHttpError(response: Response, errorText: string, formatErrorMessage = true): Error {
+	const message = formatErrorMessage ? extractErrorMessage(errorText) : errorText;
+	const error = withHttpStatus(
+		new Error(`Cloud Code Assist API error (${response.status}): ${message}`),
+		response.status,
+	) as Error & { code?: string; headers?: Headers };
+	error.headers = response.headers;
+	try {
+		const code = (JSON.parse(errorText) as { error?: { code?: unknown } }).error?.code;
+		if (typeof code === "string") error.code = code;
+	} catch {
+		// The response body is not JSON.
+	}
+	return error;
 }
 
 interface GeminiCliApiKeyPayload {
@@ -255,6 +280,9 @@ interface CloudCodeAssistResponseChunk {
 			};
 			finishReason?: string;
 		}>;
+		promptFeedback?: {
+			blockReason?: string;
+		};
 		usageMetadata?: {
 			promptTokenCount?: number;
 			candidatesTokenCount?: number;
@@ -326,7 +354,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 			const endpoints = baseUrl ? [baseUrl] : isAntigravity ? ANTIGRAVITY_ENDPOINT_FALLBACKS : [DEFAULT_ENDPOINT];
 
 			let requestBody = buildRequest(model, context, projectId, options, isAntigravity);
-			const replacementPayload = await options?.onPayload?.(requestBody, model);
+			const replacementPayload = await options?.onPayload?.(requestBody, model, options?.attemptScope);
 			if (replacementPayload !== undefined) {
 				requestBody = replacementPayload as typeof requestBody;
 			}
@@ -358,6 +386,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				options?.toolChoice !== undefined &&
 				options.toolChoice !== "auto" &&
 				options.toolChoice !== "none";
+			options.onStreamCreated?.();
 			let response = await fetchWithRetry(
 				attempt => `${endpoints[Math.min(attempt, endpoints.length - 1)]}/v1internal:streamGenerateContent?alt=sse`,
 				{
@@ -373,11 +402,13 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 			);
 			if (!response.ok && sentForcedToolChoice) {
 				const errorText = await response.text();
-				const error = withHttpStatus(
-					new Error(`Cloud Code Assist API error (${response.status}): ${extractErrorMessage(errorText)}`),
-					response.status,
-				);
-				if (firstTokenTime === undefined && isForcedToolChoiceUnsupportedError(error, true)) {
+				const error = createGeminiCliHttpError(response, errorText);
+				if (
+					!options?.fallbackManaged &&
+					!options?.disableProviderRetries &&
+					firstTokenTime === undefined &&
+					isForcedToolChoiceUnsupportedError(error, true)
+				) {
 					const beforeMark = resolveToolChoice(model, options?.toolChoice);
 					markToolChoiceIncapability(model, "auto", error.message);
 					stream.push({
@@ -396,6 +427,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					};
 					requestBodyJson = JSON.stringify(requestBody);
 					rawRequestDump = { ...rawRequestDump, body: requestBody };
+					options.onStreamCreated?.();
 					response = await fetchWithRetry(
 						attempt =>
 							`${endpoints[Math.min(attempt, endpoints.length - 1)]}/v1internal:streamGenerateContent?alt=sse`,
@@ -416,10 +448,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 			}
 			if (!response.ok) {
 				const errorText = await response.text();
-				throw withHttpStatus(
-					new Error(`Cloud Code Assist API error (${response.status}): ${extractErrorMessage(errorText)}`),
-					response.status,
-				);
+				throw createGeminiCliHttpError(response, errorText);
 			}
 			const requestUrl = response.url;
 
@@ -454,6 +483,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				}
 
 				let hasContent = false;
+				let providerSafetyStop = false;
 				let currentBlock: TextContent | ThinkingContent | null = null;
 				const blocks = output.content;
 				const blockIndex = () => blocks.length - 1;
@@ -461,7 +491,12 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				for await (const chunk of readSseJson<CloudCodeAssistResponseChunk>(
 					activeResponse.body!,
 					options?.signal,
-					event => options?.onSseEvent?.({ event: event.event, data: event.data, raw: [...event.raw] }, model),
+					event =>
+						options?.onSseEvent?.(
+							{ event: event.event, data: event.data, raw: [...event.raw] },
+							model,
+							options?.attemptScope,
+						),
 				)) {
 					const responseData = chunk.response;
 					if (!responseData) continue;
@@ -537,9 +572,43 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					}
 
 					if (candidate?.finishReason) {
-						output.stopReason = mapStopReasonString(candidate.finishReason);
-						if (output.content.some(b => b.type === "toolCall")) {
-							output.stopReason = "toolUse";
+						if (isGoogleCandidateSafetyStopReason(candidate.finishReason)) {
+							providerSafetyStop = true;
+							hasContent = true;
+							// Adapter-minted terminal authority from the parsed
+							// structured finish reason (#4777).
+							mintProviderSafetyStop(
+								output,
+								candidate.finishReason,
+								PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+								options?.fetch,
+								isProviderSafetyStopAdapterInvocation(options),
+							);
+							output.stopReason = "error";
+						} else if (!providerSafetyStop) {
+							output.stopReason = mapStopReasonString(candidate.finishReason);
+							if (output.stopReason === "stop" && output.content.some(b => b.type === "toolCall")) {
+								output.stopReason = "toolUse";
+							}
+						}
+					}
+
+					const blockReason = getGooglePromptBlockReason(responseData.promptFeedback);
+					if (blockReason) {
+						hasContent = true;
+						if (isGooglePromptSafetyStopReason(blockReason)) {
+							providerSafetyStop = true;
+							// Prompt-level block reason: adapter-minted authority (#4777).
+							mintProviderSafetyStop(
+								output,
+								blockReason,
+								PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+								options?.fetch,
+								isProviderSafetyStopAdapterInvocation(options),
+							);
+							output.stopReason = "error";
+						} else if (!providerSafetyStop) {
+							output.stopReason = "error";
 						}
 					}
 
@@ -605,10 +674,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 
 					if (!currentResponse.ok) {
 						const retryErrorText = await currentResponse.text();
-						throw withHttpStatus(
-							new Error(`Cloud Code Assist API error (${currentResponse.status}): ${retryErrorText}`),
-							currentResponse.status,
-						);
+						throw createGeminiCliHttpError(currentResponse, retryErrorText, false);
 					}
 				}
 
@@ -647,6 +713,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(error);
+			output.transportFailure = transportFailureFacts(error);
 			output.errorMessage = await appendRawHttpRequestDumpFor400(
 				error instanceof Error ? error.message : JSON.stringify(error),
 				error,

@@ -2,7 +2,11 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
-import { SessionManager, type SessionMessageEntry } from "@gajae-code/coding-agent/session/session-manager";
+import {
+	CURRENT_SESSION_VERSION,
+	SessionManager,
+	type SessionMessageEntry,
+} from "@gajae-code/coding-agent/session/session-manager";
 import { getBlobsDir, TempDir } from "@gajae-code/utils";
 
 function isAssistantSessionEntry(entry: unknown): entry is SessionMessageEntry & { message: AssistantMessage } {
@@ -60,6 +64,42 @@ describe("SessionManager signature persistence", () => {
 		expect(assistant.content[0]).toMatchObject({ type: "thinking", thinking: "reasoning", thinkingSignature: "" });
 		expect(assistant.content[1]).toMatchObject({ type: "text", text: "done", textSignature: "" });
 		expect(assistant.content[2]).toMatchObject({ type: "toolCall", id: "tool_1", thoughtSignature: "" });
+	});
+
+	it("round-trips provider safety-stop classification across session reopen", async () => {
+		using tempDir = TempDir.createSync("@pi-session-provider-safety-stop-");
+		const session = SessionManager.create(tempDir.path(), tempDir.path());
+
+		session.appendMessage({ role: "user", content: "blocked request", timestamp: 1 });
+		session.appendMessage({
+			role: "assistant",
+			content: [],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorKind: "provider_safety_stop",
+			errorMessage: "Refusal (safety): Policy violation",
+			timestamp: 2,
+		} satisfies AssistantMessage);
+		await session.flush();
+
+		const reloaded = await SessionManager.open(session.getSessionFile()!);
+		const assistant = getAssistantMessage(reloaded);
+		expect(assistant).toMatchObject({
+			stopReason: "error",
+			errorKind: "provider_safety_stop",
+			errorMessage: "Refusal (safety): Policy violation",
+		});
+		await reloaded.close();
 	});
 
 	it("externalizes provider image data URLs and restores preserved history payloads across reload", async () => {
@@ -133,8 +173,9 @@ describe("SessionManager signature persistence", () => {
 		});
 	});
 
-	it("rehydrates assistant replay metadata in memory without rewriting the session file", async () => {
+	it("rehydrates assistant replay metadata with an append-only patch", async () => {
 		using tempDir = TempDir.createSync("@pi-session-rehydrate-persistence-");
+		const thinking = "reasoning".repeat(200);
 		const session = SessionManager.create(tempDir.path(), tempDir.path());
 		const providerPayload = {
 			type: "openaiResponsesHistory" as const,
@@ -155,7 +196,7 @@ describe("SessionManager signature persistence", () => {
 		session.appendMessage({
 			role: "assistant",
 			content: [
-				{ type: "thinking", thinking: "reasoning", thinkingSignature: JSON.stringify(providerPayload.items[0]) },
+				{ type: "thinking", thinking, thinkingSignature: JSON.stringify(providerPayload.items[0]) },
 				{ type: "text", text: "done" },
 			],
 			api: "openai-responses",
@@ -178,22 +219,30 @@ describe("SessionManager signature persistence", () => {
 		const sessionFile = session.getSessionFile();
 		if (!sessionFile) throw new Error("Expected persisted session file");
 		const persistedBefore = await fs.readFile(sessionFile, "utf8");
-		const initialMtimeMs = (await fs.stat(sessionFile)).mtimeMs;
+		expect(JSON.parse(persistedBefore.split("\n", 1)[0]!).version).toBe(CURRENT_SESSION_VERSION);
 		await session.close();
 
 		const reloaded = await SessionManager.open(sessionFile);
 		const assistant = getAssistantMessage(reloaded);
 
-		// After rehydration, assistant providerPayload must be stripped to prevent
-		// stale native history replay on warmed sessions.
 		expect(assistant.providerPayload).toBeUndefined();
 		expect(assistant.content[0]).toMatchObject({
 			type: "thinking",
-			thinking: "reasoning",
+			thinking,
 			thinkingSignature: undefined,
 		});
-		expect(await fs.readFile(sessionFile, "utf8")).toBe(persistedBefore);
-		expect((await fs.stat(sessionFile)).mtimeMs).toBe(initialMtimeMs);
+		const persistedAfter = await fs.readFile(sessionFile, "utf8");
+		expect(persistedAfter.startsWith(persistedBefore)).toBe(true);
+		const patch = JSON.parse(persistedAfter.slice(persistedBefore.length));
+		expect(persistedAfter.slice(persistedBefore.length)).toEndWith("\n");
+		expect(patch).toMatchObject({ type: "entry_patch" });
+		expect(patch.patch.message).not.toHaveProperty("providerPayload");
+		expect(patch.patch.message.content[0]).not.toHaveProperty("thinkingSignature");
+		expect(patch.patch.message.content[0]).toMatchObject({ type: "thinking", thinking });
 		await reloaded.close();
+		await reloaded.close();
+		const reopened = await SessionManager.open(sessionFile);
+		expect(getAssistantMessage(reopened).content[0]).toMatchObject({ type: "thinking", thinking });
+		await reopened.close();
 	});
 });

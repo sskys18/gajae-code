@@ -27,11 +27,69 @@ const enum ToolCallStatus {
  * - Injects synthetic "aborted" tool results
  * - Adds a <turn-aborted> guidance marker for the model
  */
+/**
+ * Detect directly adjacent private thinking blocks inside one assistant message's
+ * content. `thinking` and `redacted_thinking` are one adjacency class: the
+ * Anthropic wire contract rejects a replayed assistant turn where two such blocks
+ * sit next to each other with no intervening `tool_use`/`text` block (#4416).
+ *
+ * This is a pure, allocation-free predicate used by defense-in-depth diagnostics
+ * (issue #4443): the write-time transcript assertion (coding-agent persistence)
+ * and the stream-assembler SSE diagnostic (anthropic stream completion). It never
+ * inspects block payloads — only the block-type sequence — so it cannot leak
+ * thinking text, signatures, or credentials.
+ *
+ * Blocks separated by any non-private block (`tool_use`, `text`, …) are ordinary
+ * interleaved-thinking shape and return `false`.
+ */
+export function hasAdjacentPrivateThinkingBlocks(content: { type: string }[]): boolean {
+	let previousWasPrivate = false;
+	for (const block of content) {
+		const isPrivate = block.type === "thinking" || block.type === "redactedThinking";
+		if (isPrivate && previousWasPrivate) return true;
+		previousWasPrivate = isPrivate;
+	}
+	return false;
+}
+
+/**
+ * Collapse a run of directly adjacent `thinking` blocks inside one assistant message down
+ * to its first block.
+ *
+ * Anthropic accepts a replayed assistant turn carrying a single thinking block, and accepts
+ * thinking blocks separated by a `tool_use` (ordinary interleaved-thinking shape), but
+ * rejects two directly adjacent `thinking` blocks with
+ * `messages.N.content.M: thinking or redacted_thinking blocks in the latest assistant
+ * message cannot be modified`, citing the *second* block of the pair. Because the offending
+ * message keeps its index as history grows, a single such turn makes every later request in
+ * that session fail, and the mutation repair - scoped to the latest assistant message -
+ * can never reach it (#4416).
+ *
+ * `redactedThinking` is not folded in this phase, but the final send-boundary
+ * collapse in `convertAnthropicMessages` (#4425) treats `thinking` and
+ * `redacted_thinking` as one adjacency class per the API contract.
+ */
+function collapseAdjacentThinking<T extends { type: string }>(content: T[]): T[] {
+	let previousWasThinking = false;
+	let dropped = false;
+	const collapsed: T[] = [];
+	for (const block of content) {
+		const thinking = block.type === "thinking";
+		if (thinking && previousWasThinking) {
+			dropped = true;
+			continue;
+		}
+		previousWasThinking = thinking;
+		collapsed.push(block);
+	}
+	return dropped ? collapsed : content;
+}
+
 export function transformMessages<TApi extends Api>(
 	messages: Message[],
 	model: Model<TApi>,
 	normalizeToolCallId?: (id: string, model: Model<TApi>, source: AssistantMessage) => string,
-	options?: { repairLatestAssistantThinking?: boolean },
+	options?: { repairLatestAssistantThinking?: boolean; repairAllAssistantThinking?: boolean },
 ): Message[] {
 	// Build a map of original tool call IDs to normalized IDs
 	const toolCallIdMap = new Map<string, string>();
@@ -73,20 +131,40 @@ export function transformMessages<TApi extends Api>(
 			// are kept so the second pass can either preserve real results or synthesize
 			// an explicit aborted result without leaving dangling tool_use blocks.
 			const hasPartialThinking = assistantMsg.stopReason === "aborted" || assistantMsg.stopReason === "error";
-			const dropLatestAssistantThinking =
-				options?.repairLatestAssistantThinking === true &&
-				index === latestAssistantIndex &&
+			// One-shot Anthropic replay repair. `repairLatestAssistantThinking` targets the
+			// "latest assistant message ... cannot be modified" 400; `repairAllAssistantThinking`
+			// targets the "Invalid `signature` in `thinking` block" 400, which can cite a block
+			// anywhere in the replayed history (e.g. after compaction/pruning rewrote an earlier
+			// turn), so the drop must apply to every assistant message. Within each
+			// message only blocks that would replay as native thinking/redacted_thinking
+			// are dropped; cross-model reasoning degrades to text and is preserved.
+			const dropAssistantThinkingForRepair =
+				(options?.repairAllAssistantThinking === true ||
+					(options?.repairLatestAssistantThinking === true && index === latestAssistantIndex)) &&
 				model.api === "anthropic-messages" &&
 				assistantMsg.api === "anthropic-messages";
 
 			const transformedContent = assistantMsg.content.flatMap(block => {
 				if (block.type === "thinking") {
-					if (hasPartialThinking || dropLatestAssistantThinking) return [];
+					if (hasPartialThinking) return [];
 					const sanitized = block;
+					// Repair must only drop blocks that would otherwise replay as native
+					// thinking. Cross-model/provider reasoning degrades to unsigned text
+					// below and was never replayed as a signed block, so it cannot be the
+					// signature failure — dropping it would silently lose valid context.
+					const replaysAsNativeThinking = mustPreserveLatestAnthropicThinking || isSameModel;
+					if (dropAssistantThinkingForRepair && replaysAsNativeThinking) return [];
 					if (mustPreserveLatestAnthropicThinking) return sanitized;
 					// For same model: keep thinking blocks with signatures (needed for replay)
-					// even if the thinking text is empty (OpenAI encrypted reasoning)
-					if (isSameModel && sanitized.thinkingSignature) return sanitized;
+					// even if the thinking text is empty — but only for non-Anthropic APIs where
+					// the signature represents OpenAI encrypted reasoning. For anthropic-messages,
+					// a signed block with empty text means clear_thinking_20251015 stripped the
+					// content server-side while the stale signature remained; replaying it
+					// produces `thinking ... cannot be modified` 400s on every turn (#4247).
+					if (isSameModel && sanitized.thinkingSignature) {
+						if (sanitized.thinking.trim() === "" && model.api === "anthropic-messages") return [];
+						return sanitized;
+					}
 					// Skip empty thinking blocks, convert others to plain text
 					if (!sanitized.thinking || sanitized.thinking.trim() === "") return [];
 					if (isSameModel) return sanitized;
@@ -97,7 +175,13 @@ export function transformMessages<TApi extends Api>(
 				}
 
 				if (block.type === "redactedThinking") {
-					if (hasPartialThinking || dropLatestAssistantThinking) return [];
+					if (hasPartialThinking) return [];
+					// Same restriction as thinking blocks: cross-model/provider redacted
+					// blocks already drop below, so repair only needs to cover blocks that
+					// would replay as native redacted_thinking.
+					if (dropAssistantThinkingForRepair && (mustPreserveLatestAnthropicThinking || isSameModel)) {
+						return [];
+					}
 					if (mustPreserveLatestAnthropicThinking) return block;
 					if (isSameModel) return block;
 					return [];
@@ -134,9 +218,14 @@ export function transformMessages<TApi extends Api>(
 				return block;
 			});
 
+			// Only the Anthropic wire shape rejects adjacent private blocks; other targets
+			// either degrade reasoning to text above or carry their own encoding rules.
+			const replayableContent =
+				model.api === "anthropic-messages" ? collapseAdjacentThinking(transformedContent) : transformedContent;
+
 			return {
 				...assistantMsg,
-				content: transformedContent,
+				content: replayableContent,
 			};
 		}
 		return msg;

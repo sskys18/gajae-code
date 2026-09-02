@@ -6,7 +6,7 @@
  */
 import type { AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import type { CompactionResult } from "@gajae-code/agent-core/compaction";
-import type { Model, Static, TSchema } from "@gajae-code/ai";
+import type { Model, Static, TSchema } from "@gajae-code/ai/core";
 import type { Component } from "@gajae-code/tui";
 import type { Rule } from "../../capability/rule";
 import type { ModelRegistry } from "../../config/model-registry";
@@ -47,7 +47,7 @@ export interface CustomToolAPI {
 	exec(command: string, args: string[], options?: ExecOptions): Promise<ExecResult>;
 	/** UI methods for user interaction (select, confirm, input, notify, custom) */
 	ui: CustomToolUIContext;
-	/** Whether UI is available (false in print/RPC mode) */
+	/** Whether an interactive UI is available */
 	hasUI: boolean;
 	/** File logger for error/warning/debug messages */
 	logger: typeof import("@gajae-code/utils").logger;
@@ -70,6 +70,8 @@ export interface CustomToolContext {
 	sessionManager: ReadonlySessionManager;
 	/** Model registry - use for API key resolution and model retrieval */
 	modelRegistry: ModelRegistry;
+	/** Credential-selection identity for provider authentication. */
+	credentialSessionId?: string;
 	/** Current model (may be undefined if no model is selected yet) */
 	model: Model | undefined;
 	/** Whether the agent is idle (not streaming) */
@@ -78,7 +80,7 @@ export interface CustomToolContext {
 	hasQueuedMessages(): boolean;
 	/** Abort the current agent operation (fire-and-forget, does not wait) */
 	abort(): void;
-	/** Settings instance for the current session. Prefer over the global singleton. */
+	/** Settings-compatible, read-only session facade. Mutating or secret accessors are blocked at runtime. */
 	settings?: Settings;
 }
 

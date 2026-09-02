@@ -1,5 +1,5 @@
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import type { ImageContent } from "@gajae-code/ai";
+import type { ImageContent } from "@gajae-code/ai/core";
 import type { Component } from "@gajae-code/tui";
 import { Markdown, Text } from "@gajae-code/tui";
 import { prompt } from "@gajae-code/utils";
@@ -183,8 +183,7 @@ function timeoutSecondsFromMs(timeoutMs: number): number {
 }
 
 async function resolveBackend(session: ToolSession, language: EvalLanguage): Promise<ResolvedBackend> {
-	const allowPy = (session.settings.get("eval.py") as boolean | undefined) ?? true;
-	const allowJs = (session.settings.get("eval.js") as boolean | undefined) ?? true;
+	const { python: allowPy, js: allowJs } = resolveEvalBackends(session);
 
 	if (language === "python") {
 		if (!allowPy) throw new ToolError("Python backend is disabled (eval.py = false).");

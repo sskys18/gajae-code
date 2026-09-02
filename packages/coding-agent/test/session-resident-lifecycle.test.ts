@@ -1,21 +1,99 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { exportSessionToHtml } from "@gajae-code/coding-agent/export/html";
 import { SessionManager, type SessionMessageEntry } from "@gajae-code/coding-agent/session/session-manager";
+import * as native from "@gajae-code/natives";
+import { getAgentDir, getResidentCacheRootDir, setAgentDir } from "@gajae-code/utils";
 
+const originalAgentDir = getAgentDir();
+const originalAgentDirOverride = process.env.GJC_CODING_AGENT_DIR;
 const tempDirs: string[] = [];
+beforeEach(() => {
+	setAgentDir(path.join(tempRoot(), "agent"));
+});
 afterEach(async () => {
-	for (const dir of tempDirs.splice(0)) await fs.promises.rm(dir, { recursive: true, force: true });
 	vi.restoreAllMocks();
+	setAgentDir(originalAgentDir);
+	if (originalAgentDirOverride === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+	else process.env.GJC_CODING_AGENT_DIR = originalAgentDirOverride;
+	for (const dir of tempDirs.splice(0)) await fs.promises.rm(dir, { recursive: true, force: true });
 });
 
 function tempRoot(prefix = "gjc-resident-life-"): string {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 	tempDirs.push(dir);
 	return dir;
+}
+
+function failedNativeRename(): native.NativeNoReplaceResult {
+	return {
+		ok: false,
+		code: "io_error",
+		mutationState: "not_committed",
+		durabilityState: "not_attempted",
+		reason: "io_failure",
+		primitive: "unknown",
+		phase: "rename",
+		diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+	};
+}
+function installVerifiedNativeCleanup(): void {
+	vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+		const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
+		if (
+			identity.parentDev === undefined ||
+			identity.parentIno === undefined ||
+			parent.dev !== identity.parentDev ||
+			parent.ino !== identity.parentIno
+		)
+			throw new Error("resident cleanup parent authority mismatch");
+		const stat = fs.lstatSync(pathname, { bigint: true });
+		if (
+			stat.dev !== identity.dev ||
+			stat.ino !== identity.ino ||
+			stat.nlink !== identity.nlink ||
+			stat.size !== identity.size ||
+			stat.mtimeNs !== identity.mtimeNs
+		)
+			throw new Error("resident cleanup file identity mismatch");
+		if (identity.sha256) {
+			const digest = createHash("sha256").update(fs.readFileSync(pathname)).digest("hex");
+			if (digest !== identity.sha256) throw new Error("resident cleanup file digest mismatch");
+		}
+		if (identity.directory && identity.quarantineName) {
+			const detachedPath = path.join(path.dirname(pathname), identity.quarantineName);
+			fs.renameSync(pathname, detachedPath);
+			return { ok: true, detachedPath };
+		}
+		fs.rmSync(pathname, { force: true });
+		return { ok: true };
+	});
+	vi.spyOn(native, "exactRemoveDirectoryTree").mockImplementation((pathname, snapshot, parentIdentity) => {
+		const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
+		if (!parentIdentity) throw new Error("resident tree cleanup parent authority missing");
+		if (parent.dev !== parentIdentity.dev || parent.ino !== parentIdentity.ino)
+			throw new Error("resident tree cleanup parent authority mismatch");
+		const current = native.snapshotDirectoryTree(pathname);
+		if (!current.ok || !current.snapshot || current.snapshot.entries.length !== snapshot.entries.length)
+			throw new Error("resident tree cleanup snapshot mismatch");
+		const expected = new Map(snapshot.entries.map(entry => [entry.relativePath, entry]));
+		for (const entry of current.snapshot.entries) {
+			const authorized = expected.get(entry.relativePath);
+			if (!authorized) throw new Error("resident tree cleanup snapshot mismatch");
+			if (entry.relativePath === "") {
+				if (entry.kind !== "directory" || entry.dev !== authorized.dev || entry.ino !== authorized.ino)
+					throw new Error("resident tree cleanup root identity mismatch");
+			} else if (JSON.stringify(entry) !== JSON.stringify(authorized)) {
+				throw new Error("resident tree cleanup child identity mismatch");
+			}
+		}
+		fs.rmSync(pathname, { recursive: true, force: true });
+		return { ok: true };
+	});
 }
 
 function assistant(text: string): AssistantMessage {
@@ -50,17 +128,24 @@ function firstAssistant(sm: SessionManager): SessionMessageEntry {
 	return entry;
 }
 
-function residentCacheRoot(sm: SessionManager): string {
-	const artifactsDir = sm.getArtifactsDir();
-	if (!artifactsDir) throw new Error("Expected artifacts dir");
-	return path.join(artifactsDir, "resident-cache");
+function residentCacheRoot(): string {
+	return getResidentCacheRootDir(getAgentDir());
 }
 
-function activeResidentCacheDir(sm: SessionManager): string {
-	const root = residentCacheRoot(sm);
-	const dirs = fs.existsSync(root) ? fs.readdirSync(root).filter(name => name.startsWith(sm.getSessionId())) : [];
-	if (dirs.length !== 1) throw new Error(`Expected one active resident cache dir, got ${dirs.length}`);
-	return path.join(root, dirs[0]!);
+function residentCacheDirs(): string[] {
+	const root = residentCacheRoot();
+	return fs.existsSync(root)
+		? fs
+				.readdirSync(root)
+				.map(name => path.join(root, name))
+				.filter(dir => path.basename(dir).startsWith("i-") && fs.statSync(dir).isDirectory())
+		: [];
+}
+
+function residentTextCacheDir(sm: SessionManager): string {
+	const dir = sm.residentTextCacheDirForTests();
+	if (!dir) throw new Error("Expected a directory-backed resident text cache");
+	return dir;
 }
 
 async function makeLargeSession(
@@ -75,7 +160,7 @@ async function makeLargeSession(
 	const sessionFile = sm.getSessionFile();
 	const artifactsDir = sm.getArtifactsDir();
 	if (!sessionFile || !artifactsDir) throw new Error("Expected persisted paths");
-	return { sm, root, sessionFile, artifactsDir, cacheDir: activeResidentCacheDir(sm) };
+	return { sm, root, sessionFile, artifactsDir, cacheDir: residentTextCacheDir(sm) };
 }
 
 describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", () => {
@@ -100,26 +185,50 @@ describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", 
 	});
 
 	it("cleans resident cache on session deletion, session-file switch, and close", async () => {
-		const { sm, sessionFile, cacheDir } = await makeLargeSession(`cleanup one ${"c".repeat(2048)}`);
-		expect(fs.existsSync(cacheDir)).toBe(true);
-
 		const second = await makeLargeSession(`cleanup two ${"d".repeat(2048)}`);
 		await second.sm.close();
+		const { sm, sessionFile, cacheDir } = await makeLargeSession(`cleanup one ${"c".repeat(2048)}`);
+		expect(fs.existsSync(cacheDir)).toBe(true);
 		const switchCacheDir = cacheDir;
 		await sm.setSessionFile(second.sessionFile);
 		expect(fs.existsSync(switchCacheDir)).toBe(false);
 		expect(JSON.stringify(sm.getEntries())).toContain("cleanup two");
-		const activeCacheDir = activeResidentCacheDir(sm);
+		const activeCacheDir = residentTextCacheDir(sm);
 		expect(fs.existsSync(activeCacheDir)).toBe(true);
 		await sm.close();
 		expect(fs.existsSync(activeCacheDir)).toBe(false);
 
 		const deletion = await makeLargeSession(`delete cleanup ${"e".repeat(2048)}`);
 		expect(fs.existsSync(deletion.cacheDir)).toBe(true);
+		const foreignSessionFile = path.join(path.dirname(deletion.sessionFile), "foreign.jsonl");
+		const foreignArtifactsDir = foreignSessionFile.slice(0, -6);
+		fs.writeFileSync(foreignSessionFile, "foreign transcript");
+		fs.mkdirSync(foreignArtifactsDir);
+		fs.writeFileSync(path.join(foreignArtifactsDir, "foreign.txt"), "foreign artifact");
+		await deletion.sm.setSessionFile(sessionFile);
+		expect(fs.existsSync(deletion.cacheDir)).toBe(false);
+		installVerifiedNativeCleanup();
 		await deletion.sm.dropSession(deletion.sessionFile);
 		expect(fs.existsSync(deletion.artifactsDir)).toBe(false);
 		expect(fs.existsSync(deletion.cacheDir)).toBe(false);
+		expect(fs.existsSync(deletion.sessionFile)).toBe(false);
+		expect(fs.existsSync(foreignSessionFile)).toBe(true);
+		expect(fs.existsSync(foreignArtifactsDir)).toBe(true);
+		expect(fs.existsSync(path.join(foreignArtifactsDir, "foreign.txt"))).toBe(true);
 		expect(fs.existsSync(sessionFile)).toBe(true);
+	});
+
+	it("completes managed deletion with descriptor-bound final cleanup authority", async () => {
+		const survivor = await makeLargeSession(`pending delete survivor ${"v".repeat(2048)}`);
+		await survivor.sm.close();
+		const deletion = await makeLargeSession(`pending delete cleanup ${"n".repeat(2048)}`);
+		await deletion.sm.setSessionFile(survivor.sessionFile);
+
+		await expect(deletion.sm.dropSession(deletion.sessionFile)).resolves.toBeUndefined();
+		expect(fs.existsSync(deletion.sessionFile)).toBe(false);
+		expect(fs.existsSync(deletion.artifactsDir)).toBe(false);
+		expect(fs.existsSync(deletion.cacheDir)).toBe(false);
+		expect(fs.existsSync(survivor.sessionFile)).toBe(true);
 	});
 
 	it("fork re-externalizes resident text into an independent cache and keeps both managers readable", async () => {
@@ -129,36 +238,42 @@ describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", 
 		if (!forked) throw new Error("Expected fork result");
 		expect(forked.oldSessionFile).toBe(oldSessionFile);
 		expect(forked.newSessionFile).not.toBe(oldSessionFile);
-		const newCacheRoot = path.join(sm.getArtifactsDir()!, "resident-cache");
-		const newCacheDirs = fs.readdirSync(newCacheRoot).filter(name => name.startsWith(sm.getSessionId()));
-		expect(newCacheDirs).toHaveLength(1);
-		expect(path.join(newCacheRoot, newCacheDirs[0]!)).not.toBe(oldCacheDir);
+		const forkCacheDir = residentTextCacheDir(sm);
+		expect(forkCacheDir).not.toBe(oldCacheDir);
 		expect(JSON.stringify(sm.getEntries())).toContain(sentinel);
 		expect(JSON.stringify(sm.buildSessionContext())).toContain(sentinel);
 
 		const oldManager = await SessionManager.open(oldSessionFile);
 		expect(JSON.stringify(oldManager.getEntries())).toContain(sentinel);
+		const cacheDirs = residentCacheDirs();
+		const oldManagerCacheDir = residentTextCacheDir(oldManager);
+		expect(oldManagerCacheDir).not.toBe(forkCacheDir);
+		expect(cacheDirs).toContain(forkCacheDir);
+		expect(cacheDirs).toContain(oldManagerCacheDir);
 		await oldManager.close();
 		await sm.close();
 	});
 
 	it("moveTo materializes before cache reset and rewrites JSONL from the new resident store", async () => {
 		const sentinel = `move resident ${"m".repeat(2048)}`;
-		const { sm, sessionFile } = await makeLargeSession(sentinel);
+		const { sm, sessionFile, cacheDir } = await makeLargeSession(sentinel);
 		const newRoot = tempRoot("gjc-resident-moved-");
 		await sm.moveTo(newRoot);
 		const movedFile = sm.getSessionFile();
 		if (!movedFile) throw new Error("Expected moved session file");
-		const movedCacheRoot = path.join(path.dirname(movedFile), path.basename(sessionFile, ".jsonl"), "resident-cache");
 		expect(movedFile).not.toBe(sessionFile);
 		expect(JSON.stringify(sm.getEntries())).toContain(sentinel);
 		expect(JSON.stringify(sm.buildSessionContext())).toContain(sentinel);
 		expect(await readPersistedJsonl(movedFile)).toContain(sentinel.slice(0, 100));
 		expect(await readPersistedJsonl(movedFile)).not.toContain("__gjcResidentBlob");
 		expect(await readPersistedJsonl(movedFile)).not.toContain("blob:sha256:");
-		const movedCacheDirs = fs.readdirSync(movedCacheRoot).filter(name => name.startsWith(sm.getSessionId()));
-		expect(movedCacheDirs).toHaveLength(1);
+		const movedCacheDir = residentTextCacheDir(sm);
+		expect(movedCacheDir).not.toBe(cacheDir);
+		// The superseded text store must not survive the move, even though the
+		// managed sidecar cache keeps its own instance dir under the same root.
+		expect(residentCacheDirs()).not.toContain(cacheDir);
 		await sm.close();
+		expect(residentCacheDirs()).toEqual([]);
 	});
 
 	it("restoreState re-owns resident text before resetting the resident store", async () => {
@@ -181,17 +296,16 @@ describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", 
 		await sm.close();
 	});
 
-	it("keeps live resident text readable when moveTo session-file rename fails", async () => {
-		const sentinel = `failed session rename ${"r".repeat(2048)}`;
+	it("keeps live resident text readable when moveTo session-file publication fails", async () => {
+		const sentinel = `failed session publication ${"r".repeat(2048)}`;
 		const { sm, root, sessionFile } = await makeLargeSession(sentinel);
 		const newRoot = tempRoot("gjc-resident-failed-move-");
-		const realRename = fs.promises.rename.bind(fs.promises);
-		vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
-			if (String(source) === sessionFile) throw new Error("simulated session rename failure");
-			return realRename(source, target);
-		});
+		const realRename = native.renameNoReplacePath;
+		vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, target) =>
+			String(source) === sessionFile ? failedNativeRename() : realRename(source, target),
+		);
 
-		await expect(sm.moveTo(newRoot)).rejects.toThrow("simulated session rename failure");
+		await expect(sm.moveTo(newRoot)).rejects.toThrow("Atomic session rename failed: io_error");
 		expect(sm.getCwd()).toBe(root);
 		expect(sm.getSessionFile()).toBe(sessionFile);
 		expect(fs.existsSync(sessionFile)).toBe(true);
@@ -202,18 +316,19 @@ describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", 
 		await sm.close();
 	});
 
-	it("keeps live resident text readable when moveTo artifact rename fails after session rollback", async () => {
-		const sentinel = `failed artifact rename ${"a".repeat(2048)}`;
+	it("keeps live resident text readable when artifact publication fails after session rollback", async () => {
+		const sentinel = `failed artifact publication ${"a".repeat(2048)}`;
 		const { sm, root, sessionFile } = await makeLargeSession(sentinel);
 		const oldArtifactDir = sessionFile.slice(0, -6);
+		fs.mkdirSync(oldArtifactDir, { recursive: true });
+		fs.writeFileSync(path.join(oldArtifactDir, "fixture.txt"), "artifact");
 		const newRoot = tempRoot("gjc-resident-failed-artifact-move-");
-		const realRename = fs.promises.rename.bind(fs.promises);
-		vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
-			if (String(source) === oldArtifactDir) throw new Error("simulated artifact rename failure");
-			return realRename(source, target);
-		});
+		const realRename = native.renameNoReplacePath;
+		vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, target) =>
+			String(source) === oldArtifactDir ? failedNativeRename() : realRename(source, target),
+		);
 
-		await expect(sm.moveTo(newRoot)).rejects.toThrow("simulated artifact rename failure");
+		await expect(sm.moveTo(newRoot)).rejects.toThrow("Atomic session rename failed: io_error");
 		expect(sm.getCwd()).toBe(root);
 		expect(sm.getSessionFile()).toBe(sessionFile);
 		expect(fs.existsSync(sessionFile)).toBe(true);

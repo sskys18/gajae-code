@@ -1,13 +1,13 @@
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@gajae-code/agent-core";
-import { FileType, glob } from "@gajae-code/natives";
+import type { FileType as FileTypeEnum, glob as globFn } from "@gajae-code/natives";
 import {
 	CONFIG_DIR_NAME,
 	getConfigDirName,
 	getPluginsDir,
 	getProjectDir,
+	getTrustedHomeDir,
 	logger,
 	parseFrontmatter,
 	tryParseJson,
@@ -20,7 +20,24 @@ import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
 import type { ForkContextPolicy } from "../task/types";
 import { parseThinkingLevel } from "../thinking";
 
-import { buildPluginDirRoot } from "./plugin-dir-roots";
+type DiscoveryNativeModule = {
+	FileType: typeof FileTypeEnum;
+	glob: typeof globFn;
+};
+
+let discoveryNativeModule: DiscoveryNativeModule | undefined;
+let discoveryNativeLoad: Promise<DiscoveryNativeModule> | undefined;
+
+async function discoveryNatives(): Promise<DiscoveryNativeModule> {
+	if (discoveryNativeModule) return discoveryNativeModule;
+	discoveryNativeLoad ??= Promise.resolve(
+		require("@gajae-code/natives") as { FileType: typeof FileTypeEnum; glob: typeof globFn },
+	).then(mod => {
+		discoveryNativeModule = { FileType: mod.FileType, glob: mod.glob };
+		return discoveryNativeModule;
+	});
+	return await discoveryNativeLoad;
+}
 
 /**
  * Standard paths for each config source.
@@ -180,6 +197,14 @@ export function buildRuleFromMarkdown(
 		rawMode === "never" || rawMode === "prose-only" || rawMode === "tool-only" || rawMode === "always"
 			? rawMode
 			: undefined;
+	const rawRepeatMode = frontmatter.repeatMode;
+	const repeatMode: Rule["repeatMode"] =
+		rawRepeatMode === "once" || rawRepeatMode === "after-gap" ? rawRepeatMode : undefined;
+	const repeatGap =
+		typeof frontmatter.repeatGap === "number" && Number.isInteger(frontmatter.repeatGap) && frontmatter.repeatGap > 0
+			? frontmatter.repeatGap
+			: undefined;
+
 	return {
 		name: resolvedName,
 		path: filePath,
@@ -190,6 +215,8 @@ export function buildRuleFromMarkdown(
 		condition,
 		scope,
 		interruptMode,
+		repeatMode,
+		repeatGap,
 		_source: source,
 	};
 }
@@ -304,10 +331,11 @@ function parseForkContextPolicy(value: unknown): ForkContextPolicy | undefined {
 async function globIf(
 	dir: string,
 	pattern: string,
-	fileType: FileType,
+	fileType: FileTypeEnum,
 	recursive: boolean = true,
 ): Promise<Array<{ path: string }>> {
 	try {
+		const { glob } = await discoveryNatives();
 		const result = await glob({ pattern, path: dir, gitignore: true, hidden: false, fileType, recursive });
 		return result.matches;
 	} catch {
@@ -332,6 +360,37 @@ export function compareSkillOrder(aName: string, aPath: string, bName: string, b
 	return cmp(aPath, bPath);
 }
 
+/** Maximum bytes read per incremental frontmatter scan chunk. */
+export const SKILL_FRONTMATTER_SCAN_BYTES = 4 * 1024;
+/** Maximum total bytes read while seeking the frontmatter closing delimiter. */
+export const SKILL_FRONTMATTER_SCAN_TOTAL_BYTES = 64 * 1024;
+
+async function readSkillFrontmatter(skillPath: string): Promise<SkillFrontmatter | null> {
+	const file = Bun.file(skillPath);
+	const size = (await fs.promises.stat(skillPath)).size;
+	const scanLimit = Math.min(size, SKILL_FRONTMATTER_SCAN_TOTAL_BYTES);
+	let offset = 0;
+	let prefix = "";
+	const decoder = new TextDecoder();
+	while (offset < scanLimit) {
+		const end = Math.min(offset + SKILL_FRONTMATTER_SCAN_BYTES, scanLimit);
+		const bytes = new Uint8Array(await file.slice(offset, end).arrayBuffer());
+		const chunk = decoder.decode(bytes, { stream: end < scanLimit });
+		if (!chunk) break;
+		prefix += chunk;
+		offset = end;
+
+		const opening = prefix.match(/^---[ \t]*(?:\r?\n|$)/);
+		if (!opening) return null;
+		const afterOpening = prefix.slice(opening[0].length);
+		const closing = afterOpening.match(/\r?\n---[ \t]*(?:\r?\n|$)/);
+		if (!closing || closing.index === undefined) continue;
+		const bounded = prefix.slice(0, opening[0].length + closing.index + closing[0].length);
+		return parseFrontmatter(bounded, { source: skillPath }).frontmatter as SkillFrontmatter;
+	}
+	return null;
+}
+
 export async function scanSkillsFromDir(
 	_ctx: LoadContext,
 	options: ScanSkillsFromDirOptions,
@@ -351,13 +410,22 @@ export async function scanSkillsFromDir(
 	}
 	const loadSkill = async (skillPath: string) => {
 		try {
-			const content = await readFile(skillPath);
-			if (!content) return;
-			const { frontmatter, body } = parseFrontmatter(content, { source: skillPath });
-			if (frontmatter.enabled === false) {
+			const frontmatter = await readSkillFrontmatter(skillPath);
+			if (!frontmatter) {
+				if (fs.statSync(skillPath).size > SKILL_FRONTMATTER_SCAN_TOTAL_BYTES) {
+					warnings.push(
+						`Skill frontmatter exceeded ${SKILL_FRONTMATTER_SCAN_TOTAL_BYTES} byte scan cap: ${skillPath}`,
+					);
+				} else {
+					warnings.push(
+						`Skill file has no parseable frontmatter (expected a leading \`---\` YAML block with name/description): ${skillPath}`,
+					);
+				}
 				return;
 			}
+			if (frontmatter.enabled === false) return;
 			if (requireDescription && !frontmatter.description) {
+				warnings.push(`Skill is missing a description in frontmatter: ${skillPath}`);
 				return;
 			}
 			const skillDirName = path.basename(path.dirname(skillPath));
@@ -366,7 +434,10 @@ export async function scanSkillsFromDir(
 			items.push({
 				name,
 				path: skillPath,
-				content: body,
+				loadContent: async () => {
+					const content = await Bun.file(skillPath).text();
+					return parseFrontmatter(content, { source: skillPath }).body;
+				},
 				frontmatter: frontmatter as SkillFrontmatter,
 				level,
 				_source: createSourceMeta(providerId, skillPath, level),
@@ -460,6 +531,7 @@ export async function loadFilesFromDir<T>(
 	// Use native glob for fast scanning with gitignore support
 	let matches: Array<{ path: string }>;
 	try {
+		const { glob, FileType } = await discoveryNatives();
 		const result = await glob({
 			pattern,
 			path: dir,
@@ -546,6 +618,7 @@ async function readExtensionModuleManifest(
  */
 export async function discoverExtensionModulePaths(_ctx: LoadContext, dir: string): Promise<string[]> {
 	const discovered = new Set<string>();
+	const { FileType } = await discoveryNatives();
 	// Find all candidate files in parallel using glob
 	const [directFiles, indexFiles, packageJsonFiles] = await Promise.all([
 		// 1. Direct *.ts or *.js files
@@ -722,8 +795,8 @@ export function parseClaudePluginsRegistry(content: string): ClaudePluginsRegist
  */
 export async function resolveActiveProjectRegistryPath(cwd: string): Promise<string | null> {
 	// Pass 1: walk up looking for an existing .gjc/ directory (nearest wins).
-	// Stop before os.homedir() — ~/.gjc/ is the user-level config dir, not a project root.
-	const homeDir = os.homedir();
+	// Stop before the provenance-checked home — ~/.gjc/ is the user-level config dir, not a project root.
+	const homeDir = getTrustedHomeDir();
 	let dir = path.resolve(cwd);
 	while (dir !== homeDir) {
 		try {
@@ -764,7 +837,7 @@ export async function resolveActiveProjectRegistryPath(cwd: string): Promise<str
  * bootstrapped directory (no .gjc/ or .git/ yet) works: writeInstalledPluginsRegistry auto-creates
  * the directory tree on first write.
  *
- * Returns undefined when cwd is os.homedir() — that path is already the user registry and must
+ * Returns undefined when cwd is the trusted home — that path is already the user registry and must
  * never alias as the project registry.
  */
 export async function resolveOrDefaultProjectRegistryPath(cwd: string): Promise<string | undefined> {
@@ -773,7 +846,7 @@ export async function resolveOrDefaultProjectRegistryPath(cwd: string): Promise<
 	// Home directory must not be treated as a project root: the fallback path would alias
 	// getInstalledPluginsRegistryPath(), causing MarketplaceManager to load the same file
 	// as both user and project registry and producing duplicates / disambiguation errors.
-	if (path.resolve(cwd) === os.homedir()) return undefined;
+	if (path.resolve(cwd) === getTrustedHomeDir()) return undefined;
 	return path.join(cwd, getConfigDirName(), "plugins", "installed_plugins.json");
 }
 
@@ -800,7 +873,7 @@ export async function listClaudePluginRoots(
 	const projectRoots: ClaudePluginRoot[] = [];
 
 	// ── GJC installed plugins registry ───────────────────────────────────────
-	// In production `home` is `os.homedir()`, so `getPluginsDir(home)` resolves to the
+	// In production `home` is the provenance-checked home, so `getPluginsDir(home)` resolves to the
 	// same XDG-aware path the marketplace writer uses (reads and writes always agree).
 	// Tests pass a temp dir, which short-circuits the resolver for deterministic isolation.
 	const gjcRegistryPath = path.join(getPluginsDir(home), "installed_plugins.json");
@@ -890,14 +963,6 @@ export async function listClaudePluginRoots(
 		roots.push(...projectRoots, ...deduped);
 	}
 
-	// Merge --plugin-dir roots (highest precedence) on every fresh load
-	if (injectedPluginDirRoots.length > 0) {
-		const injectedIds = new Set(injectedPluginDirRoots.map(r => r.id));
-		const filtered = roots.filter(r => !injectedIds.has(r.id));
-		roots.length = 0;
-		roots.push(...injectedPluginDirRoots, ...filtered);
-	}
-
 	const result = { roots, warnings };
 	pluginRootsCache.set(cacheKey, result);
 	return result;
@@ -908,7 +973,7 @@ export async function listClaudePluginRoots(
  */
 export function clearClaudePluginRootsCache(): void {
 	pluginRootsCache.clear();
-	preloadedPluginRoots = [...injectedPluginDirRoots];
+	preloadedPluginRoots = [];
 	// Re-warm preloaded roots asynchronously so sync LSP config reads stay valid
 	if (lastPreloadHome) {
 		void preloadPluginRoots(lastPreloadHome, getProjectDir());
@@ -931,7 +996,6 @@ export function clearPluginRootsAndCaches(extraPaths?: readonly string[]): void 
 // getPreloadedPluginRoots(). Safe degradation: empty array if not warmed.
 
 let preloadedPluginRoots: ClaudePluginRoot[] = [];
-let injectedPluginDirRoots: ClaudePluginRoot[] = [];
 let lastPreloadHome: string | undefined;
 
 /**
@@ -951,42 +1015,4 @@ export async function preloadPluginRoots(home: string, cwd?: string): Promise<vo
  */
 export function getPreloadedPluginRoots(): readonly ClaudePluginRoot[] {
 	return preloadedPluginRoots;
-}
-
-// ── --plugin-dir injection ──────────────────────────────────────────────────
-
-/**
- * Inject synthetic plugin roots from --plugin-dir paths.
- * These are prepended to the cache with highest precedence (before GJC/Anthropic model entries).
- * Must be called before any listAnthropic modelPluginRoots() access.
- */
-export async function injectPluginDirRoots(home: string, dirs: string[], cwd?: string): Promise<void> {
-	const injected: ClaudePluginRoot[] = [];
-	for (const dir of dirs) {
-		const resolved = path.resolve(dir);
-		// Read plugin name from manifest
-		let pluginName = path.basename(resolved);
-		try {
-			const manifestPath = path.join(resolved, ".claude-plugin", "plugin.json");
-			const content = await Bun.file(manifestPath).text();
-			const manifest = JSON.parse(content);
-			if (typeof manifest.name === "string" && manifest.name) {
-				pluginName = manifest.name;
-			}
-		} catch {
-			// No manifest or invalid — use directory name
-		}
-
-		injected.push(buildPluginDirRoot(resolved, pluginName));
-	}
-
-	// Set injected roots BEFORE populating cache so listAnthropic modelPluginRoots merges them.
-	injectedPluginDirRoots = injected;
-	lastPreloadHome = home; // ensure cache-clear re-warm fires even when injectPluginDirRoots was the startup path
-	// Clear any stale cache entries (populated before injected roots were set).
-	pluginRootsCache.clear();
-	// Rebuild — cache miss triggers fresh load that includes both user+project registries
-	// and prepends injectedPluginDirRoots at highest precedence.
-	const { roots } = await listClaudePluginRoots(home, cwd);
-	preloadedPluginRoots = roots;
 }

@@ -5,6 +5,7 @@ import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/mod
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 
 const model = (provider: string, id: string): Model =>
 	({
@@ -18,7 +19,7 @@ const model = (provider: string, id: string): Model =>
 	}) as Model;
 
 const codexModel = model("openai-codex", "gpt-5.5");
-const minimaxModel = model("minimax-code", "minimax-v3");
+const minimaxModel = model("minimax-code", "MiniMax-M3");
 
 const profile = (name: string, provider: string, selector: string): ModelProfileDefinition => ({
 	name,
@@ -28,8 +29,8 @@ const profile = (name: string, provider: string, selector: string): ModelProfile
 });
 
 const codexProfile = profile("codex-medium", "openai-codex", "openai-codex/gpt-5.5:medium");
-const minimaxProfile = profile("minimax-medium", "minimax-code", "minimax-code/minimax-v3:medium");
-const plainMinimaxProfile = profile("minimax", "minimax-code", "minimax-code/minimax-v3:medium");
+const minimaxProfile = profile("minimax-medium", "minimax-code", "minimax-code/MiniMax-M3:medium");
+const plainMinimaxProfile = profile("minimax", "minimax-code", "minimax-code/MiniMax-M3:medium");
 let testTheme = await getThemeByName("red-claw");
 
 function installTestTheme(): void {
@@ -59,6 +60,7 @@ function createControllerContext(
 
 	const profiles = new Map((options.profiles ?? [codexProfile, minimaxProfile]).map(entry => [entry.name, entry]));
 	let activeProfile = options.activeProfile;
+	let configuredDefaultChain: readonly string[] | undefined;
 	const session = {
 		model: undefined as Model | undefined,
 		thinkingLevel: undefined as ThinkingLevel | undefined,
@@ -70,6 +72,10 @@ function createControllerContext(
 			this.model = next;
 			this.thinkingLevel = thinkingLevel;
 		},
+		getConfiguredModelChain: () => configuredDefaultChain,
+		setConfiguredModelChain(_role: string, chain: readonly string[]) {
+			configuredDefaultChain = chain;
+		},
 		setActiveModelProfile: vi.fn((name: string | undefined) => {
 			activeProfile = name;
 		}),
@@ -78,6 +84,8 @@ function createControllerContext(
 			refresh: vi.fn(async () => {}),
 			authStorage: {
 				login: vi.fn(async () => {}),
+				listCredentialInventory: vi.fn(() => []),
+				listCredentialRemovalTargets: vi.fn(() => []),
 			},
 			getModelProfiles: () => new Map(profiles),
 			getModelProfile: (name: string) => profiles.get(name),
@@ -91,7 +99,7 @@ function createControllerContext(
 	};
 	const ctx = {
 		ui: { setFocus: vi.fn(), requestRender: vi.fn() },
-		editorContainer: { clear: vi.fn(), addChild: vi.fn() },
+		editorContainer: { clear: vi.fn(), detachChild: vi.fn(), addChild: vi.fn() },
 		editor: {},
 		settings,
 		session,
@@ -102,12 +110,12 @@ function createControllerContext(
 		showStatus: vi.fn(),
 		showError: vi.fn(),
 	};
-	return { ctx, settings, session, setCalls };
+	return { ctx: ctx as unknown as InteractiveModeContext, settings, session, setCalls };
 }
 
-async function login(ctx: ReturnType<typeof createControllerContext>["ctx"], providerId: string): Promise<void> {
+async function login(ctx: InteractiveModeContext, providerId: string): Promise<void> {
 	installTestTheme();
-	const controller = new SelectorController(ctx as never);
+	const controller = new SelectorController(ctx);
 	await controller.showOAuthSelector("login", providerId);
 }
 

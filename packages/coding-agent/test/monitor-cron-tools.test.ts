@@ -207,6 +207,24 @@ describe("MonitorTool", () => {
 		expect(slice?.text.match(/same\n/g)).toHaveLength(20);
 	});
 
+	it("coalesces persistent lines arriving on separate event-loop ticks", async () => {
+		const steered: Array<{ customType: string; content: string; details?: unknown }> = [];
+		const session = createSession(settings, { steered });
+		const tool = MonitorTool.createIf(session)!;
+		await tool.execute("call", {
+			command: "printf 'first\\n'; sleep 0.05; printf 'second\\n'; sleep 0.05; printf 'third\\n'",
+			kind: "log",
+			description: "tick test",
+			persistent: true,
+		});
+		await manager.waitForAll();
+		await new Promise(resolve => setTimeout(resolve, 300));
+
+		expect(steered.length).toBe(1);
+		expect(steered[0]?.content).toContain("third");
+		expect(steered[0]?.content).toContain("(+2 earlier lines)");
+	});
+
 	it("persistent monitor preserves latest state when cap is full", async () => {
 		const steered: Array<{ customType: string; content: string; details?: unknown }> = [];
 		const session = createSession(settings, { steered });
@@ -349,6 +367,14 @@ describe("Cron tools", () => {
 		expect(cron.parameters.safeParse({ op: "bogus" }).success).toBe(false);
 	});
 
+	it("routes silent recurring polling to monitor instead of cron", () => {
+		const { cron } = makeTools();
+		expect(cron.description).toContain("Cron is not a silent polling primitive");
+		expect(cron.description).toContain("use `monitor`");
+		expect(cron.description).toContain("set `persistent: true`");
+		expect(cron.description).toContain("Do not schedule a cron prompt that asks the agent to suppress routine polls");
+	});
+
 	it("schedules a recurring task, lists it with human schedule, and returns an 8-character id", async () => {
 		const { create, list } = makeTools();
 		const result = expectText(
@@ -410,6 +436,7 @@ describe("Cron tools", () => {
 			expect(steered).toHaveLength(1);
 			expect(steered[0]?.customType).toBe("cron-fire");
 			expect(steered[0]?.content).toContain("run one");
+			await Promise.resolve();
 			expect(expectText(await list.execute("call", {})).details.jobs).toHaveLength(0);
 		});
 	});
@@ -433,6 +460,7 @@ describe("Cron tools", () => {
 				nowMs: clock.now(),
 			});
 			clock.tick(fireAt - clock.now());
+			await Promise.resolve();
 			expect(expectText(await list.execute("call", {})).details.jobs).toHaveLength(0);
 
 			const deleteResult = await del.execute("call", { id });
@@ -503,6 +531,33 @@ describe("Cron tools", () => {
 				recurring: true,
 			}),
 		).rejects.toThrow(/Cron task limit reached/);
+	});
+
+	it("registers owner cleanup through the session endpoint manager, not the global manager", async () => {
+		const foreign = new AsyncJobManager({ onJobComplete: async () => {} });
+		try {
+			// Session A's manager is endpoint-registered while concurrent session
+			// B is process-global. Cron cleanup must be consumed when A's
+			// lifecycle runs owner cleanups, not when B shuts down.
+			AsyncJobManager.setInstance(foreign);
+			expect(AsyncJobManager.registerForEndpoint("test-session", manager)).toBe(true);
+			const session = createSession(settings);
+			const create = CronTool.createIf(session)!;
+			const list = CronTool.createIf(session)!;
+			await create.execute("call", {
+				op: "create",
+				cron_expression: "*/5 * * * *",
+				prompt: "endpoint-owned cleanup",
+			});
+			expect(expectText(await list.execute("call", { op: "list" })).details.jobs).toHaveLength(1);
+			manager.runOwnerCleanups({ ownerId: "0-Test" });
+			expect(expectText(await list.execute("call", { op: "list" })).details.jobs).toHaveLength(0);
+		} finally {
+			AsyncJobManager.setInstance(manager);
+			AsyncJobManager.unregisterManager(manager);
+			AsyncJobManager.unregisterManager(foreign);
+			await foreign.dispose({ timeoutMs: 100 });
+		}
 	});
 
 	it("clears timers and schedules when owner cleanup fires", async () => {

@@ -4,7 +4,7 @@ Core implementation package for the `gjc` coding agent in the `gajae-code` monor
 
 For installation, setup, provider configuration, model roles, slash commands, and full CLI reference, see:
 - [Monorepo README (local)](../../README.md)
-- [Monorepo README (GitHub)](https://github.com/can1357/gajae-code#readme)
+- [Monorepo README (GitHub)](https://github.com/Yeachan-Heo/gajae-code#readme)
 
 Package-specific references:
 - [CHANGELOG](./CHANGELOG.md)
@@ -24,6 +24,8 @@ For simple local side effects that do not need a full extension, set the user-le
 gjc config set completion.notifyCommand 'cmux notify --title "$GJC_NOTIFICATION_TITLE" --body "$GJC_NOTIFICATION_BODY"'
 ```
 
+On macOS, GJC emits the terminal BEL for completion, approval, and ask notifications by default when `notifications.terminalBell` has not been configured. Set it to `false` to keep macOS terminals silent.
+
 When GJC runs inside a cmux terminal (`CMUX_WORKSPACE_ID` is set), GJC best-effort renames that cmux workspace to the current GJC session name (with a `GJC: ` prefix) — but only when the workspace still has its default title, so a name you pinned (or one set by a peer session sharing the workspace) is never overwritten. Opt out with `GJC_NO_CMUX_RENAME=1`.
 
 Windows Terminal may keep BEL (`[Console]::Write([char]7)`) silent depending on profile and system sound settings even when `notifications.terminalBell` is enabled. For an audible Windows completion beep, configure a user-level PowerShell command hook instead:
@@ -33,7 +35,6 @@ gjc config set completion.notifyCommand 'powershell.exe -NoProfile -Command "[Co
 ```
 
 `cmux notify` returning successfully means GJC handed the completion event to cmux. cmux may still suppress the native desktop banner when the app/window is focused, the emitting workspace is active, or the notification panel is open. In those cases, check cmux's notification panel or unread workspace state instead of treating the missing banner as a GJC delivery failure.
-
 Recommended external mapping:
 
 | Notification | Public event | Status guidance |
@@ -86,6 +87,10 @@ export default function lifecycleNotifier(pi: ExtensionAPI) {
 ```
 
 This is the supported repo-native lifecycle notification path. It is not Claude Code hook compatibility, and it remains disabled unless the user configures an extension/hook handler and private delivery target.
+
+## Windows psmux authority boundary
+
+On native Windows, GJC-managed psmux sessions persist a per-owner `ProviderAuthority`: the exact resolved executable identity and an isolated tmux-compatible `-L` namespace. `GJC_TMUX_COMMAND` is an executable path/name only, never `psmux -L …`. Recover managed sessions through GJC so it reuses and re-proves that authority; do not fall back to ambient `tmux`/`psmux` or manually recreate a namespace. An unavailable, changed, or ambiguous authority fails closed.
 
 ## Memory backends
 

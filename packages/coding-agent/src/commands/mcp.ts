@@ -1,5 +1,5 @@
 /**
- * Direct MCP server registration for standalone GJC.
+ * Explicit MCP server config storage for standalone GJC.
  */
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { type MCPAction, type MCPCommandArgs, runMCPCommand } from "../cli/mcp-cli";
@@ -7,7 +7,7 @@ import { type MCPAction, type MCPCommandArgs, runMCPCommand } from "../cli/mcp-c
 const ACTIONS: MCPAction[] = ["add", "list", "remove"];
 
 export default class MCP extends Command {
-	static description = "Register standalone MCP servers explicitly in GJC config";
+	static description = "Register MCP servers that ordinary standalone sessions load at startup";
 	static delegateHelp = true;
 
 	static examples = [
@@ -49,11 +49,16 @@ export default class MCP extends Command {
 		}),
 		cwd: Flags.string({ description: "Working directory for stdio server" }),
 		timeout: Flags.integer({ description: "Connection timeout in milliseconds" }),
+		sharing: Flags.string({
+			description: "MCP connection sharing mode",
+			options: ["per-session", "shared"],
+			default: "per-session",
+		}),
 	};
 
 	async run(): Promise<void> {
 		if (this.argv.includes("--help") || this.argv.includes("-h")) {
-			this.printHelp();
+			this.#printHelp();
 			return;
 		}
 
@@ -75,20 +80,21 @@ export default class MCP extends Command {
 				header: flags.header,
 				cwd: flags.cwd,
 				timeout: flags.timeout,
+				sharing: flags.sharing as MCPCommandArgs["flags"]["sharing"],
 			},
 		};
 		await runMCPCommand(cmd);
 	}
 
-	private printHelp(): void {
-		process.stdout.write(`Register standalone MCP servers explicitly in GJC config
+	#printHelp(): void {
+		process.stdout.write(`Register MCP servers that ordinary standalone sessions load at startup
 
 USAGE
   $ gjc mcp [add|list|remove] [NAME] [COMMAND_OR_URL] [ARGS...] [FLAGS]
 
 COMMANDS
-  add     Add an explicit user-provided MCP server definition
-  list    List registered servers with env/header/auth values redacted
+  add     Register an explicit user-provided MCP server definition
+  list    List registered servers with source, status, and env/header/auth values redacted
   remove  Remove a registered server and print the removed definition redacted
 
 FLAGS
@@ -103,6 +109,7 @@ FLAGS
       --header=<value>   HTTP/SSE header as KEY=VALUE (repeatable; redacted in output)
       --cwd=<value>      Working directory for stdio server
       --timeout=<int>    Connection timeout in milliseconds
+      --sharing=<value>  per-session | shared (default: per-session)
 
 EXAMPLES
   $ gjc mcp add context7 npx -y @upstash/context7-mcp
@@ -110,8 +117,13 @@ EXAMPLES
   $ gjc mcp list --json
   $ gjc mcp remove context7
 
-SECURITY
-  This command writes only the server definition supplied on this invocation. It does not import or inherit Claude Code, Codex, OpenCode, or other live MCP configs. Public output redacts env, header, auth, and OAuth credential values.
+RUNTIME
+  Registrations are consumed by ordinary standalone gjc sessions at startup
+  (conventional autoload) unless disabled (enabled: false or the disabledServers
+  list), marked autoload: false, or the session opts out with --no-mcp. This
+  command stores only the definition supplied on this invocation; it does not
+  import or inherit Claude Code, Codex, OpenCode, or other live MCP configs.
+  Public output redacts env, header, auth, and OAuth credential values.
 `);
 	}
 }

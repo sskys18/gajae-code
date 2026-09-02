@@ -15,14 +15,26 @@ export interface MCPServer {
 	name: string;
 	/** Whether this server is enabled (default: true) */
 	enabled?: boolean;
+	/** Whether explicit runtime MCP consumers should connect automatically (default: true) */
+	autoload?: boolean;
 	/** Connection timeout in milliseconds */
+	/** MCP connection pool identity mode; defaults to one lease per session. */
+	sharing?: "per-session" | "shared";
 	timeout?: number;
+	/**
+	 * Protocol preference for remote (http/sse) servers: `auto` (default) negotiates
+	 * MCP 2026-07-28 (stateless) first with a bounded observable legacy fallback,
+	 * `2026-07-28` is strict modern-only, `legacy` forces the compatibility handshake.
+	 */
+	protocol?: "auto" | "2026-07-28" | "legacy";
 	/** Command to run (for stdio transport) */
 	command?: string;
 	/** Command arguments */
 	args?: string[];
 	/** Environment variables */
 	env?: Record<string, string>;
+	/** Whether explicit stdio runtime consumers should avoid inheriting host environment */
+	noInheritEnv?: boolean;
 	/** Working directory for stdio transport */
 	cwd?: string;
 	/** URL (for HTTP/SSE transport) */

@@ -10,10 +10,14 @@ import { contextFileCapability } from "./capability/context-file";
 import { systemPromptCapability } from "./capability/system-prompt";
 import type { SkillsSettings } from "./config/settings";
 import { type ContextFile, loadCapability, type SystemPrompt as SystemPromptFile } from "./discovery";
-import { loadSkills, type Skill } from "./extensibility/skills";
+import type { Skill } from "./extensibility/skills";
+import browserAsidePrompt from "./prompts/agent-fragments/browser-aside.md" with { type: "text" };
 import customSystemPromptTemplate from "./prompts/system/custom-system-prompt.md" with { type: "text" };
 import projectPromptTemplate from "./prompts/system/project-prompt.md" with { type: "text" };
 import systemPromptTemplate from "./prompts/system/system-prompt.md" with { type: "text" };
+import volatileProjectContextTemplate from "./prompts/system/volatile-project-context.md" with { type: "text" };
+import { escapePromptMetadata } from "./session/messages";
+import { DEFAULT_ESSENTIAL_TOOL_NAMES } from "./tools";
 import { shortenPath } from "./tools/render-utils";
 import { AGENTS_MD_LIMIT, buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
 
@@ -65,6 +69,11 @@ function dedupePromptSource(source: string | null | undefined, otherSources: Arr
 	if (!resolvedSource) return "";
 
 	return otherSources.some(otherSource => promptSourceContainsRule(otherSource, resolvedSource)) ? "" : resolvedSource;
+}
+
+/** Neutralize tag-like sequences in embedded project context so file bodies cannot escape framing. */
+function sanitizeEmbeddedPromptContent(content: string): string {
+	return escapePromptMetadata(content, { preserveNewlines: true });
 }
 
 function firstNonEmpty(...values: (string | undefined | null)[]): string | null {
@@ -237,43 +246,63 @@ function dedupeExactContextFiles(
 		// Keep the closest matching context entry when content is byte-for-byte identical.
 		lastIndexByContent.set(file.content, index);
 	}
-
 	return contextFiles.filter((file, index) => lastIndexByContent.get(file.content) === index);
 }
 
-/**
- * Load all project context files using the capability API.
- * Returns {path, content, depth} entries for all discovered context files.
- * Files are sorted by depth (descending) so files closer to cwd appear last/more prominent.
- */
-export async function loadProjectContextFiles(
-	options: LoadContextFilesOptions = {},
-): Promise<Array<{ path: string; content: string; depth?: number }>> {
-	const resolvedCwd = options.cwd ?? getProjectDir();
+export interface ProjectContextFilesResult {
+	contextFiles: Array<{ path: string; content: string; depth?: number }>;
+	warnings: string[];
+}
 
+/**
+ * Load all context files using the capability API.
+ * Returns {path, content, depth} entries for all discovered context files.
+ * Native user-global files (`~/.gjc/agent/AGENTS.md`) come first, then project
+ * files sorted by depth (descending) so files closer to cwd appear last/more
+ * prominent. User-home files from foreign providers (`~/.claude/CLAUDE.md`,
+ * `~/.codex/AGENTS.md`, …) stay excluded — only gjc's own user config applies.
+ */
+export async function loadProjectContextFilesResult(
+	options: LoadContextFilesOptions = {},
+): Promise<ProjectContextFilesResult> {
+	const resolvedCwd = options.cwd ?? getProjectDir();
 	const result = await loadCapability(contextFileCapability.id, { cwd: resolvedCwd });
+	const items = result.items as ContextFile[];
+
+	// Native user-global context applies everywhere and is least specific, so it
+	// renders first — project files rendered later take precedence over it.
+	const userFiles = items
+		.filter(item => item.level === "user" && item._source.provider === "native")
+		.map(item => ({ path: item.path, content: item.content }));
 
 	// Convert project-level ContextFile items and preserve depth info
-	const files = result.items
-		.filter(item => (item as ContextFile).level === "project")
-		.map(item => {
-			const contextFile = item as ContextFile;
-			return {
-				path: contextFile.path,
-				content: contextFile.content,
-				depth: contextFile.depth,
-			};
-		});
+	const projectFiles = items
+		.filter(item => item.level === "project")
+		.map(item => ({
+			path: item.path,
+			content: item.content,
+			depth: item.depth,
+		}));
 
 	// Sort by depth (descending): higher depth (farther from cwd) comes first,
 	// so files closer to cwd appear later and are more prominent
-	files.sort((a, b) => {
+	projectFiles.sort((a, b) => {
 		const depthA = a.depth ?? -1;
 		const depthB = b.depth ?? -1;
 		return depthB - depthA;
 	});
 
-	return dedupeExactContextFiles(files);
+	return {
+		contextFiles: dedupeExactContextFiles([...userFiles, ...projectFiles]),
+		warnings: result.warnings,
+	};
+}
+
+/** Load project context files without exposing discovery diagnostics. */
+export async function loadProjectContextFiles(
+	options: LoadContextFilesOptions = {},
+): Promise<Array<{ path: string; content: string; depth?: number }>> {
+	return (await loadProjectContextFilesResult(options)).contextFiles;
 }
 
 /**
@@ -338,6 +367,8 @@ export interface BuildSystemPromptOptions {
 	appendSystemPrompt?: string;
 	/** Rendered GJC plugin system-appendix blocks (lower-authority, appended last). */
 	pluginAppendices?: string;
+	/** Browser surface selected for the session. */
+	browserBackend?: "native" | "aside";
 	/** Repeat full tool descriptions in system prompt. Default: false */
 	repeatToolDescriptions?: boolean;
 	/** Skills settings for discovery. */
@@ -352,10 +383,8 @@ export interface BuildSystemPromptOptions {
 	rules?: Array<{ name: string; description?: string; path: string; globs?: string[] }>;
 	/** Intent field name injected into every tool schema. If set, explains the field in the prompt. */
 	intentField?: string;
-	/** Whether MCP tool discovery is active for this prompt build. */
-	mcpDiscoveryMode?: boolean;
-	/** Discoverable MCP server summaries to advertise when discovery mode is active. */
-	mcpDiscoveryServerSummaries?: string[];
+	/** Whether built-in tool discovery is active; enables the tool-discovery prompt block. */
+	toolDiscoveryActive?: boolean;
 	/** Encourage the agent to delegate via tasks unless changes are trivial. */
 	eagerTasks?: boolean;
 	/** Rules with alwaysApply=true — their full content is injected into the prompt. */
@@ -364,18 +393,150 @@ export interface BuildSystemPromptOptions {
 	secretsEnabled?: boolean;
 	/** Pre-loaded workspace tree (skips discovery if provided). May be a Promise to allow early kick-off. */
 	workspaceTree?: WorkspaceTree | Promise<WorkspaceTree>;
+	/**
+	 * Render a trimmed role-agent base prompt for subagent sessions: omits the
+	 * workflow-surface/routing/self-awareness (`<gjc-runtime>`) and `<soul>` blocks
+	 * that only apply to the top-level interactive/print agent. Tool safety, repo
+	 * safety, and the completion contract are retained. Default: false.
+	 */
+	subagent?: boolean;
 }
 
-/** Result of building provider-facing system prompt messages. */
 export interface BuildSystemPromptResult {
 	/** Ordered system prompt blocks. Providers should preserve entries as distinct messages/blocks. */
 	systemPrompt: string[];
+	/** Context-file discovery warnings visible to SDK and session callers. */
+	warnings: string[];
+}
+/** Host wall-clock facts injected with every turn. */
+export interface LocalTimeContext {
+	/** Local calendar date with weekday, e.g. `2026-08-19 (Wed)`. */
+	date: string;
+	/** Local clock time with UTC offset and IANA zone, e.g. `21:04 UTC+09:00 (Asia/Seoul)`. */
+	time: string;
+}
+
+/**
+ * Render the host's local date and clock time for the volatile turn context.
+ *
+ * Every field is derived from a single `Intl.DateTimeFormat` pass over one
+ * resolved zone, so the date, clock, offset, and zone name can never disagree
+ * with each other the way `Date`'s local getters can. Falls back to UTC only
+ * when the runtime has no usable ICU zone.
+ *
+ * @param timeZone IANA zone override. Default: the host zone.
+ */
+export function getLocalTimeContext(now: Date = new Date(), timeZone?: string): LocalTimeContext {
+	try {
+		const zone = timeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+		const parts = new Intl.DateTimeFormat("en-US", {
+			timeZone: zone,
+			year: "numeric",
+			month: "2-digit",
+			day: "2-digit",
+			weekday: "short",
+			hour: "2-digit",
+			minute: "2-digit",
+			hourCycle: "h23",
+			timeZoneName: "longOffset",
+		}).formatToParts(now);
+		const part = (type: Intl.DateTimeFormatPartTypes): string =>
+			parts.find(candidate => candidate.type === type)?.value ?? "";
+		const year = part("year");
+		const month = part("month");
+		const day = part("day");
+		const hour = part("hour");
+		const minute = part("minute");
+		if (!year || !month || !day || !hour || !minute) throw new Error("incomplete date parts");
+		// `longOffset` renders "GMT+09:00", or a bare "GMT" at zero offset.
+		const offset = part("timeZoneName").replace(/^GMT$/, "UTC+00:00").replace(/^GMT/, "UTC");
+		const weekday = part("weekday");
+		return {
+			date: weekday ? `${year}-${month}-${day} (${weekday})` : `${year}-${month}-${day}`,
+			time: `${hour}:${minute} ${offset}${zone ? ` (${zone})` : ""}`.trim(),
+		};
+	} catch (error) {
+		logger.warn("Could not resolve host timezone for volatile project context; falling back to UTC", {
+			error: String(error),
+		});
+		const fallbackNow = Number.isFinite(now.getTime()) ? now : new Date(0);
+		const iso = fallbackNow.toISOString();
+		return { date: iso.slice(0, 10), time: `${iso.slice(11, 16)} UTC+00:00 (UTC)` };
+	}
+}
+
+export interface BuildVolatileProjectContextOptions {
+	cwd?: string;
+	/** Clock source for the rendered local date/time. Default: `new Date()`. */
+	now?: Date;
+	/** Trusted/test-only override in the derived `YYYY-MM-DD (Www)` or `YYYY-MM-DD` format. */
+	date?: string;
+	/** Trusted/test-only override in the derived `HH:MM UTC±HH:MM (IANA/Zone)` format. */
+	localTime?: string;
+	workspaceTree?: WorkspaceTree;
+}
+
+const LOCAL_DATE_OVERRIDE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})(?: \(([A-Z][a-z]{2})\))?$/u;
+const LOCAL_TIME_OVERRIDE_PATTERN =
+	/^(\d{2}):(\d{2}) UTC([+-])(\d{2}):(\d{2}) \(([A-Za-z0-9_+-]+(?:\/[A-Za-z0-9_+-]+)*)\)$/u;
+
+function isValidLocalDateOverride(value: string): boolean {
+	const match = LOCAL_DATE_OVERRIDE_PATTERN.exec(value);
+	if (!match) return false;
+	const year = Number(match[1]);
+	const month = Number(match[2]);
+	const day = Number(match[3]);
+	const instant = new Date(Date.UTC(2000, month - 1, day));
+	instant.setUTCFullYear(year);
+	if (instant.getUTCFullYear() !== year || instant.getUTCMonth() !== month - 1 || instant.getUTCDate() !== day)
+		return false;
+	const weekday = match[4];
+	if (!weekday) return true;
+	return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][instant.getUTCDay()] === weekday;
+}
+
+function isValidLocalTimeOverride(value: string): boolean {
+	const match = LOCAL_TIME_OVERRIDE_PATTERN.exec(value);
+	if (!match) return false;
+	const hour = Number(match[1]);
+	const minute = Number(match[2]);
+	const offsetHour = Number(match[4]);
+	const offsetMinute = Number(match[5]);
+	return hour < 24 && minute < 60 && offsetHour < 24 && offsetMinute < 60;
+}
+
+export function buildVolatileProjectContext(options: BuildVolatileProjectContextOptions = {}): string {
+	const resolvedCwd = options.cwd ?? getProjectDir();
+	const local = getLocalTimeContext(options.now ?? new Date());
+	const date = escapePromptMetadata(
+		options.date && isValidLocalDateOverride(options.date) ? options.date : local.date,
+	);
+	const localTime = escapePromptMetadata(
+		options.localTime && isValidLocalTimeOverride(options.localTime) ? options.localTime : local.time,
+	);
+	return prompt
+		.render(volatileProjectContextTemplate, {
+			date,
+			localTime,
+			cwd: escapePromptMetadata(shortenPath(resolvedCwd.replace(/\\/g, "/"))),
+			workspaceTree: {
+				...(options.workspaceTree ?? {
+					rootPath: resolvedCwd,
+					rendered: "",
+					truncated: false,
+					totalLines: 0,
+					agentsMdFiles: [],
+				}),
+				rendered: escapePromptMetadata(options.workspaceTree?.rendered ?? "", { preserveNewlines: true }),
+			},
+		})
+		.trim();
 }
 
 /** Build the system prompt with tools, guidelines, and context */
 export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}): Promise<BuildSystemPromptResult> {
 	if ($env.NULL_PROMPT === "true") {
-		return { systemPrompt: [] };
+		return { systemPrompt: [], warnings: [] };
 	}
 
 	const {
@@ -383,20 +544,19 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		tools,
 		appendSystemPrompt,
 		pluginAppendices,
+		browserBackend,
 		repeatToolDescriptions = false,
-		skillsSettings,
 		toolNames: providedToolNames,
 		cwd,
 		contextFiles: providedContextFiles,
-		skills: providedSkills,
 		rules,
 		alwaysApplyRules,
 		intentField,
-		mcpDiscoveryMode = false,
-		mcpDiscoveryServerSummaries = [],
+		toolDiscoveryActive = false,
 		eagerTasks = false,
 		secretsEnabled = false,
 		workspaceTree: providedWorkspaceTree,
+		subagent = false,
 	} = options;
 	const resolvedCwd = cwd ?? getProjectDir();
 
@@ -404,8 +564,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		resolvedCustomPrompt: undefined as string | undefined,
 		resolvedAppendPrompt: undefined as string | undefined,
 		systemPromptCustomization: null as string | null,
-		contextFiles: dedupeExactContextFiles(providedContextFiles ?? []),
-		skills: providedSkills ?? ([] as Skill[]),
+		contextFiles: { contextFiles: [] as Array<{ path: string; content: string; depth?: number }>, warnings: [] },
 		workspaceTree: {
 			rootPath: resolvedCwd,
 			rendered: "",
@@ -447,22 +606,16 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		cwd: resolvedCwd,
 	});
 	const contextFilesPromise = providedContextFiles
-		? Promise.resolve(providedContextFiles)
-		: logger.time("loadProjectContextFiles", loadProjectContextFiles, { cwd: resolvedCwd });
+		? Promise.resolve({ contextFiles: providedContextFiles, warnings: [] })
+		: logger.time("loadProjectContextFiles", loadProjectContextFilesResult, { cwd: resolvedCwd });
 	const workspaceTreePromise =
 		providedWorkspaceTree !== undefined
 			? Promise.resolve(providedWorkspaceTree)
 			: logger.time("buildWorkspaceTree", () =>
 					buildWorkspaceTree(resolvedCwd, { timeoutMs: SYSTEM_PROMPT_PREP_TIMEOUT_MS }),
 				);
-	const skillsPromise: Promise<Skill[]> =
-		providedSkills !== undefined
-			? Promise.resolve(providedSkills)
-			: skillsSettings?.enabled !== false
-				? loadSkills({ ...skillsSettings, cwd: resolvedCwd }).then(result => result.skills)
-				: Promise.resolve([]);
 
-	const [resolvedCustomPrompt, resolvedAppendPrompt, systemPromptCustomization, contextFiles, skills, workspaceTree] =
+	const [resolvedCustomPrompt, resolvedAppendPrompt, systemPromptCustomization, contextFileResult, workspaceTree] =
 		await Promise.all([
 			withDeadline(
 				"customPrompt",
@@ -479,12 +632,10 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 				systemPromptCustomizationPromise,
 				prepDefaults.systemPromptCustomization,
 			),
-			withDeadline("loadProjectContextFiles", contextFilesPromise, prepDefaults.contextFiles).then(
-				dedupeExactContextFiles,
-			),
-			withDeadline("loadSkills", skillsPromise, prepDefaults.skills),
+			withDeadline("loadProjectContextFiles", contextFilesPromise, prepDefaults.contextFiles),
 			withDeadline("buildWorkspaceTree", workspaceTreePromise, prepDefaults.workspaceTree),
 		]);
+	const contextFiles = dedupeExactContextFiles(contextFileResult.contextFiles);
 	const agentsMdFiles = Array.from(new Set(workspaceTree.agentsMdFiles)).sort().slice(0, AGENTS_MD_LIMIT);
 
 	if (timedOut.length > 0) {
@@ -507,8 +658,9 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		}
 	}
 
-	const date = new Date().toISOString().slice(0, 10);
-	const dateTime = date;
+	// Date/time deliberately absent: volatile clock facts live in the per-turn
+	// volatile project context (see buildVolatileProjectContext), never in this
+	// cached stable prefix.
 	const promptCwd = shortenPath(resolvedCwd.replace(/\\/g, "/"));
 
 	// Build tool metadata for system prompt rendering
@@ -520,26 +672,21 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 			// Tools map provided
 			toolNames = Array.from(tools.keys());
 		} else {
-			// Use defaults
-			toolNames = ["read", "bash", "eval", "edit", "write"]; // TODO: Why?
+			// Use the same essential-tool baseline as a default session.
+			toolNames = [...DEFAULT_ESSENTIAL_TOOL_NAMES];
 		}
 	}
 
 	// Build tool descriptions for system prompt rendering.
 	const toolPromptNames = new Map<string, string>(toolNames.map(name => [name, tools?.get(name)?.wireName ?? name]));
 	const toolRefs = Object.fromEntries(toolPromptNames.entries());
+	const hasHiddenToolDiscoveryTool = Object.hasOwn(toolRefs, "search_tool_bm25");
 	const toolInfo = toolNames.map(name => ({
 		name: toolPromptNames.get(name) ?? name,
 		internalName: name,
 		label: tools?.get(name)?.label ?? "",
 		description: tools?.get(name)?.description ?? "",
 	}));
-
-	// Filter skills for the rendered system prompt:
-	// - require the `read` tool so the model can actually fetch skill content;
-	// - drop skills with frontmatter `hide: true` (still loadable via skill:// and /skill:<name>).
-	const hasRead = tools?.has("read");
-	const filteredSkills = hasRead ? skills.filter(skill => skill.hide !== true) : [];
 
 	const effectiveSystemPromptCustomization = dedupePromptSource(systemPromptCustomization, [
 		resolvedCustomPrompt,
@@ -549,6 +696,17 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const injectedAlwaysApplyRules = dedupeAlwaysApplyRules(alwaysApplyRules, promptSources);
 
 	const environment = await logger.time("getEnvironmentInfo", getEnvironmentInfo);
+	const sanitizedContextFiles = contextFiles.map(file => ({
+		...file,
+		path: escapePromptMetadata(file.path),
+		content: sanitizeEmbeddedPromptContent(file.content),
+	}));
+	const sanitizedAlwaysApplyRules = injectedAlwaysApplyRules.map(rule => ({
+		...rule,
+		name: escapePromptMetadata(rule.name),
+		path: escapePromptMetadata(rule.path),
+		content: sanitizeEmbeddedPromptContent(rule.content),
+	}));
 	const data = {
 		systemPromptCustomization: effectiveSystemPromptCustomization,
 		customPrompt: resolvedCustomPrompt,
@@ -558,22 +716,18 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		repeatToolDescriptions,
 		toolRefs,
 		environment,
-		contextFiles,
-		agentsMdSearch: { files: agentsMdFiles },
+		contextFiles: sanitizedContextFiles,
+		agentsMdSearch: { files: agentsMdFiles.map(file => escapePromptMetadata(file)) },
 		workspaceTree,
-		skills: filteredSkills,
 		rules: rules ?? [],
-		alwaysApplyRules: injectedAlwaysApplyRules,
-		date,
-		dateTime,
+		alwaysApplyRules: sanitizedAlwaysApplyRules,
 		cwd: promptCwd,
 		intentTracing: !!intentField,
 		intentField: intentField ?? "",
-		mcpDiscoveryMode,
-		hasMCPDiscoveryServers: mcpDiscoveryServerSummaries.length > 0,
-		mcpDiscoveryServerSummaries,
+		toolDiscoveryActive: toolDiscoveryActive && hasHiddenToolDiscoveryTool,
 		eagerTasks,
 		secretsEnabled,
+		subagent,
 	};
 	const rendered = prompt.render(resolvedCustomPrompt ? customSystemPromptTemplate : systemPromptTemplate, data);
 	const systemPrompt = [rendered];
@@ -582,11 +736,15 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		systemPrompt.push(projectPrompt);
 	}
 
+	if (browserBackend === "aside") {
+		systemPrompt.push(browserAsidePrompt.trim());
+	}
+
 	// Plugin system appendices are appended last as a lower-authority block; they
 	// can never override base/project/developer instructions above them.
 	if (pluginAppendices?.trim()) {
 		systemPrompt.push(pluginAppendices.trim());
 	}
 
-	return { systemPrompt };
+	return { systemPrompt, warnings: contextFileResult.warnings };
 }

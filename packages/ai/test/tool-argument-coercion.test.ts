@@ -1,7 +1,16 @@
 import { describe, expect, it } from "bun:test";
-import type { Tool, ToolCall } from "@gajae-code/ai/types";
+import type { RawArgumentValidationResult, Tool, ToolCall } from "@gajae-code/ai/types";
 import { validateToolArguments } from "@gajae-code/ai/utils/validation";
 import * as z from "zod/v4";
+
+function captureMessage(run: () => void): string {
+	try {
+		run();
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
+	}
+	throw new Error("Expected validation to throw");
+}
 
 describe("Tool argument coercion", () => {
 	it("coerces numeric strings when schema expects number", () => {
@@ -969,5 +978,186 @@ describe("Tool argument coercion", () => {
 
 		const result = validateToolArguments(tool, toolCall) as Record<string, unknown>;
 		expect(result.op).toBe("fix");
+	});
+	it("runs an opt-in raw argument adapter before null normalization and terminal rejection", () => {
+		let observed: unknown;
+		const tool: Tool = {
+			name: "raw-adapter",
+			description: "",
+			parameters: z.object({ value: z.string().optional() }),
+			rawArgumentValidation: arguments_ => {
+				observed = arguments_.value;
+				return arguments_.value === "null" ? { outcome: "reject" } : { outcome: "passthrough" };
+			},
+		};
+
+		expect(() =>
+			validateToolArguments(tool, {
+				type: "toolCall",
+				id: "call-raw-adapter",
+				name: "raw-adapter",
+				arguments: { value: "null" },
+			}),
+		).toThrow("raw arguments rejected before coercion");
+		expect(observed).toBe("null");
+	});
+	it("emits only authority-controlled raw rejection guidance and preserves the generic fallback", () => {
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "call-raw-guidance",
+			name: "raw-guidance",
+			arguments: {},
+		};
+		const tool = (result: RawArgumentValidationResult): Tool => ({
+			name: "raw-guidance",
+			description: "",
+			parameters: z.object({}),
+			rawArgumentValidation: () => result,
+		});
+
+		expect(() => validateToolArguments(tool({ outcome: "reject" }), toolCall)).toThrow(
+			'Validation failed for tool "raw-guidance": raw arguments rejected before coercion',
+		);
+		expect(() =>
+			validateToolArguments(
+				tool({
+					outcome: "reject",
+					code: "ask-intent-review-requires-positive-round",
+				}),
+				toolCall,
+			),
+		).toThrow("deepInterview.intent_review is post-Round-0 only and requires a positive round");
+
+		const untrusted = "untrusted-".repeat(2_000);
+		let message = "";
+		try {
+			validateToolArguments(
+				tool({ outcome: "reject", code: untrusted } as unknown as RawArgumentValidationResult),
+				toolCall,
+			);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		expect(message).toBe('Validation failed for tool "raw-guidance": raw arguments rejected before coercion');
+		expect(message).not.toContain("untrusted-");
+	});
+
+	it("appends structured rejection detail without disturbing codes that carry none", () => {
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "call-raw-detail",
+			name: "raw-guidance",
+			arguments: {},
+		};
+		const tool = (result: RawArgumentValidationResult): Tool => ({
+			name: "raw-guidance",
+			description: "",
+			parameters: z.object({}),
+			rawArgumentValidation: () => result,
+		});
+		const base = 'Validation failed for tool "raw-guidance": raw arguments rejected before coercion';
+
+		// A code that carries no detail keeps exactly the message it had before.
+		expect(
+			captureMessage(() =>
+				validateToolArguments(
+					tool({ outcome: "reject", code: "ask-intent-review-requires-positive-round" }),
+					toolCall,
+				),
+			),
+		).toBe(`${base}; deepInterview.intent_review is post-Round-0 only and requires a positive round`);
+
+		expect(
+			captureMessage(() =>
+				validateToolArguments(
+					tool({
+						outcome: "reject",
+						code: "todo-write-unknown-op-entry-key",
+						detail: { rejectedKeys: ["note"], hint: "use text" },
+					}),
+					toolCall,
+				),
+			),
+		).toBe(
+			`${base}; todo_write operation entries accept only op, list, task, phase, items, and text keys; rejected key: "note" (use text)`,
+		);
+
+		expect(
+			captureMessage(() =>
+				validateToolArguments(
+					tool({
+						outcome: "reject",
+						code: "todo-write-unknown-root-key",
+						detail: { rejectedKeys: ["alpha", "beta"] },
+					}),
+					toolCall,
+				),
+			),
+		).toBe(`${base}; todo_write root accepts only an ops array of operation entries; rejected keys: "alpha", "beta"`);
+		// The #4649 Round-0 topology correction names the omitted required fields
+		// alongside the fixed guidance, and its hint stays within the clamp.
+		expect(
+			captureMessage(() =>
+				validateToolArguments(
+					tool({
+						outcome: "reject",
+						code: "ask-round-zero-metadata-requires-full-topology-fields",
+						detail: {
+							rejectedKeys: ["deepInterview.ambiguity", "deepInterview.intent_contract"],
+							hint: "ambiguity is the observed 0..1 score at ask time (1 before Round 1), never a guess; intent_contract = { items: [{ id, category, statement }], confirmation_options } of displayed items/labels",
+						},
+					}),
+					toolCall,
+				),
+			),
+		).toBe(
+			`${base}; Round 0 review-topology deepInterview metadata requires every topology field; retry once with the named fields instead of re-sending the incomplete object; rejected keys: "deepInterview.ambiguity", "deepInterview.intent_contract" (ambiguity is the observed 0..1 score at ask time (1 before Round 1), never a guess; intent_contract = { items: [{ id, category, statement }], confirmation_options } of displayed items/labels)`,
+		);
+
+		// An empty key list adds nothing, and detail on an unrecognized code is
+		// dropped along with the code itself.
+		expect(
+			captureMessage(() =>
+				validateToolArguments(
+					tool({ outcome: "reject", code: "todo-write-unknown-root-key", detail: { rejectedKeys: [] } }),
+					toolCall,
+				),
+			),
+		).toBe(`${base}; todo_write root accepts only an ops array of operation entries`);
+
+		const overlong = "k".repeat(500);
+		const message = captureMessage(() =>
+			validateToolArguments(
+				tool({
+					outcome: "reject",
+					code: "untrusted-code",
+					detail: { rejectedKeys: [overlong] },
+				} as unknown as RawArgumentValidationResult),
+				toolCall,
+			),
+		);
+		expect(message).toBe(base);
+	});
+
+	it("clamps oversized rejection detail instead of echoing it whole", () => {
+		const toolCall: ToolCall = { type: "toolCall", id: "call-raw-clamp", name: "raw-guidance", arguments: {} };
+		const message = captureMessage(() =>
+			validateToolArguments(
+				{
+					name: "raw-guidance",
+					description: "",
+					parameters: z.object({}),
+					rawArgumentValidation: () => ({
+						outcome: "reject",
+						code: "todo-write-unknown-op-entry-key",
+						detail: { rejectedKeys: Array.from({ length: 12 }, (_, index) => `k${index}`.repeat(80)) },
+					}),
+				},
+				toolCall,
+			),
+		);
+		expect(message).toContain('rejected keys: "');
+		expect(message).not.toContain("k8");
+		expect(message.length).toBeLessThan(800);
 	});
 });

@@ -6,9 +6,8 @@
  * - Registering providers (where to find it)
  * - Loading items for a capability across all providers
  */
-import * as os from "node:os";
 import * as path from "node:path";
-import { getProjectDir, logger } from "@gajae-code/utils";
+import { getAgentDir, getProjectDir, getTrustedHomeDir, logger } from "@gajae-code/utils";
 
 import type { Settings } from "../config/settings";
 import { clearCache as clearFsCache, findRepoRoot, cacheStats as fsCacheStats, invalidate as invalidateFs } from "./fs";
@@ -41,6 +40,8 @@ const disabledProviders = new Set<string>();
 
 /** Settings manager for persistence (if set) */
 let settings: Settings | null = null;
+/** Session-local settings keyed by normalized working directory. */
+const settingsByCwd = new Map<string, Settings>();
 
 // =============================================================================
 // Registration API
@@ -109,7 +110,12 @@ async function loadImpl<T>(
 	const contributingProviders: string[] = [];
 	const disabledExtensionIds = options.includeDisabled
 		? new Set<string>()
-		: new Set<string>(options.disabledExtensions ?? settings?.get("disabledExtensions") ?? []);
+		: new Set<string>(
+				options.disabledExtensions ??
+					options.settings?.get("disabledExtensions") ??
+					settings?.get("disabledExtensions") ??
+					[],
+			);
 
 	const results = await Promise.all(
 		providers.map(async provider => {
@@ -208,8 +214,11 @@ async function loadImpl<T>(
  * Filter providers based on options and disabled state.
  */
 function filterProviders<T>(capability: Capability<T>, options: LoadOptions): Provider<T>[] {
-	let providers = (capability.providers as Provider<T>[]).filter(p => !disabledProviders.has(p.id));
-
+	const activeSettings = options.settings ?? settingsByCwd.get(path.normalize(options.cwd ?? getProjectDir()));
+	const activeDisabledProviders = new Set(activeSettings?.get("disabledProviders") ?? disabledProviders);
+	let providers = (capability.providers as Provider<T>[]).filter(
+		p => options.includeDisabledProviders === true || !activeDisabledProviders.has(p.id),
+	);
 	if (options.providers) {
 		const allowed = new Set(options.providers);
 		providers = providers.filter(p => allowed.has(p.id));
@@ -232,9 +241,10 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 	}
 
 	const cwd = options.cwd ?? getProjectDir();
-	const home = os.homedir();
+	const home = getTrustedHomeDir();
+	const userAgentDir = options.agentDir ? path.resolve(options.agentDir) : getAgentDir();
 	const repoRoot = await findRepoRoot(cwd);
-	const ctx: LoadContext = { cwd, home, repoRoot };
+	const ctx: LoadContext = { cwd, home, userAgentDir, repoRoot, settings: options.settings };
 	const providers = filterProviders(capability, options);
 
 	return await loadImpl(capability, providers, ctx, options);
@@ -249,63 +259,82 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
  * Call this once on startup to enable persistent provider state.
  */
 export function initializeWithSettings(activeSettings: Settings): void {
+	settingsByCwd.set(path.normalize(activeSettings.getCwd()), activeSettings);
 	settings = activeSettings;
-	// Load disabled providers from settings
-	const disabled = settings.get("disabledProviders");
+	const disabled = activeSettings.get("disabledProviders");
 	disabledProviders.clear();
-	for (const id of disabled) {
-		disabledProviders.add(id);
-	}
+	for (const id of disabled) disabledProviders.add(id);
 }
 
+/** Remove a disposed session scope without disturbing a newer replacement. */
+export function releaseSettingsScope(activeSettings: Settings): void {
+	const cwd = path.normalize(activeSettings.getCwd());
+	if (settingsByCwd.get(cwd) === activeSettings) settingsByCwd.delete(cwd);
+}
+
+function assertDisabledProvidersWritable(activeSettings: Settings): void {
+	if (!activeSettings.canWriteDurableConfig()) {
+		throw new Error(
+			"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+		);
+	}
+}
 /**
  * Persist current disabled providers to settings.
  */
-function persistDisabledProviders(): void {
-	if (settings) {
-		settings.set("disabledProviders", Array.from(disabledProviders));
-	}
+function persistDisabledProviders(activeSettings: Settings, providers: ReadonlySet<string>): void {
+	assertDisabledProvidersWritable(activeSettings);
+	activeSettings.set("disabledProviders", Array.from(providers));
 }
 
-/**
- * Disable a provider globally (across all capabilities).
- */
-export function disableProvider(providerId: string): void {
-	disabledProviders.add(providerId);
-	persistDisabledProviders();
+/** Disable a provider for the supplied session settings. */
+export function disableProvider(
+	providerId: string,
+	activeSettings: Settings = settings ??
+		(() => {
+			throw new Error("Capability settings unavailable");
+		})(),
+): void {
+	const providers = new Set(activeSettings.get("disabledProviders"));
+	providers.add(providerId);
+	persistDisabledProviders(activeSettings, providers);
 }
 
-/**
- * Enable a previously disabled provider.
- */
-export function enableProvider(providerId: string): void {
-	disabledProviders.delete(providerId);
-	persistDisabledProviders();
+/** Enable a provider for the supplied session settings. */
+export function enableProvider(
+	providerId: string,
+	activeSettings: Settings = settings ??
+		(() => {
+			throw new Error("Capability settings unavailable");
+		})(),
+): void {
+	const providers = new Set(activeSettings.get("disabledProviders"));
+	providers.delete(providerId);
+	persistDisabledProviders(activeSettings, providers);
 }
 
-/**
- * Check if a provider is enabled.
- */
-export function isProviderEnabled(providerId: string): boolean {
-	return !disabledProviders.has(providerId);
+/** Check whether a provider is enabled by the supplied session settings. */
+export function isProviderEnabled(
+	providerId: string,
+	activeSettings: Settings | undefined = settings ?? undefined,
+): boolean {
+	return !new Set(activeSettings?.get("disabledProviders") ?? disabledProviders).has(providerId);
 }
 
-/**
- * Get list of all disabled provider IDs.
- */
-export function getDisabledProviders(): string[] {
-	return Array.from(disabledProviders);
+/** Get disabled providers from the supplied session settings. */
+export function getDisabledProviders(activeSettings: Settings | undefined = settings ?? undefined): string[] {
+	return [...(activeSettings?.get("disabledProviders") ?? disabledProviders)];
 }
 
-/**
- * Set disabled providers from a list (replaces current set).
- */
-export function setDisabledProviders(providerIds: string[]): void {
-	disabledProviders.clear();
-	for (const id of providerIds) {
-		disabledProviders.add(id);
-	}
-	persistDisabledProviders();
+/** Replace disabled providers for the supplied session settings. */
+export function setDisabledProviders(
+	providerIds: string[],
+	activeSettings: Settings = settings ??
+		(() => {
+			throw new Error("Capability settings unavailable");
+		})(),
+): void {
+	persistDisabledProviders(activeSettings, new Set(providerIds));
 }
 
 // =============================================================================

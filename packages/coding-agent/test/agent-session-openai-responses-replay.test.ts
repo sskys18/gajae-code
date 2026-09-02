@@ -7,6 +7,7 @@ import type { AssistantMessage, Message, ProviderPayload, ProviderSessionState, 
 import { createOpenAIResponsesHistoryPayload } from "@gajae-code/ai/utils";
 import * as asyncModule from "@gajae-code/coding-agent/async";
 import * as settingsModule from "@gajae-code/coding-agent/config/settings";
+import * as internalUrls from "@gajae-code/coding-agent/internal-urls";
 import type { CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
 import * as sdkModule from "@gajae-code/coding-agent/sdk";
 import type { AgentSession, ForkContextSeed } from "@gajae-code/coding-agent/session/agent-session";
@@ -31,6 +32,10 @@ function createUsage(): Usage {
 		totalTokens: 2,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
+}
+
+function makeFsError(code: "EACCES" | "EPERM" | "EROFS"): NodeJS.ErrnoException {
+	return Object.assign(new Error(code), { code });
 }
 
 function createUserHistoryPayload(provider = "openai"): ProviderPayload {
@@ -87,6 +92,26 @@ function createStaleAssistantMessage(
 		providerPayload: createStaleAssistantHistoryPayload(provider),
 		timestamp: Date.now(),
 	};
+}
+
+function rewritePersistedAssistantsAsStale(sessionFile: string, assistantTexts: readonly string[]): void {
+	let assistantIndex = 0;
+	const rewritten = fs
+		.readFileSync(sessionFile, "utf8")
+		.split("\n")
+		.map(line => {
+			if (!line) return line;
+			const record = JSON.parse(line) as SessionEntry;
+			if (record.type !== "message" || record.message.role !== "assistant") return line;
+			const assistantText = assistantTexts[assistantIndex++];
+			if (assistantText === undefined) throw new Error("Unexpected persisted assistant message");
+			record.message = { ...createStaleAssistantMessage(assistantText), timestamp: record.message.timestamp };
+			return JSON.stringify(record);
+		})
+		.join("\n");
+	if (assistantIndex !== assistantTexts.length)
+		throw new Error("Expected every stale assistant fixture to be persisted");
+	fs.writeFileSync(sessionFile, rewritten);
 }
 
 function isSessionMessageEntry(entry: SessionEntry): entry is SessionMessageEntry {
@@ -308,6 +333,112 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		await openedSessionManager.close();
 	});
 
+	it("sanitizes multiple stale managed assistants in memory without rewriting on open", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-3793-managed-open-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const assistantTexts = ["First stale managed assistant", "Second stale managed assistant"];
+		const destination = SessionManager.managedDestination(tempDir, path.join(tempDir, "agent"));
+		const persistedSessionManager = SessionManager.create(tempDir, destination);
+		for (const assistantText of assistantTexts) {
+			persistedSessionManager.appendMessage(createStaleAssistantMessage(assistantText));
+		}
+		await persistedSessionManager.flush();
+		const sessionFile = persistedSessionManager.getSessionFile();
+		if (!sessionFile) {
+			throw new Error("Expected persisted managed session file");
+		}
+		await persistedSessionManager.close();
+		rewritePersistedAssistantsAsStale(sessionFile, assistantTexts);
+
+		let openedSessionManager: SessionManager | undefined;
+		try {
+			const opened = await SessionManager.open(sessionFile, destination);
+			openedSessionManager = opened;
+			const persistedAssistantEntries = assistantTexts.map(assistantText =>
+				findPersistedMessageEntry(opened, "assistant", assistantText),
+			);
+			for (const persistedAssistantEntry of persistedAssistantEntries) {
+				const { message } = persistedAssistantEntry;
+				if (message.role !== "assistant") {
+					throw new Error("Expected persisted managed assistant message");
+				}
+				expectAssistantReplayMetadataSanitized(message);
+			}
+			await opened.close();
+			openedSessionManager = undefined;
+
+			const reopened = await SessionManager.open(sessionFile, destination);
+			openedSessionManager = reopened;
+			for (const assistantText of assistantTexts) {
+				const { message } = findPersistedMessageEntry(reopened, "assistant", assistantText);
+				if (message.role !== "assistant") {
+					throw new Error("Expected reopened managed assistant message");
+				}
+				expectAssistantReplayMetadataSanitized(message);
+			}
+
+			const persistedText = fs.readFileSync(sessionFile, "utf8");
+			const patchRecords = persistedText.split("\n").filter(record => record.includes('"type":"entry_patch"'));
+			expect(persistedText).toContain("enc_stale");
+			expect(patchRecords).toHaveLength(0);
+		} finally {
+			await openedSessionManager?.close();
+		}
+	});
+
+	it("sanitizes a managed transcript larger than 20 MiB in memory without rewriting on open", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-3793-large-managed-open-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const assistantTexts = Array.from(
+			{ length: 256 },
+			(_, index) => `Large stale managed assistant ${index} ${"x".repeat(96 * 1024)}`,
+		);
+
+		const sourceManager = SessionManager.create(tempDir, path.join(tempDir, "source"));
+		for (const assistantText of assistantTexts) {
+			sourceManager.appendMessage(createStaleAssistantMessage(assistantText));
+		}
+		await sourceManager.flush();
+		const sourceFile = sourceManager.getSessionFile();
+		if (!sourceFile) throw new Error("Expected large source session file");
+		await sourceManager.close();
+
+		const destination = SessionManager.managedDestination(tempDir, path.join(tempDir, "agent"));
+		const placeholderManager = SessionManager.create(tempDir, destination);
+		await placeholderManager.flush();
+		const sessionFile = placeholderManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected managed destination session file");
+		await placeholderManager.close();
+		fs.copyFileSync(sourceFile, sessionFile);
+		rewritePersistedAssistantsAsStale(sessionFile, assistantTexts);
+		expect(fs.statSync(sessionFile).size).toBeGreaterThan(20 * 1024 * 1024);
+
+		let openedSessionManager: SessionManager | undefined;
+		try {
+			const opened = await SessionManager.open(sessionFile, destination);
+			openedSessionManager = opened;
+
+			for (const assistantText of [assistantTexts[0]!, assistantTexts.at(-1)!]) {
+				const { message } = findPersistedMessageEntry(opened, "assistant", assistantText);
+				if (message.role !== "assistant") throw new Error("Expected large persisted assistant message");
+				expectAssistantReplayMetadataSanitized(message);
+			}
+
+			await opened.close();
+			openedSessionManager = undefined;
+			const reopened = await SessionManager.open(sessionFile, destination);
+			openedSessionManager = reopened;
+			const patchRecords = fs
+				.readFileSync(sessionFile, "utf8")
+				.split("\n")
+				.filter(record => record.includes('"type":"entry_patch"'));
+			expect(patchRecords).toHaveLength(0);
+			expect(fs.readFileSync(sessionFile, "utf8")).toContain("enc_stale");
+		} finally {
+			await openedSessionManager?.close();
+		}
+	}, 30_000);
+
 	it("sanitizes stale assistant replay metadata when forking a persisted session", async () => {
 		const sourceDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-fork-source-${Snowflake.next()}-`));
 		const forkDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-fork-target-${Snowflake.next()}-`));
@@ -426,10 +557,14 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		} satisfies ProviderSessionState);
 
 		const seed = await parent.buildForkContextSeed({ maxMessages: 10, maxTokens: 10_000 });
-		expect(seed.cacheIdentity).toBe(parent.sessionId);
-		expect(seed.messages).toHaveLength(2);
+		expect(seed.messages).toHaveLength(3);
 		expect(seed.metadata.skippedReasons["developer-role"]).toBe(1);
-		expect(seed.metadata.skippedReasons["tool-result-role"]).toBe(1);
+		const inheritedToolDigest = seed.messages.at(-1);
+		expect(inheritedToolDigest).toMatchObject({
+			role: "user",
+			content: [{ type: "text", text: "[tool result: bash]\nparent tool output" }],
+		});
+		expect(seed.metadata.approximateTokens).toBeGreaterThan(0);
 		expect(seed.agentMessages).toEqual(seed.messages);
 		expect(seed.messages.every(message => !("providerPayload" in message))).toBe(true);
 		const inheritedAssistant = seed.messages.find(message => message.role === "assistant");
@@ -475,7 +610,11 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		authStorages.push(childAuthStorage);
 
 		expect(child.sessionId).not.toBe(parent.sessionId);
-		expect(child.agent.providerSessionId).toBe(parent.sessionId);
+		// A fork owns a new transcript and provider transport/cache affinity. It
+		// inherits only the sanitized prompt seed, never the parent's session.
+		expect(child.agent.sessionId).toBe(child.sessionId);
+		expect(child.agent.providerSessionId).toBe(child.sessionId);
+		expect(child.agent.providerSessionId).not.toBe(parent.agent.providerSessionId);
 		expect(child.providerSessionState).toBe(childState);
 		expect(child.providerSessionState).not.toBe(parent.providerSessionState);
 		const childCodexState = child.providerSessionState.get("openai-codex-responses") as
@@ -488,12 +627,26 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		}
 		expect(parent.providerSessionState.size).toBe(1);
 		expect(parentCloseSpy).not.toHaveBeenCalled();
-		expect(child.messages.slice(0, 2)).toEqual(seed.agentMessages);
+		expect(child.messages.slice(0, seed.agentMessages.length)).toEqual(seed.agentMessages);
 
 		parent.agent.appendMessage({ role: "user", content: "oversized ".repeat(5_000), timestamp: Date.now() });
 		const boundedSeed = await parent.buildForkContextSeed({ maxMessages: 10, maxTokens: 1 });
 		expect(boundedSeed.messages).toHaveLength(0);
 		expect(boundedSeed.metadata.skippedReasons["token-limit"]).toBeGreaterThan(0);
+
+		parent.agent.appendMessage({ role: "user", content: "Preserve this prompt", timestamp: Date.now() + 1 });
+		parent.agent.appendMessage(createStaleAssistantMessage("oversized assistant ".repeat(5_000)));
+		const lastTurnSeed = await parent.buildForkContextSeed({
+			maxMessages: 2,
+			maxTokens: 100,
+			preserveLatestUser: true,
+		});
+		expect(lastTurnSeed.messages.map(message => message.role)).toEqual(["user", "assistant"]);
+		expect(getTextContent(lastTurnSeed.messages[0]!)).toContain("Preserve this prompt");
+		expect(lastTurnSeed.metadata.approximateTokens).toBeLessThanOrEqual(100);
+		expect(lastTurnSeed.metadata.includedMessages + lastTurnSeed.metadata.skippedMessages).toBe(
+			lastTurnSeed.metadata.parentMessageCount,
+		);
 	});
 
 	it("propagates appendOnlyPrefixSnapshot through buildForkContextSeed when append-only mode is active", async () => {
@@ -533,6 +686,128 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 			expect(seed.appendOnlyPrefixSnapshot).toBeUndefined();
 		}
 	});
+
+	it("preserves a forked child seeded prefix across compaction and prune rewrites", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-fc-seeded-rewrite-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const parentManager = SessionManager.create(tempDir, tempDir);
+		const { session: parent, authStorage: parentAuthStorage } = await createSessionHarness(tempDir, parentManager, {
+			provider: "openai-codex",
+			modelId: "gpt-5.2-codex",
+			settings: { "provider.appendOnlyContext": "on" },
+		});
+		sessions.push(parent);
+		authStorages.push(parentAuthStorage);
+		parent.agent.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "parent seeded prefix" }],
+			attribution: "user",
+			timestamp: Date.now() - 10_000,
+		});
+		const seed = await parent.buildForkContextSeed({ maxMessages: 10, maxTokens: 10_000 });
+		expect(seed.appendOnlyPrefixSnapshot).toBeDefined();
+		const childManager = SessionManager.create(tempDir, tempDir);
+		const { session: child, authStorage: childAuthStorage } = await createSessionHarness(tempDir, childManager, {
+			provider: "openai-codex",
+			modelId: "gpt-5.2-codex",
+			settings: { "provider.appendOnlyContext": "on", "compaction.keepRecentTokens": 10 },
+			forkContextSeed: seed,
+		});
+		sessions.push(child);
+		authStorages.push(childAuthStorage);
+		const appendOnly = child.agent.appendOnlyContext;
+		expect(appendOnly).not.toBeUndefined();
+		if (!appendOnly) return;
+		const seededPrefix = appendOnly.log.toMessages();
+		expect(seededPrefix).toEqual(seed.messages);
+
+		const oldLocal = { role: "user" as const, content: "child old local", timestamp: Date.now() - 3_000 };
+		const keptLocal = { role: "user" as const, content: "child kept local", timestamp: Date.now() - 2_000 };
+		child.agent.appendMessage(oldLocal);
+		child.agent.appendMessage(keptLocal);
+		childManager.appendMessage(oldLocal);
+		const firstKeptEntryId = childManager.appendMessage(keptLocal);
+		const compactionEntryId = childManager.appendCompaction(
+			"child summary",
+			"child summary",
+			firstKeptEntryId,
+			1_000,
+		);
+		const compactionLocal = {
+			role: "user" as const,
+			content: "child-before-compaction-rewrite",
+			timestamp: Date.now() - 1_000,
+		};
+		appendOnly.syncMessages([...seededPrefix, compactionLocal]);
+		expect(appendOnly.log.toMessages()).toHaveLength(seededPrefix.length + 1);
+		await child.applyCompactionPostAppendForTests(compactionEntryId, firstKeptEntryId);
+		expect(appendOnly.log.toMessages().slice(0, seededPrefix.length)).toEqual(seededPrefix);
+		expect(appendOnly.log.toMessages()).not.toContainEqual(compactionLocal);
+
+		const pruneOutput = "fork-prune-output-".repeat(60_000);
+		const pruneCallId = "fork-prune-call";
+		const pruneAssistant = {
+			role: "assistant" as const,
+			content: [{ type: "toolCall" as const, id: pruneCallId, name: "bash", arguments: { command: "cat" } }],
+			api: child.model!.api,
+			provider: child.model!.provider,
+			model: child.model!.id,
+			usage: createUsage(),
+			stopReason: "toolUse" as const,
+			timestamp: Date.now(),
+		};
+		const pruneResult = {
+			role: "toolResult" as const,
+			toolCallId: pruneCallId,
+			toolName: "bash",
+			content: [{ type: "text" as const, text: pruneOutput }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		const recentPruneResult = {
+			role: "toolResult" as const,
+			toolCallId: "fork-recent-call",
+			toolName: "bash",
+			content: [{ type: "text" as const, text: "fork-recent-output-".repeat(20_000) }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		const pruneFinalAssistant = {
+			...createStaleAssistantMessage("fork final response", {
+				api: child.model!.api,
+				provider: child.model!.provider,
+				model: child.model!.id,
+			}),
+			usage: { ...createUsage(), totalTokens: (child.model!.contextWindow ?? 200_000) + 100_000 },
+		};
+		for (const message of [
+			pruneAssistant,
+			pruneResult,
+			recentPruneResult,
+			{ role: "user" as const, content: "fork fence one", timestamp: Date.now() },
+			pruneFinalAssistant,
+			{ role: "user" as const, content: "fork fence two", timestamp: Date.now() },
+		]) {
+			child.agent.appendMessage(message as never);
+			childManager.appendMessage(message as never);
+		}
+		const pruneLocal = { role: "user" as const, content: "child-before-prune-rewrite", timestamp: Date.now() };
+		appendOnly.syncMessages([...seededPrefix, pruneLocal]);
+		expect(appendOnly.log.toMessages()).toHaveLength(seededPrefix.length + 1);
+		const outcome = await child.runMidRunMaintenanceForTests({
+			systemPrompt: child.state.systemPrompt,
+			messages: child.messages,
+			tools: [],
+		});
+		expect(outcome).toBe("pruned");
+		expect(appendOnly.log.toMessages().slice(0, seededPrefix.length)).toEqual(seededPrefix);
+		expect(appendOnly.log.toMessages()).not.toContainEqual(pruneLocal);
+		// Each session created by this test races the workspace-tree scan's 5s
+		// startup deadline, so on slower runners the two harness sessions plus the
+		// maintenance can exceed bun's 5s default. The CI failure this guards was
+		// the StablePrefix fingerprint crash (fast); the generous bound only
+		// prevents environment-speed false timeouts.
+	}, 30_000);
 
 	it("spawns bundled executor and architect via TaskTool with inheritContext: bounded through the production path", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-fc-task-${Snowflake.next()}-`));
@@ -649,6 +924,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 				"task.forkContext.enabled": true,
 			}),
 			getSessionFile: () => parent.sessionManager.getSessionFile(),
+			getSessionId: () => parent.sessionId,
 			getSessionSpawns: () => "*",
 			model: parent.model,
 			buildForkContextSeed: (opts: Parameters<AgentSession["buildForkContextSeed"]>[0]) =>
@@ -659,6 +935,9 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 				getAvailable: () => [],
 				getApiKey: async () => null,
 			},
+			// Inject the manager used by this production-path harness; the real SDK
+			// ToolSession exposes the same accessor for endpoint-owned routing.
+			getAsyncJobManager: () => manager,
 		};
 
 		const tool = await taskModule.TaskTool.create(
@@ -687,12 +966,14 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		expect(execChild).toBeDefined();
 		expect(archChild).toBeDefined();
 
+		const expectedIds = new Map([
+			["executor", JSON.stringify(["subagent-canonical", parent.sessionId, "0-ExecFork"])],
+			["architect", JSON.stringify(["subagent-canonical", parent.sessionId, "0-ArchFork"])],
+		]);
 		for (const child of [execChild!, archChild!]) {
 			expect(child.forkContextSeed).toBeDefined();
-			// cacheIdentity is the seed-borne identity; it must reuse the parent's sessionId so
-			// the child session's provider-side prefix cache hits when configured via sdk.ts:870
-			// (which uses options.forkContextSeed?.cacheIdentity as the providerSessionId fallback).
-			expect(child.forkContextSeed!.cacheIdentity).toBe(parent.sessionId);
+			expect(child.providerSessionId).toBe(expectedIds.get(child.agentDisplayName!));
+			expect(child.providerSessionId).not.toBe(parent.sessionId);
 		}
 	});
 
@@ -812,9 +1093,14 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		const { session, authStorage } = await createSessionHarness(tempDir, reloadedSessionManager, {
 			provider: "openai-codex",
 			modelId: "gpt-5.2-codex",
+			settings: { "provider.appendOnlyContext": "on" },
 		});
 		sessions.push(session);
 		authStorages.push(authStorage);
+		const appendOnly = session.agent.appendOnlyContext;
+		expect(appendOnly).not.toBeUndefined();
+		appendOnly?.syncMessages([{ role: "user", content: "reload-provider-marker" }]);
+		expect(appendOnly?.log.length).toBe(1);
 
 		const closeSpy = vi.fn();
 		session.providerSessionState.set("openai-codex-responses", { close: closeSpy } satisfies ProviderSessionState);
@@ -831,6 +1117,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		await session.reload();
 
 		expect(closeSpy).toHaveBeenCalledTimes(1);
+		expect(appendOnly?.log.length).toBe(0);
 		expect(session.providerSessionState.size).toBe(0);
 		expect(session.model?.provider).toBe("openai-codex");
 		expect(session.model?.id).toBe("gpt-5.2-codex");
@@ -945,6 +1232,93 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		expect(session.sessionManager).toBe(currentSessionManager);
 		expect(session.sessionFile).toBe(sessionFile);
 		expectAssistantReplayMetadataSanitized(findRuntimeAssistant(session, "Unreadable assistant snapshot"));
+	});
+
+	it.each([
+		"EACCES",
+		"EPERM",
+		"EROFS",
+	] as const)("publishes a read-only successor and retries local:// setup after %s", async code => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-readonly-local-switch-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const currentSessionManager = SessionManager.create(tempDir, tempDir);
+		const { session, authStorage } = await createSessionHarness(tempDir, currentSessionManager);
+		sessions.push(session);
+		authStorages.push(authStorage);
+		const predecessorSessionId = session.sessionId;
+		const { sessionFile } = await createPersistedSession(tempDir, sessionManager => {
+			sessionManager.appendMessage({ role: "user", content: "read-only successor", timestamp: Date.now() });
+		});
+		const readiness = vi.spyOn(internalUrls, "initializeLocalRoot").mockRejectedValue(makeFsError(code));
+
+		try {
+			await expect(session.switchSession(sessionFile)).resolves.toBe(true);
+			const successorSessionId = session.sessionManager.getSessionId();
+			expect(successorSessionId).not.toBe(predecessorSessionId);
+			expect(session.sessionId).toBe(successorSessionId);
+			expect(session.agent.sessionId).toBe(successorSessionId);
+			expect(session.sessionFile).toBe(sessionFile);
+
+			await expect(session.reload()).resolves.toBeUndefined();
+			expect(readiness).toHaveBeenCalledTimes(2);
+
+			const localOptions = {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				isManagedDestination: () => session.sessionManager.isManagedDestination(),
+				getManagedLegacyLocalMigrationSource: () => session.sessionManager.getManagedLegacyLocalMigrationSource(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			};
+			const localMkdir = vi.spyOn(fs, "mkdirSync").mockImplementation((() => {
+				throw makeFsError(code);
+			}) as typeof fs.mkdirSync);
+			try {
+				expect(() => internalUrls.resolveLocalUrlToPath("local://retry.md", localOptions)).toThrow(code);
+			} finally {
+				localMkdir.mockRestore();
+			}
+			const localPath = internalUrls.resolveLocalUrlToPath("local://retry.md", localOptions);
+			fs.writeFileSync(localPath, "retried local root");
+			expect(fs.readFileSync(localPath, "utf8")).toBe("retried local root");
+		} finally {
+			readiness.mockRestore();
+		}
+	});
+
+	it("rolls back an unrelated local-root failure with predecessor authority intact", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-local-switch-rollback-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const currentSessionManager = SessionManager.create(tempDir, tempDir);
+		const { session, authStorage } = await createSessionHarness(tempDir, currentSessionManager);
+		sessions.push(session);
+		authStorages.push(authStorage);
+		const predecessor = {
+			sessionId: session.sessionId,
+			sessionFile: session.sessionFile,
+			managerSessionId: currentSessionManager.getSessionId(),
+			managerSessionFile: currentSessionManager.getSessionFile(),
+			agentSessionId: session.agent.sessionId,
+			agentProviderSessionId: session.agent.providerSessionId,
+		};
+		const { sessionFile } = await createPersistedSession(tempDir, sessionManager => {
+			sessionManager.appendMessage({ role: "user", content: "failed successor", timestamp: Date.now() });
+		});
+		const readiness = vi
+			.spyOn(internalUrls, "initializeLocalRoot")
+			.mockRejectedValueOnce(new Error("unexpected local root initialization failure"));
+
+		try {
+			await expect(session.switchSession(sessionFile)).rejects.toThrow(
+				"unexpected local root initialization failure",
+			);
+			expect(session.sessionId).toBe(predecessor.sessionId);
+			expect(session.sessionFile).toBe(predecessor.sessionFile);
+			expect(currentSessionManager.getSessionId()).toBe(predecessor.managerSessionId);
+			expect(currentSessionManager.getSessionFile()).toBe(predecessor.managerSessionFile);
+			expect(session.agent.sessionId).toBe(predecessor.agentSessionId);
+			expect(session.agent.providerSessionId).toBe(predecessor.agentProviderSessionId);
+		} finally {
+			readiness.mockRestore();
+		}
 	});
 
 	it("clears provider session state and sanitizes loaded assistant metadata when switching sessions", async () => {

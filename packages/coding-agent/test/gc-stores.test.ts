@@ -2,9 +2,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileLocksGcAdapter } from "@gajae-code/coding-agent/config/file-lock-gc";
+import { collectFileLocksForGc, fileLocksGcAdapter } from "@gajae-code/coding-agent/config/file-lock-gc";
 import type { GcContext, GcPidProbe } from "@gajae-code/coding-agent/gjc-runtime/gc-runtime";
-import { teamWorkersGcAdapter } from "@gajae-code/coding-agent/gjc-runtime/team-gc";
+import { collectGcReport, computeExitCode } from "@gajae-code/coding-agent/gjc-runtime/gc-runtime";
 import {
 	harnessLeasesGcAdapter,
 	registryEntriesGcAdapter,
@@ -149,12 +149,14 @@ describe("fileLocksGcAdapter", () => {
 			env: { ...process.env, GJC_RECEIPT_SPOOL_DIR: spoolDir },
 			cwd: base,
 		};
-		const { records } = await fileLocksGcAdapter.collect(ctx);
+		const { records, errors, warnings } = await collectFileLocksForGc(ctx, { roots: [spoolDir] });
 		const byPath = new Map(records.map(r => [path.resolve(r.path ?? r.id), r]));
 		expect(byPath.get(path.resolve(deadLock))?.removable).toBe(true);
 		expect(byPath.get(path.resolve(aliveLock))?.removable).toBe(false);
 		expect(byPath.get(path.resolve(oldLiveLock))?.removable).toBe(false);
 		expect(byPath.get(path.resolve(malformedLock))?.removable).toBe(false);
+		expect(errors).toEqual([]);
+		expect(warnings ?? []).toEqual([]);
 
 		// prune removes only the dead lock dir after re-probe.
 		const outcome = await fileLocksGcAdapter.prune(byPath.get(path.resolve(deadLock))!, ctx);
@@ -162,74 +164,57 @@ describe("fileLocksGcAdapter", () => {
 		expect(await fs.exists(deadLock)).toBe(false);
 		expect(await fs.exists(aliveLock)).toBe(true);
 	});
-});
 
-describe("teamWorkersGcAdapter (PID dominance)", () => {
-	test("dead-pid worker removable; live-pid worker with failed lifecycle is KEPT", async () => {
+	test("walk cap is a per-root warning and does not skip remaining roots (#3852)", async () => {
 		const base = await makeTemp();
-		const harnessRoot = path.join(base, "state", "harness");
-		const teamRoot = path.join(base, "state", "team");
-		const registryDir = path.join(base, "reg");
-		await writeJson(path.join(registryDir, "h-x.json"), {
-			sessionId: "h-x",
-			roots: [{ root: harnessRoot, updatedAt: new Date().toISOString() }],
-		});
-		const deadWorker = path.join(teamRoot, "alpha", "workers", "w-dead");
-		const liveFailedWorker = path.join(teamRoot, "alpha", "workers", "w-live-failed");
-		await writeJson(path.join(deadWorker, "heartbeat.json"), {
-			pid: DEAD_PID,
-			last_turn_at: new Date().toISOString(),
-			turn_count: 0,
-		});
-		await writeJson(path.join(deadWorker, "lifecycle.json"), {
-			pid: DEAD_PID,
-			lifecycle_state: "running",
-			stop_reason: null,
-		});
-		await writeJson(path.join(liveFailedWorker, "heartbeat.json"), {
-			pid: ALIVE_PID,
-			last_turn_at: new Date().toISOString(),
-			turn_count: 0,
-		});
-		await writeJson(path.join(liveFailedWorker, "lifecycle.json"), {
-			pid: ALIVE_PID,
-			lifecycle_state: "failed",
-			stop_reason: "crashed",
-		});
+		const agentDir = path.join(base, "agent");
+		await fs.mkdir(agentDir, { recursive: true });
+		// Flood the agent root so a tiny budget truncates it; spool stays small.
+		const flooded = path.join(agentDir, "flood");
+		await fs.mkdir(flooded, { recursive: true });
+		for (let i = 0; i < 8; i++) {
+			await fs.writeFile(path.join(flooded, `f${i}`), "x", "utf8");
+		}
 
-		const { records } = await teamWorkersGcAdapter.collect(ctxFor(base, registryDir));
-		const dead = records.find(r => r.id === "alpha/w-dead");
-		const liveFailed = records.find(r => r.id === "alpha/w-live-failed");
-		expect(dead?.removable).toBe(true);
-		expect(dead?.status).toBe("dead");
-		// PID liveness dominates the failed lifecycle => kept.
-		expect(liveFailed?.removable).toBe(false);
-	});
+		const spoolDir = path.join(base, "spool");
+		const spoolLock = path.join(spoolDir, "spool-dead.lock");
+		await writeJson(path.join(spoolLock, "info"), { pid: DEAD_PID, timestamp: Date.now() });
 
-	test("dead heartbeat pid but LIVE lifecycle pid is KEPT (all-PID dominance)", async () => {
-		const base = await makeTemp();
-		const harnessRoot = path.join(base, "state", "harness");
-		const teamRoot = path.join(base, "state", "team");
-		const registryDir = path.join(base, "reg");
-		await writeJson(path.join(registryDir, "h-mixed.json"), {
-			sessionId: "h-mixed",
-			roots: [{ root: harnessRoot, updatedAt: new Date().toISOString() }],
-		});
-		const mixedWorker = path.join(teamRoot, "alpha", "workers", "w-mixed");
-		// heartbeat pid is dead, but the lifecycle pid is a live process => keep.
-		await writeJson(path.join(mixedWorker, "heartbeat.json"), {
-			pid: DEAD_PID,
-			last_turn_at: new Date().toISOString(),
-			turn_count: 0,
-		});
-		await writeJson(path.join(mixedWorker, "lifecycle.json"), {
-			pid: ALIVE_PID,
-			lifecycle_state: "running",
-			stop_reason: null,
-		});
+		const ctx: GcContext = {
+			probe: splitProbe,
+			force: false,
+			env: { ...process.env, GJC_RECEIPT_SPOOL_DIR: spoolDir },
+			cwd: base,
+		};
+		// Budget of 3 is enough to start agent root but not exhaust its flood,
+		// while still fully scanning the small spool root (independent budget).
+		const roots = [agentDir, spoolDir];
+		const result = await collectFileLocksForGc(ctx, { maxWalkEntries: 3, roots });
+		expect(result.errors).toEqual([]);
+		const warnings = result.warnings ?? [];
+		expect(warnings.length).toBeGreaterThan(0);
+		for (const warning of warnings) {
+			expect(warning.store).toBe("file_locks");
+			expect(warning.message).toContain("file lock discovery capped at 3 entries for root");
+			expect(warning.message).toContain("scanned");
+		}
+		// Spool lock must still be discovered after agent root truncation.
+		const spoolRec = result.records.find(r => path.resolve(r.path ?? r.id) === path.resolve(spoolLock));
+		expect(spoolRec?.removable).toBe(true);
 
-		const { records } = await teamWorkersGcAdapter.collect(ctxFor(base, registryDir));
-		const mixed = records.find(r => r.id === "alpha/w-mixed");
-		expect(mixed?.removable).toBe(false);
+		const report = await collectGcReport(
+			[
+				{
+					store: "file_locks",
+					collect: async c => collectFileLocksForGc(c, { maxWalkEntries: 3, roots }),
+					prune: fileLocksGcAdapter.prune.bind(fileLocksGcAdapter),
+				},
+			],
+			ctx,
+			false,
+		);
+		expect(report.errors).toEqual([]);
+		expect(report.warnings.length).toBeGreaterThan(0);
+		expect(computeExitCode(report)).toBe(0);
 	});
 });

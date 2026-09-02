@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { streamPiNative } from "../src/providers/pi-native-client";
+import { streamSimple } from "../src/stream";
 import type { AssistantMessage, AssistantMessageEvent, Context, FetchImpl, Model } from "../src/types";
+import { isProviderSafetyStopAuthenticated } from "../src/utils/provider-safety-stop";
 
 function sseBytes(events: AssistantMessageEvent[]): Uint8Array {
 	const encoder = new TextEncoder();
@@ -120,6 +122,39 @@ describe("streamPiNative request shape", () => {
 		expect(body.options.temperature).toBe(0.7);
 	});
 
+	it("propagates configured and per-request output budgets through the public pi-native path", async () => {
+		const bodies: Array<Record<string, unknown>> = [];
+		const fetchImpl: FetchImpl = (async (_input, init) => {
+			bodies.push(JSON.parse(init?.body as string) as Record<string, unknown>);
+			return fakeResponse([{ type: "done", reason: "stop", message: baseAssistant() }]);
+		}) as FetchImpl;
+		const model = fakeModel({ maxTokens: 65_536, maxTokensSource: "configured" });
+
+		await streamSimple(model, baseContext, { apiKey: "gw-bearer", fetch: fetchImpl }).result();
+		await streamSimple(model, baseContext, { apiKey: "gw-bearer", fetch: fetchImpl, maxTokens: 70_000 }).result();
+
+		expect((bodies[0].options as Record<string, unknown>).maxTokens).toBe(65_536);
+		expect((bodies[1].options as Record<string, unknown>).maxTokens).toBe(70_000);
+	});
+
+	it("keeps zero and non-finite request budgets on the safe default", async () => {
+		const budgets: unknown[] = [];
+		const fetchImpl: FetchImpl = (async (_input, init) => {
+			const body = JSON.parse(init?.body as string) as { options: { maxTokens: unknown } };
+			budgets.push(body.options.maxTokens);
+			return fakeResponse([{ type: "done", reason: "stop", message: baseAssistant() }]);
+		}) as FetchImpl;
+
+		await streamSimple(fakeModel(), baseContext, { apiKey: "gw-bearer", fetch: fetchImpl, maxTokens: 0 }).result();
+		await streamSimple(fakeModel(), baseContext, {
+			apiKey: "gw-bearer",
+			fetch: fetchImpl,
+			maxTokens: Number.POSITIVE_INFINITY,
+		}).result();
+
+		expect(budgets).toEqual([32_000, 32_000]);
+	});
+
 	it("strips non-wire fields (signal, apiKey, fetch, callbacks) from `options`", async () => {
 		// `apiKey` must ride in the Authorization header, never the body — sending
 		// it twice would let a logged request leak the gateway bearer. The other
@@ -177,13 +212,13 @@ describe("streamPiNative request shape", () => {
 		}) as FetchImpl;
 
 		await streamPiNative(
-			fakeModel({ headers: { "x-gjc-slot": "robogjc-1", Authorization: "Bearer model-wins" } }),
+			fakeModel({ headers: { "x-gjc-slot": "worker-1", Authorization: "Bearer model-wins" } }),
 			baseContext,
 			{ apiKey: "options-loses", fetch: fetchImpl },
 		).result();
 
 		const headers = captured.init?.headers as Record<string, string>;
-		expect(headers["x-gjc-slot"]).toBe("robogjc-1");
+		expect(headers["x-gjc-slot"]).toBe("worker-1");
 		expect(headers.Authorization).toBe("Bearer model-wins");
 	});
 
@@ -241,14 +276,12 @@ describe("streamPiNative event flow", () => {
 		await expect(stream.result()).rejects.toThrow(/502/);
 	});
 
-	it("synthesizes a terminal `done` when the SSE stream closes silently", async () => {
-		// Models the gateway dropping mid-stream — without this synthetic terminator,
-		// `.result()` would hang forever.
+	it("fails with classified transport evidence when the SSE stream closes silently", async () => {
 		const halfEvents: AssistantMessageEvent[] = [{ type: "start", partial: baseAssistant() }];
 		const encoder = new TextEncoder();
 		const body = new ReadableStream<Uint8Array>({
 			start(controller) {
-				for (const e of halfEvents) controller.enqueue(encoder.encode(`data: ${JSON.stringify(e)}\n\n`));
+				for (const event of halfEvents) controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
 				controller.close();
 			},
 		});
@@ -256,13 +289,11 @@ describe("streamPiNative event flow", () => {
 			new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } })) as FetchImpl;
 
 		const stream = streamPiNative(fakeModel(), baseContext, { apiKey: "k", fetch: fetchImpl });
-		const seen = await collectEvents(stream);
-		expect(seen.length).toBeGreaterThanOrEqual(2);
-		expect(seen[seen.length - 1].type).toBe("done");
-
-		const result = await stream.result();
-		expect(result.role).toBe("assistant");
-		expect(result.stopReason).toBe("stop");
+		await expect(collectEvents(stream)).rejects.toMatchObject({
+			message: "pi-native SSE stream closed without terminal event",
+			status: 502,
+		});
+		await expect(stream.result()).rejects.toMatchObject({ status: 502 });
 	});
 
 	it("fails fast when the caller's signal is already aborted before fetch fires", async () => {
@@ -300,5 +331,61 @@ describe("streamPiNative event flow", () => {
 			signal: controller.signal,
 		}).result();
 		expect(captured.signal).toBe(controller.signal);
+	});
+});
+
+describe("streamPiNative provider safety-stop provenance", () => {
+	const typedStop = (): AssistantMessage =>
+		baseAssistant({
+			stopReason: "error",
+			errorKind: "provider_safety_stop",
+			errorMessage: "Refusal (safety): policy violation",
+		});
+
+	it("does not mint authority from a caller-supplied fetch and loopback URL", async () => {
+		const fetchImpl: FetchImpl = (async () =>
+			fakeResponse([{ type: "error", reason: "error", error: typedStop() }])) as FetchImpl;
+		const model = fakeModel({ baseUrl: "http://127.0.0.1:4000" });
+
+		const result = await streamPiNative(model, baseContext, { apiKey: "k", fetch: fetchImpl }).result();
+		expect(result.errorKind).toBe("provider_safety_stop");
+		expect(isProviderSafetyStopAuthenticated(result)).toBe(false);
+	});
+
+	it("keeps the public streamSimple pi-native path fail-closed", async () => {
+		const fetchImpl: FetchImpl = (async () =>
+			fakeResponse([{ type: "done", reason: "stop", message: typedStop() }])) as FetchImpl;
+
+		const result = await streamSimple(fakeModel({ baseUrl: "http://127.0.0.1:4000" }), baseContext, {
+			apiKey: "k",
+			fetch: fetchImpl,
+		}).result();
+
+		expect(result.errorKind).toBe("provider_safety_stop");
+		expect(isProviderSafetyStopAuthenticated(result)).toBe(false);
+	});
+
+	it("does not authenticate a typed stop from any serialized gateway endpoint", async () => {
+		const fetchImpl: FetchImpl = (async () =>
+			fakeResponse([{ type: "error", reason: "error", error: typedStop() }])) as FetchImpl;
+
+		const result = await streamPiNative(fakeModel(), baseContext, { apiKey: "k", fetch: fetchImpl }).result();
+		expect(result.errorKind).toBe("provider_safety_stop");
+		expect(isProviderSafetyStopAuthenticated(result)).toBe(false);
+	});
+
+	it("never authenticates a done-carried typed stop after SSE serialization", async () => {
+		const fetchImpl: FetchImpl = (async () =>
+			fakeResponse([{ type: "done", reason: "stop", message: typedStop() }])) as FetchImpl;
+		const model = fakeModel({ baseUrl: "http://localhost:4000" });
+
+		const result = await streamPiNative(model, baseContext, { apiKey: "k", fetch: fetchImpl }).result();
+		expect(isProviderSafetyStopAuthenticated(result)).toBe(false);
+
+		const plainFetch: FetchImpl = (async () =>
+			fakeResponse([{ type: "done", reason: "stop", message: baseAssistant() }])) as FetchImpl;
+		const plain = await streamPiNative(model, baseContext, { apiKey: "k", fetch: plainFetch }).result();
+		expect(plain.errorKind).toBeUndefined();
+		expect(isProviderSafetyStopAuthenticated(plain)).toBe(false);
 	});
 });

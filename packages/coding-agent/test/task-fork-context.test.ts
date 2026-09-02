@@ -6,9 +6,11 @@ import { parseAgentFields } from "../src/discovery/helpers";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../src/sdk";
 import * as sdkModule from "../src/sdk";
 import type { AgentSession, AgentSessionEvent, ForkContextSeed } from "../src/session/agent-session";
-import { TaskTool } from "../src/task";
+import { resolveForkContextMaxTokens, TaskTool } from "../src/task";
 import { getBundledAgent } from "../src/task/agents";
 import * as discoveryModule from "../src/task/discovery";
+import { trimForkContextSeedForModel } from "../src/task/executor";
+import { FORK_CONTEXT_TOKEN_BUDGET_BY_MODE } from "../src/task/fork-context-budget";
 import type { AgentDefinition, TaskParams } from "../src/task/types";
 import { getTaskSchema, taskSchema } from "../src/task/types";
 import type { ToolSession } from "../src/tools";
@@ -82,12 +84,14 @@ function createYieldingSession(): AgentSession {
 function createSession(
 	overrides: Partial<Record<string, unknown>> = {},
 	buildForkContextSeed?: ToolSession["buildForkContextSeed"],
+	sessionId?: string,
 ): ToolSession {
 	return {
 		cwd: "/tmp",
 		hasUI: false,
 		settings: Settings.isolated({ "async.enabled": false, ...overrides }),
 		getSessionFile: () => null,
+		getSessionId: () => sessionId ?? "parent-session",
 		getSessionSpawns: () => "*",
 		model: { contextWindow: 1_000 } as Model,
 		buildForkContextSeed,
@@ -157,9 +161,32 @@ function createSeed(text = "seed"): ForkContextSeed {
 			maxTokens: 250,
 			skippedReasons: {},
 		},
-		cacheIdentity: "parent-cache-id",
 	};
 }
+
+test("normalizes invalid fork-context token caps and enforces the child context ceiling", () => {
+	expect(resolveForkContextMaxTokens(Number.NaN, { contextWindow: 1_000 } as Model)).toBe(150);
+	expect(resolveForkContextMaxTokens(Number.POSITIVE_INFINITY, undefined)).toBe(15_000);
+	expect(resolveForkContextMaxTokens(0.5, undefined)).toBe(1);
+	const seed = createSeed("seed ".repeat(2_000));
+	seed.metadata.maxTokens = 10_000;
+	const trimmed = trimForkContextSeedForModel(seed, { contextWindow: 1_000 } as Model);
+	expect(trimmed.messages).toEqual([]);
+	expect(trimmed.metadata.maxTokens).toBe(0);
+	expect(trimmed.metadata.skippedReasons["child-context-ceiling"]).toBe(1);
+});
+
+test("keeps a nonzero inherited context budget for policy-capped Grok 4.6", () => {
+	const seed = createSeed("parent context");
+	const trimmed = trimForkContextSeedForModel(seed, {
+		contextWindow: 500_000,
+		maxTokens: 64_000,
+	} as Model);
+
+	expect(trimmed.messages).toHaveLength(1);
+	expect(trimmed.metadata.maxTokens).toBeGreaterThan(0);
+	expect(trimmed.metadata.skippedReasons["child-context-ceiling"]).toBeUndefined();
+});
 
 describe("fork context policy surface", () => {
 	afterEach(() => {
@@ -383,13 +410,39 @@ describe("fork context policy surface", () => {
 		expect(seedBuilder).not.toHaveBeenCalled();
 		expect(getOptions()?.forkContextSeed).toBeUndefined();
 	});
+	test("does not apply profile alias intent to a manual override outside a partial profile", async () => {
+		mockAgents([createAgent("executor", "allowed")]);
+		const { getOptions } = mockCreateAgentSession();
+		const parent = createSession({
+			"task.agentModelOverrides": { executor: "shared-model" },
+		});
+		Object.assign(parent, { getActiveModelProfile: () => "planner-only" });
+		Object.assign(parent.modelRegistry!, {
+			getModelProfile: () => ({
+				name: "planner-only",
+				requiredProviders: [],
+				modelMapping: { planner: "planner-alias" },
+				source: "user" as const,
+			}),
+		});
+		const tool = await TaskTool.create(parent);
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [{ id: "ManualExecutor", description: "manual", assignment: "Keep manual override exact." }],
+		});
+
+		expect(getOptions()?.activeModelProfile).toBeUndefined();
+	});
 
 	test("passes a sanitized fork seed and cache identity without sharing provider state", async () => {
 		mockAgents([createAgent("executor", "allowed")]);
 		const seed = createSeed();
 		const seedBuilder = vi.fn(async () => seed);
 		const { getOptions } = mockCreateAgentSession();
-		const tool = await TaskTool.create(createSession({ "task.forkContext.enabled": true }, seedBuilder));
+		const parent = createSession({ "task.forkContext.enabled": true }, seedBuilder);
+		Object.assign(parent, { getCredentialSessionId: () => "credential-pool" });
+		const tool = await TaskTool.create(parent);
 
 		await executeDetached(tool, {
 			agent: "executor",
@@ -398,9 +451,13 @@ describe("fork context policy surface", () => {
 			],
 		});
 
-		expect(seedBuilder).toHaveBeenCalledWith({ maxMessages: 50, maxTokens: 250, signal: undefined });
+		expect(seedBuilder).toHaveBeenCalledWith({ maxMessages: 50, maxTokens: 8000, signal: undefined });
 		expect(getOptions()?.forkContextSeed).toBe(seed);
-		expect(getOptions()?.providerSessionId).toBeUndefined();
+		const parentSessionId = parent.getSessionId?.();
+		const forkScope = getOptions()?.providerSessionId;
+		expect(forkScope).toBeDefined();
+		expect(forkScope).not.toBe(parentSessionId);
+		expect(getOptions()?.credentialSessionId).toBe("credential-pool");
 		expect(getOptions()?.providerSessionState).toBeUndefined();
 		expect(getOptions()?.toolNames).toEqual(["read"]);
 		const systemPromptOption = getOptions()?.systemPrompt;
@@ -408,6 +465,57 @@ describe("fork context policy surface", () => {
 			typeof systemPromptOption === "function" ? systemPromptOption(["base", "tail"]) : systemPromptOption;
 		expect(renderedPrompt?.join("\n")).toContain("executor system prompt");
 		expect(renderedPrompt?.join("\n")).toContain("forked snapshot of the parent conversation");
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [
+				{
+					id: "ForkSeedSibling",
+					description: "seed",
+					assignment: "Use inherited context.",
+					inheritContext: "bounded",
+				},
+			],
+		});
+
+		const siblingScope = getOptions()?.providerSessionId;
+		expect(siblingScope).toBeDefined();
+		expect(siblingScope).not.toBe(parentSessionId);
+		expect(siblingScope).not.toBe(forkScope);
+	});
+
+	test("suppresses fork-context prompt notice for zero-message seeds", async () => {
+		mockAgents([createAgent("executor", "allowed")]);
+		const seed = createSeed();
+		seed.messages = [];
+		seed.agentMessages = [];
+		seed.metadata.includedMessages = 0;
+		seed.metadata.skippedMessages = 1;
+		seed.metadata.approximateTokens = 0;
+		seed.metadata.skippedReasons = { "empty-content": 1 };
+		const seedBuilder = vi.fn(async () => seed);
+		const { getOptions } = mockCreateAgentSession();
+		const tool = await TaskTool.create(createSession({ "task.forkContext.enabled": true }, seedBuilder));
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [
+				{
+					id: "EmptyForkSeed",
+					description: "seed",
+					assignment: "Use inherited context.",
+					inheritContext: "bounded",
+				},
+			],
+		});
+
+		expect(getOptions()?.forkContextSeed).toBe(seed);
+		const systemPromptOption = getOptions()?.systemPrompt;
+		const renderedPrompt =
+			typeof systemPromptOption === "function" ? systemPromptOption(["base", "tail"]) : systemPromptOption;
+		const rendered = renderedPrompt?.join("\n") ?? "";
+		expect(rendered).not.toContain("Forked Conversation Snapshot");
+		expect(rendered).not.toContain("forked snapshot of the parent conversation");
 	});
 
 	test("uses configured maxMessages to cap bounded fork-context seeds", async () => {
@@ -430,9 +538,82 @@ describe("fork context policy surface", () => {
 			],
 		});
 
-		expect(seedBuilder).toHaveBeenCalledWith({ maxMessages: 3, maxTokens: 250, signal: undefined });
+		expect(seedBuilder).toHaveBeenCalledWith({ maxMessages: 3, maxTokens: 8000, signal: undefined });
 	});
 
+	test("uses shared advisory token budgets for receipt, last-turn, bounded, and none fork-context seeds", async () => {
+		mockAgents([createAgent("executor", "allowed")]);
+		const seedBuilder = vi.fn(async () => createSeed());
+		const { getOptions } = mockCreateAgentSession();
+		const tool = await TaskTool.create(createSession({ "task.forkContext.enabled": true }, seedBuilder));
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [
+				{
+					id: "NoForkSeed",
+					description: "seed",
+					assignment: "Use no inherited context.",
+					inheritContext: "none",
+				},
+			],
+		});
+		expect(FORK_CONTEXT_TOKEN_BUDGET_BY_MODE.none).toBe(0);
+		expect(seedBuilder).not.toHaveBeenCalled();
+		expect(getOptions()?.forkContextSeed).toBeUndefined();
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [
+				{
+					id: "ReceiptForkSeed",
+					description: "seed",
+					assignment: "Use receipt context.",
+					inheritContext: "receipt",
+				},
+			],
+		});
+		expect(seedBuilder).toHaveBeenLastCalledWith({
+			maxMessages: 1,
+			maxTokens: FORK_CONTEXT_TOKEN_BUDGET_BY_MODE.receipt,
+			signal: undefined,
+		});
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [
+				{
+					id: "LastTurnForkSeed",
+					description: "seed",
+					assignment: "Use last turn context.",
+					inheritContext: "last-turn",
+				},
+			],
+		});
+		expect(seedBuilder).toHaveBeenLastCalledWith({
+			maxMessages: 2,
+			maxTokens: FORK_CONTEXT_TOKEN_BUDGET_BY_MODE["last-turn"],
+			preserveLatestUser: true,
+			signal: undefined,
+		});
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [
+				{
+					id: "BoundedForkSeedBudget",
+					description: "seed",
+					assignment: "Use bounded context.",
+					inheritContext: "bounded",
+				},
+			],
+		});
+		expect(seedBuilder).toHaveBeenLastCalledWith({
+			maxMessages: 50,
+			maxTokens: FORK_CONTEXT_TOKEN_BUDGET_BY_MODE.bounded,
+			signal: undefined,
+		});
+	});
 	test("uses reduced model-window fallback for full fork-context seeds", async () => {
 		mockAgents([createAgent("executor", "allowed")]);
 		const seed = createSeed();
@@ -502,6 +683,40 @@ describe("fork context policy surface", () => {
 
 		expect(seedBuilder).toHaveBeenCalledTimes(1);
 		expect(getOptions()?.forkContextSeed).toBe(seedAtDispatch);
+	});
+
+	test("TaskTool registers task jobs on the session's endpoint-owned manager, never the process-global instance", async () => {
+		// Reproduction of the review-thread P1 scenario: the registration sites
+		// are endpoint-qualified, so TaskTool's manager selection must resolve
+		// the session's ENDPOINT manager — with concurrent top-level sessions
+		// and B as the process-global instance, recording A's task in B's
+		// manager would make an A scope:"owned" abort consult A's manager and
+		// return uncertainty while the task continues.
+		mockAgents([createAgent("executor")]);
+		mockCreateAgentSession();
+		const endpointManager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const foreign = new AsyncJobManager({ onJobComplete: async () => {} });
+		try {
+			AsyncJobManager.setInstance(foreign);
+			// Mirror the production sdk/session.ts wiring: the session's
+			// manager is registered under its endpoint.
+			AsyncJobManager.registerForEndpoint("ep-task-route", endpointManager);
+			const tool = await TaskTool.create(
+				createSession({ "task.forkContext.enabled": true, "async.enabled": true }, undefined, "ep-task-route"),
+			);
+			await tool.execute("tool-call", {
+				agent: "executor",
+				tasks: [{ id: "Route", description: "r", assignment: "a" }],
+			} as TaskParams);
+			// The task job landed in the ENDPOINT manager; the process-global
+			// (foreign) manager never received it.
+			expect(endpointManager.getAllJobs().length).toBeGreaterThan(0);
+			expect(foreign.getAllJobs().length).toBe(0);
+		} finally {
+			AsyncJobManager.setInstance(undefined);
+			AsyncJobManager.unregisterManager(endpointManager);
+			AsyncJobManager.unregisterManager(foreign);
+		}
 	});
 
 	test("bundled executor and architect agents default to forkContext: allowed", () => {

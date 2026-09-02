@@ -6,7 +6,7 @@ import {
 	type AuthCredentialStore,
 	SqliteAuthCredentialStore,
 	type StoredAuthCredential,
-} from "@gajae-code/ai";
+} from "@gajae-code/ai/core";
 import { getAgentDbPath, isRecord, logger } from "@gajae-code/utils";
 import type { RawSettings as Settings } from "../config/settings";
 
@@ -37,6 +37,8 @@ const instances = new Map<string, AgentStorage>();
 export class AgentStorage {
 	#db: Database;
 	#authStore: AuthCredentialStore;
+	#dbPath: string;
+	#closed = false;
 
 	#listSettingsStmt: Statement;
 	#upsertModelUsageStmt: Statement;
@@ -44,6 +46,7 @@ export class AgentStorage {
 	#modelUsageCache: string[] | null = null;
 
 	private constructor(dbPath: string) {
+		this.#dbPath = dbPath;
 		this.#ensureDir(dbPath);
 		try {
 			this.#db = new Database(dbPath);
@@ -209,12 +212,16 @@ FROM model_usage_legacy
 	/**
 	 * Returns singleton instance for the given database path, creating if needed.
 	 * Retries on SQLITE_BUSY with exponential backoff.
-	 * @param dbPath - Path to the SQLite database file (defaults to config path)
+	 * @param dbPath - Path to the database file (defaults to config path)
+	 * @param options.isolated - Open an independent handle instead of the cached process-wide instance.
 	 * @returns AgentStorage instance for the given path
 	 */
-	static async open(dbPath: string = getAgentDbPath()): Promise<AgentStorage> {
-		const existing = instances.get(dbPath);
-		if (existing) return existing;
+	static async open(dbPath: string = getAgentDbPath(), options?: { isolated?: boolean }): Promise<AgentStorage> {
+		const isolated = options?.isolated === true;
+		if (!isolated) {
+			const existing = instances.get(dbPath);
+			if (existing) return existing;
+		}
 
 		const maxRetries = 3;
 		const baseDelayMs = 100;
@@ -223,7 +230,7 @@ FROM model_usage_legacy
 		for (let attempt = 0; attempt < maxRetries; attempt++) {
 			try {
 				const storage = new AgentStorage(dbPath);
-				instances.set(dbPath, storage);
+				if (!isolated) instances.set(dbPath, storage);
 				return storage;
 			} catch (err) {
 				const isSqliteBusy = err && typeof err === "object" && (err as { code?: string }).code === "SQLITE_BUSY";
@@ -258,9 +265,44 @@ FROM model_usage_legacy
 					key: row.key,
 					error: String(error),
 				});
+				// A malformed row must fail the whole read: the migration drains
+				// rows only after a fully successful read, and deleting a row that
+				// never decoded would permanently lose its value. Throwing keeps
+				// every row (including the malformed one) in place for repair.
+				throw error;
 			}
 		}
 		return settings as Settings;
+	}
+
+	/**
+	 * @deprecated Settings are now stored in config.yml, not agent.db.
+	 * Clears the legacy settings rows after they have been drained into
+	 * config.yml so a later load never re-imports them (the database has no
+	 * other one-time guard). Retries transient SQLITE_BUSY contention with
+	 * exponential backoff and THROWS on persistent failure: the migration must
+	 * not treat a failed drain as success while stale rows stay eligible for
+	 * re-import on a later load.
+	 */
+	async clearSettings(): Promise<void> {
+		const maxRetries = 3;
+		const baseDelayMs = 100;
+		let lastError: Error | undefined;
+		for (let attempt = 0; attempt < maxRetries; attempt++) {
+			try {
+				this.#db.run("DELETE FROM settings");
+				return;
+			} catch (error) {
+				const isSqliteBusy =
+					error && typeof error === "object" && (error as { code?: string }).code === "SQLITE_BUSY";
+				if (!isSqliteBusy) {
+					throw error;
+				}
+				lastError = error as Error;
+				await Bun.sleep(baseDelayMs * 2 ** attempt);
+			}
+		}
+		throw lastError ?? new Error("Failed to clear legacy settings after retries");
 	}
 
 	/**
@@ -420,6 +462,10 @@ FROM model_usage_legacy
 		this.#authStore.setCache(key, value, expiresAtSec);
 	}
 
+	deleteCachePrefix(prefix: string): void {
+		this.#authStore.deleteCachePrefix?.(prefix);
+	}
+
 	/**
 	 * Deletes expired cache entries. Call periodically for cleanup.
 	 */
@@ -427,6 +473,21 @@ FROM model_usage_legacy
 		this.#authStore.cleanExpiredCache();
 	}
 
+	/**
+	 * Release prepared statements and the shared SQLite handle.
+	 *
+	 * AgentStorage instances are cached by path, so closing also evicts this
+	 * instance and allows a later open() to create a fresh handle.
+	 */
+	close(): void {
+		if (this.#closed) return;
+		this.#closed = true;
+		this.#listSettingsStmt.finalize();
+		this.#upsertModelUsageStmt.finalize();
+		this.#listModelUsageStmt.finalize();
+		this.#authStore.close();
+		if (instances.get(this.#dbPath) === this) instances.delete(this.#dbPath);
+	}
 	/**
 	 * Ensures the parent directory for the database file exists.
 	 * @param dbPath - Path to the database file

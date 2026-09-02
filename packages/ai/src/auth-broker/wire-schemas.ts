@@ -11,10 +11,18 @@
  * `hasOnlyFields` allowlist for the same effect.
  */
 import * as z from "zod/v4";
-import { REMOTE_REFRESH_SENTINEL } from "../auth-storage";
+import { isCanonicalMCPOAuthBinding, REMOTE_REFRESH_SENTINEL } from "../auth-storage";
 import { usageReportSchema } from "../usage";
 
 // ─── Credential payloads ───────────────────────────────────────────────────
+
+export const mcpOAuthBindingSchema = z
+	.object({
+		resourceOrigin: z.string().min(1),
+		tokenEndpoint: z.string().min(1),
+	})
+	.strict()
+	.refine(isCanonicalMCPOAuthBinding, { message: "MCP OAuth binding must use canonical HTTP(S) URLs" });
 
 /** Real OAuth credential (broker-side) — refresh token is the actual upstream value. */
 export const oauthCredentialSchema = z
@@ -37,6 +45,7 @@ export const oauthCredentialSchema = z
 		projectId: z.string().optional(),
 		email: z.string().optional(),
 		accountId: z.string().optional(),
+		mcpBinding: mcpOAuthBindingSchema.optional(),
 	})
 	.strict();
 
@@ -72,6 +81,7 @@ export const credentialSnapshotEntrySchema = z
 		provider: z.string().min(1),
 		credential: snapshotCredentialSchema,
 		identityKey: z.string().nullable(),
+		revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
 	})
 	.strict();
 
@@ -92,11 +102,34 @@ export const refresherScheduleSchema = z
 
 export const snapshotResponseSchema = z
 	.object({
+		epoch: z.string().min(1).optional(),
 		generation: z.number().int(),
 		generatedAt: z.number(),
 		serverNowMs: z.number(),
 		refresher: refresherScheduleSchema,
 		credentials: z.array(snapshotEntrySchema),
+	})
+	.strict();
+
+// ─── Credential metadata ───────────────────────────────────────────────────
+
+/** Closed redacted projection: no token, key, identity object, or extension fields. */
+export const credentialMetadataRecordSchema = z
+	.object({
+		id: z.number().int(),
+		provider: z.string().min(1),
+		type: z.enum(["oauth", "api_key"]),
+		identity: z.string().nullable(),
+		disabledCause: z.string().nullable(),
+	})
+	.strict();
+
+export const credentialMetadataResponseSchema = z
+	.object({
+		epoch: z.string().min(1).optional(),
+		generation: z.number().int().nonnegative(),
+		generatedAt: z.number().finite().nonnegative(),
+		credentials: z.array(credentialMetadataRecordSchema),
 	})
 	.strict();
 
@@ -113,6 +146,7 @@ export const snapshotStreamSnapshotEventSchema = snapshotResponseSchema
 export const snapshotStreamEntryEventSchema = z
 	.object({
 		kind: z.literal("entry"),
+		epoch: z.string().min(1).optional(),
 		generation: z.number().int(),
 		serverNowMs: z.number(),
 		refresher: refresherScheduleSchema,
@@ -124,6 +158,7 @@ export const snapshotStreamEntryEventSchema = z
 export const snapshotStreamRemovedEventSchema = z
 	.object({
 		kind: z.literal("removed"),
+		epoch: z.string().min(1).optional(),
 		generation: z.number().int(),
 		serverNowMs: z.number(),
 		refresher: refresherScheduleSchema,
@@ -164,6 +199,13 @@ export const usageResponseSchema = z
 
 // ─── Refresh ───────────────────────────────────────────────────────────────
 
+export const credentialRefreshRequestSchema = z
+	.object({
+		clientId: z.string().optional(),
+		clientSecret: z.string().optional(),
+	})
+	.strict();
+
 export const credentialRefreshResponseSchema = z
 	.object({
 		entry: credentialSnapshotEntrySchema,
@@ -175,6 +217,7 @@ export const credentialRefreshResponseSchema = z
 export const credentialDisableRequestSchema = z
 	.object({
 		cause: z.string().optional(),
+		expectedRevision: z.number().int().positive().optional(),
 	})
 	.strict();
 
@@ -187,6 +230,7 @@ export const credentialDisableResponseSchema = z
 // ─── Upload ────────────────────────────────────────────────────────────────
 const credentialIfAbsentReasonSchema = z.enum([
 	"inserted",
+	"updated-existing",
 	"skipped-existing",
 	"skipped-existing-runtime",
 	"skipped-existing-config",
