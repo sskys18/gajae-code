@@ -142,8 +142,12 @@ gjc mcp remove aside-search --project
 
 Docs-only remains the smallest safe outcome for the search/context sidecar in issue #1097: existing GJC MCP registration can store a user-provided Aside MCP server definition for redacted inspection, and Aside already documents `aside mcp`. `/aside` is the separate CLI-ergonomics path: an explicit composer command that probes and optionally execs the user-installed binary, without adapter glue and without restoring the reverted Aside browser-tool backend. The future-safe boundary is to keep Aside external and opt-in, document read/search/context-only use, and require a separate design before GJC claims runtime support for browser actions, login, payment, internal-tool, or private browser-session workflows.
 
-## Option D: `browser.backend: aside` (native routing)
+## Option D: `browser.backend: aside` (CLI routing)
 
-This fork-local setting selects Aside as the browser surface. Set `browser.backend` to `"aside"` to hide GJC's built-in browser tool and add system-prompt guidance requiring browser work through direct `aside repl` or `aside exec` CLI commands. It does not register or use an MCP server, does not restore the reverted in-process Aside browser backend, and leaves upstream's boundary decision above unchanged.
+`browser.backend` selects the browser surface offered to the model. The default `"native"` keeps the built-in Puppeteer `browser` tool. Setting it to `"aside"` hides the built-in tool (it is neither active nor discoverable) and appends a `<browser-backend>` system-prompt block that requires every browser task to run through the Bash tool as a direct `aside repl` (deterministic Playwright) or `aside exec` (agentic) invocation. It does not register or start an MCP server, does not spawn or supervise any Aside process from GJC, and does not restore the reverted in-process Aside browser driver; the boundary decision above is unchanged because the operator opts in explicitly per setting.
 
-There is no fallback to the native browser. When the Aside CLI is unavailable, the direct CLI command fails clearly and the session has no browser tool.
+There is no fallback to the native browser. When the Aside CLI is unavailable, the direct CLI command fails in the Bash tool result and the session has no browser tool.
+
+```sh
+gjc config set browser.backend aside
+```
