@@ -141,3 +141,9 @@ gjc mcp remove aside-search --project
 ## Decision
 
 Docs-only remains the smallest safe outcome for the search/context sidecar in issue #1097: existing GJC MCP registration can store a user-provided Aside MCP server definition for redacted inspection, and Aside already documents `aside mcp`. `/aside` is the separate CLI-ergonomics path: an explicit composer command that probes and optionally execs the user-installed binary, without adapter glue and without restoring the reverted Aside browser-tool backend. The future-safe boundary is to keep Aside external and opt-in, document read/search/context-only use, and require a separate design before GJC claims runtime support for browser actions, login, payment, internal-tool, or private browser-session workflows.
+
+## Option D: `browser.backend: aside` (native routing)
+
+This fork-local setting selects Aside as the browser surface. Set `browser.backend` to `"aside"` to hide GJC's built-in browser tool, auto-register `aside mcp` as an always-on MCP server, and add system-prompt guidance requiring browser work through Aside's persistent live logged-in browser REPL. It does not restore the reverted in-process Aside browser backend, and upstream's boundary decision above remains unchanged.
+
+There is no fallback to the native browser. When the Aside CLI is unavailable, GJC logs a warning naming `browser.backend`, includes the installation command, and starts the session with no browser tool.
