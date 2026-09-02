@@ -545,6 +545,29 @@ describe("system Handlebars prompt templates", () => {
 		expect(promptText).not.toContain("Edit: `edit`");
 	}, 30_000);
 
+	test("adds the Aside browser guidance only for the Aside backend", async () => {
+		const options = {
+			cwd: os.tmpdir(),
+			contextFiles: [],
+			skills: [],
+			rules: [],
+			toolNames: ["read"],
+			workspaceTree: {
+				rootPath: os.tmpdir(),
+				rendered: "",
+				truncated: false,
+				totalLines: 0,
+				agentsMdFiles: [],
+			},
+		};
+
+		const native = await buildSystemPrompt({ ...options, browserBackend: "native" });
+		const aside = await buildSystemPrompt({ ...options, browserBackend: "aside" });
+
+		expect(native.systemPrompt.join("\n\n")).not.toContain("<browser-backend>");
+		expect(aside.systemPrompt.join("\n\n")).toContain("<browser-backend>");
+	}, 30_000);
+
 	test("buildSystemPrompt omits CPU info when os.cpus fails", async () => {
 		vi.spyOn(os, "cpus").mockImplementation(() => {
 			throw new Error("os.cpus() failed");
